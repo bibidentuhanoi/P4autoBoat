@@ -1,0 +1,39 @@
+menu "Board Configuration"
+
+    config I2C_SDA_PIN
+        int "I2C SDA Pin"
+        default 8
+
+    config I2C_SCL_PIN
+        int "I2C SCL Pin"
+        default 7
+
+    config TOF_A_LPN_PIN
+        int "ToF Sensor A LPN Pin"
+        default 52
+
+    config TOF_B_LPN_PIN
+        int "ToF Sensor B LPN Pin"
+        default 29
+
+    config TOF_A_ADDR
+        hex "ToF Sensor A Address"
+        default 0x22
+
+    config TOF_B_ADDR
+        hex "ToF Sensor B Address"
+        default 0x24
+
+    config FUSION_COMPLEMENTARY_ALPHA
+        string "Fusion Complementary Alpha"
+        default "0.96"
+
+    config CALIB_GYRO_SAMPLES
+        int "Gyro Calibration Samples"
+        default 500
+
+    config CALIB_MAG_DURATION
+        int "Mag Calibration Duration (s)"
+        default 15
+
+endmenu
