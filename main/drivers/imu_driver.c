@@ -25,7 +25,7 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
 
     i2c_write_byte(h_qmc, 0x0A, 0x80);
     vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_write_byte(h_qmc, 0x09, 0x05 | 0x10);
+    i2c_write_byte(h_qmc, 0x09, 0x05); // ±2G, 50Hz, OSR=512, continuous
     i2c_write_byte(h_qmc, 0x0B, 0x01);
 
     // ICM20948 Init

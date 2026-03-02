@@ -20,6 +20,7 @@ static FusionResult current_fusion;
 static float mag_filt[3] = {0};
 static float pitch = 0.0f;
 static float roll = 0.0f;
+static float alpha;
 
 void fusion_init(CalibrationData* calib_data) {
     calib = calib_data;
@@ -80,7 +81,7 @@ void task_imu_fusion(void *pvParameters) {
             float acc_pitch = atan2f(-raw_ax, acc_denom) * RAD_TO_DEG;
 
             // Simple complementary filter
-            float alpha = strtof(CONFIG_FUSION_COMPLEMENTARY_ALPHA, NULL);
+            alpha = strtof(CONFIG_FUSION_COMPLEMENTARY_ALPHA, NULL);
             if (alpha <= 0.0f || alpha >= 1.0f) {
                 alpha = 0.96f; // Fallback safety
             }

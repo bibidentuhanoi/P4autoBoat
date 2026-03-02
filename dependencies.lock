@@ -2,9 +2,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.0
+    version: 5.4.3
   rjrp44/vl53l5cx:
-    component_hash: 6dbc68bb35a424f6f5392834ddab94ad5fac121a0e3f90dde4d2bdff22699b46
+    component_hash: 
+      6dbc68bb35a424f6f5392834ddab94ad5fac121a0e3f90dde4d2bdff22699b46
     dependencies:
     - name: idf
       require: private

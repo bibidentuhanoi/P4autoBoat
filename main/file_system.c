@@ -20,21 +20,21 @@ void fs_save_calibration(const CalibrationData* calib) {
     nvs_handle_t my_handle;
     esp_err_t err;
 
-    printf("\nSaving calibration to NVS...\n");
+    ESP_LOGI(TAG,"\nSaving calibration to NVS...\n");
 
     err = nvs_open("storage", NVS_READWRITE, &my_handle);
     if (err != ESP_OK) {
-        printf("Error (%s) opening NVS handle!\n", esp_err_to_name(err));
+        ESP_LOGI(TAG,"Error (%s) opening NVS handle!\n", esp_err_to_name(err));
         return;
     }
 
     err = nvs_set_blob(my_handle, "imu_cal", calib, sizeof(CalibrationData));
     if (err != ESP_OK) {
-        printf("Failed to write blob to NVS! (%s)\n", esp_err_to_name(err));
+        ESP_LOGI(TAG,"Failed to write blob to NVS! (%s)\n", esp_err_to_name(err));
     } else {
         err = nvs_commit(my_handle);
         if (err == ESP_OK) {
-            printf("Calibration data successfully saved to flash memory!\n");
+            ESP_LOGI(TAG,"Calibration data successfully saved to flash memory!\n");
         }
     }
 
@@ -47,7 +47,7 @@ bool fs_load_calibration(CalibrationData* calib) {
 
     err = nvs_open("storage", NVS_READONLY, &my_handle);
     if (err != ESP_OK) {
-        printf("NVS empty or uninitialized. (Normal on first boot)\n");
+        ESP_LOGI(TAG,"NVS empty or uninitialized. (Normal on first boot)\n");
         return false;
     }
 
@@ -59,7 +59,7 @@ bool fs_load_calibration(CalibrationData* calib) {
     }
 
     if (required_size != sizeof(CalibrationData)) {
-        printf("NVS Data size mismatch! Firmware updated? Forcing recalibration.\n");
+        ESP_LOGI(TAG,"NVS Data size mismatch! Firmware updated? Forcing recalibration.\n");
         nvs_close(my_handle);
         return false;
     }
@@ -73,7 +73,7 @@ bool fs_load_calibration(CalibrationData* calib) {
     }
 
     if (temp_cal.magic_word != CALIB_MAGIC_WORD) {
-        printf("NVS Data format corrupted or outdated. Forcing recalibration.\n");
+        ESP_LOGI(TAG,"NVS Data format corrupted or outdated. Forcing recalibration.\n");
         return false;
     }
 
@@ -83,21 +83,21 @@ bool fs_load_calibration(CalibrationData* calib) {
 
         if (isnan(temp_cal.m_scale[i]) || isinf(temp_cal.m_scale[i]) ||
            (temp_cal.m_scale[i] <= 0.05f) || (temp_cal.m_scale[i] > 20.0f)) {
-            printf("CRITICAL: Corrupted Magnetometer scale factor detected! Forcing recalibration.\n");
+            ESP_LOGI(TAG,"CRITICAL: Corrupted Magnetometer scale factor detected! Forcing recalibration.\n");
             return false;
         }
     }
 
     *calib = temp_cal;
 
-    printf("\n--- LOADED CALIBRATION FROM NVS ---\n");
-    printf(".g_bias = {%.2ff, %.2ff, %.2ff}\n", calib->g_bias[0], calib->g_bias[1], calib->g_bias[2]);
-    printf(".m_bias = {%.2ff, %.2ff, %.2ff}\n", calib->m_bias[0], calib->m_bias[1], calib->m_bias[2]);
-    printf(".m_scale = {%.4ff, %.4ff, %.4ff}\n", calib->m_scale[0], calib->m_scale[1], calib->m_scale[2]);
-    printf(".pitch_tare = %.2ff\n", calib->pitch_tare);
-    printf(".roll_tare = %.2ff\n", calib->roll_tare);
-    printf(".heading_tare = %.2ff\n", calib->heading_tare);
-    printf("-----------------------------------\n");
+    ESP_LOGI(TAG,"\n--- LOADED CALIBRATION FROM NVS ---\n");
+    ESP_LOGI(TAG,".g_bias = {%.2ff, %.2ff, %.2ff}\n", calib->g_bias[0], calib->g_bias[1], calib->g_bias[2]);
+    ESP_LOGI(TAG,".m_bias = {%.2ff, %.2ff, %.2ff}\n", calib->m_bias[0], calib->m_bias[1], calib->m_bias[2]);
+    ESP_LOGI(TAG,".m_scale = {%.4ff, %.4ff, %.4ff}\n", calib->m_scale[0], calib->m_scale[1], calib->m_scale[2]);
+    ESP_LOGI(TAG,".pitch_tare = %.2ff\n", calib->pitch_tare);
+    ESP_LOGI(TAG,".roll_tare = %.2ff\n", calib->roll_tare);
+    ESP_LOGI(TAG,".heading_tare = %.2ff\n", calib->heading_tare);
+    ESP_LOGI(TAG,"-----------------------------------\n");
 
     return true;
 }

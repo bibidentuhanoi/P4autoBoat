@@ -1,131 +1,13 @@
-# import serial
-# import threading
-# import numpy as np
-# import matplotlib.pyplot as plt
-# import matplotlib.animation as animation
-# from matplotlib.patches import Rectangle
-# import time
-# import re
-
-# # ==========================================
-# # CONFIGURATION
-# # ==========================================
-# COM_PORT = '/dev/ttyACM0'
-# BAUD_RATE = 115200
-# MAX_DISTANCE = 2000  # mm (The color scale limit)
-# # ==========================================
-
-# # Data structures
-# grid_A = np.ones((8, 8)) * MAX_DISTANCE
-# grid_B = np.ones((8, 8)) * MAX_DISTANCE
-# data_lock = threading.Lock()
-
-# def serial_reader():
-#     global grid_A, grid_B
-#     while True:
-#         try:
-#             ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.1)
-#             ser.reset_input_buffer()
-            
-#             current_sensor = None
-#             temp_grid = []
-
-#             while True:
-#                 line_raw = ser.readline()
-#                 if not line_raw: continue
-#                 try:
-#                     line = line_raw.decode('utf-8', errors='ignore').strip()
-#                 except: continue
-
-#                 if "SENSOR A" in line:
-#                     current_sensor = 'A'; temp_grid = []
-#                     continue
-#                 elif "SENSOR B" in line:
-#                     current_sensor = 'B'; temp_grid = []
-#                     continue
-
-#                 nums = [int(s) for s in re.findall(r'\d+', line)]
-#                 if len(nums) == 8 and current_sensor is not None:
-#                     temp_grid.append(nums)
-#                     if len(temp_grid) == 8:
-#                         with data_lock:
-#                             if current_sensor == 'A': grid_A = np.array(temp_grid)
-#                             else: grid_B = np.array(temp_grid)
-#                         temp_grid = []
-#                         current_sensor = None 
-#         except:
-#             time.sleep(2)
-
-# # ------------------------------------------
-# # Setup UI
-# # ------------------------------------------
-# plt.style.use('dark_background')
-# fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-# fig.canvas.manager.set_window_title('VL53L5CX Dual 8x8 Live Radar')
-
-# cmap = 'turbo' 
-
-# # Sensor A Setup
-# im1 = ax1.imshow(grid_A, vmin=0, vmax=MAX_DISTANCE, cmap=cmap, interpolation='gaussian')
-# ax1.set_title("SENSOR A (Left)", fontsize=16, color='#00FFCC', pad=20)
-# target_a = ax1.text(0, -1, "", color='white', fontsize=12, fontweight='bold')
-# rect_a = Rectangle((0,0), 1, 1, fill=False, color='white', linewidth=2)
-# ax1.add_patch(rect_a)
-
-# # Sensor B Setup
-# im2 = ax2.imshow(grid_B, vmin=0, vmax=MAX_DISTANCE, cmap=cmap, interpolation='gaussian')
-# ax2.set_title("SENSOR B (Right)", fontsize=16, color='#00FFCC', pad=20)
-# target_b = ax2.text(0, -1, "", color='white', fontsize=12, fontweight='bold')
-# rect_b = Rectangle((0,0), 1, 1, fill=False, color='white', linewidth=2)
-# ax2.add_patch(rect_b)
-
-# # Stats Text (at the bottom)
-# stats_a = ax1.text(0, 8.5, "Min: ---mm | Avg: ---mm", color='yellow', fontsize=10)
-# stats_b = ax2.text(0, 8.5, "Min: ---mm | Avg: ---mm", color='yellow', fontsize=10)
-
-# for ax in [ax1, ax2]:
-#     ax.set_xticks(range(8))
-#     ax.set_yticks(range(8))
-#     ax.grid(color='white', linestyle='--', linewidth=0.5, alpha=0.3)
-
-# plt.colorbar(im1, ax=ax1, label='Distance (mm)', fraction=0.046, pad=0.04)
-# plt.colorbar(im2, ax=ax2, label='Distance (mm)', fraction=0.046, pad=0.04)
-
-# def update_plot(frame):
-#     with data_lock:
-#         # Update A
-#         im1.set_data(grid_A)
-#         min_a = np.min(grid_A)
-#         avg_a = np.mean(grid_A)
-#         min_idx_a = np.unravel_index(np.argmin(grid_A, axis=None), grid_A.shape)
-#         rect_a.set_xy((min_idx_a[1]-0.5, min_idx_a[0]-0.5))
-#         stats_a.set_text(f"CLOSEST: {min_a}mm | AVG: {int(avg_a)}mm")
-        
-#         # Update B
-#         im2.set_data(grid_B)
-#         min_b = np.min(grid_B)
-#         avg_b = np.mean(grid_B)
-#         min_idx_b = np.unravel_index(np.argmin(grid_B, axis=None), grid_B.shape)
-#         rect_b.set_xy((min_idx_b[1]-0.5, min_idx_b[0]-0.5))
-#         stats_b.set_text(f"CLOSEST: {min_b}mm | AVG: {int(avg_b)}mm")
-
-#     return [im1, im2, rect_a, rect_b, stats_a, stats_b]
-
-# if __name__ == '__main__':
-#     thread = threading.Thread(target=serial_reader, daemon=True)
-#     thread.start()
-
-#     print("Visualizer running...")
-#     ani = animation.FuncAnimation(fig, update_plot, interval=30, blit=True, cache_frame_data=False)
-#     plt.tight_layout()
-#     plt.show()
 import serial
 import threading
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.gridspec as gridspec
-from matplotlib.patches import Rectangle, FancyArrowPatch
+from matplotlib.patches import Rectangle, Circle, Polygon
+from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.patheffects as pe
 import time
 import re
 
@@ -137,236 +19,534 @@ BAUD_RATE    = 115200
 MAX_DISTANCE = 2000  # mm
 # ==========================================
 
-# Data structures
-grid_A = np.ones((8, 8)) * MAX_DISTANCE
-grid_B = np.ones((8, 8)) * MAX_DISTANCE
+# ==========================================
+# DESIGN TOKENS
+# ==========================================
+BG_BASE     = '#05080F'
+BG_CARD     = '#0B1525'
+BORDER      = '#112240'
+BLUE_DIM    = '#0D2545'
+BLUE_MID    = '#1565C0'
+BLUE_BRIGHT = '#1E90FF'
+BLUE_GLOW   = '#42A5F5'
+CYAN        = '#00D4FF'
+CYAN_LABEL  = '#7DD3FC'   # bright-but-calm label blue — readable against dark cards
+AMBER       = '#FFC107'
+WHITE_SOFT  = '#CBD8E6'
+WHITE_DIM   = '#5C7A9B'
+RED_ALERT   = '#EF5350'
 
-imu = {
-    'ax': 0.0, 'ay': 0.0, 'az': 0.0,
-    'gx': 0.0, 'gy': 0.0, 'gz': 0.0,
-    'mx': 0.0, 'my': 0.0, 'mz': 0.0,
-}
-
+# ==========================================
+# DATA
+# ==========================================
+grid_A   = np.ones((8, 8)) * MAX_DISTANCE
+grid_B   = np.ones((8, 8)) * MAX_DISTANCE
+imu_data = {'pitch': 0.0, 'roll': 0.0, 'heading': 0.0}
 data_lock = threading.Lock()
 
 # ==========================================
-# SERIAL READER THREAD
+# SERIAL READER
 # ==========================================
 IMU_PATTERN = re.compile(
-    r'AX:([-\d.]+)\s+AY:([-\d.]+)\s+AZ:([-\d.]+)\s+'
-    r'GX:([-\d.]+)\s+GY:([-\d.]+)\s+GZ:([-\d.]+)\s+'
-    r'MX:([-\d.]+)\s+MY:([-\d.]+)\s+MZ:([-\d.]+)'
+    r'\[(SENSOR [AB])\] IMU: Pitch:\s*([-\d.]+)\s*\|\s*Roll:\s*([-\d.]+)\s*\|\s*Head:\s*([-\d.]+)'
 )
 
 def serial_reader():
-    global grid_A, grid_B, imu
+    global grid_A, grid_B, imu_data
     while True:
         try:
-            ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.1)
+            ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.01)
             ser.reset_input_buffer()
-
-            current_sensor = None
-            temp_grid = []
-
             while True:
                 line_raw = ser.readline()
                 if not line_raw:
                     continue
                 try:
                     line = line_raw.decode('utf-8', errors='ignore').strip()
-                except:
+                except UnicodeDecodeError:
                     continue
+                m = IMU_PATTERN.search(line)
+                if m:
+                    current_sensor = m.group(1)
+                    pitch   = float(m.group(2))
+                    roll    = float(m.group(3))
+                    heading = float(m.group(4))
+                    with data_lock:
+                        imu_data['pitch']   = pitch
+                        imu_data['roll']    = roll
+                        imu_data['heading'] = heading
 
-                # ToF sensor header detection
-                if "SENSOR A" in line:
-                    current_sensor = 'A'
+                    sep_raw     = ser.readline().decode('utf-8', errors='ignore').strip()
+                    sep_match   = re.match(r'^[IWED] \(\d+\) [^:]+: (.*)', sep_raw)
+                    sep_content = sep_match.group(1) if sep_match else sep_raw
+                    if not sep_content.startswith('----'):
+                        continue
+
                     temp_grid = []
-                    continue
-                elif "SENSOR B" in line:
-                    current_sensor = 'B'
-                    temp_grid = []
-                    continue
+                    for _ in range(8):
+                        row_raw     = ser.readline().decode('utf-8', errors='ignore').strip()
+                        row_match   = re.match(r'^[IWED] \(\d+\) [^:]+: (.*)', row_raw)
+                        row_content = row_match.group(1) if row_match else row_raw
+                        nums        = [int(s) for s in re.findall(r'-?\d+', row_content)]
+                        if len(nums) == 8:
+                            temp_grid.append(nums)
 
-                # IMU line detection
-                if line.startswith("IMU:"):
-                    m = IMU_PATTERN.search(line)
-                    if m:
-                        vals = [float(x) for x in m.groups()]
-                        with data_lock:
-                            imu['ax'], imu['ay'], imu['az'] = vals[0], vals[1], vals[2]
-                            imu['gx'], imu['gy'], imu['gz'] = vals[3], vals[4], vals[5]
-                            imu['mx'], imu['my'], imu['mz'] = vals[6], vals[7], vals[8]
-                    continue
-
-                # ToF grid rows
-                nums = [int(s) for s in re.findall(r'\d+', line)]
-                if len(nums) == 8 and current_sensor is not None:
-                    temp_grid.append(nums)
                     if len(temp_grid) == 8:
                         with data_lock:
-                            if current_sensor == 'A':
+                            if current_sensor == 'SENSOR A':
                                 grid_A = np.array(temp_grid)
-                            else:
+                            elif current_sensor == 'SENSOR B':
                                 grid_B = np.array(temp_grid)
-                        temp_grid = []
-                        current_sensor = None
-
         except Exception as e:
             print(f"Serial error: {e}")
             time.sleep(2)
 
 # ==========================================
-# UI SETUP
+# 3D BOX MATH
 # ==========================================
-plt.style.use('dark_background')
+w, l, h = 1.2, 2.5, 0.4
+base_vertices = np.array([
+    [-w/2, -l/2, -h/2], [w/2, -l/2, -h/2], [w/2,  l/2, -h/2], [-w/2,  l/2, -h/2],
+    [-w/2, -l/2,  h/2], [w/2, -l/2,  h/2], [w/2,  l/2,  h/2], [-w/2,  l/2,  h/2],
+])
+box_edges = [
+    (0,1),(1,2),(2,3),(3,0),
+    (4,5),(5,6),(6,7),(7,4),
+    (0,4),(1,5),(2,6),(3,7),
+]
 
-# Layout: top row = two heatmaps, bottom = IMU panel
-fig = plt.figure(figsize=(16, 10))
-fig.canvas.manager.set_window_title('VL53L5CX Dual 8x8 + ICM-20948 Live View')
+def get_rotation_matrix(pitch_deg, roll_deg, yaw_deg):
+    # Pitch rotates around X-axis (width)
+    # Roll rotates around Y-axis (length)
+    p, r, y = np.radians(pitch_deg), np.radians(roll_deg), np.radians(yaw_deg)
+    Rx = np.array([[1,0,0],[0,np.cos(p),-np.sin(p)],[0,np.sin(p),np.cos(p)]])
+    Ry = np.array([[np.cos(r),0,np.sin(r)],[0,1,0],[-np.sin(r),0,np.cos(r)]])
+    Rz = np.array([[np.cos(y),-np.sin(y),0],[np.sin(y),np.cos(y),0],[0,0,1]])
+    return Rz @ Ry @ Rx
 
-gs = gridspec.GridSpec(2, 3, figure=fig,
-                       height_ratios=[2.2, 1],
-                       hspace=0.45, wspace=0.35)
+# ==========================================
+# FIGURE
+# ==========================================
+plt.rcParams.update({
+    'font.family':     'DejaVu Sans',
+    'text.color':      WHITE_SOFT,
+    'axes.labelcolor': WHITE_DIM,
+    'xtick.color':     WHITE_DIM,
+    'ytick.color':     WHITE_DIM,
+})
 
-ax1   = fig.add_subplot(gs[0, 0])   # Sensor A heatmap
-ax2   = fig.add_subplot(gs[0, 2])   # Sensor B heatmap
-ax_ag = fig.add_subplot(gs[1, 0])   # Accel + Gyro bars
-ax_m  = fig.add_subplot(gs[1, 1])   # Magnetometer compass
-ax_v  = fig.add_subplot(gs[1, 2])   # Numerical readout
+fig = plt.figure(figsize=(22, 12), facecolor=BG_BASE)
+fig.canvas.manager.set_window_title('AutoBoat  ·  Navigation & Proximity System')
 
-cmap = 'turbo'
+# ── Title bar ────────────────────────────────────────────────────────────
+fig.text(0.5, 0.973, 'AUTOBOAT  ·  NAVIGATION SYSTEM',
+         ha='center', va='top', fontsize=15, fontweight='bold',
+         color=CYAN, fontfamily='monospace',
+         path_effects=[pe.withSimplePatchShadow(
+             shadow_rgbFace=BLUE_MID, alpha=0.35, rho=0.6)])
+fig.text(0.5, 0.946, '━' * 120,
+         ha='center', va='top', fontsize=7, color=BLUE_DIM)
 
-# --- Sensor A ---
-im1 = ax1.imshow(grid_A, vmin=0, vmax=MAX_DISTANCE, cmap=cmap, interpolation='gaussian')
-ax1.set_title("SENSOR A (Left)", fontsize=14, color='#00FFCC', pad=12)
-rect_a = Rectangle((-0.5, -0.5), 1, 1, fill=False, color='white', linewidth=2)
-ax1.add_patch(rect_a)
-stats_a = ax1.text(0, 8.6, "CLOSEST: ---mm | AVG: ---mm", color='yellow', fontsize=9)
-for ax in [ax1]:
-    ax.set_xticks(range(8)); ax.set_yticks(range(8))
-    ax.grid(color='white', linestyle='--', linewidth=0.4, alpha=0.3)
-plt.colorbar(im1, ax=ax1, label='Distance (mm)', fraction=0.046, pad=0.04)
+# ── 6-column, 2-row grid ─────────────────────────────────────────────────
+#
+#   Row 0  │  Sensor A  [cols 0:3]  │  Sensor B  [cols 3:6]  │
+#   Row 1  │  IMU       [cols 0:2]  │  Compass   [cols 2:4]  │  3D  [cols 4:6]  │
+#
+#   Layout guarantees:
+#     • IMU  left  edge == Sensor A left  edge  (col 0)
+#     • 3D   right edge == Sensor B right edge  (col 6)
+#     • Compass centre  == col-3 seam between A and B  ✓
+#     • height_ratios slightly reduced for row 0 (less top-heavy)
+# ─────────────────────────────────────────────────────────────────────────
+gs = gridspec.GridSpec(
+    2, 6, figure=fig,
+    height_ratios=[1.65, 1.0],
+    hspace=0.44,
+    wspace=0.30,
+    left=0.04, right=0.97,
+    top=0.916, bottom=0.04,
+)
 
-# --- Sensor B ---
-im2 = ax2.imshow(grid_B, vmin=0, vmax=MAX_DISTANCE, cmap=cmap, interpolation='gaussian')
-ax2.set_title("SENSOR B (Right)", fontsize=14, color='#00FFCC', pad=12)
-rect_b = Rectangle((-0.5, -0.5), 1, 1, fill=False, color='white', linewidth=2)
-ax2.add_patch(rect_b)
-stats_b = ax2.text(0, 8.6, "CLOSEST: ---mm | AVG: ---mm", color='yellow', fontsize=9)
-for ax in [ax2]:
-    ax.set_xticks(range(8)); ax.set_yticks(range(8))
-    ax.grid(color='white', linestyle='--', linewidth=0.4, alpha=0.3)
-plt.colorbar(im2, ax=ax2, label='Distance (mm)', fraction=0.046, pad=0.04)
+ax_A    = fig.add_subplot(gs[0, 0:3])
+ax_B    = fig.add_subplot(gs[0, 3:6])
+ax_imu  = fig.add_subplot(gs[1, 0:2])
+ax_comp = fig.add_subplot(gs[1, 2:4])
+ax_3d   = fig.add_subplot(gs[1, 4:6], projection='3d')
 
-# --- Accel + Gyro Bar Chart ---
-ax_ag.set_title("Accel (g) | Gyro (dps)", fontsize=11, color='#FF9944')
-bar_labels  = ['AX', 'AY', 'AZ', 'GX', 'GY', 'GZ']
-bar_colors  = ['#FF4444', '#44FF44', '#4444FF', '#FF8800', '#00CCFF', '#FF00FF']
-bar_vals    = [0.0] * 6
-bars        = ax_ag.bar(bar_labels, bar_vals, color=bar_colors, width=0.6)
-ax_ag.set_ylim(-20, 20)
-ax_ag.axhline(0, color='white', linewidth=0.5, alpha=0.5)
-ax_ag.set_ylabel("Value", fontsize=9)
-ax_ag.tick_params(labelsize=8)
-accel_range_line = ax_ag.axhspan(-2, 2, alpha=0.05, color='red')   # visual accel range hint
+# ==========================================
+# CARD STYLER
+# ==========================================
+def style_card(ax, title, title_color=CYAN):
+    ax.set_facecolor(BG_CARD)
+    for sp in ax.spines.values():
+        sp.set_edgecolor(BORDER)
+        sp.set_linewidth(1.2)
+    ax.set_title(title, fontsize=11, color=title_color,
+                 pad=9, fontweight='bold', loc='left',
+                 fontfamily='monospace')
 
-# --- Magnetometer Compass ---
-ax_m.set_xlim(-1.3, 1.3)
-ax_m.set_ylim(-1.3, 1.3)
-ax_m.set_aspect('equal')
-ax_m.set_title("Magnetometer (XY)", fontsize=11, color='#FF9944')
-ax_m.set_facecolor('#0a0a0a')
-compass_circle = plt.Circle((0, 0), 1.0, color='#333333', fill=False, linewidth=1.5)
-ax_m.add_patch(compass_circle)
-for label, pos in [('N', (0, 1.15)), ('S', (0, -1.25)),
-                    ('E', (1.15, 0)), ('W', (-1.25, 0))]:
-    ax_m.text(pos[0], pos[1], label, ha='center', va='center',
-              color='#888888', fontsize=9)
-# Compass needle
-mag_arrow, = ax_m.plot([0, 0], [0, 0.8], color='#FF4444', linewidth=3)
-mag_dot    = ax_m.plot(0, 0, 'wo', markersize=5)[0]
-ax_m.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-mag_strength_text = ax_m.text(0, -1.2, "Strength: --- uT", ha='center',
-                               color='#AAAAAA', fontsize=8)
+# ==========================================
+# HEATMAPS  (Sensor A & B)
+# ==========================================
+CMAP = 'Blues_r'
 
-# --- Numerical Readout Panel ---
-ax_v.axis('off')
-ax_v.set_title("IMU Values", fontsize=11, color='#FF9944')
-readout_text = ax_v.text(0.05, 0.95, "Waiting for data...",
-                          transform=ax_v.transAxes,
-                          color='white', fontsize=10,
-                          verticalalignment='top',
-                          fontfamily='monospace')
+for ax, title in [(ax_A, '◈  SENSOR A  ·  PORT'),
+                  (ax_B, '◈  SENSOR B  ·  STARBOARD')]:
+    style_card(ax, title)
+    ax.set_xticks(range(8))
+    ax.set_yticks(range(8))
+    ax.set_xticklabels([str(i+1) for i in range(8)], fontsize=10, color=WHITE_SOFT)
+    ax.set_yticklabels([str(i+1) for i in range(8)], fontsize=10, color=WHITE_SOFT)
+    ax.tick_params(length=3, width=1.0)
+    ax.grid(color=BORDER, linestyle='-', linewidth=0.5, alpha=0.5)
+
+im1 = ax_A.imshow(grid_A, vmin=0, vmax=MAX_DISTANCE,
+                   cmap=CMAP, interpolation='gaussian', aspect='auto')
+im2 = ax_B.imshow(grid_B, vmin=0, vmax=MAX_DISTANCE,
+                   cmap=CMAP, interpolation='gaussian', aspect='auto')
+
+rect_a = Rectangle((-0.5,-0.5), 1, 1, fill=False,
+                    edgecolor=CYAN, linewidth=2.0, linestyle='--', zorder=5)
+rect_b = Rectangle((-0.5,-0.5), 1, 1, fill=False,
+                    edgecolor=CYAN, linewidth=2.0, linestyle='--', zorder=5)
+ax_A.add_patch(rect_a)
+ax_B.add_patch(rect_b)
+
+bbox_kw = dict(boxstyle='round,pad=0.3', facecolor=BG_BASE,
+               edgecolor=BORDER, linewidth=0.8)
+stats_a = ax_A.text(7.4, -0.6, '', color=CYAN, fontsize=9,
+                     ha='right', va='top', fontfamily='monospace', bbox=bbox_kw)
+stats_b = ax_B.text(7.4, -0.6, '', color=CYAN, fontsize=9,
+                     ha='right', va='top', fontfamily='monospace', bbox=bbox_kw)
+
+for im, ax in [(im1, ax_A), (im2, ax_B)]:
+    cb = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+    cb.ax.yaxis.set_tick_params(color=WHITE_SOFT, labelsize=9)
+    cb.outline.set_edgecolor(BORDER)
+    cb.set_label('mm', color=WHITE_SOFT, fontsize=10)
+    plt.setp(cb.ax.yaxis.get_ticklabels(), color=WHITE_SOFT)
+
+# ==========================================
+# IMU PANEL  —  Pitch & Roll
+# Two locked label+value units, centered in each half of the panel.
+# No decorative bars, no floating rules — just clean paired data.
+# ==========================================
+ax_imu.set_facecolor(BG_CARD)
+for sp in ax_imu.spines.values():
+    sp.set_edgecolor(BORDER); sp.set_linewidth(1.2)
+ax_imu.axis('off')
+ax_imu.set_title('◈  ATTITUDE', fontsize=11, color=CYAN,
+                  pad=9, fontweight='bold', loc='left', fontfamily='monospace')
+
+# Each metric occupies one horizontal half of the panel.
+# Label sits directly above the number — they are one unit.
+#   PITCH block centred at x=0.28, ROLL block centred at x=0.72
+for cx, label in [(0.28, 'PITCH'), (0.72, 'ROLL')]:
+    # Dim, small label — contrast with the bright number below does all the work
+    ax_imu.text(cx, 0.58, label,
+                transform=ax_imu.transAxes, color=WHITE_DIM,
+                fontsize=8, fontfamily='monospace', fontweight='normal',
+                ha='center', va='bottom', alpha=0.75)
+    # No underline — deleted entirely
+
+val_pitch = ax_imu.text(
+    0.28, 0.20, '+00.00°', transform=ax_imu.transAxes,
+    color=BLUE_GLOW, fontsize=30, fontweight='bold',
+    fontfamily='monospace', ha='center', va='bottom')
+
+val_roll = ax_imu.text(
+    0.72, 0.20, '+00.00°', transform=ax_imu.transAxes,
+    color=BLUE_GLOW, fontsize=30, fontweight='bold',
+    fontfamily='monospace', ha='center', va='bottom')
+
+# ==========================================
+# COMPASS  —  centred on the A | B seam
+# Heading value sits directly under the dial
+# ==========================================
+ax_comp.set_facecolor(BG_CARD)
+for sp in ax_comp.spines.values():
+    sp.set_edgecolor(BORDER); sp.set_linewidth(1.2)
+ax_comp.set_title('◈  COMPASS', fontsize=11, color=CYAN,
+                   pad=9, fontweight='bold', loc='left', fontfamily='monospace')
+ax_comp.axis('off')
+
+COMP_R   = 0.80
+TICK_OUT = 0.88
+LABEL_R  = 1.03
+
+# Bottom space reserved for large heading readout
+ax_comp.set_xlim(-1.26, 1.26)
+ax_comp.set_ylim(-1.55, 1.24)
+ax_comp.set_aspect('equal')
+
+# Background fill — solid base plate
+for r, alpha in [(TICK_OUT + 0.04, 0.22), (COMP_R, 0.12)]:
+    ax_comp.add_patch(Circle((0, 0), r, color=BLUE_MID, alpha=alpha, zorder=0))
+
+# Radial vignette: stacked dark rings, opaque at rim fading clear at centre.
+# Creates the illusion of a recessed, domed dial face.
+_N_VIGNETTE = 28
+for i in range(_N_VIGNETTE):
+    # fraction 0 = rim, 1 = centre
+    frac   = i / _N_VIGNETTE
+    radius = COMP_R * (1.0 - frac * 0.90)
+    # Alpha peaks at the rim (frac≈0), drops to 0 at centre (frac≈1)
+    valpha = 0.055 * (1.0 - frac) ** 1.6
+    ax_comp.add_patch(Circle((0, 0), radius,
+                              color='#020510', alpha=valpha, zorder=1))
+
+ax_comp.add_patch(Circle((0, 0), TICK_OUT + 0.04, fill=False,
+                           color=BLUE_BRIGHT, linewidth=1.8, zorder=2, alpha=0.7))
+ax_comp.add_patch(Circle((0, 0), COMP_R, fill=False,
+                           color=BORDER, linewidth=0.8, zorder=2))
+
+# Tick marks
+for deg in range(0, 360, 5):
+    a = np.radians(deg)
+    sa, ca = np.sin(a), np.cos(a)
+    if deg % 90 == 0:
+        r_in, lw, col = COMP_R * 0.80, 2.0, CYAN
+    elif deg % 45 == 0:
+        r_in, lw, col = COMP_R * 0.85, 1.4, BLUE_GLOW
+    elif deg % 10 == 0:
+        r_in, lw, col = COMP_R * 0.91, 1.0, BLUE_MID
+    else:
+        r_in, lw, col = COMP_R * 0.955, 0.5, BORDER
+    ax_comp.plot([sa * r_in, sa * TICK_OUT],
+                 [ca * r_in, ca * TICK_OUT],
+                 color=col, linewidth=lw, zorder=2)
+
+# Cardinals
+cardinals = {
+    0:   ('N',  RED_ALERT,  13, 'bold'),
+    90:  ('E',  WHITE_SOFT, 10, 'normal'),
+    180: ('S',  WHITE_SOFT, 10, 'normal'),
+    270: ('W',  WHITE_SOFT, 10, 'normal'),
+    45:  ('NE', WHITE_DIM,   8, 'normal'),
+    135: ('SE', WHITE_DIM,   8, 'normal'),
+    225: ('SW', WHITE_DIM,   8, 'normal'),
+    315: ('NW', WHITE_DIM,   8, 'normal'),
+}
+for deg, (lbl, col, fs, fw) in cardinals.items():
+    a = np.radians(deg)
+    ax_comp.text(np.sin(a) * LABEL_R, np.cos(a) * LABEL_R,
+                 lbl, color=col, ha='center', va='center',
+                 fontsize=fs, fontweight=fw, zorder=3, fontfamily='monospace')
+
+# Hub
+ax_comp.add_patch(Circle((0, 0), 0.09, color=BLUE_BRIGHT, alpha=0.5, zorder=6))
+ax_comp.add_patch(Circle((0, 0), 0.045, color=CYAN, zorder=7))
+
+# Needle
+NEEDLE_TIP  = 0.66
+NEEDLE_BASE = 0.22
+NEEDLE_W    = 0.050
+
+north_tri_pts = np.array([[0,  NEEDLE_TIP ], [-NEEDLE_W, 0], [NEEDLE_W, 0]])
+south_tri_pts = np.array([[0, -NEEDLE_BASE], [-NEEDLE_W, 0], [NEEDLE_W, 0]])
+
+needle_north = Polygon(north_tri_pts, closed=True,
+                        facecolor=RED_ALERT, edgecolor='#FF8A80',
+                        linewidth=0.8, zorder=5,
+                        path_effects=[pe.withSimplePatchShadow(
+                            shadow_rgbFace='#B71C1C', alpha=0.6, rho=0.7)])
+needle_south = Polygon(south_tri_pts, closed=True,
+                        facecolor=BLUE_DIM, edgecolor=BORDER,
+                        linewidth=0.8, zorder=5)
+ax_comp.add_patch(needle_north)
+ax_comp.add_patch(needle_south)
+
+# ── Heading value — large, directly beneath the dial ──────────────────────
+compass_hdg_val = ax_comp.text(
+    0, -1.28, '000.0°',
+    color=AMBER, ha='center', va='center',
+    fontsize=24, fontweight='bold',
+    fontfamily='monospace', zorder=6)
+# "HEADING" label removed — the degree symbol, amber colour and compass above
+# already make this self-evident; the blank space reads as intentional.
+
+def rotate_needle_pts(base_pts, heading_deg):
+    a = np.radians(-heading_deg)
+    c, s = np.cos(a), np.sin(a)
+    R2 = np.array([[c, -s], [s, c]])
+    return (R2 @ base_pts.T).T
+
+# ==========================================
+# 3D ORIENTATION
+# ==========================================
+# Transparent axes background — boat floats on pure black like a HUD element
+ax_3d.set_facecolor('none')
+ax_3d.patch.set_alpha(0.0)
+ax_3d.set_title('◈  3D ORIENTATION', fontsize=11, color=CYAN,
+                 pad=9, fontweight='bold', loc='left', fontfamily='monospace')
+
+# Symmetric limits: (0,0,0) sits at dead centre of the bounding box,
+# so the boat pivots cleanly around its own centre on every axis.
+ax_3d.set_xlim([-2, 2]); ax_3d.set_ylim([-2, 2]); ax_3d.set_zlim([-2, 2])
+
+# Isometric camera — angled enough to see pitch, roll & yaw simultaneously
+ax_3d.view_init(elev=22, azim=-55)
+
+# Grid: only halves (-2, 0, 2) — two divisions per axis, no subdivision clutter
+ax_3d.set_xticks([-2, 0, 2])
+ax_3d.set_yticks([-2, 0, 2])
+ax_3d.set_zticks([-2, 0, 2])
+
+# No tick labels or marks
+ax_3d.set_xticklabels([])
+ax_3d.set_yticklabels([])
+ax_3d.set_zticklabels([])
+ax_3d.tick_params(axis='both', which='both', length=0, pad=0)
+
+# Axis name labels
+ax_3d.set_xlabel('X', color=CYAN, fontsize=11, fontweight='bold', labelpad=1)
+ax_3d.set_ylabel('Y', color=CYAN, fontsize=11, fontweight='bold', labelpad=1)
+ax_3d.set_zlabel('Z', color=CYAN, fontsize=11, fontweight='bold', labelpad=1)
+
+# Kill all pane fills AND pane edges — no grey/coloured background panels at all
+ax_3d.xaxis.pane.fill = False
+ax_3d.yaxis.pane.fill = False
+ax_3d.zaxis.pane.fill = False
+ax_3d.xaxis.pane.set_edgecolor('none')
+ax_3d.yaxis.pane.set_edgecolor('none')
+ax_3d.zaxis.pane.set_edgecolor('none')
+
+# Sparse grid lines in the same dark border tone as the rest of the UI
+ax_3d.grid(True, color=BORDER, linewidth=0.5, alpha=0.5)
+
+# Box wireframe edges
+box_lines = [ax_3d.plot([], [], [], color=BLUE_BRIGHT,
+                         linewidth=2.0, alpha=0.9)[0] for _ in range(12)]
+fwd_line, = ax_3d.plot([], [], [], color=RED_ALERT,
+                        linewidth=3.0, marker='^', markersize=8, alpha=1.0)
+
+# Box face fills — initialized to zero-size quads so no artifact appears
+# before the first animation frame writes real rotated vertices.
+_zero_face = [[[0,0,0],[0,0,0],[0,0,0],[0,0,0]]]
+box_faces = Poly3DCollection(
+    _zero_face * 6,
+    facecolor=BLUE_MID,
+    edgecolor='none',
+    alpha=0.17,
+    zorder=2
+)
+ax_3d.add_collection3d(box_faces)
+
+# ==========================================
+# BOTTOM ROW DIVIDERS  (drawn once in figure coords)
+# Two faint vertical lines with alpha that fades to 0 at top & bottom —
+# soft gradient separators, not rigid hard grid lines.
+# ==========================================
+_dividers_drawn = [False]
+
+def draw_bottom_dividers():
+    if _dividers_drawn[0]:
+        return
+    _dividers_drawn[0] = True
+
+    pos_imu  = ax_imu.get_position()
+    pos_comp = ax_comp.get_position()
+    pos_3d   = ax_3d.get_position()
+    y0 = min(pos_imu.y0, pos_comp.y0, pos_3d.y0)
+    y1 = max(pos_imu.y1, pos_comp.y1, pos_3d.y1)
+    x_div1 = (pos_imu.x1 + pos_comp.x0) / 2
+    x_div2 = (pos_comp.x1 + pos_3d.x0)  / 2
+
+    # Simulate a gradient by drawing N small segments with varying alpha.
+    # Alpha envelope: sin²(t) peaks at centre (t=π/2) and is 0 at ends.
+    N = 60
+    ys = np.linspace(y0, y1, N + 1)
+    for xd in (x_div1, x_div2):
+        for i in range(N):
+            t     = np.pi * i / (N - 1)          # 0 → π
+            alpha = (np.sin(t) ** 2) * 0.55       # 0 at ends, 0.55 at centre
+            fig.add_artist(plt.Line2D(
+                [xd, xd], [ys[i], ys[i+1]],
+                transform=fig.transFigure,
+                color=BLUE_MID, linewidth=1.2,
+                alpha=float(alpha), zorder=0,
+                solid_capstyle='butt'
+            ))
 
 # ==========================================
 # ANIMATION UPDATE
 # ==========================================
+# Face index quads — defined here so update_plot can reference them
+BOX_FACE_QUADS = [
+    (0, 1, 2, 3),   # bottom
+    (4, 5, 6, 7),   # top
+    (0, 1, 5, 4),   # front
+    (2, 3, 7, 6),   # back
+    (0, 3, 7, 4),   # left
+    (1, 2, 6, 5),   # right
+]
+
 def update_plot(frame):
+    draw_bottom_dividers()
+
     with data_lock:
-        # --- Sensor A ---
-        im1.set_data(grid_A)
-        min_a     = np.min(grid_A)
-        avg_a     = np.mean(grid_A)
-        idx_a     = np.unravel_index(np.argmin(grid_A), grid_A.shape)
-        rect_a.set_xy((idx_a[1] - 0.5, idx_a[0] - 0.5))
-        stats_a.set_text(f"CLOSEST: {int(min_a)}mm | AVG: {int(avg_a)}mm")
+        gA  = np.copy(grid_A)
+        gB  = np.copy(grid_B)
+        p   = imu_data['pitch']
+        r   = imu_data['roll']
+        hdg = imu_data['heading']
 
-        # --- Sensor B ---
-        im2.set_data(grid_B)
-        min_b     = np.min(grid_B)
-        avg_b     = np.mean(grid_B)
-        idx_b     = np.unravel_index(np.argmin(grid_B), grid_B.shape)
-        rect_b.set_xy((idx_b[1] - 0.5, idx_b[0] - 0.5))
-        stats_b.set_text(f"CLOSEST: {int(min_b)}mm | AVG: {int(avg_b)}mm")
+    # 1 — Heatmaps
+    for grid, im, rect, stats in [
+        (gA, im1, rect_a, stats_a),
+        (gB, im2, rect_b, stats_b),
+    ]:
+        im.set_data(grid)
+        min_val = int(np.min(grid))
+        avg_val = int(np.mean(grid))
+        idx = np.unravel_index(np.argmin(grid), grid.shape)
+        rect.set_xy((idx[1] - 0.5, idx[0] - 0.5))
+        stats.set_text(f'MIN {min_val:4d}  AVG {avg_val:4d}  mm')
 
-        # --- Accel + Gyro Bars ---
-        new_vals = [
-            imu['ax'], imu['ay'], imu['az'],
-            imu['gx'] / 100.0,  # Scale gyro to fit same axis (÷100 dps)
-            imu['gy'] / 100.0,
-            imu['gz'] / 100.0,
-        ]
-        for bar, val in zip(bars, new_vals):
-            bar.set_height(val)
-            # Clip bars to ylim to avoid rendering outside
-            if val > 0:
-                bar.set_y(0)
-            else:
-                bar.set_y(val)
-                bar.set_height(abs(val))
+    # 2 — Pitch & Roll  (colour by magnitude)
+    def att_color(v):
+        return RED_ALERT if abs(v) > 20 else AMBER if abs(v) > 10 else BLUE_GLOW
 
-        # --- Magnetometer Compass ---
-        mx, my = imu['mx'], imu['my']
-        strength = (mx**2 + my**2 + imu['mz']**2) ** 0.5
-        norm = (mx**2 + my**2) ** 0.5
-        if norm > 0:
-            nx, ny = mx / norm * 0.9, my / norm * 0.9
-        else:
-            nx, ny = 0, 0.9
-        mag_arrow.set_data([0, nx], [0, ny])
-        mag_strength_text.set_text(f"Strength: {strength:.1f} uT")
+    val_pitch.set_text(f'{p:+.2f}°')
+    val_pitch.set_color(att_color(p))
+    val_roll.set_text(f'{r:+.2f}°')
+    val_roll.set_color(att_color(r))
 
-        # --- Numerical Readout ---
-        readout = (
-            f"  ACCELEROMETER\n"
-            f"  AX: {imu['ax']:+.3f} g\n"
-            f"  AY: {imu['ay']:+.3f} g\n"
-            f"  AZ: {imu['az']:+.3f} g\n\n"
-            f"  GYROSCOPE\n"
-            f"  GX: {imu['gx']:+7.2f} dps\n"
-            f"  GY: {imu['gy']:+7.2f} dps\n"
-            f"  GZ: {imu['gz']:+7.2f} dps\n\n"
-            f"  MAGNETOMETER\n"
-            f"  MX: {imu['mx']:+7.2f} uT\n"
-            f"  MY: {imu['my']:+7.2f} uT\n"
-            f"  MZ: {imu['mz']:+7.2f} uT\n"
-            f"  |B|: {strength:.1f} uT"
-        )
-        readout_text.set_text(readout)
+    # 3 — Compass + Heading value below
+    needle_north.set_xy(rotate_needle_pts(north_tri_pts, hdg))
+    needle_south.set_xy(rotate_needle_pts(south_tri_pts, hdg))
+    compass_hdg_val.set_text(f'{hdg % 360:05.1f}°')
 
-    return [im1, im2, rect_a, rect_b, stats_a, stats_b,
-            *bars, mag_arrow, mag_strength_text, readout_text]
+    # 4 — 3D box: pitch & roll ONLY — yaw is handled exclusively by the compass.
+    # Passing 0 for yaw locks the bow arrow to always point the same direction;
+    # the box only tilts, never spins, making balance instantly readable.
+    R  = get_rotation_matrix(p, r, 0)
+    rv = (R @ base_vertices.T).T
 
+    for line, edge in zip(box_lines, box_edges):
+        p1, p2 = rv[edge[0]], rv[edge[1]]
+        line.set_data([p1[0], p2[0]], [p1[1], p2[1]])
+        line.set_3d_properties([p1[2], p2[2]])
+        
+    # Draw arrow along the centre spine: from back (-l/2) to nose (+l/2 + tip)
+    arrow_base = np.array([0, -l/2, 0])
+    arrow_tip  = np.array([0,  l/2 + 0.5, 0])
+
+    arr_b_rot = R @ arrow_base
+    arr_t_rot = R @ arrow_tip
+
+    fwd_line.set_data([arr_b_rot[0], arr_t_rot[0]], [arr_b_rot[1], arr_t_rot[1]])
+    fwd_line.set_3d_properties([arr_b_rot[2], arr_t_rot[2]])
+
+    # Update face fills
+    new_faces = [[rv[i].tolist() for i in quad] for quad in BOX_FACE_QUADS]
+    box_faces.set_verts(new_faces)
+
+    return ([im1, im2, rect_a, rect_b, stats_a, stats_b,
+              val_pitch, val_roll,
+              needle_north, needle_south, compass_hdg_val,
+              fwd_line, box_faces]
+            + box_lines)
 
 # ==========================================
 # MAIN
@@ -375,12 +555,11 @@ if __name__ == '__main__':
     thread = threading.Thread(target=serial_reader, daemon=True)
     thread.start()
 
-    print("Visualizer running... (Close the window to stop)")
+    print('AutoBoat visualizer running… (close window to stop)')
     ani = animation.FuncAnimation(
         fig, update_plot,
-        interval=30,
+        interval=20,
         blit=True,
         cache_frame_data=False
     )
-    plt.tight_layout()
     plt.show()
