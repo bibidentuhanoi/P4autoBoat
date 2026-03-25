@@ -36,4 +36,61 @@ menu "Board Configuration"
         int "Mag Calibration Duration (s)"
         default 15
 
+
+    menu "Camera Configuration"
+
+        config CAM_SCCB_SCL_PIN
+            int "Camera SCCB SCL Pin"
+            default 8
+            help
+                SCL pin for camera SCCB (I2C_NUM_0). Reversed from sensor bus (I2C_NUM_1 SCL=7).
+
+        config CAM_SCCB_SDA_PIN
+            int "Camera SCCB SDA Pin"
+            default 7
+            help
+                SDA pin for camera SCCB (I2C_NUM_0). Reversed from sensor bus (I2C_NUM_1 SDA=8).
+
+        config CAM_RESET_PIN
+            int "Camera Reset Pin (-1 = not used)"
+            default -1
+
+        config CAM_PWDN_PIN
+            int "Camera Power-Down Pin (-1 = not used)"
+            default -1
+
+        config CAM_XCLK_PIN
+            int "Camera XCLK Pin (-1 = not used)"
+            default -1
+
+        config CAM_XCLK_FREQ_HZ
+            int "Camera XCLK Frequency (Hz)"
+            default 24000000
+
+        config CAM_FRAME_WIDTH
+            int "Camera Frame Width"
+            default 640
+
+        config CAM_FRAME_HEIGHT
+            int "Camera Frame Height"
+            default 480
+
+    endmenu
+
+    menu "WiFi Configuration"
+
+        config WIFI_SSID
+            string "WiFi SSID"
+            default "Bi Bop"
+
+        config WIFI_PASSWORD
+            string "WiFi Password"
+            default "0903875378"
+
+        config HTTP_STREAM_PORT
+            int "HTTP Stream Port"
+            default 80
+
+    endmenu
+
 endmenu

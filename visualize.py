@@ -1,4 +1,4 @@
-import serial
+import sys
 import threading
 import numpy as np
 import matplotlib.pyplot as plt
@@ -9,13 +9,17 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.patheffects as pe
 import time
-import re
+import requests
+import io
+from PIL import Image
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-COM_PORT     = '/dev/ttyACM0'
-BAUD_RATE    = 115200
+ESP32_IP     = sys.argv[1] if len(sys.argv) > 1 else '192.168.1.100'
+STREAM_URL   = f'http://{ESP32_IP}/stream'
+IMU_URL      = f'http://{ESP32_IP}/api/imu'
+SNAPSHOT_URL = f'http://{ESP32_IP}/api/snapshot'
 MAX_DISTANCE = 2000  # mm
 # ==========================================
 
@@ -42,64 +46,82 @@ RED_ALERT   = '#EF5350'
 grid_A   = np.ones((8, 8)) * MAX_DISTANCE
 grid_B   = np.ones((8, 8)) * MAX_DISTANCE
 imu_data = {'pitch': 0.0, 'roll': 0.0, 'heading': 0.0}
-data_lock = threading.Lock()
+latest_frame = None
+data_lock     = threading.Lock()
+imu_lock      = threading.Lock()
+frame_lock    = threading.Lock()
+snapshot_lock = threading.Lock()
 
 # ==========================================
-# SERIAL READER
+# WIFI DATA THREADS
 # ==========================================
-IMU_PATTERN = re.compile(
-    r'\[(SENSOR [AB])\] IMU: Pitch:\s*([-\d.]+)\s*\|\s*Roll:\s*([-\d.]+)\s*\|\s*Head:\s*([-\d.]+)'
-)
-
-def serial_reader():
-    global grid_A, grid_B, imu_data
+def mjpeg_reader():
+    """Pull MJPEG frames from /stream, store latest as numpy array."""
+    global latest_frame
+    backoff = 1
     while True:
         try:
-            ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=0.01)
-            ser.reset_input_buffer()
-            while True:
-                line_raw = ser.readline()
-                if not line_raw:
-                    continue
-                try:
-                    line = line_raw.decode('utf-8', errors='ignore').strip()
-                except UnicodeDecodeError:
-                    continue
-                m = IMU_PATTERN.search(line)
-                if m:
-                    current_sensor = m.group(1)
-                    pitch   = float(m.group(2))
-                    roll    = float(m.group(3))
-                    heading = float(m.group(4))
-                    with data_lock:
-                        imu_data['pitch']   = pitch
-                        imu_data['roll']    = roll
-                        imu_data['heading'] = heading
-
-                    sep_raw     = ser.readline().decode('utf-8', errors='ignore').strip()
-                    sep_match   = re.match(r'^[IWED] \(\d+\) [^:]+: (.*)', sep_raw)
-                    sep_content = sep_match.group(1) if sep_match else sep_raw
-                    if not sep_content.startswith('----'):
-                        continue
-
-                    temp_grid = []
-                    for _ in range(8):
-                        row_raw     = ser.readline().decode('utf-8', errors='ignore').strip()
-                        row_match   = re.match(r'^[IWED] \(\d+\) [^:]+: (.*)', row_raw)
-                        row_content = row_match.group(1) if row_match else row_raw
-                        nums        = [int(s) for s in re.findall(r'-?\d+', row_content)]
-                        if len(nums) == 8:
-                            temp_grid.append(nums)
-
-                    if len(temp_grid) == 8:
-                        with data_lock:
-                            if current_sensor == 'SENSOR A':
-                                grid_A = np.array(temp_grid)
-                            elif current_sensor == 'SENSOR B':
-                                grid_B = np.array(temp_grid)
+            r = requests.get(STREAM_URL, stream=True, timeout=10)
+            backoff = 1
+            buf = b''
+            for chunk in r.iter_content(chunk_size=4096):
+                buf += chunk
+                a = buf.find(b'\xff\xd8')
+                b = buf.find(b'\xff\xd9')
+                if a != -1 and b != -1 and b > a:
+                    jpg = buf[a:b+2]
+                    buf = buf[b+2:]
+                    try:
+                        img = Image.open(io.BytesIO(jpg))
+                        arr = np.array(img)
+                        with frame_lock:
+                            latest_frame = arr
+                    except Exception:
+                        pass
         except Exception as e:
-            print(f"Serial error: {e}")
-            time.sleep(2)
+            print(f"MJPEG error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 5)
+
+def imu_poller():
+    """Poll /api/imu at ~20Hz for fast heading updates."""
+    backoff = 1
+    while True:
+        try:
+            r = requests.get(IMU_URL, timeout=2)
+            if r.status_code == 200:
+                d = r.json()
+                with imu_lock:
+                    imu_data['pitch']   = d.get('pitch', 0.0)
+                    imu_data['roll']    = d.get('roll', 0.0)
+                    imu_data['heading'] = d.get('heading', 0.0)
+                backoff = 1
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"IMU poll error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 5)
+
+def snapshot_poller():
+    """Poll /api/snapshot at ~5Hz for synced ToF grids."""
+    global grid_A, grid_B
+    backoff = 1
+    while True:
+        try:
+            r = requests.get(SNAPSHOT_URL, timeout=2)
+            if r.status_code == 200:
+                d = r.json()
+                with snapshot_lock:
+                    if d.get('tof_a') is not None:
+                        grid_A = np.array(d['tof_a'])
+                    if d.get('tof_b') is not None:
+                        grid_B = np.array(d['tof_b'])
+                backoff = 1
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"Snapshot poll error: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 5)
 
 # ==========================================
 # 3D BOX MATH
@@ -159,8 +181,8 @@ fig.text(0.5, 0.946, '━' * 120,
 #     • height_ratios slightly reduced for row 0 (less top-heavy)
 # ─────────────────────────────────────────────────────────────────────────
 gs = gridspec.GridSpec(
-    2, 6, figure=fig,
-    height_ratios=[1.65, 1.0],
+    3, 6, figure=fig,
+    height_ratios=[1.65, 1.0, 1.2],
     hspace=0.44,
     wspace=0.30,
     left=0.04, right=0.97,
@@ -172,6 +194,7 @@ ax_B    = fig.add_subplot(gs[0, 3:6])
 ax_imu  = fig.add_subplot(gs[1, 0:2])
 ax_comp = fig.add_subplot(gs[1, 2:4])
 ax_3d   = fig.add_subplot(gs[1, 4:6], projection='3d')
+ax_cam  = fig.add_subplot(gs[2, :])
 
 # ==========================================
 # CARD STYLER
@@ -433,6 +456,19 @@ box_faces = Poly3DCollection(
 ax_3d.add_collection3d(box_faces)
 
 # ==========================================
+# CAMERA PANEL
+# ==========================================
+style_card(ax_cam, '◈  CAMERA  ·  LIVE FEED')
+ax_cam.axis('off')
+# Placeholder image — black until first frame arrives
+cam_placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+cam_img = ax_cam.imshow(cam_placeholder, aspect='auto')
+cam_no_signal = ax_cam.text(
+    0.5, 0.5, 'NO CAMERA', transform=ax_cam.transAxes,
+    color=WHITE_DIM, fontsize=18, fontfamily='monospace',
+    ha='center', va='center', alpha=0.6)
+
+# ==========================================
 # BOTTOM ROW DIVIDERS  (drawn once in figure coords)
 # Two faint vertical lines with alpha that fades to 0 at top & bottom —
 # soft gradient separators, not rigid hard grid lines.
@@ -484,12 +520,22 @@ BOX_FACE_QUADS = [
 def update_plot(frame):
     draw_bottom_dividers()
 
-    with data_lock:
+    with snapshot_lock:
         gA  = np.copy(grid_A)
         gB  = np.copy(grid_B)
+    with imu_lock:
         p   = imu_data['pitch']
         r   = imu_data['roll']
         hdg = imu_data['heading']
+
+    # Camera frame update
+    with frame_lock:
+        cam_frame = latest_frame
+    if cam_frame is not None:
+        cam_img.set_data(cam_frame)
+        cam_no_signal.set_visible(False)
+    else:
+        cam_no_signal.set_visible(True)
 
     # 1 — Heatmaps
     for grid, im, rect, stats in [
@@ -545,17 +591,22 @@ def update_plot(frame):
     return ([im1, im2, rect_a, rect_b, stats_a, stats_b,
               val_pitch, val_roll,
               needle_north, needle_south, compass_hdg_val,
-              fwd_line, box_faces]
+              fwd_line, box_faces, cam_img, cam_no_signal]
             + box_lines)
 
 # ==========================================
 # MAIN
 # ==========================================
 if __name__ == '__main__':
-    thread = threading.Thread(target=serial_reader, daemon=True)
-    thread.start()
+    print(f'Connecting to ESP32 at {ESP32_IP}...')
+    print(f'  MJPEG:    {STREAM_URL}')
+    print(f'  IMU:      {IMU_URL}')
+    print(f'  Snapshot: {SNAPSHOT_URL}')
 
-    print('AutoBoat visualizer running… (close window to stop)')
+    for target in [mjpeg_reader, imu_poller, snapshot_poller]:
+        threading.Thread(target=target, daemon=True).start()
+
+    print('AutoBoat visualizer running... (close window to stop)')
     ani = animation.FuncAnimation(
         fig, update_plot,
         interval=20,

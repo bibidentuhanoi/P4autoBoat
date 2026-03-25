@@ -17,6 +17,12 @@
 // Drivers
 #include "drivers/imu_driver.h"
 #include "drivers/tof_driver.h"
+#include "drivers/camera_driver.h"
+
+// Connectivity
+#include "wifi_manager.h"
+#include "camera_stream.h"
+#include "sensor_api.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -40,45 +46,6 @@ static CalibrationData calib_data = {
 static tof_devices_t tof_devs;
 
 // ==========================================
-// TOF TASK
-// ==========================================
-void print_8x8_grid(const char* name, VL53L5CX_ResultsData* res) {
-    FusionResult fusion_res;
-    fusion_get_result(&fusion_res);
-
-    ESP_LOGI(TAG, "[%s] IMU: Pitch: %6.2f | Roll: %6.2f | Head: %6.2f",
-             name, fusion_res.pitch, fusion_res.roll, fusion_res.heading);
-    ESP_LOGI(TAG, "--------------------------------");
-
-    char row_buf[64]; // 8 cols * max 6 chars each = ~48 chars, 64 is safe
-
-    for (int row = 0; row < 8; row++) {
-        int pos = 0;
-        for (int col = 0; col < 8; col++) {
-            int zone = row * 8 + col;
-            int idx  = VL53L5CX_NB_TARGET_PER_ZONE * zone;
-            pos += snprintf(row_buf + pos, sizeof(row_buf) - pos,
-                            "%4d ", (int)res->distance_mm[idx]);
-        }
-        ESP_LOGI(TAG, "%s", row_buf);
-    }
-}
-
-void task_tof_reporting(void *pvParameters) {
-    VL53L5CX_ResultsData resA, resB;
-    
-    while(1) {
-        if (tof_read_grid(&tof_devs.dev_a, &resA) == ESP_OK) {
-            print_8x8_grid("SENSOR A", &resA);
-        }
-        if (tof_read_grid(&tof_devs.dev_b, &resB) == ESP_OK) {
-            print_8x8_grid("SENSOR B", &resB);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-// ==========================================
 // APP MAIN
 // ==========================================
 void app_main(void) {
@@ -88,7 +55,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing NVS...");
     fs_init();
 
-    // 2. Initialize I2C Bus
+    // 2. Initialize Camera (XCLK must start ASAP after boot — before I2C sensor init)
+    //    Uses I2C_NUM_0 (SCL=8, SDA=7) for SCCB. Sequential with I2C_NUM_1 below.
+    ESP_LOGI(TAG, "Initializing camera...");
+    ESP_ERROR_CHECK(camera_init());
+
+    // 3. Initialize sensor I2C Bus (I2C_NUM_1: SCL=7, SDA=8)
     ESP_LOGI(TAG, "Initializing I2C bus...");
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -141,10 +113,22 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing sensor fusion...");
     fusion_init(&calib_data);
 
-    // 8. Start RTOS Tasks
+    // 8. Connect to WiFi (blocks until connected or timeout)
+    ESP_LOGI(TAG, "Connecting to WiFi...");
+    esp_err_t wifi_ret = wifi_init();
+    httpd_handle_t httpd_handle = NULL;
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi unavailable (%s) — camera stream disabled", esp_err_to_name(wifi_ret));
+    } else {
+        // 9. Start MJPEG HTTP stream server + sensor API
+        ESP_ERROR_CHECK(camera_stream_server_start(&httpd_handle));
+        ESP_ERROR_CHECK(sensor_api_register(httpd_handle, &tof_devs));
+    }
+
+    // 10. Start RTOS Tasks
     ESP_LOGI(TAG, "Starting tasks...");
-    xTaskCreate(task_imu_fusion,    "IMU_Task", 4096,  NULL, 5, NULL);
-    xTaskCreate(task_tof_reporting, "ToF_Task", 16384, NULL, 4, NULL);
+    xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      5, NULL);
+    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 4, NULL);
 
     ESP_LOGI(TAG, "System running.");
 }

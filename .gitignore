@@ -31,6 +31,7 @@ build/
 flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
+kconfgen_tmp*.old
 
 # ESP-IDF dependencies
 # For older versions or manual component management
@@ -70,6 +71,13 @@ compile_commands.json
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+# Claude Code
+CLAUDE.md
+.claude/
+
+# Documentation / example projects (not part of firmware)
+docs/
 
 # User-specific configuration files
 *.user
