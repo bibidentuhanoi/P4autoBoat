@@ -1,0 +1,4 @@
+boat.ToFGrid.distances            max_count:64
+boat.SensorSnapshot.imu           type:FT_OPTIONAL
+boat.SensorSnapshot.tof_a         type:FT_OPTIONAL
+boat.SensorSnapshot.tof_b         type:FT_OPTIONAL

@@ -8,3 +8,5 @@ dependencies:
   espressif/esp_new_jpeg: "*"
   ## WiFi on ESP32-P4 (via coprocessor, e.g. ESP32-C6)
   esp_wifi_remote: "*"
+  ## Protobuf encoding for telemetry pipeline
+  livekit/nanopb: "^0.4.9"

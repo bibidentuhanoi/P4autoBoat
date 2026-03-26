@@ -1,0 +1,40 @@
+syntax = "proto3";
+package boat;
+
+message IMUData {
+  float pitch   = 1;
+  float roll    = 2;
+  float heading = 3;
+}
+
+message ToFGrid {
+  bool           valid     = 1;
+  repeated int32 distances = 2;  // 64 values, row-major 8x8
+}
+
+message SensorSnapshot {
+  uint64  timestamp_us = 1;
+  IMUData imu          = 2;
+  ToFGrid tof_a        = 3;
+  ToFGrid tof_b        = 4;
+}
+
+message MotorCommand {
+  float throttle = 1;  // -1.0 to 1.0
+  float rudder   = 2;  // -1.0 to 1.0
+}
+
+message SystemStatus {
+  uint32 heap_free    = 1;
+  int32  wifi_rssi    = 2;
+  uint64 uptime_us    = 3;
+}
+
+// Envelope — every message on the wire is a BoatMessage
+message BoatMessage {
+  oneof payload {
+    SensorSnapshot sensors  = 1;
+    MotorCommand   motor    = 2;
+    SystemStatus   status   = 3;
+  }
+}
