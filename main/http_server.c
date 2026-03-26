@@ -26,6 +26,12 @@ esp_err_t http_server_start(void)
     cfg.stack_size       = 8192;
     cfg.max_open_sockets = 7;
     cfg.max_uri_handlers = 4;
+    cfg.recv_wait_timeout  = 30;   /* WebSocket clients are long-lived, don't kill after 5s */
+    cfg.send_wait_timeout  = 10;
+    cfg.keep_alive_enable  = true;
+    cfg.keep_alive_idle    = 15;
+    cfg.keep_alive_interval = 5;
+    cfg.keep_alive_count   = 3;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &cfg);
