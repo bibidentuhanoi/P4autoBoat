@@ -21,25 +21,36 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
 esp_err_t http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port      = CONFIG_HTTP_API_PORT;   /* 80 */
+    cfg.server_port      = CONFIG_HTTP_API_PORT;
     cfg.ctrl_port        = 32768;
     cfg.stack_size       = 8192;
     cfg.max_open_sockets = 7;
     cfg.max_uri_handlers = 4;
 
     httpd_handle_t server = NULL;
-    ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start failed");
+    esp_err_t ret = httpd_start(&server, &cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    /* Dashboard */
-    static const httpd_uri_t dashboard_uri = {
+    const httpd_uri_t dashboard_uri = {
         .uri = "/", .method = HTTP_GET,
         .handler = dashboard_handler, .user_ctx = NULL,
     };
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &dashboard_uri),
-                        TAG, "register / failed");
+    ret = httpd_register_uri_handler(server, &dashboard_uri);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "register / failed: %s", esp_err_to_name(ret));
+        httpd_stop(server);
+        return ret;
+    }
 
-    /* WebSocket transport (registers /ws and hooks into pipeline) */
-    ESP_RETURN_ON_ERROR(ws_transport_init(server), TAG, "ws_transport_init failed");
+    ret = ws_transport_init(server);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ws_transport_init failed: %s", esp_err_to_name(ret));
+        httpd_stop(server);
+        return ret;
+    }
 
     ESP_LOGI(TAG, "HTTP server ready on port %d: / (dashboard), /ws (protobuf)",
              CONFIG_HTTP_API_PORT);
