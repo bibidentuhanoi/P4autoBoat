@@ -12,6 +12,7 @@
 #include "esp_video_init.h"
 #include "driver/jpeg_encode.h"
 #include "driver/jpeg_types.h"
+#include "driver/ppa.h"
 #include "camera_driver.h"
 
 static const char *TAG = "CAM_DRV";
@@ -30,6 +31,9 @@ static jpeg_encoder_handle_t  s_jpeg_enc;
 static uint8_t               *s_jpeg_buf;
 static uint32_t               s_jpeg_buf_size;
 static uint32_t               s_jpeg_out_len;
+static ppa_client_handle_t    s_ppa_srm;
+static uint8_t               *s_ppa_out_buf;
+static uint32_t               s_ppa_out_buf_size;
 
 esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
 {
@@ -72,25 +76,8 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
         goto cleanup;
     }
 
-    /* 3. Flip — one VIDIOC_S_CTRL call per control (reference pattern, not EXT_CTRLS).
-     *    Warn but do not fail — some sensor builds may not support flip. */
-    {
-        struct v4l2_control ctrl;
-
-        ctrl.id    = V4L2_CID_VFLIP;
-        ctrl.value = CONFIG_CAM_VFLIP;
-        if (ioctl(s_cam_fd, VIDIOC_S_CTRL, &ctrl) != 0) {
-            ESP_LOGW(TAG, "VFLIP ioctl failed (non-fatal)");
-        }
-
-        ctrl.id    = V4L2_CID_HFLIP;
-        ctrl.value = CONFIG_CAM_HFLIP;
-        if (ioctl(s_cam_fd, VIDIOC_S_CTRL, &ctrl) != 0) {
-            ESP_LOGW(TAG, "HFLIP ioctl failed (non-fatal)");
-        }
-
-        ESP_LOGI(TAG, "Flip: VFLIP=%d HFLIP=%d", CONFIG_CAM_VFLIP, CONFIG_CAM_HFLIP);
-    }
+    /* 3. Flip — sensor-level VFLIP/HFLIP shifts the Bayer pattern and breaks ISP colors.
+     *    PPA hardware 180° rotation is applied on the RGB565 buffer in camera_capture_frame(). */
 
     /* 4. Read actual output format — always log FourCC.
      *    ISP pipeline outputs RGB565 (RGBP). That is expected — we encode to JPEG below.
@@ -148,7 +135,27 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                  CONFIG_CAM_JPEG_QUALITY, s_jpeg_buf_size);
     }
 
-    /* 6. Request mmap buffers */
+    /* 6. Init PPA SRM client for 180° rotation (mirror_x + mirror_y).
+     *    Runs on dedicated DMA2D hardware — zero CPU cost per frame. */
+    {
+        ppa_client_config_t ppa_cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+        };
+        ESP_GOTO_ON_ERROR(ppa_register_client(&ppa_cfg, &s_ppa_srm),
+                          cleanup, TAG, "ppa_register_client failed");
+
+        s_ppa_out_buf_size = s_cam_width * s_cam_height * 2;
+        s_ppa_out_buf = heap_caps_aligned_calloc(64, 1, s_ppa_out_buf_size,
+                                                  MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+        if (!s_ppa_out_buf) {
+            ESP_LOGE(TAG, "PPA output buffer alloc failed (%"PRIu32" bytes)", s_ppa_out_buf_size);
+            ret = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        ESP_LOGI(TAG, "PPA SRM ready for 180 deg rotation");
+    }
+
+    /* 7. Request mmap buffers */
     {
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
@@ -159,7 +166,7 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "VIDIOC_REQBUFS failed");
     }
 
-    /* 7. Query, mmap, and queue each buffer */
+    /* 8. Query, mmap, and queue each buffer */
     for (int i = 0; i < CAM_BUF_COUNT; i++) {
         struct v4l2_buffer buf;
         memset(&buf, 0, sizeof(buf));
@@ -182,7 +189,7 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "VIDIOC_QBUF[%d] failed", i);
     }
 
-    /* 8. Start streaming */
+    /* 9. Start streaming */
     {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ESP_GOTO_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
@@ -193,6 +200,14 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
     return ESP_OK;
 
 cleanup:
+    if (s_ppa_out_buf) {
+        free(s_ppa_out_buf);
+        s_ppa_out_buf = NULL;
+    }
+    if (s_ppa_srm) {
+        ppa_unregister_client(s_ppa_srm);
+        s_ppa_srm = NULL;
+    }
     if (s_jpeg_buf) {
         free(s_jpeg_buf);
         s_jpeg_buf = NULL;
@@ -231,6 +246,47 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    /* Rotate 180° via PPA hardware (mirror_x + mirror_y on RGB565 after ISP). */
+    uint8_t *rgb_buf = s_cam_buf[s_current_buf.index];
+    uint32_t rgb_len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
+    {
+        ppa_srm_oper_config_t srm_cfg = {
+            .in = {
+                .buffer       = rgb_buf,
+                .pic_w        = s_cam_width,
+                .pic_h        = s_cam_height,
+                .block_w      = s_cam_width,
+                .block_h      = s_cam_height,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm       = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .out = {
+                .buffer       = s_ppa_out_buf,
+                .buffer_size  = s_ppa_out_buf_size,
+                .pic_w        = s_cam_width,
+                .pic_h        = s_cam_height,
+                .block_offset_x = 0,
+                .block_offset_y = 0,
+                .srm_cm       = PPA_SRM_COLOR_MODE_RGB565,
+            },
+            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+            .scale_x        = 1.0,
+            .scale_y        = 1.0,
+            .mirror_x       = true,
+            .mirror_y       = true,
+            .mode           = PPA_TRANS_MODE_BLOCKING,
+        };
+        esp_err_t ppa_ret = ppa_do_scale_rotate_mirror(s_ppa_srm, &srm_cfg);
+        if (ppa_ret != ESP_OK) {
+            ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
+            ESP_LOGW(TAG, "PPA rotate failed: %s", esp_err_to_name(ppa_ret));
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        rgb_buf = s_ppa_out_buf;
+        rgb_len = s_ppa_out_buf_size;
+    }
+
     /* Encode RGB565 → JPEG using HW encoder. */
     jpeg_encode_cfg_t enc_cfg = {
         .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
@@ -239,8 +295,6 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
         .width         = s_cam_width,
         .height        = s_cam_height,
     };
-    uint8_t *rgb_buf = s_cam_buf[s_current_buf.index];
-    uint32_t rgb_len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
     s_jpeg_out_len = 0;
 
     esp_err_t enc_ret = jpeg_encoder_process(s_jpeg_enc, &enc_cfg,
