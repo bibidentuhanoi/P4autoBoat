@@ -32,8 +32,8 @@ void task_sensor_snapshot(void *pvParameters)
         snap.imu.roll    = imu.roll;
         snap.imu.heading = imu.heading;
 
-        /* ToF A */
-        VL53L5CX_ResultsData tof_res;
+        /* ToF A — static to avoid ~2KB+ stack allocation per loop iteration */
+        static VL53L5CX_ResultsData tof_res;
         snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
         if (snap.has_tof_a) {
             snap.tof_a.valid = true;
