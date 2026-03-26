@@ -13,6 +13,8 @@
 #include "driver/jpeg_encode.h"
 #include "driver/jpeg_types.h"
 #include "driver/ppa.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "camera_driver.h"
 
 static const char *TAG = "CAM_DRV";
@@ -34,6 +36,7 @@ static uint32_t               s_jpeg_out_len;
 static ppa_client_handle_t    s_ppa_srm;
 static uint8_t               *s_ppa_out_buf;
 static uint32_t               s_ppa_out_buf_size;
+static bool                   s_streaming;
 
 esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
 {
@@ -189,12 +192,21 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "VIDIOC_QBUF[%d] failed", i);
     }
 
-    /* 9. Do NOT start streaming here — camera_start_streaming() is called
-     *    on demand when a consumer (MJPEG client, ESP-DL) needs frames.
-     *    This prevents the ISP pipeline from running with no consumer,
-     *    which causes buffer starvation and crashes. */
+    /* 9. Start streaming to initialize the ISP pipeline fully,
+     *    then immediately stop. Consumers call camera_start_streaming()
+     *    when they need frames. This avoids ISP crash from buffer starvation. */
+    {
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ESP_GOTO_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
+                          cleanup, TAG, "VIDIOC_STREAMON failed");
+        s_streaming = true;
+        vTaskDelay(pdMS_TO_TICKS(100));  /* let ISP pipeline initialize */
+        ioctl(s_cam_fd, VIDIOC_STREAMOFF, &type);
+        s_streaming = false;
+        s_frame_held = false;
+    }
 
-    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG (streaming off until requested)",
+    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG (streaming on demand)",
              s_cam_width, s_cam_height);
     return ESP_OK;
 
@@ -323,12 +335,20 @@ void camera_release_frame(void)
     s_frame_held = false;
 }
 
-static bool s_streaming = false;
-
 esp_err_t camera_start_streaming(void)
 {
     if (s_cam_fd < 0) return ESP_ERR_INVALID_STATE;
     if (s_streaming) return ESP_OK;
+
+    /* Re-queue all buffers — STREAMOFF dequeues them */
+    for (int i = 0; i < CAM_BUF_COUNT; i++) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index  = i;
+        ioctl(s_cam_fd, VIDIOC_QBUF, &buf);
+    }
 
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ESP_RETURN_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
