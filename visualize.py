@@ -16,7 +16,7 @@ from PIL import Image
 # ==========================================
 # CONFIGURATION
 # ==========================================
-ESP32_IP     = sys.argv[1] if len(sys.argv) > 1 else '192.168.1.100'
+ESP32_IP     = sys.argv[1] if len(sys.argv) > 1 else '192.168.1.201'
 STREAM_URL   = f'http://{ESP32_IP}/stream'
 IMU_URL      = f'http://{ESP32_IP}/api/imu'
 SNAPSHOT_URL = f'http://{ESP32_IP}/api/snapshot'
