@@ -5,24 +5,31 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "sdkconfig.h"
 #include "linux/videodev2.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
+#include "driver/jpeg_encode.h"
+#include "driver/jpeg_types.h"
 #include "camera_driver.h"
 
 static const char *TAG = "CAM_DRV";
 
 #define CAM_BUF_COUNT  2
 
-static int                s_cam_fd = -1;
-static uint8_t           *s_cam_buf[CAM_BUF_COUNT];
-static uint32_t           s_cam_buf_size;
-static uint32_t           s_cam_width;
-static uint32_t           s_cam_height;
-static uint32_t           s_cam_pixel_format;
-static struct v4l2_buffer s_current_buf;
-static bool               s_frame_held;
+static int                    s_cam_fd = -1;
+static uint8_t               *s_cam_buf[CAM_BUF_COUNT];
+static uint32_t               s_cam_buf_size;
+static uint32_t               s_cam_width;
+static uint32_t               s_cam_height;
+static uint32_t               s_cam_pixel_format;
+static struct v4l2_buffer     s_current_buf;
+static bool                   s_frame_held;
+static jpeg_encoder_handle_t  s_jpeg_enc;
+static uint8_t               *s_jpeg_buf;
+static uint32_t               s_jpeg_buf_size;
+static uint32_t               s_jpeg_out_len;
 
 esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
 {
@@ -86,7 +93,8 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
     }
 
     /* 4. Read actual output format — always log FourCC.
-     *    ISP pipeline + HW JPEG device → must be V4L2_PIX_FMT_JPEG. Fail loudly if not. */
+     *    ISP pipeline outputs RGB565 (RGBP). That is expected — we encode to JPEG below.
+     *    V4L2_PIX_FMT_RGB565X (big-endian) requires CONFIG_ESP_VIDEO_ENABLE_SWAP_BYTE. */
     {
         struct v4l2_format fmt;
         memset(&fmt, 0, sizeof(fmt));
@@ -94,60 +102,50 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
         ESP_GOTO_ON_ERROR(ioctl(s_cam_fd, VIDIOC_G_FMT, &fmt),
                           cleanup, TAG, "VIDIOC_G_FMT failed");
 
-        s_cam_width        = fmt.fmt.pix.width;
-        s_cam_height       = fmt.fmt.pix.height;
-        s_cam_pixel_format = fmt.fmt.pix.pixelformat;
+        s_cam_width  = fmt.fmt.pix.width;
+        s_cam_height = fmt.fmt.pix.height;
+        uint32_t raw_fmt = fmt.fmt.pix.pixelformat;
 
         char fourcc[5] = {
-            (char)( s_cam_pixel_format        & 0xFF),
-            (char)((s_cam_pixel_format >>  8) & 0xFF),
-            (char)((s_cam_pixel_format >> 16) & 0xFF),
-            (char)((s_cam_pixel_format >> 24) & 0xFF),
+            (char)( raw_fmt        & 0xFF),
+            (char)((raw_fmt >>  8) & 0xFF),
+            (char)((raw_fmt >> 16) & 0xFF),
+            (char)((raw_fmt >> 24) & 0xFF),
             '\0'
         };
-        ESP_LOGI(TAG, "Format: %"PRIu32"x%"PRIu32" fmt=%s (0x%08"PRIx32")",
-                 s_cam_width, s_cam_height, fourcc, s_cam_pixel_format);
+        ESP_LOGI(TAG, "CSI format: %"PRIu32"x%"PRIu32" raw=%s (0x%08"PRIx32") — will encode to JPEG",
+                 s_cam_width, s_cam_height, fourcc, raw_fmt);
 
-        if (s_cam_pixel_format != V4L2_PIX_FMT_JPEG) {
-            ESP_LOGE(TAG, "Expected JPEG (ISP+HW-JPEG pipeline) but got fmt=%s. "
-                     "sdkconfig must have CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y "
-                     "and CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE=y", fourcc);
+        if (raw_fmt != V4L2_PIX_FMT_RGB565) {
+            ESP_LOGE(TAG, "Expected RGB565 from ISP pipeline but got %s. "
+                     "Check CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y in sdkconfig.", fourcc);
             ret = ESP_ERR_NOT_SUPPORTED;
             goto cleanup;
         }
     }
 
-    /* 5. Set JPEG quality.
-     *    Reference: set_camera_jpeg_quality() in example_encoder.c (lines 243–294).
-     *    Query valid range → clamp desired value → set via V4L2_CID_JPEG_CLASS ctrl_class. */
+    /* 5. Init HW JPEG encoder (esp_driver_jpeg).
+     *    Matches example_encoder.c with CONFIG_EXAMPLE_SELECT_JPEG_HW_DRIVER=y.
+     *    Encodes RGB565 → JPEG in camera_capture_frame() using this engine.
+     *    Output buffer: width*height*2 bytes — generous upper bound for any quality. */
     {
-        struct v4l2_query_ext_ctrl qctrl = {0};
-        qctrl.id = V4L2_CID_JPEG_COMPRESSION_QUALITY;
+        jpeg_encode_engine_cfg_t eng_cfg = { .timeout_ms = 40 };
+        ESP_GOTO_ON_ERROR(jpeg_new_encoder_engine(&eng_cfg, &s_jpeg_enc),
+                          cleanup, TAG, "jpeg_new_encoder_engine failed");
 
-        if (ioctl(s_cam_fd, VIDIOC_QUERY_EXT_CTRL, &qctrl) == 0) {
-            int quality = CONFIG_CAM_JPEG_QUALITY;
-            if      (quality > (int)qctrl.maximum) quality = (int)qctrl.maximum;
-            else if (quality < (int)qctrl.minimum) quality = (int)qctrl.minimum;
-            else quality = (int)qctrl.minimum +
-                           ((quality - (int)qctrl.minimum) / (int)qctrl.step) * (int)qctrl.step;
-
-            struct v4l2_ext_controls controls = {0};
-            struct v4l2_ext_control  control[1];
-            controls.ctrl_class = V4L2_CID_JPEG_CLASS;
-            controls.count      = 1;
-            controls.controls   = control;
-            control[0].id       = V4L2_CID_JPEG_COMPRESSION_QUALITY;
-            control[0].value    = quality;
-
-            if (ioctl(s_cam_fd, VIDIOC_S_EXT_CTRLS, &controls) == 0) {
-                ESP_LOGI(TAG, "JPEG quality set to %d (range %lld-%lld step %lld)",
-                         quality, qctrl.minimum, qctrl.maximum, qctrl.step);
-            } else {
-                ESP_LOGW(TAG, "JPEG quality ioctl failed — device default used");
-            }
-        } else {
-            ESP_LOGW(TAG, "JPEG quality not queryable — device default used");
+        s_jpeg_buf_size = s_cam_width * s_cam_height * 2;
+        s_jpeg_buf = heap_caps_malloc(s_jpeg_buf_size,
+                                      MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM | MALLOC_CAP_CACHE_ALIGNED);
+        if (!s_jpeg_buf) {
+            ESP_LOGE(TAG, "JPEG output buffer alloc failed (%"PRIu32" bytes)", s_jpeg_buf_size);
+            ret = ESP_ERR_NO_MEM;
+            goto cleanup;
         }
+
+        /* Report format as JPEG to upper layers — stream code checks this. */
+        s_cam_pixel_format = V4L2_PIX_FMT_JPEG;
+        ESP_LOGI(TAG, "JPEG encoder ready: quality=%d buf=%"PRIu32" bytes",
+                 CONFIG_CAM_JPEG_QUALITY, s_jpeg_buf_size);
     }
 
     /* 6. Request mmap buffers */
@@ -195,6 +193,14 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
     return ESP_OK;
 
 cleanup:
+    if (s_jpeg_buf) {
+        free(s_jpeg_buf);
+        s_jpeg_buf = NULL;
+    }
+    if (s_jpeg_enc) {
+        jpeg_del_encoder_engine(s_jpeg_enc);
+        s_jpeg_enc = NULL;
+    }
     if (s_cam_fd >= 0) {
         close(s_cam_fd);
         s_cam_fd = -1;
@@ -225,13 +231,33 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    *buf = s_cam_buf[s_current_buf.index];
-    /* bytesused = actual JPEG payload. Never use full buf.length — that includes
-     * uninitialised memory past the JPEG end marker (causes browser decode errors). */
-    *len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
+    /* Encode RGB565 → JPEG using HW encoder. */
+    jpeg_encode_cfg_t enc_cfg = {
+        .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
+        .sub_sample    = JPEG_DOWN_SAMPLING_YUV422,
+        .image_quality = CONFIG_CAM_JPEG_QUALITY,
+        .width         = s_cam_width,
+        .height        = s_cam_height,
+    };
+    uint8_t *rgb_buf = s_cam_buf[s_current_buf.index];
+    uint32_t rgb_len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
+    s_jpeg_out_len = 0;
+
+    esp_err_t enc_ret = jpeg_encoder_process(s_jpeg_enc, &enc_cfg,
+                                              rgb_buf, rgb_len,
+                                              s_jpeg_buf, s_jpeg_buf_size,
+                                              &s_jpeg_out_len);
+    if (enc_ret != ESP_OK || s_jpeg_out_len == 0) {
+        ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
+        ESP_LOGW(TAG, "JPEG encode failed: %s", esp_err_to_name(enc_ret));
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *buf = s_jpeg_buf;
+    *len = s_jpeg_out_len;
     if (width)     *width     = s_cam_width;
     if (height)    *height    = s_cam_height;
-    if (pixel_fmt) *pixel_fmt = s_cam_pixel_format;
+    if (pixel_fmt) *pixel_fmt = s_cam_pixel_format; /* V4L2_PIX_FMT_JPEG */
 
     s_frame_held = true;
     return ESP_OK;
