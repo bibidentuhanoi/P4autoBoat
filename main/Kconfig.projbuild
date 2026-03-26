@@ -67,13 +67,22 @@ menu "Board Configuration"
             int "Camera XCLK Frequency (Hz)"
             default 24000000
 
-        config CAM_FRAME_WIDTH
-            int "Camera Frame Width"
-            default 640
+        config CAM_VFLIP
+            int "Camera Vertical Flip (0=off, 1=on)"
+            default 1
 
-        config CAM_FRAME_HEIGHT
-            int "Camera Frame Height"
-            default 480
+        config CAM_HFLIP
+            int "Camera Horizontal Flip (0=off, 1=on)"
+            default 1
+
+        config CAM_JPEG_QUALITY
+            int "JPEG Compression Quality (1-100)"
+            default 60
+            range 1 100
+            help
+                JPEG encoding quality for the MJPEG stream.
+                Lower values = smaller frames, less bandwidth.
+                Higher values = better image quality, more bandwidth.
 
     endmenu
 
