@@ -1,19 +1,30 @@
 {
-	"name": "ESP-IDF QEMU",
-	"build": {
-		"dockerfile": "Dockerfile"
-	},
-	"customizations": {
-		"vscode": {
-			"settings": {
-				"terminal.integrated.defaultProfile.linux": "bash",
-				"idf.gitPath": "/usr/bin/git"
-			},
-			"extensions": [
-				"espressif.esp-idf-extension",
-				"espressif.esp-idf-web"
-			]
-		}
-	},
-	"runArgs": ["--privileged"]
+    "name": "ESP-IDF QEMU",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "lts"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash",
+                "idf.gitPath": "/usr/bin/git"
+            },
+            "extensions":[
+                "espressif.esp-idf-extension",
+                "espressif.esp-idf-web"
+            ]
+        }
+    },
+    "runArgs":[
+        "--device-cgroup-rule=c 166:* rmw",
+        "--device-cgroup-rule=c 188:* rmw"
+    ],
+    "mounts":[
+        "source=/dev,target=/dev,type=bind"
+    ]
 }
