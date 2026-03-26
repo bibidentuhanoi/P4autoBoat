@@ -72,11 +72,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing camera...");
     ESP_ERROR_CHECK(camera_init(sccb_handle));
 
-    // 3b. Delete SCCB bus — frees GPIO7/GPIO8 for sensor I2C bus
-    ESP_LOGI(TAG, "Releasing SCCB bus (handing off GPIO7/GPIO8 to sensor bus)...");
-    ESP_ERROR_CHECK(i2c_del_master_bus(sccb_handle));
+    // 3b. esp_video attached its OV5647 device to sccb_handle internally — i2c_del_master_bus
+    //     would fail with ESP_ERR_INVALID_STATE. We don't need to delete: once camera_init()
+    //     returns, SCCB is done forever (camera streams via MIPI CSI). I2C_NUM_0 stays alive
+    //     but idle. I2C_NUM_1 below will re-route GPIO7/GPIO8 via the GPIO matrix.
 
-    // 4. Create sensor I2C bus on same GPIO7/GPIO8 (now free of SCCB)
+    // 4. Create sensor I2C bus on same GPIO7/GPIO8 (GPIO matrix re-routes from I2C_NUM_0)
     ESP_LOGI(TAG, "Initializing sensor I2C bus...");
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
