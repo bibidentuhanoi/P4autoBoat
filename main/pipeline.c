@@ -82,6 +82,30 @@ void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
     }
 }
 
+void pipeline_publish_status(const boat_SystemStatus *status)
+{
+    boat_BoatMessage msg = boat_BoatMessage_init_zero;
+    msg.which_payload = boat_BoatMessage_status_tag;
+    msg.payload.status = *status;
+
+    uint8_t buf[64];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+
+    if (!pb_encode(&stream, boat_BoatMessage_fields, &msg)) {
+        ESP_LOGE(TAG, "Status encode failed: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+
+    size_t len = stream.bytes_written;
+
+    for (int i = 0; i < s_transport_count; i++) {
+        esp_err_t ret = s_transports[i].send(buf, len, s_transports[i].ctx);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Transport %d status send failed: %s", i, esp_err_to_name(ret));
+        }
+    }
+}
+
 void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 {
     boat_BoatMessage msg = boat_BoatMessage_init_zero;

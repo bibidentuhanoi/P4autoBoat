@@ -125,7 +125,10 @@
   <h1>AutoBoat</h1>
   <div id="status-dot"></div>
   <span id="status-label">disconnected</span>
-  <span id="msg-rate" style="margin-left:auto; color:var(--dim); font-size:11px;"></span>
+  <span id="sys-heap" style="margin-left:auto; color:var(--dim); font-size:11px;"></span>
+  <span id="sys-rssi" style="color:var(--dim); font-size:11px;"></span>
+  <span id="sys-uptime" style="color:var(--dim); font-size:11px;"></span>
+  <span id="msg-rate" style="color:var(--dim); font-size:11px;"></span>
 </header>
 
 <div class="grid">
@@ -264,6 +267,14 @@ function connectWS() {
         }
         if (s.tofA) drawTof('tof-a', s.tofA);
         if (s.tofB) drawTof('tof-b', s.tofB);
+      }
+      if (msg.status) {
+        const st = msg.status;
+        $('sys-heap').textContent = `Heap: ${(st.heapFree / 1024).toFixed(0)} KB`;
+        $('sys-rssi').textContent = st.wifiRssi ? `RSSI: ${st.wifiRssi} dBm` : '';
+        const secs = Number(st.uptimeUs) / 1e6;
+        const m = Math.floor(secs / 60), s2 = Math.floor(secs % 60);
+        $('sys-uptime').textContent = `Up: ${m}m${s2}s`;
       }
     } catch (e) {
       console.error('Decode error:', e);

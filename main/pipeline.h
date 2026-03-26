@@ -20,9 +20,15 @@ esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx);
 
 /**
  * @brief Encode a SensorSnapshot to protobuf and fan out to all registered transports.
- *        Called from sensor task context (5Hz).
+ *        Called from sensor task context (20Hz).
  */
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap);
+
+/**
+ * @brief Encode a SystemStatus to protobuf and fan out to all registered transports.
+ *        Called from sensor task context (~1Hz).
+ */
+void pipeline_publish_status(const boat_SystemStatus *status);
 
 /**
  * @brief Decode incoming raw protobuf bytes and dispatch to registered handlers.

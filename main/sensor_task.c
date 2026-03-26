@@ -3,6 +3,8 @@
 #include "sensor_fusion.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "vl53l5cx_api.h"
@@ -10,30 +12,34 @@
 
 static const char *TAG = "SENSOR_TASK";
 
+#define SNAPSHOT_INTERVAL_MS  50   /* 20 Hz sensor publish */
+#define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
+
 void task_sensor_snapshot(void *pvParameters)
 {
     tof_devices_t *devs = (tof_devices_t *)pvParameters;
 
-    /* Static allocation — boat_SensorSnapshot with two 64-element
-     * ToF grids is ~540 bytes encoded; avoids stack overflow risk. */
+    /* Static allocation — avoids stack overflow risk */
     static boat_SensorSnapshot snap;
+    static VL53L5CX_ResultsData tof_res;
 
-    ESP_LOGI(TAG, "Sensor snapshot task started (5Hz)");
+    uint32_t iteration = 0;
+
+    ESP_LOGI(TAG, "Sensor snapshot task started (%d Hz)", 1000 / SNAPSHOT_INTERVAL_MS);
 
     while (true) {
         snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
         snap.timestamp_us = (uint64_t)esp_timer_get_time();
 
-        /* IMU */
+        /* IMU — always available */
         FusionResult imu;
         fusion_get_result(&imu);
-        snap.has_imu    = true;
+        snap.has_imu     = true;
         snap.imu.pitch   = imu.pitch;
         snap.imu.roll    = imu.roll;
         snap.imu.heading = imu.heading;
 
-        /* ToF A — static to avoid ~2KB+ stack allocation per loop iteration */
-        static VL53L5CX_ResultsData tof_res;
+        /* ToF A */
         snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
         if (snap.has_tof_a) {
             snap.tof_a.valid = true;
@@ -57,6 +63,20 @@ void task_sensor_snapshot(void *pvParameters)
 
         pipeline_publish_sensors(&snap);
 
-        vTaskDelay(pdMS_TO_TICKS(200));  /* 5 Hz */
+        /* SystemStatus at ~1Hz */
+        if (++iteration % STATUS_EVERY_N == 0) {
+            boat_SystemStatus sys = boat_SystemStatus_init_zero;
+            sys.heap_free = (uint32_t)esp_get_free_heap_size();
+            sys.uptime_us = (uint64_t)esp_timer_get_time();
+
+            wifi_ap_record_t ap;
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                sys.wifi_rssi = ap.rssi;
+            }
+
+            pipeline_publish_status(&sys);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS));
     }
 }
