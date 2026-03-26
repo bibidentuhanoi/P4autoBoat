@@ -67,13 +67,16 @@ camera_init()
        csi.sccb_config.freq = 400000
        csi.reset_pin = CONFIG_CAM_RESET_PIN     (-1)
        csi.pwdn_pin  = CONFIG_CAM_PWDN_PIN      (-1)
+       On failure: ESP_LOGE with hint to check CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+       and CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_VIDEO_DEVICE in sdkconfig
 
   2. open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDWR)
 
-  3. VIDIOC_S_EXT_CTRLS — set VFLIP + HFLIP
-       ctrl_class = V4L2_CID_USER_CLASS
+  3. Set VFLIP + HFLIP using individual VIDIOC_S_CTRL calls (one per control)
+       This matches the reference — it does NOT use VIDIOC_S_EXT_CTRLS for flip.
        V4L2_CID_VFLIP = CONFIG_CAM_VFLIP
        V4L2_CID_HFLIP = CONFIG_CAM_HFLIP
+       Log result; warn but do not fail if ioctl returns error (some sensors ignore it)
 
   4. VIDIOC_G_FMT — read actual format
        Log FourCC string so it's always visible in boot log
@@ -124,9 +127,9 @@ No encoder engine. No output buffer. No semaphore. No format-mapping table.
   loop:
     VIDIOC_DQBUF
     if !(flags & V4L2_BUF_FLAG_DONE) → VIDIOC_QBUF, continue
-    send "--frame\r\n"
+    send "\r\n--frame\r\n"                          ← leading \r\n required by multipart MIME
     send "Content-Type: image/jpeg\r\nContent-Length: <bytesused>\r\n\r\n"
-    send jpeg bytes (buf[index], bytesused)
+    send jpeg bytes (buf[index], bytesused)          ← bytesused only, NOT full buf length
     VIDIOC_QBUF
     on send error → break
 ```
@@ -160,13 +163,14 @@ nvs → fs → camera_init() → imu → tof → fusion → wifi → stream
 
 ## Files NOT Changed
 
-`camera_stream.h`, `Kconfig.projbuild`, `sdkconfig.defaults`, `main.c` (structure), all IMU/ToF/fusion code.
+`camera_stream.h`, `Kconfig.projbuild`, `sdkconfig.defaults`, all IMU/ToF/fusion code.
 
 ---
 
 ## Success Criteria
 
 - Boot log shows `Format: 800x640 fmt=JPEG`
+- Boot log shows no I2C arbitration errors on port 0 after `camera_init()` (confirms SCCB bus is independent)
 - Stream at `http://<ip>:80/stream` shows **full color image** with no purple tint and no line artifacts
-- JPEG quality matches `CONFIG_CAM_JPEG_QUALITY` (default 60)
-- All existing sensor/fusion functionality unaffected
+- JPEG quality log confirms clamped value applied via ioctl (matches `CONFIG_CAM_JPEG_QUALITY` default 60)
+- All existing sensor/fusion tasks start and log normally after `camera_init()` completes
