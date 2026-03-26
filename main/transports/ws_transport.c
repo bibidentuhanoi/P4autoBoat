@@ -21,6 +21,16 @@ static SemaphoreHandle_t s_client_mutex = NULL;
 static void add_client(int fd)
 {
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+
+    /* Deduplicate — browser refresh reuses the same fd without a CLOSE frame */
+    for (int i = 0; i < s_client_count; i++) {
+        if (s_client_fds[i] == fd) {
+            ESP_LOGI(TAG, "Client reconnected (fd=%d, total=%d)", fd, s_client_count);
+            xSemaphoreGive(s_client_mutex);
+            return;
+        }
+    }
+
     if (s_client_count < WS_MAX_CLIENTS) {
         s_client_fds[s_client_count++] = fd;
         ESP_LOGI(TAG, "Client connected (fd=%d, total=%d)", fd, s_client_count);
