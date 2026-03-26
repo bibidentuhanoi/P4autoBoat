@@ -62,7 +62,7 @@ static const httpd_uri_t s_stream_uri = {
     .user_ctx = NULL,
 };
 
-esp_err_t camera_stream_server_start(httpd_handle_t *out_handle)
+esp_err_t camera_stream_server_start(void)
 {
     uint32_t width, height, pixel_fmt;
     camera_get_frame_info(&width, &height, &pixel_fmt);
@@ -76,15 +76,20 @@ esp_err_t camera_stream_server_start(httpd_handle_t *out_handle)
     ESP_LOGI(TAG, "MJPEG stream: %"PRIu32"x%"PRIu32" -> http://<ip>:%d/stream",
              width, height, CONFIG_HTTP_STREAM_PORT);
 
+    /* Dedicated server for MJPEG only — isolated from API server on port 80.
+     * The stream handler is a blocking while(1) loop; keeping it separate
+     * prevents it from starving the API/dashboard httpd task. */
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = CONFIG_HTTP_STREAM_PORT;
-    cfg.stack_size  = 8192;
+    cfg.server_port      = CONFIG_HTTP_STREAM_PORT;
+    cfg.ctrl_port        = 32769;  /* must differ from port-80 server (32768) */
+    cfg.stack_size       = 8192;
+    cfg.max_open_sockets = 4;
+    cfg.max_uri_handlers = 2;
 
     httpd_handle_t server = NULL;
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_stream_uri),
                         TAG, "register /stream failed");
 
-    if (out_handle) *out_handle = server;
     return ESP_OK;
 }

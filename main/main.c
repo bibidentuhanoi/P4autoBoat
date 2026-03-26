@@ -22,7 +22,9 @@
 // Connectivity
 #include "wifi_manager.h"
 #include "camera_stream.h"
-#include "sensor_api.h"
+#include "pipeline.h"
+#include "http_server.h"
+#include "sensor_task.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -132,16 +134,19 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing sensor fusion...");
     fusion_init(&calib_data);
 
+    // Initialize data pipeline
+    ESP_LOGI(TAG, "Initializing data pipeline...");
+    ESP_ERROR_CHECK(pipeline_init());
+
     // 10. Connect to WiFi (blocks until connected or timeout)
     ESP_LOGI(TAG, "Connecting to WiFi...");
     esp_err_t wifi_ret = wifi_init();
-    httpd_handle_t httpd_handle = NULL;
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi unavailable (%s) — camera stream disabled", esp_err_to_name(wifi_ret));
     } else {
-        // 11. Start MJPEG HTTP stream server + sensor API
-        ESP_ERROR_CHECK(camera_stream_server_start(&httpd_handle));
-        ESP_ERROR_CHECK(sensor_api_register(httpd_handle, &tof_devs));
+        // 11. Start servers — stream on port 81, API/dashboard on port 80
+        ESP_ERROR_CHECK(camera_stream_server_start());
+        ESP_ERROR_CHECK(http_server_start());
     }
 
     // 12. Start RTOS Tasks
