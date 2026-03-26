@@ -32,6 +32,10 @@ esp_err_t pipeline_init(void)
 
 esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx)
 {
+    if (!send) {
+        ESP_LOGE(TAG, "Transport send function cannot be NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
     if (s_transport_count >= PIPELINE_MAX_TRANSPORTS) {
         ESP_LOGE(TAG, "Max transports reached (%d)", PIPELINE_MAX_TRANSPORTS);
         return ESP_ERR_NO_MEM;

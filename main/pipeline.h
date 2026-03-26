@@ -10,8 +10,11 @@ esp_err_t pipeline_init(void);
 
 /**
  * @brief Register a transport adapter for outgoing data.
- * @param send  Function pointer called for each published message.
+ * @param send  Function pointer called for each published message. Must not be NULL.
  * @param ctx   Opaque context passed to send().
+ * @note  MUST be called before starting any FreeRTOS tasks that call
+ *        pipeline_publish_sensors() or pipeline_handle_incoming().
+ *        Registration is not thread-safe and must complete during init.
  */
 esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx);
 
@@ -34,5 +37,6 @@ typedef void (*motor_command_handler_fn)(const boat_MotorCommand *cmd);
 
 /**
  * @brief Register a handler for incoming MotorCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
