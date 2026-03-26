@@ -32,13 +32,18 @@ static void add_client(int fd)
 static void remove_client(int fd)
 {
     xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+    bool found = false;
     for (int i = 0; i < s_client_count; i++) {
         if (s_client_fds[i] == fd) {
             s_client_fds[i] = s_client_fds[s_client_count - 1];
             s_client_count--;
             ESP_LOGI(TAG, "Client removed (fd=%d, total=%d)", fd, s_client_count);
+            found = true;
             break;
         }
+    }
+    if (!found) {
+        ESP_LOGW(TAG, "remove_client: fd=%d not found (already removed or recycled)", fd);
     }
     xSemaphoreGive(s_client_mutex);
 }
@@ -91,9 +96,20 @@ static esp_err_t ws_handler(httpd_req_t *req)
     /* Incoming frame */
     httpd_ws_frame_t frame = { .type = HTTPD_WS_TYPE_BINARY };
 
-    /* First call: get frame length */
+    /* First call: get frame type and length */
     esp_err_t ret = httpd_ws_recv_frame(req, &frame, 0);
     if (ret != ESP_OK) return ret;
+
+    /* Handle close frame — remove client immediately */
+    if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+        remove_client(httpd_req_to_sockfd(req));
+        return ESP_OK;
+    }
+
+    if (frame.fragmented) {
+        ESP_LOGW(TAG, "Fragmented WS frame ignored (fd=%d)", httpd_req_to_sockfd(req));
+        return ESP_OK;
+    }
 
     if (frame.len == 0) return ESP_OK;
 
@@ -119,7 +135,12 @@ static esp_err_t ws_handler(httpd_req_t *req)
 esp_err_t ws_transport_init(httpd_handle_t server)
 {
     s_server = server;
+    if (s_client_mutex != NULL) {
+        vSemaphoreDelete(s_client_mutex);
+        s_client_mutex = NULL;
+    }
     s_client_count = 0;
+    memset(s_client_fds, -1, sizeof(s_client_fds));
 
     s_client_mutex = xSemaphoreCreateMutex();
     if (!s_client_mutex) {
