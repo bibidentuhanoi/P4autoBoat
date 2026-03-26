@@ -192,22 +192,17 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "VIDIOC_QBUF[%d] failed", i);
     }
 
-    /* 9. Start streaming to initialize the ISP pipeline fully,
-     *    then immediately stop. Consumers call camera_start_streaming()
-     *    when they need frames. This avoids ISP crash from buffer starvation. */
+    /* 9. Start streaming — ISP pipeline stays alive.
+     *    A drain task in camera_stream.c keeps buffers cycling
+     *    when no MJPEG client is connected (prevents ISP crash). */
     {
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         ESP_GOTO_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
                           cleanup, TAG, "VIDIOC_STREAMON failed");
         s_streaming = true;
-        vTaskDelay(pdMS_TO_TICKS(100));  /* let ISP pipeline initialize */
-        ioctl(s_cam_fd, VIDIOC_STREAMOFF, &type);
-        s_streaming = false;
-        s_frame_held = false;
     }
 
-    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG (streaming on demand)",
-             s_cam_width, s_cam_height);
+    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG", s_cam_width, s_cam_height);
     return ESP_OK;
 
 cleanup:
@@ -370,6 +365,20 @@ esp_err_t camera_stop_streaming(void)
     s_frame_held = false;
     ESP_LOGI(TAG, "Camera streaming stopped");
     return ESP_OK;
+}
+
+void camera_drain_frame(void)
+{
+    if (s_cam_fd < 0 || s_frame_held) return;
+
+    struct v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+
+    if (ioctl(s_cam_fd, VIDIOC_DQBUF, &buf) == 0) {
+        ioctl(s_cam_fd, VIDIOC_QBUF, &buf);
+    }
 }
 
 void camera_get_frame_info(uint32_t *width, uint32_t *height, uint32_t *pixel_fmt)

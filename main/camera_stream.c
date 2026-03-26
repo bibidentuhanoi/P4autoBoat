@@ -19,6 +19,24 @@ static const char *TAG = "CAM_STREAM";
 #define PART_BOUNDARY "\r\n--" BOUNDARY "\r\n"
 #define PART_HEADER   "Content-Type: image/jpeg\r\nContent-Length: %"PRIu32"\r\n\r\n"
 
+/* ---- Frame drain ----
+ * The ISP pipeline runs continuously after VIDIOC_STREAMON.
+ * If nobody calls VIDIOC_DQBUF the buffer queue fills up,
+ * ISP metadata indices corrupt → crash.
+ * This task does lightweight drain (DQBUF+QBUF, no PPA/JPEG)
+ * when no MJPEG client is connected. Near-zero CPU cost. */
+static volatile bool s_client_streaming = false;
+
+static void camera_drain_task(void *pvParameters)
+{
+    while (true) {
+        if (!s_client_streaming) {
+            camera_drain_frame();
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     void     *frame_buf;
@@ -26,13 +44,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     char      hdr[96];
     esp_err_t ret;
 
-    /* Start camera on demand — ISP pipeline only runs when needed */
-    ret = camera_start_streaming();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start camera: %s", esp_err_to_name(ret));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Camera start failed");
-        return ESP_FAIL;
-    }
+    s_client_streaming = true;
 
     httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" BOUNDARY);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -59,8 +71,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
         if (ret != ESP_OK) break;
     }
 
-    /* Client disconnected — stop camera, free ISP/DMA resources */
-    camera_stop_streaming();
+    s_client_streaming = false;
 
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
@@ -101,6 +112,9 @@ esp_err_t camera_stream_server_start(void)
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_stream_uri),
                         TAG, "register /stream failed");
+
+    /* Lightweight drain — keeps ISP pipeline alive when no MJPEG client */
+    xTaskCreate(camera_drain_task, "CamDrain", 2048, NULL, 2, NULL);
 
     return ESP_OK;
 }

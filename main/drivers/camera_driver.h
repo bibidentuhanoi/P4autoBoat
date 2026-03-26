@@ -27,5 +27,8 @@ esp_err_t camera_start_streaming(void);
 /** @brief Stop V4L2 streaming (VIDIOC_STREAMOFF). Stops ISP pipeline. Idempotent. */
 esp_err_t camera_stop_streaming(void);
 
+/** @brief Lightweight drain — DQBUF+QBUF only, no PPA/JPEG. Keeps ISP pipeline alive. */
+void camera_drain_frame(void);
+
 /** @brief Query resolution and pixel format without capturing. */
 void camera_get_frame_info(uint32_t *width, uint32_t *height, uint32_t *pixel_fmt);
