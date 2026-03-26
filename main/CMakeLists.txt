@@ -13,5 +13,5 @@ idf_component_register(
     PRIV_REQUIRES
         spi_flash esp_timer nvs_flash driver
         esp_video esp_wifi esp_wifi_remote esp_netif
-        esp_http_server espressif__esp_new_jpeg json
+        esp_http_server esp_driver_jpeg json esp_driver_ppa
     INCLUDE_DIRS "include" "drivers")
