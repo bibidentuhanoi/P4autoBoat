@@ -1,6 +1,7 @@
 #include "ws_transport.h"
 #include "pipeline.h"
 #include "esp_log.h"
+#include "esp_check.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
