@@ -60,10 +60,11 @@ The IMU (ICM20948) and ToF (VL53L5CX ×2) remain on their own I2C bus — comple
 **Init sequence (matches `example_init_video.c` + `init_web_cam_video()`):**
 
 ```
-camera_init()
+camera_init(sccb_handle)
   1. esp_video_init(&cam_cfg)
        cam_cfg.csi only — NO .jpeg field
-       csi.sccb_config.init_sccb = true        ← esp_video owns the I2C bus
+       csi.sccb_config.init_sccb = false       ← app owns the I2C bus (passed as sccb_handle)
+       csi.sccb_config.i2c_handle = sccb_handle
        csi.sccb_config.freq = 400000
        csi.reset_pin = CONFIG_CAM_RESET_PIN     (-1)
        csi.pwdn_pin  = CONFIG_CAM_PWDN_PIN      (-1)
@@ -96,12 +97,12 @@ camera_init()
   8. VIDIOC_STREAMON
 ```
 
-**Public API — unchanged signatures except `camera_init`:**
+**Public API — updated signatures:**
 ```c
-esp_err_t camera_init(void);                          // was camera_init(i2c_handle)
-esp_err_t camera_capture_frame(...);                  // unchanged
-void      camera_release_frame(void);                 // unchanged
-void      camera_get_frame_info(...);                 // unchanged
+esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle);  // app creates SCCB bus, passes handle
+esp_err_t camera_capture_frame(...);                          // unchanged
+void      camera_release_frame(void);                         // unchanged
+void      camera_get_frame_info(...);                         // unchanged
 ```
 
 ---
@@ -144,11 +145,16 @@ Note: `bytesused` is used directly — not the full buffer size. This avoids sen
 // Before (current — wrong order):
 nvs → fs → imu → tof → fusion → wifi → camera_init(i2c_handle) → stream
 
-// After (reference pattern — camera first):
-nvs → fs → camera_init() → imu → tof → fusion → wifi → stream
+// After (GPIO handoff pattern — camera first):
+nvs
+→ i2c_new_master_bus(I2C0, SCL=8, SDA=7)   ← temporary SCCB bus
+→ camera_init(sccb_handle)                  ← programs OV5647, starts MIPI CSI
+→ i2c_del_master_bus(sccb_handle)           ← frees GPIO7/GPIO8
+→ i2c_new_master_bus(I2C0, SCL=8, SDA=7)   ← sensor bus (IMU + ToF)
+→ imu → tof → fusion → wifi → stream
 ```
 
-`camera_init()` no longer takes `i2c_master_bus_handle_t`. Call site in `main.c` updated accordingly.
+`camera_init()` takes `i2c_master_bus_handle_t sccb_handle` — a temporary bus the caller creates and deletes after init.
 
 ---
 
