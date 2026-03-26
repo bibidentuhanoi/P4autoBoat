@@ -19,12 +19,36 @@ static const char *TAG = "CAM_STREAM";
 #define PART_BOUNDARY "\r\n--" BOUNDARY "\r\n"
 #define PART_HEADER   "Content-Type: image/jpeg\r\nContent-Length: %"PRIu32"\r\n\r\n"
 
+/* ---- Frame drain ----
+ * The ISP pipeline runs continuously after VIDIOC_STREAMON.
+ * If nobody calls VIDIOC_DQBUF the V4L2 buffer queue fills up,
+ * the ISP metadata buffers stall, and buf.index corrupts → crash.
+ * This background task drains frames when no MJPEG client is connected. */
+static volatile bool s_client_streaming = false;
+
+static void camera_drain_task(void *pvParameters)
+{
+    void  *buf;
+    size_t len;
+
+    while (true) {
+        if (!s_client_streaming) {
+            if (camera_capture_frame(&buf, &len, NULL, NULL, NULL) == ESP_OK) {
+                camera_release_frame();
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));  /* ~33fps drain keeps pipeline flowing */
+    }
+}
+
 static esp_err_t stream_handler(httpd_req_t *req)
 {
     void     *frame_buf;
     size_t    frame_len;
     char      hdr[96];
     esp_err_t ret;
+
+    s_client_streaming = true;
 
     httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" BOUNDARY);
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -50,6 +74,8 @@ static esp_err_t stream_handler(httpd_req_t *req)
         camera_release_frame();
         if (ret != ESP_OK) break;
     }
+
+    s_client_streaming = false;
 
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
@@ -90,6 +116,9 @@ esp_err_t camera_stream_server_start(void)
     ESP_RETURN_ON_ERROR(httpd_start(&server, &cfg), TAG, "httpd_start failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &s_stream_uri),
                         TAG, "register /stream failed");
+
+    /* Start background frame drain — keeps ISP pipeline alive when no client streams */
+    xTaskCreate(camera_drain_task, "CamDrain", 2048, NULL, 2, NULL);
 
     return ESP_OK;
 }
