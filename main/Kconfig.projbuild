@@ -96,9 +96,13 @@ menu "Board Configuration"
             string "WiFi Password"
             default "0903875378"
 
-        config HTTP_STREAM_PORT
-            int "HTTP Stream Port"
+        config HTTP_API_PORT
+            int "HTTP API/Dashboard Port"
             default 80
+
+        config HTTP_STREAM_PORT
+            int "HTTP MJPEG Stream Port"
+            default 81
 
     endmenu
 
