@@ -189,14 +189,13 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "VIDIOC_QBUF[%d] failed", i);
     }
 
-    /* 9. Start streaming */
-    {
-        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        ESP_GOTO_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
-                          cleanup, TAG, "VIDIOC_STREAMON failed");
-    }
+    /* 9. Do NOT start streaming here — camera_start_streaming() is called
+     *    on demand when a consumer (MJPEG client, ESP-DL) needs frames.
+     *    This prevents the ISP pipeline from running with no consumer,
+     *    which causes buffer starvation and crashes. */
 
-    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG", s_cam_width, s_cam_height);
+    ESP_LOGI(TAG, "Camera ready: %"PRIu32"x%"PRIu32" JPEG (streaming off until requested)",
+             s_cam_width, s_cam_height);
     return ESP_OK;
 
 cleanup:
@@ -322,6 +321,35 @@ void camera_release_frame(void)
     if (!s_frame_held || s_cam_fd < 0) return;
     ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
     s_frame_held = false;
+}
+
+static bool s_streaming = false;
+
+esp_err_t camera_start_streaming(void)
+{
+    if (s_cam_fd < 0) return ESP_ERR_INVALID_STATE;
+    if (s_streaming) return ESP_OK;
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ESP_RETURN_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMON, &type),
+                        TAG, "VIDIOC_STREAMON failed");
+    s_streaming = true;
+    ESP_LOGI(TAG, "Camera streaming started");
+    return ESP_OK;
+}
+
+esp_err_t camera_stop_streaming(void)
+{
+    if (s_cam_fd < 0) return ESP_ERR_INVALID_STATE;
+    if (!s_streaming) return ESP_OK;
+
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    ESP_RETURN_ON_ERROR(ioctl(s_cam_fd, VIDIOC_STREAMOFF, &type),
+                        TAG, "VIDIOC_STREAMOFF failed");
+    s_streaming = false;
+    s_frame_held = false;
+    ESP_LOGI(TAG, "Camera streaming stopped");
+    return ESP_OK;
 }
 
 void camera_get_frame_info(uint32_t *width, uint32_t *height, uint32_t *pixel_fmt)

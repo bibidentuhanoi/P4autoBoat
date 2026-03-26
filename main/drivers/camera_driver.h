@@ -21,5 +21,11 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
 /** @brief Return the held frame buffer back to the driver. */
 void camera_release_frame(void);
 
+/** @brief Start V4L2 streaming (VIDIOC_STREAMON). Call before capturing frames. Idempotent. */
+esp_err_t camera_start_streaming(void);
+
+/** @brief Stop V4L2 streaming (VIDIOC_STREAMOFF). Stops ISP pipeline. Idempotent. */
+esp_err_t camera_stop_streaming(void);
+
 /** @brief Query resolution and pixel format without capturing. */
 void camera_get_frame_info(uint32_t *width, uint32_t *height, uint32_t *pixel_fmt);
