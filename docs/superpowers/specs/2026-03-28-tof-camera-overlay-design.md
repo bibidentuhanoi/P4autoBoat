@@ -122,7 +122,7 @@ Both sensors are mirrored (A is flipped relative to B), so each needs independen
 
 ### Visual Design
 
-- **Heatmap**: blue (4000 mm, far) → red (0 mm, close). Reuses existing `distToColor()` function.
+- **Heatmap**: blue (4000 mm, far) → red (0 mm, close). The existing `distToColor()` uses a 2000 mm max — the overlay version will use a separate scale with 4000 mm max to cover the full ToF range.
 - **Opacity**: 0.35 alpha — camera image visible beneath.
 - **Overlap zone**: where ToF-A and ToF-B zones overlap (~35° center), both rectangles draw independently. No blending or fusion. Overlap appears slightly more opaque.
 - **No labels or numbers** on the overlay. The existing separate 8×8 heatmap canvases remain for detailed reading.
@@ -183,7 +183,7 @@ All new code added to `dashboard.html` `<script>` block:
 ### Performance
 
 - 128 zones × 4 corners = 512 pinhole projections per frame at 5 Hz
-- Pure arithmetic + canvas `fillRect` — trivially fast in JS
+- Pure arithmetic + canvas `beginPath/moveTo/lineTo/fill` for quadrilaterals — trivially fast in JS
 - No DOM manipulation, no compositing tricks
 
 ## What This Design Does NOT Include
