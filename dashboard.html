@@ -547,6 +547,49 @@ function drawTof(canvasId, tofGrid) {
   ctx.putImageData(img, 0, 0);
 }
 
+// ── ToF overlay — canvas sizing ─────────────────────────────
+let overlayCtx = null;
+let overlayScale = 1;
+let overlayOffsetX = 0;
+let overlayOffsetY = 0;
+
+function updateOverlaySize() {
+  const canvas = $('tof-overlay');
+  const img = $('cam-img');
+  const container = $('cam-container');
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+
+  canvas.width = cw;
+  canvas.height = ch;
+
+  // Compute letterbox offsets for object-fit: contain
+  const imgAspect = TOF_OVERLAY.camW / TOF_OVERLAY.camH;  // 800/640 = 1.25
+  const containerAspect = cw / ch;
+
+  let drawW, drawH;
+  if (containerAspect > imgAspect) {
+    // Pillarboxed (bars on sides)
+    drawH = ch;
+    drawW = ch * imgAspect;
+  } else {
+    // Letterboxed (bars on top/bottom)
+    drawW = cw;
+    drawH = cw / imgAspect;
+  }
+
+  overlayScale = drawW / TOF_OVERLAY.camW;
+  overlayOffsetX = (cw - drawW) / 2;
+  overlayOffsetY = (ch - drawH) / 2;
+
+  overlayCtx = canvas.getContext('2d');
+}
+
+// Observe container size changes
+const resizeObs = new ResizeObserver(() => updateOverlaySize());
+resizeObs.observe($('cam-container'));
+updateOverlaySize();
+
 // ── Init ────────────────────────────────────────────────────
 drawHorizon(0, 0);
 drawTof('tof-a', null);
