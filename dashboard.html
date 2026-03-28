@@ -395,6 +395,31 @@ function distToColor(mm) {
   ];
 }
 
+// ── ToF overlay color (4000mm range) ────────────────────────
+const OVERLAY_MAX_MM = 4000;
+
+function overlayColor(mm) {
+  if (!mm || mm <= 0) return null;  // no target — skip zone
+  const t = Math.min(mm, OVERLAY_MAX_MM) / OVERLAY_MAX_MM;
+  const stops = [
+    [255, 0,   0  ],   // close = red
+    [255, 180, 0  ],   // orange
+    [0,   255, 80 ],   // green
+    [0,   200, 255],   // cyan
+    [0,   60,  200],   // far = blue
+  ];
+  const scaled = t * (stops.length - 1);
+  const i = Math.floor(scaled);
+  const f = scaled - i;
+  const a = stops[Math.min(i, stops.length - 1)];
+  const b = stops[Math.min(i + 1, stops.length - 1)];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f),
+  ];
+}
+
 function drawTof(canvasId, tofGrid) {
   const c = $(canvasId);
   const ctx = c.getContext('2d');
