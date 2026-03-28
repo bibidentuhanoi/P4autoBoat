@@ -285,6 +285,7 @@ function connectWS() {
         }
         if (s.tofA) drawTof('tof-a', s.tofA);
         if (s.tofB) drawTof('tof-b', s.tofB);
+        renderOverlay(s.tofA, s.tofB);
       }
       if (msg.status) {
         const st = msg.status;
