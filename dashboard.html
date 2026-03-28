@@ -420,6 +420,110 @@ function overlayColor(mm) {
   ];
 }
 
+// ── ToF overlay — geometry & projection ─────────────────────
+const TOF_OVERLAY = {
+  // Camera intrinsics (800x640 @ 72° HFoV)
+  camW: 800,
+  camH: 640,
+  focalPx: 400 / Math.tan(36 * Math.PI / 180),  // ≈ 550.6
+  cx: 400,
+  cy: 320,
+
+  // VL53L5CX zone grid
+  zones: 8,
+  zoneDeg: 5.625,  // 45° / 8, linearly spaced (f-theta)
+
+  // Zone ordering flip flags (calibrate empirically)
+  flipHA: false,  // flip horizontal for sensor A
+  flipVA: false,  // flip vertical for sensor A
+  flipHB: false,  // flip horizontal for sensor B
+  flipVB: false,  // flip vertical for sensor B
+
+  // Sensor A (port) — offset in mm, yaw in radians
+  sensorA: {
+    tx: -24.6,  ty: 0,  tz: -7.27,
+    yaw: -5 * Math.PI / 180,
+  },
+  // Sensor B (starboard)
+  sensorB: {
+    tx: 24.6,  ty: 0,  tz: -7.27,
+    yaw: 5 * Math.PI / 180,
+  },
+
+  alpha: 0.35,  // overlay opacity
+};
+
+/**
+ * Project a single 3D point from sensor frame to camera pixel.
+ * @param {object} sensor - TOF_OVERLAY.sensorA or .sensorB
+ * @param {number} az - horizontal angle in radians (sensor-local)
+ * @param {number} el - vertical angle in radians (sensor-local, positive=down)
+ * @param {number} d  - distance in mm
+ * @returns {[number, number]} pixel [px, py] in native 800x640 coords, or null if behind camera
+ */
+function tofProject(sensor, az, el, d) {
+  // Ray direction in sensor-local frame
+  const dx = Math.tan(az);
+  const dy = Math.tan(el);
+  const dz = 1.0;
+  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+  // 3D point in sensor frame
+  const sx = d * dx / len;
+  const sy = d * dy / len;
+  const sz = d * dz / len;
+
+  // Rotate by yaw + translate to camera frame
+  const cosY = Math.cos(sensor.yaw);
+  const sinY = Math.sin(sensor.yaw);
+  const cx = cosY * sx - sinY * sz + sensor.tx;
+  const cy = sy + sensor.ty;
+  const cz = sinY * sx + cosY * sz + sensor.tz;
+
+  // Behind camera — don't render
+  if (cz <= 0) return null;
+
+  // Pinhole projection
+  const f = TOF_OVERLAY.focalPx;
+  const px = f * (cx / cz) + TOF_OVERLAY.cx;
+  const py = f * (cy / cz) + TOF_OVERLAY.cy;
+  return [px, py];
+}
+
+/**
+ * Get the 4 projected pixel corners for a ToF zone.
+ * @param {object} sensor - TOF_OVERLAY.sensorA or .sensorB
+ * @param {number} row - zone row 0-7
+ * @param {number} col - zone col 0-7
+ * @param {number} d - distance reading in mm
+ * @param {boolean} flipH - flip horizontal
+ * @param {boolean} flipV - flip vertical
+ * @returns {Array|null} [[x0,y0],[x1,y1],[x2,y2],[x3,y3]] or null
+ */
+function projectZoneCorners(sensor, row, col, d, flipH, flipV) {
+  if (!d || d <= 0) return null;
+  d = Math.min(d, OVERLAY_MAX_MM);  // clamp projection distance per spec
+
+  const zd = TOF_OVERLAY.zoneDeg * Math.PI / 180;
+  const c = flipH ? (7 - col) : col;
+  const r = flipV ? (7 - row) : row;
+
+  // Angular bounds of this zone
+  const azMin = (c - 4) * zd;
+  const azMax = (c - 3) * zd;
+  const elMin = (r - 4) * zd;
+  const elMax = (r - 3) * zd;
+
+  // Project all 4 corners at the zone's measured distance
+  const tl = tofProject(sensor, azMin, elMin, d);
+  const tr = tofProject(sensor, azMax, elMin, d);
+  const br = tofProject(sensor, azMax, elMax, d);
+  const bl = tofProject(sensor, azMin, elMax, d);
+
+  if (!tl || !tr || !br || !bl) return null;
+  return [tl, tr, br, bl];
+}
+
 function drawTof(canvasId, tofGrid) {
   const c = $(canvasId);
   const ctx = c.getContext('2d');
