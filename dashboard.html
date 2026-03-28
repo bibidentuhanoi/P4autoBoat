@@ -590,6 +590,62 @@ const resizeObs = new ResizeObserver(() => updateOverlaySize());
 resizeObs.observe($('cam-container'));
 updateOverlaySize();
 
+// ── ToF overlay — renderer ──────────────────────────────────
+let overlayEnabled = true;
+
+function renderOverlay(tofA, tofB) {
+  if (!overlayCtx) return;
+  const canvas = $('tof-overlay');
+  overlayCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!overlayEnabled) return;
+
+  overlayCtx.globalAlpha = TOF_OVERLAY.alpha;
+
+  function drawSensor(tofGrid, sensor, flipH, flipV) {
+    if (!tofGrid || !tofGrid.valid || !tofGrid.distances || tofGrid.distances.length < 64) return;
+
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const mm = tofGrid.distances[row * 8 + col];
+        const color = overlayColor(mm);
+        if (!color) continue;  // no target
+
+        const corners = projectZoneCorners(sensor, row, col, mm, flipH, flipV);
+        if (!corners) continue;
+
+        // Transform native px → display px (with letterbox offset)
+        overlayCtx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(
+          corners[0][0] * overlayScale + overlayOffsetX,
+          corners[0][1] * overlayScale + overlayOffsetY
+        );
+        for (let i = 1; i < 4; i++) {
+          overlayCtx.lineTo(
+            corners[i][0] * overlayScale + overlayOffsetX,
+            corners[i][1] * overlayScale + overlayOffsetY
+          );
+        }
+        overlayCtx.closePath();
+        overlayCtx.fill();
+      }
+    }
+  }
+
+  drawSensor(tofA, TOF_OVERLAY.sensorA, TOF_OVERLAY.flipHA, TOF_OVERLAY.flipVA);
+  drawSensor(tofB, TOF_OVERLAY.sensorB, TOF_OVERLAY.flipHB, TOF_OVERLAY.flipVB);
+
+  overlayCtx.globalAlpha = 1.0;
+}
+
+$('overlay-cb').addEventListener('change', (e) => {
+  overlayEnabled = e.target.checked;
+  if (!overlayEnabled && overlayCtx) {
+    overlayCtx.clearRect(0, 0, $('tof-overlay').width, $('tof-overlay').height);
+  }
+});
+
 // ── Init ────────────────────────────────────────────────────
 drawHorizon(0, 0);
 drawTof('tof-a', null);
