@@ -6,7 +6,7 @@ dependencies:
       require: private
       version: '>=4.1'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     version: 0.5.3
   espressif/eppp_link:
@@ -38,7 +38,7 @@ dependencies:
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     targets:
     - esp32p4
@@ -55,7 +55,7 @@ dependencies:
       require: private
       version: '>=4.4'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     version: 1.0.4
   espressif/esp_hosted:
@@ -65,7 +65,7 @@ dependencies:
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     version: 2.12.3
   espressif/esp_ipa:
@@ -79,16 +79,17 @@ dependencies:
       require: private
       version: '>=5.4'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     targets:
     - esp32p4
     version: 1.3.1
   espressif/esp_new_jpeg:
+    component_hash: 2f06f88e94fbc781b26a9be4291ff4ffc88596c90436a1e1358a7a38296b44ae
     dependencies: []
     source:
-      path: /workspaces/BoatEspP4/managed_components/espressif__esp_new_jpeg
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     targets:
     - esp32
     - esp32s2
@@ -120,28 +121,40 @@ dependencies:
       type: service
     version: 1.1.2
   espressif/esp_video:
+    component_hash: ba8f4aa63ad9bda3cc18a3afe1b9ba5b39c7359a6ad79392a94e42ba8cf9e5f8
     dependencies:
     - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
       version: 0.*
     - name: espressif/esp_cam_sensor
+      registry_url: https://components.espressif.com
+      require: private
       version: 2.0.*
     - name: espressif/esp_h264
+      registry_url: https://components.espressif.com
+      require: private
       rules:
       - if: target in [esp32p4]
       version: 1.0.4
     - name: espressif/esp_ipa
+      registry_url: https://components.espressif.com
+      require: private
       rules:
       - if: target in [esp32p4]
       version: 1.3.*
     - name: idf
+      require: private
       version: '>=5.4'
     - name: espressif/usb_host_uvc
+      registry_url: https://components.espressif.com
+      require: private
       rules:
       - if: target in [esp32p4, esp32s3]
       version: 2.4.*
     source:
-      path: /workspaces/BoatEspP4/managed_components/espressif__esp_video
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     targets:
     - esp32p4
     - esp32s3
@@ -151,18 +164,24 @@ dependencies:
     - esp32c61
     version: 2.0.1
   espressif/esp_wifi_remote:
+    component_hash: 4bd046a7474454fcac858bd5e689a0e401dda8df21a5abba175d4ebd1205254c
     dependencies:
     - name: espressif/esp_hosted
+      registry_url: https://components.espressif.com
+      require: private
       rules:
       - if: target in [esp32h2, esp32p4]
       version: '>=2.11'
     - name: espressif/wifi_remote_over_eppp
+      registry_url: https://components.espressif.com
+      require: private
       version: '>=0.1'
     - name: idf
+      require: private
       version: '>=5.3'
     source:
-      path: /workspaces/BoatEspP4/managed_components/espressif__esp_wifi_remote
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 1.4.2
   espressif/usb_host_uvc:
     component_hash: f20c4e4dea50536e2e29daaf589b5f5984402284c155867daef27d6b64869f78
@@ -178,7 +197,7 @@ dependencies:
       - if: target not in ["linux"]
       version: ^1.0.0
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     targets:
     - esp32s2
@@ -188,36 +207,39 @@ dependencies:
     - linux
     version: 2.4.2
   espressif/wifi_remote_over_eppp:
-    component_hash: ac4d13625cc9f88597cd612d2758580fac287d8ec731b606f2a0720d28cda6cd
+    component_hash: 06d8bc15348bbd21f1390daace36ed5adcf6026c93c5b69decc55fa04df2711a
     dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
     - name: espressif/eppp_link
       registry_url: https://components.espressif.com
       require: private
       version: '>=0.1'
-    - name: idf
-      require: private
-      version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
-    version: 0.3.1
+    version: 0.3.2
   idf:
     source:
       type: idf
     version: 5.5.3
   livekit/nanopb:
+    component_hash: 5b3bd915d2eb2ad1a7bb4a3ca655c40f31bab5f4f48e75ec04e300dc9ab78f4d
     dependencies: []
     source:
-      path: /workspaces/BoatEspP4/managed_components/livekit__nanopb
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 0.4.9
   rjrp44/vl53l5cx:
+    component_hash: 6dbc68bb35a424f6f5392834ddab94ad5fac121a0e3f90dde4d2bdff22699b46
     dependencies:
     - name: idf
+      require: private
       version: '>=5.4'
     source:
-      path: /workspaces/BoatEspP4/managed_components/rjrp44__vl53l5cx
-      type: local
+      registry_url: https://components.espressif.com/
+      type: service
     version: 4.0.0
 direct_dependencies:
 - espressif/esp_new_jpeg
@@ -226,6 +248,6 @@ direct_dependencies:
 - idf
 - livekit/nanopb
 - rjrp44/vl53l5cx
-manifest_hash: d6cb570186aebfd88b4ceaf87b5e2c05d48e1264ee3df6dc59d083e8da53ee40
+manifest_hash: 2e7feee0624cf0e4c6fa948ea0698200aa5d4f48b71b233cd9e2719f66a13339
 target: esp32p4
 version: 2.0.0

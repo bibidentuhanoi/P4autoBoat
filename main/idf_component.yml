@@ -4,19 +4,14 @@ dependencies:
     version: '>=5.3'
   rjrp44/vl53l5cx:
     version: "^4.0.0"
-    override_path: "../managed_components/rjrp44__vl53l5cx"
   ## Camera: video framework + JPEG encoder
   espressif/esp_video:
-    version: "*"
-    override_path: "../managed_components/espressif__esp_video"
+    version: "2.0.1"
   espressif/esp_new_jpeg:
-    version: "*"
-    override_path: "../managed_components/espressif__esp_new_jpeg"
+    version: "1.0.0"
   ## WiFi on ESP32-P4 (via coprocessor, e.g. ESP32-C6)
   espressif/esp_wifi_remote:
-    version: "*"
-    override_path: "../managed_components/espressif__esp_wifi_remote"
+    version: "1.4.2"
   ## Protobuf encoding for telemetry pipeline
   livekit/nanopb:
     version: "^0.4.9"
-    override_path: "../managed_components/livekit__nanopb"
