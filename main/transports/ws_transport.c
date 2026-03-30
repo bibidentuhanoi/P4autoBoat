@@ -4,12 +4,16 @@
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include <string.h>
-#include <unistd.h>
+#include <sys/socket.h>
 
 static const char *TAG = "WS_TRANSPORT";
 
 #define WS_MAX_CLIENTS 4
+#define WS_SLOT_SIZE   1500
+#define WS_TX_STACK    8192
+#define WS_TX_PRIORITY 2
 
 /* ---- Client tracking (mutex-protected) ---- */
 
@@ -17,6 +21,13 @@ static httpd_handle_t s_server = NULL;
 static int s_client_fds[WS_MAX_CLIENTS];
 static int s_client_count = 0;
 static SemaphoreHandle_t s_client_mutex = NULL;
+
+/* ---- Double-buffer slot: sensor writes one, TX task reads the other ---- */
+
+static uint8_t  s_slot_buf[2][WS_SLOT_SIZE];
+static size_t   s_slot_len[2];
+static volatile int s_write_idx = 0;
+static TaskHandle_t s_tx_task = NULL;
 
 static void add_client(int fd)
 {
@@ -32,6 +43,11 @@ static void add_client(int fd)
     }
 
     if (s_client_count < WS_MAX_CLIENTS) {
+        /* Cap send blocking to 50ms — prevents esp_hosted spinlock from
+         * holding interrupts long enough to trigger the 300ms WDT */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
         s_client_fds[s_client_count++] = fd;
         ESP_LOGI(TAG, "Client connected (fd=%d, total=%d)", fd, s_client_count);
     } else {
@@ -60,38 +76,73 @@ static void remove_client(int fd)
 }
 
 /* ---- Transport send (called from sensor task) ---- */
+/* Writes into the double-buffer slot and notifies the TX task.
+ * Never touches the WiFi stack — returns immediately. */
 
 static esp_err_t ws_transport_send(const uint8_t *buf, size_t len, void *ctx)
 {
     (void)ctx;
+    if (len > WS_SLOT_SIZE) return ESP_ERR_INVALID_SIZE;
 
-    /* Snapshot client list under mutex */
-    int fds[WS_MAX_CLIENTS];
-    int count;
-    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-    count = s_client_count;
-    memcpy(fds, s_client_fds, count * sizeof(int));
-    xSemaphoreGive(s_client_mutex);
+    int idx = s_write_idx;
+    memcpy(s_slot_buf[idx], buf, len);
+    s_slot_len[idx] = len;
 
-    if (count == 0) return ESP_OK;
+    /* Flip: TX task will read this buffer; next sensor write goes to the other */
+    s_write_idx = idx ^ 1;
 
-    httpd_ws_frame_t frame = {
-        .type    = HTTPD_WS_TYPE_BINARY,
-        .payload = (uint8_t *)buf,
-        .len     = len,
-        .final   = true,
-    };
-
-    for (int i = 0; i < count; i++) {
-        esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Send failed fd=%d: %s — removing stale client",
-                     fds[i], esp_err_to_name(ret));
-            remove_client(fds[i]);
-        }
+    /* Wake TX task */
+    if (s_tx_task) {
+        xTaskNotifyGive(s_tx_task);
     }
 
     return ESP_OK;
+}
+
+/* ---- TX task: drains the latest slot over WiFi ---- */
+
+static void ws_tx_task(void *arg)
+{
+    (void)arg;
+
+    /* Local copy — sensor can freely overwrite the slot while we send */
+    static uint8_t tx_buf[WS_SLOT_SIZE];
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
+        /* Snapshot the completed buffer before sensor can overwrite it */
+        int read_idx = s_write_idx ^ 1;
+        size_t len = s_slot_len[read_idx];
+        if (len == 0) continue;
+        memcpy(tx_buf, s_slot_buf[read_idx], len);
+
+        /* Snapshot client list under mutex */
+        int fds[WS_MAX_CLIENTS];
+        int count;
+        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+        count = s_client_count;
+        memcpy(fds, s_client_fds, count * sizeof(int));
+        xSemaphoreGive(s_client_mutex);
+
+        if (count == 0) continue;
+
+        httpd_ws_frame_t frame = {
+            .type    = HTTPD_WS_TYPE_BINARY,
+            .payload = tx_buf,
+            .len     = len,
+            .final   = true,
+        };
+
+        for (int i = 0; i < count; i++) {
+            esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Send failed fd=%d: %s — removing stale client",
+                         fds[i], esp_err_to_name(ret));
+                remove_client(fds[i]);
+            }
+        }
+    }
 }
 
 /* ---- WebSocket handler (runs in httpd task) ---- */
@@ -173,6 +224,14 @@ esp_err_t ws_transport_init(httpd_handle_t server)
     /* Disconnect cleanup relies on send-failure detection in ws_transport_send().
      * ESP-IDF does not reliably deliver close events for all disconnect scenarios
      * (client crash, network drop), so stale fds are removed when send fails. */
+
+    /* Start TX task — owns all WiFi sends, decoupled from sensor task */
+    BaseType_t ret_task = xTaskCreate(ws_tx_task, "WS_TX", WS_TX_STACK,
+                                      NULL, WS_TX_PRIORITY, &s_tx_task);
+    if (ret_task != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create WS TX task");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Register with pipeline */
     ESP_RETURN_ON_ERROR(pipeline_register_transport(ws_transport_send, NULL),
