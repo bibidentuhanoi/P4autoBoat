@@ -72,13 +72,25 @@
   }
   /* Camera */
   #camera-card { grid-column: 1 / 3; grid-row: 1 / 3; }
-  #cam-img {
+  /* ToF overlay */
+  #cam-container {
+    position: relative;
     width: 100%;
     flex: 1;
+    min-height: 0;
+  }
+  #cam-container #cam-img {
+    width: 100%;
+    height: 100%;
     object-fit: contain;
     border-radius: 4px;
     background: #000;
-    min-height: 0;
+  }
+  #tof-overlay {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
   }
   /* IMU */
   #imu-card { grid-column: 3; grid-row: 1; }
@@ -115,6 +127,10 @@
   .tof-grid-wrap { text-align: center; }
   .tof-label { font-size: 9px; color: var(--dim); letter-spacing: 1px; margin-bottom: 4px; }
   canvas.tof { border-radius: 4px; image-rendering: pixelated; }
+  #bev-card { grid-column: 3; grid-row: 2; display: none; }
+  #bev-card.active { display: flex; }
+  #tof-card.hidden { display: none; }
+  #bev-canvas { width: 100%; flex: 1; min-height: 0; border-radius: 4px; }
 </style>
 <!-- protobuf.js — full build required for protobuf.parse() -->
 <script src="https://cdn.jsdelivr.net/npm/protobufjs@7/dist/protobuf.min.js"></script>
@@ -129,6 +145,39 @@
   <span id="sys-rssi" style="color:var(--dim); font-size:11px;"></span>
   <span id="sys-uptime" style="color:var(--dim); font-size:11px;"></span>
   <span id="msg-rate" style="color:var(--dim); font-size:11px;"></span>
+  <span style="color:var(--dim); font-size:11px;">Overlay:</span>
+  <select id="overlay-mode" style="background:var(--card);color:var(--text);border:1px solid var(--border);font-size:11px;padding:2px 4px;border-radius:4px;">
+    <option value="off">Off</option>
+    <option value="threshold" selected>Threshold</option>
+    <option value="heatmap">Heatmap</option>
+    <option value="both">Both</option>
+    <option value="legacy">Legacy (all quads)</option>
+  </select>
+  <label style="color:var(--dim); font-size:11px; cursor:pointer; user-select:none; margin-left:8px;">
+    <input type="range" id="thresh-range" min="500" max="4000" value="2000" step="100" style="width:60px;vertical-align:middle;" />
+    <span id="thresh-label">2.0m</span>
+  </label>
+  <span style="color:var(--dim); font-size:11px; margin-left:12px;">Flip A:</span>
+  <label style="color:var(--text); font-size:11px; cursor:pointer; user-select:none;">
+    <input type="checkbox" id="flipHA" /> H
+  </label>
+  <label style="color:var(--text); font-size:11px; cursor:pointer; user-select:none;">
+    <input type="checkbox" id="flipVA" /> V
+  </label>
+  <span style="color:var(--dim); font-size:11px; margin-left:8px;">Flip B:</span>
+  <label style="color:var(--text); font-size:11px; cursor:pointer; user-select:none;">
+    <input type="checkbox" id="flipHB" checked /> H
+  </label>
+  <label style="color:var(--text); font-size:11px; cursor:pointer; user-select:none;">
+    <input type="checkbox" id="flipVB" checked /> V
+  </label>
+  <span style="color:var(--dim); font-size:11px; margin-left:12px;">Pitch°:</span>
+  <label style="color:var(--text); font-size:11px; cursor:pointer; user-select:none;">
+    <input type="range" id="pitch-range" min="-30" max="30" value="-5" step="1" style="width:70px;vertical-align:middle;" />
+    <span id="pitch-label">-5°</span>
+  </label>
+  <span style="color:var(--dim); font-size:11px; margin-left:8px;">View:</span>
+  <button id="bev-toggle" onclick="toggleBEV()" style="background:var(--card);color:var(--text);border:1px solid var(--border);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;">BEV</button>
 </header>
 
 <div class="grid">
@@ -136,7 +185,10 @@
   <!-- Camera -->
   <div class="card" id="camera-card">
     <div class="card-title">Camera — MJPEG Stream</div>
-    <img id="cam-img" src="" alt="No stream" />
+    <div id="cam-container">
+      <img id="cam-img" src="" alt="No stream" />
+      <canvas id="tof-overlay"></canvas>
+    </div>
   </div>
 
   <!-- IMU -->
@@ -162,6 +214,13 @@
         <div class="imu-unit">deg</div>
       </div>
     </div>
+  </div>
+
+  <!-- BEV mini-map -->
+  <div class="card" id="bev-card">
+    <div class="card-title">BEV — top-down obstacle map</div>
+    <canvas id="bev-canvas" width="300" height="260"></canvas>
+    <div style="text-align:center;font-size:10px;color:var(--dim);" id="bev-range-label">range: 5.0 m</div>
   </div>
 
   <!-- ToF -->
@@ -267,6 +326,7 @@ function connectWS() {
         }
         if (s.tofA) drawTof('tof-a', s.tofA);
         if (s.tofB) drawTof('tof-b', s.tofB);
+        if (s.tofA || s.tofB) renderOverlay(s.tofA, s.tofB);
       }
       if (msg.status) {
         const st = msg.status;
@@ -377,6 +437,57 @@ function distToColor(mm) {
   ];
 }
 
+// ── ToF overlay color (4000mm range) ────────────────────────
+const OVERLAY_MAX_MM = 4000;
+
+function overlayColor(mm) {
+  if (!mm || mm <= 0) return null;  // no target — skip zone
+  const t = Math.min(mm, OVERLAY_MAX_MM) / OVERLAY_MAX_MM;
+  const stops = [
+    [255, 0,   0  ],   // close = red
+    [255, 180, 0  ],   // orange
+    [0,   255, 80 ],   // green
+    [0,   200, 255],   // cyan
+    [0,   60,  200],   // far = blue
+  ];
+  const scaled = t * (stops.length - 1);
+  const i = Math.floor(scaled);
+  const f = scaled - i;
+  const a = stops[Math.min(i, stops.length - 1)];
+  const b = stops[Math.min(i + 1, stops.length - 1)];
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f),
+  ];
+}
+
+// ── ToF overlay — geometry (pinhole + parallax) ─────────────
+const TOF_OVERLAY = {
+  camW: 800,
+  camH: 640,
+  // Focal length in pixels: f = (W/2) / tan(HFoV/2)
+  // RPi Camera Module v1.3 stock 3.6mm lens → 53° HFOV
+  f: 400 / Math.tan(26.5 * Math.PI / 180),  // ≈ 802 px
+  zones: 8,
+  zoneDeg: 5.625,  // 45° / 8
+
+  // From 3D CAD: dx=22.80mm (left/right), dy=6.78mm (depth), dz=0 (height)
+  // pitchDeg: sensor boresight tilt relative to camera optical axis
+  // 175° mechanical angle between sensor face and camera → 5° effective offset
+  // Tune with the Pitch° slider until overlay lands on objects
+  sensorA: { tx:  22.80, ty: 0, tz: -6.78, yawDeg:  5, pitchDeg: -5 },
+  sensorB: { tx: -22.80, ty: 0, tz: -6.78, yawDeg: -5, pitchDeg: -5 },
+
+  // Zone ordering flip flags
+  // Sensor A: no V flip, no H flip
+  // Sensor B: H flip + V flip (confirmed working)
+  flipHA: false, flipVA: false,
+  flipHB: true,  flipVB: true,
+
+  alpha: 0.35,
+};
+
 function drawTof(canvasId, tofGrid) {
   const c = $(canvasId);
   const ctx = c.getContext('2d');
@@ -398,6 +509,636 @@ function drawTof(canvasId, tofGrid) {
     }
   }
   ctx.putImageData(img, 0, 0);
+}
+
+// ── ToF overlay — canvas sizing ─────────────────────────────
+let overlayCtx = null;
+let overlayScale = 1;
+let overlayOffsetX = 0;
+let overlayOffsetY = 0;
+
+function updateOverlaySize() {
+  const canvas = $('tof-overlay');
+  const img = $('cam-img');
+  const container = $('cam-container');
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+
+  canvas.width = cw;
+  canvas.height = ch;
+
+  // Compute letterbox offsets for object-fit: contain
+  const imgAspect = TOF_OVERLAY.camW / TOF_OVERLAY.camH;  // 800/640 = 1.25
+  const containerAspect = cw / ch;
+
+  let drawW, drawH;
+  if (containerAspect > imgAspect) {
+    // Pillarboxed (bars on sides)
+    drawH = ch;
+    drawW = ch * imgAspect;
+  } else {
+    // Letterboxed (bars on top/bottom)
+    drawW = cw;
+    drawH = cw / imgAspect;
+  }
+
+  overlayScale = drawW / TOF_OVERLAY.camW;
+  overlayOffsetX = (cw - drawW) / 2;
+  overlayOffsetY = (ch - drawH) / 2;
+
+  overlayCtx = canvas.getContext('2d');
+}
+
+// Observe container size changes
+const resizeObs = new ResizeObserver(() => updateOverlaySize());
+resizeObs.observe($('cam-container'));
+updateOverlaySize();
+
+// ── ToF overlay — renderer (pinhole + parallax) ─────────────
+
+// Project a ToF zone corner (sensor-local angle) to camera pixel.
+// sensor: { tx, tz, yawDeg }
+// az, el: angles in radians in sensor-local frame
+// d: distance in mm (for parallax shift)
+// Returns [px, py] in native 800×640 camera coords.
+function tofToPixel(sensor, az, el, d) {
+  const f = TOF_OVERLAY.f;
+  const yaw   = sensor.yawDeg   * Math.PI / 180;
+  const pitch = (sensor.pitchDeg || 0) * Math.PI / 180;
+
+  // VL53L5CX returns perpendicular depth (not radial distance).
+  const sx = d * Math.tan(az);
+  const sy = d * Math.tan(el);
+  const sz = d;
+
+  // 1. Apply yaw (rotate around Y axis)
+  const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+  const rx = cosY * sx - sinY * sz;
+  const ry = sy;
+  const rz = sinY * sx + cosY * sz;
+
+  // 2. Apply pitch (rotate around X axis — corrects camera vs sensor tilt).
+  // pitchDeg < 0 shifts overlay UP: use when boxes appear below objects.
+  const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+  const camX = rx + sensor.tx;
+  const camY = cosP * ry - sinP * rz + (sensor.ty || 0);
+  const camZ = sinP * ry + cosP * rz + sensor.tz;
+
+  if (camZ <= 0) return null;
+
+  // Pinhole projection to pixels
+  return [
+    f * (camX / camZ) + TOF_OVERLAY.camW / 2,
+    f * (camY / camZ) + TOF_OVERLAY.camH / 2,
+  ];
+}
+
+// ── Overlay mode & threshold ────────────────────────────────
+let overlayMode = 'threshold';  // off, threshold, heatmap, both, legacy
+let thresholdMM = 2000;
+let lastTofA = null, lastTofB = null;
+
+$('overlay-mode').addEventListener('change', (e) => {
+  overlayMode = e.target.value;
+  renderOverlay(lastTofA, lastTofB);
+});
+$('thresh-range').addEventListener('input', (e) => {
+  thresholdMM = +e.target.value;
+  $('thresh-label').textContent = (thresholdMM / 1000).toFixed(1) + 'm';
+  renderOverlay(lastTofA, lastTofB);
+});
+
+// Pitch correction slider — seeds from initial pitchDeg
+const _initPitch = TOF_OVERLAY.sensorA.pitchDeg || 0;
+$('pitch-range').value = _initPitch;
+$('pitch-label').textContent = _initPitch + '°';
+$('pitch-range').addEventListener('input', (e) => {
+  const p = +e.target.value;
+  $('pitch-label').textContent = p + '°';
+  TOF_OVERLAY.sensorA.pitchDeg = p;
+  TOF_OVERLAY.sensorB.pitchDeg = p;
+  renderOverlay(lastTofA, lastTofB);
+});
+
+// Flip toggle controls
+['flipHA', 'flipVA', 'flipHB', 'flipVB'].forEach(id => {
+  const cb = $(id);
+  cb.checked = TOF_OVERLAY[id];
+  cb.addEventListener('change', (e) => {
+    TOF_OVERLAY[id] = e.target.checked;
+    console.log(`${id} = ${e.target.checked}`);
+    renderOverlay(lastTofA, lastTofB);
+  });
+});
+
+// ── Helper: get projected zone quad in display coords ───────
+function getZoneQuad(sensor, flipH, flipV, row, col, mm) {
+  const zd = TOF_OVERLAY.zoneDeg * Math.PI / 180;
+  const c = flipH ? (7 - col) : col;
+  const r = flipV ? (7 - row) : row;
+  const azL = (c - 4) * zd, azR = (c - 3) * zd;
+  const elT = (r - 4) * zd, elB = (r - 3) * zd;
+  const d = Math.min(mm, OVERLAY_MAX_MM);
+  const tl = tofToPixel(sensor, azL, elT, d);
+  const tr = tofToPixel(sensor, azR, elT, d);
+  const br = tofToPixel(sensor, azR, elB, d);
+  const bl = tofToPixel(sensor, azL, elB, d);
+  if (!tl || !tr || !br || !bl) return null;
+
+  // Reject zones whose centre projects outside the camera frame.
+  // These are below/above/beside the camera FoV — they belong in BEV only.
+  const camW = TOF_OVERLAY.camW, camH = TOF_OVERLAY.camH;
+  const margin = 40; // px — small margin to allow quads that straddle the edge
+  const cx = (tl[0] + br[0]) / 2;
+  const cy = (tl[1] + br[1]) / 2;
+  if (cx < -margin || cx > camW + margin ||
+      cy < -margin || cy > camH + margin) return null;
+
+  return [tl, tr, br, bl].map(p => [
+    p[0] * overlayScale + overlayOffsetX,
+    p[1] * overlayScale + overlayOffsetY
+  ]);
+}
+
+// ── Helper: get zone center in display coords ───────────────
+function getZoneCenter(sensor, flipH, flipV, row, col, mm) {
+  const zd = TOF_OVERLAY.zoneDeg * Math.PI / 180;
+  const c = flipH ? (7 - col) : col;
+  const r = flipV ? (7 - row) : row;
+  const azC = (c - 3.5) * zd;
+  const elC = (r - 3.5) * zd;
+  const p = tofToPixel(sensor, azC, elC, Math.min(mm, OVERLAY_MAX_MM));
+  if (!p) return null;
+  // Discard if outside camera frame
+  const camW = TOF_OVERLAY.camW, camH = TOF_OVERLAY.camH;
+  if (p[0] < -40 || p[0] > camW + 40 || p[1] < -40 || p[1] > camH + 40) return null;
+  return [p[0] * overlayScale + overlayOffsetX, p[1] * overlayScale + overlayOffsetY];
+}
+
+// ── Color for threshold mode (continuous gradient) ───────────
+function dangerColor(mm, thresh) {
+  const t = Math.min(mm / thresh, 1);          // 0 = touching … 1 = at threshold
+  // Lerp red→orange→cyan across [0,1]
+  let r, g, b, alpha;
+  if (t < 0.5) {
+    const u = t / 0.5;                          // 0→1 within red→orange
+    r = 255;
+    g = Math.round(50 + u * 160);               // 50→210
+    b = Math.round(50 * (1 - u));               // 50→0
+    alpha = 0.45 - u * 0.10;                    // 0.45→0.35
+  } else {
+    const u = (t - 0.5) / 0.5;                  // 0→1 within orange→cyan
+    r = Math.round(255 * (1 - u));               // 255→0
+    g = Math.round(210 - u * 10);                // 210→200
+    b = Math.round(u * 255);                     // 0→255
+    alpha = 0.35 - u * 0.15;                    // 0.35→0.20
+  }
+  const stroke = `rgb(${r},${g},${b})`;
+  return { fill: `rgba(${r},${g},${b},${alpha})`, stroke, text: stroke };
+}
+
+// ── LAYER 1: Threshold overlay ──────────────────────────────
+function drawThresholdOverlay(tofA, tofB) {
+  const ctx = overlayCtx;
+  let closest = { mm: Infinity, x: 0, y: 0, sensorLabel: '' };
+
+  function drawSensorThresh(grid, sensor, flipH, flipV, label) {
+    if (!grid || !grid.valid || !grid.distances || grid.distances.length < 64) return;
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const mm = grid.distances[row * 8 + col];
+        if (!mm || mm <= 0 || mm > thresholdMM) continue;
+
+        const quad = getZoneQuad(sensor, flipH, flipV, row, col, mm);
+        if (!quad) continue;
+        const colors = dangerColor(mm, thresholdMM);
+
+        // Fill quad
+        ctx.globalAlpha = 1.0;
+        ctx.fillStyle = colors.fill;
+        ctx.beginPath();
+        ctx.moveTo(quad[0][0], quad[0][1]);
+        for (let i = 1; i < 4; i++) ctx.lineTo(quad[i][0], quad[i][1]);
+        ctx.closePath();
+        ctx.fill();
+
+        // Strong outline
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Distance label
+        const center = getZoneCenter(sensor, flipH, flipV, row, col, mm);
+        if (center) {
+          ctx.fillStyle = '#fff';
+          ctx.font = 'bold 11px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText((mm / 1000).toFixed(1), center[0], center[1]);
+
+          if (mm < closest.mm) {
+            closest = { mm, x: center[0], y: center[1], sensorLabel: label };
+          }
+        }
+      }
+    }
+  }
+
+  drawSensorThresh(tofA, TOF_OVERLAY.sensorA, TOF_OVERLAY.flipHA, TOF_OVERLAY.flipVA, 'A');
+  drawSensorThresh(tofB, TOF_OVERLAY.sensorB, TOF_OVERLAY.flipHB, TOF_OVERLAY.flipVB, 'B');
+
+  // Closest-zone callout
+  if (closest.mm < Infinity) {
+    ctx.globalAlpha = 1.0;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(closest.x - 30, closest.y - 16, 60, 32);
+    ctx.setLineDash([]);
+
+    const tag = `CLOSEST ${(closest.mm / 1000).toFixed(1)}m`;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    const tagW = ctx.measureText(tag).width + 12;
+    ctx.fillRect(closest.x - tagW / 2, closest.y - 36, tagW, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(tag, closest.x, closest.y - 27);
+  }
+
+  // Bottom bar — min distance per column (across both sensors)
+  const colMins = new Float32Array(16).fill(Infinity); // 8 cols per sensor = 16 columns
+  function collectColMins(grid, offset) {
+    if (!grid || !grid.valid || !grid.distances || grid.distances.length < 64) return;
+    for (let col = 0; col < 8; col++) {
+      for (let row = 0; row < 8; row++) {
+        const mm = grid.distances[row * 8 + col];
+        if (mm > 0) colMins[offset + col] = Math.min(colMins[offset + col], mm);
+      }
+    }
+  }
+  collectColMins(tofB, 0);
+  collectColMins(tofA, 8);
+
+  const canvas = $('tof-overlay');
+  const barH = 28;
+  const barY = canvas.height - barH;
+  ctx.globalAlpha = 0.7;
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, barY, canvas.width, barH);
+
+  const barW = canvas.width / 16;
+  for (let i = 0; i < 16; i++) {
+    const mm = colMins[i];
+    if (mm === Infinity) continue;
+    const frac = Math.min(1, Math.max(0, 1 - mm / OVERLAY_MAX_MM));
+    const h = frac * barH;
+    const colors = dangerColor(mm, thresholdMM);
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = mm <= thresholdMM ? colors.stroke : 'rgba(0,200,255,0.3)';
+    ctx.fillRect(i * barW + 1, barY + barH - h, barW - 2, h);
+    ctx.globalAlpha = 1.0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    if (mm <= thresholdMM) {
+      ctx.fillText((mm / 1000).toFixed(1), i * barW + barW / 2, barY + barH - h - 2);
+    }
+  }
+  // Labels for the bar
+  ctx.globalAlpha = 0.6;
+  ctx.fillStyle = '#FF3B3B';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('B', 4, barY + 10);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#00BFFF';
+  ctx.fillText('A', canvas.width - 4, barY + 10);
+}
+
+// ── LAYER 2: Smooth heatmap overlay ─────────────────────────
+function drawHeatmapOverlay(tofA, tofB) {
+  const ctx = overlayCtx;
+  // Build a combined depth grid — merge both sensors into a wider grid
+  // Sensor A covers left side, B covers right side, with overlap in center
+  // For simplicity: create a 16×8 combined grid (A cols 0-7, B cols 8-15)
+  // then bilinear-interpolate to a smooth image
+
+  const gridW = 16, gridH = 8;
+  const grid = new Float32Array(gridW * gridH).fill(0);
+  const count = new Float32Array(gridW * gridH).fill(0);
+
+  function addSensor(tofGrid, colOffset, flipH, flipV) {
+    if (!tofGrid || !tofGrid.valid || !tofGrid.distances || tofGrid.distances.length < 64) return;
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const mm = tofGrid.distances[row * 8 + col];
+        if (!mm || mm <= 0) continue;
+        const c = flipH ? (7 - col) : col;
+        const r = flipV ? (7 - row) : row;
+        const gi = r * gridW + (c + colOffset);
+        grid[gi] += mm;
+        count[gi]++;
+      }
+    }
+  }
+  addSensor(tofB, 0, TOF_OVERLAY.flipHB, TOF_OVERLAY.flipVB);
+  addSensor(tofA, 8, TOF_OVERLAY.flipHA, TOF_OVERLAY.flipVA);
+
+  // Average overlapping zones
+  for (let i = 0; i < grid.length; i++) {
+    grid[i] = count[i] > 0 ? grid[i] / count[i] : 0;
+  }
+
+  // Bilinear upsample to smooth image
+  const upW = 128, upH = 64;
+  const upsampled = new Float32Array(upW * upH);
+  for (let uy = 0; uy < upH; uy++) {
+    for (let ux = 0; ux < upW; ux++) {
+      const gx = (ux + 0.5) / upW * gridW - 0.5;
+      const gy = (uy + 0.5) / upH * gridH - 0.5;
+      const x0 = Math.max(0, Math.floor(gx)), x1 = Math.min(gridW - 1, x0 + 1);
+      const y0 = Math.max(0, Math.floor(gy)), y1 = Math.min(gridH - 1, y0 + 1);
+      const fx = gx - x0, fy = gy - y0;
+      const v00 = grid[y0 * gridW + x0], v10 = grid[y0 * gridW + x1];
+      const v01 = grid[y1 * gridW + x0], v11 = grid[y1 * gridW + x1];
+      const top = v00 + (v10 - v00) * fx;
+      const bot = v01 + (v11 - v01) * fx;
+      upsampled[uy * upW + ux] = top + (bot - top) * fy;
+    }
+  }
+
+  // Now project each upsampled cell as a small quad on the overlay
+  // Use the combined angular range of both sensors
+  const zd = TOF_OVERLAY.zoneDeg * Math.PI / 180;
+  const combinedAzMin = (-5 - 22.5) * Math.PI / 180; // sensor A leftmost
+  const combinedAzMax = (5 + 22.5) * Math.PI / 180;  // sensor B rightmost
+  const combinedElMin = -22.5 * Math.PI / 180;
+  const combinedElMax = 22.5 * Math.PI / 180;
+  const azRange = combinedAzMax - combinedAzMin;
+  const elRange = combinedElMax - combinedElMin;
+
+  // Create offscreen canvas for the heatmap
+  const heatCanvas = document.createElement('canvas');
+  heatCanvas.width = upW;
+  heatCanvas.height = upH;
+  const hCtx = heatCanvas.getContext('2d');
+  const imgData = hCtx.createImageData(upW, upH);
+
+  for (let y = 0; y < upH; y++) {
+    for (let x = 0; x < upW; x++) {
+      const mm = upsampled[y * upW + x];
+      const idx = (y * upW + x) * 4;
+      if (mm <= 0) {
+        imgData.data[idx + 3] = 0;
+        continue;
+      }
+      const t = Math.min(mm, OVERLAY_MAX_MM) / OVERLAY_MAX_MM;
+      // Red(close) → Yellow → Green → Cyan → Blue(far)
+      let r, g, b;
+      if (t < 0.25) { r = 255; g = Math.round(t * 4 * 200); b = 0; }
+      else if (t < 0.5) { r = Math.round(255 - (t - 0.25) * 4 * 255); g = 220; b = 0; }
+      else if (t < 0.75) { r = 0; g = Math.round(220 - (t - 0.5) * 4 * 120); b = Math.round((t - 0.5) * 4 * 255); }
+      else { r = 0; g = Math.round(100 - (t - 0.75) * 4 * 60); b = Math.round(255 - (t - 0.75) * 4 * 55); }
+      imgData.data[idx] = r;
+      imgData.data[idx + 1] = g;
+      imgData.data[idx + 2] = b;
+      imgData.data[idx + 3] = Math.round(180 - t * 100);  // closer = more opaque
+    }
+  }
+  hCtx.putImageData(imgData, 0, 0);
+
+  // Now project the heatmap onto the overlay using the combined FoV bounds
+  // Find pixel bounds of the combined ToF FoV in camera space
+  // Use a neutral sensor at center for the heatmap projection
+  const neuSensor = { tx: 0, tz: -7.27, yawDeg: 0 };
+  const tlP = tofToPixel(neuSensor, combinedAzMin, combinedElMin, 2000);
+  const brP = tofToPixel(neuSensor, combinedAzMax, combinedElMax, 2000);
+  if (!tlP || !brP) return;
+
+  const dx0 = tlP[0] * overlayScale + overlayOffsetX;
+  const dy0 = tlP[1] * overlayScale + overlayOffsetY;
+  const dx1 = brP[0] * overlayScale + overlayOffsetX;
+  const dy1 = brP[1] * overlayScale + overlayOffsetY;
+
+  ctx.globalAlpha = 0.55;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(heatCanvas, dx0, dy0, dx1 - dx0, dy1 - dy0);
+  ctx.globalAlpha = 1.0;
+}
+
+// ── LEGACY: Original all-quads overlay ──────────────────────
+function drawLegacyOverlay(tofA, tofB) {
+  const ctx = overlayCtx;
+  ctx.globalAlpha = TOF_OVERLAY.alpha;
+
+  function drawSensor(tofGrid, sensor, flipH, flipV, label) {
+    if (!tofGrid || !tofGrid.valid || !tofGrid.distances || tofGrid.distances.length < 64) return;
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const mm = tofGrid.distances[row * 8 + col];
+        const color = overlayColor(mm);
+        if (!color) continue;
+        const quad = getZoneQuad(sensor, flipH, flipV, row, col, mm);
+        if (!quad) continue;
+        ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+        ctx.beginPath();
+        ctx.moveTo(quad[0][0], quad[0][1]);
+        for (let i = 1; i < 4; i++) ctx.lineTo(quad[i][0], quad[i][1]);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+    const boresight = tofToPixel(sensor, 0, 0, 2000);
+    if (boresight) {
+      const bx = boresight[0] * overlayScale + overlayOffsetX;
+      const by = boresight[1] * overlayScale + overlayOffsetY - 10;
+      ctx.globalAlpha = 0.9;
+      ctx.fillStyle = label === 'A' ? '#00BFFF' : '#FF3B3B';
+      ctx.font = 'bold 14px monospace';
+      ctx.fillText(`ToF-${label}`, bx - 25, by);
+      ctx.globalAlpha = TOF_OVERLAY.alpha;
+    }
+  }
+  drawSensor(tofA, TOF_OVERLAY.sensorA, TOF_OVERLAY.flipHA, TOF_OVERLAY.flipVA, 'A');
+  drawSensor(tofB, TOF_OVERLAY.sensorB, TOF_OVERLAY.flipHB, TOF_OVERLAY.flipVB, 'B');
+  ctx.globalAlpha = 1.0;
+}
+
+// ── Main render dispatcher ──────────────────────────────────
+function renderOverlay(tofA, tofB) {
+  if (tofA) lastTofA = tofA;
+  if (tofB) lastTofB = tofB;
+  if (!overlayCtx) return;
+  const canvas = $('tof-overlay');
+  overlayCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (overlayMode === 'off') return;
+
+  if (overlayMode === 'legacy') {
+    drawLegacyOverlay(lastTofA, lastTofB);
+  } else if (overlayMode === 'threshold') {
+    drawThresholdOverlay(lastTofA, lastTofB);
+  } else if (overlayMode === 'heatmap') {
+    drawHeatmapOverlay(lastTofA, lastTofB);
+  } else if (overlayMode === 'both') {
+    drawHeatmapOverlay(lastTofA, lastTofB);
+    drawThresholdOverlay(lastTofA, lastTofB);
+  }
+  // Always update BEV if active
+  drawBEV(lastTofA, lastTofB);
+}
+
+
+// ── BEV mini-map ─────────────────────────────────────────────
+let bevActive = false;
+const BEV_RANGE_M = 5.0;  // metres shown from boat to top of canvas
+
+function toggleBEV() {
+  bevActive = !bevActive;
+  $('bev-card').classList.toggle('active', bevActive);
+  $('tof-card').classList.toggle('hidden', bevActive);
+  $('bev-toggle').style.background = bevActive ? 'var(--accent)' : 'var(--card)';
+  $('bev-toggle').style.color      = bevActive ? '#000'          : 'var(--text)';
+  if (bevActive) drawBEV(lastTofA, lastTofB);
+}
+
+function tofZoneToWorld(sensor, flipH, flipV, row, col, mm) {
+  // Returns {x, y} in METRES in boat frame (x=right, y=forward)
+  // Uses same flip logic as overlay but outputs world coords not pixels
+  const zd = TOF_OVERLAY.zoneDeg * Math.PI / 180;
+  const c  = flipH ? (7 - col) : col;
+  const r  = flipV ? (7 - row) : row;
+  const az = (c - 3.5) * zd;  // horizontal angle from sensor boresight
+  const el = (r - 3.5) * zd;  // vertical angle (negative = downward)
+
+  const yaw   = sensor.yawDeg   * Math.PI / 180;
+  const pitch = (sensor.pitchDeg || 0) * Math.PI / 180;
+
+  // Zone centre in sensor-local frame (perpendicular depth = mm)
+  const sx = mm * Math.tan(az);
+  const sy = mm * Math.tan(el);
+  const sz = mm;
+
+  // Apply sensor yaw
+  const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+  const rx = cosY * sx - sinY * sz;
+  const ry = sy;
+  const rz = sinY * sx + cosY * sz;
+
+  // Apply sensor pitch then translate to camera/boat origin
+  const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+  const worldX = (rx + sensor.tx) / 1000;           // mm → m, boat X (right)
+  const worldY = (sinP * ry + cosP * rz + sensor.tz) / 1000;  // mm → m, boat Y (forward)
+  // worldZ (height) ignored for BEV — we project onto ground plane
+
+  return { x: worldX, y: worldY };
+}
+
+function drawBEV(tofA, tofB) {
+  if (!bevActive) return;
+
+  const canvas = $('bev-canvas');
+  const ctx    = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // Scale: H pixels = BEV_RANGE_M metres forward
+  const scale = H / BEV_RANGE_M;  // pixels per metre
+  // Boat origin: bottom-centre of canvas
+  const ox = W / 2, oy = H - 20;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // ── Background grid ──────────────────────────────────────────
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.lineWidth = 0.5;
+  for (let m = 1; m <= BEV_RANGE_M; m++) {
+    const py = oy - m * scale;
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(W, py); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.font = '9px monospace';
+    ctx.fillText(m + 'm', 4, py - 2);
+  }
+  // Vertical centre line
+  ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, H); ctx.stroke();
+
+  // ── Camera FoV wedge (what camera can see) ───────────────────
+  const camHFoV = Math.atan(TOF_OVERLAY.camW / 2 / TOF_OVERLAY.f);
+  ctx.beginPath();
+  ctx.moveTo(ox, oy);
+  ctx.lineTo(ox + Math.sin(camHFoV)  * BEV_RANGE_M * scale,
+             oy - Math.cos(camHFoV)  * BEV_RANGE_M * scale);
+  ctx.lineTo(ox + Math.sin(-camHFoV) * BEV_RANGE_M * scale,
+             oy - Math.cos(-camHFoV) * BEV_RANGE_M * scale);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0,191,255,0.05)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,191,255,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(0,191,255,0.5)';
+  ctx.font = '9px monospace';
+  ctx.fillText('cam FoV', ox + 6, oy - 30);
+
+  // ── Plot each ToF zone ───────────────────────────────────────
+  function plotSensor(grid, sensor, flipH, flipV, color) {
+    if (!grid || !grid.valid || !grid.distances || grid.distances.length < 64) return;
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const mm = grid.distances[row * 8 + col];
+        if (!mm || mm <= 0 || mm > 5000) continue;
+
+        const { x, y } = tofZoneToWorld(sensor, flipH, flipV, row, col, mm);
+
+        // Only forward hemisphere
+        if (y <= 0) continue;
+
+        const px = ox + x * scale;
+        const py = oy - y * scale;
+        if (px < 0 || px > W || py < 0 || py > H) continue;
+
+        // Colour by distance: red=close → orange → cyan=far
+        const t = Math.min(mm / 5000, 1);
+        let r, g, b;
+        if (t < 0.3)      { r = 255; g = Math.round(t/0.3 * 165); b = 0; }
+        else if (t < 0.6) { r = Math.round(255 - (t-0.3)/0.3 * 255); g = 200; b = 0; }
+        else               { r = 0; g = Math.round(200 - (t-0.6)/0.4 * 100); b = Math.round((t-0.6)/0.4 * 255); }
+
+        const radius = Math.max(3, 6 - t * 3);
+        ctx.beginPath();
+        ctx.arc(px, py, radius, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},0.8)`;
+        ctx.fill();
+
+        // Label closest zones
+        if (mm < (thresholdMM * 0.5)) {
+          ctx.fillStyle = '#fff';
+          ctx.font = '8px monospace';
+          ctx.fillText((mm/1000).toFixed(1), px + 5, py - 2);
+        }
+      }
+    }
+  }
+
+  plotSensor(tofA, TOF_OVERLAY.sensorA, TOF_OVERLAY.flipHA, TOF_OVERLAY.flipVA, '#00BFFF');
+  plotSensor(tofB, TOF_OVERLAY.sensorB, TOF_OVERLAY.flipHB, TOF_OVERLAY.flipVB, '#FF3B3B');
+
+  // ── Boat icon at origin ──────────────────────────────────────
+  ctx.fillStyle = '#00FF99';
+  ctx.beginPath();
+  ctx.moveTo(ox, oy - 12);
+  ctx.lineTo(ox - 7, oy + 8);
+  ctx.lineTo(ox + 7, oy + 8);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = 'rgba(0,255,153,0.6)';
+  ctx.font = '9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('BOAT', ox, oy + 18);
+  ctx.textAlign = 'left';
 }
 
 // ── Init ────────────────────────────────────────────────────
