@@ -70,6 +70,9 @@ void app_main(void) {
     ESP_LOGI(TAG, "SCCB bus: port=%d SCL=%d SDA=%d",
              I2C_NUM_0, CONFIG_CAM_SCCB_SCL_PIN, CONFIG_CAM_SCCB_SDA_PIN);
 
+    /* Let SCCB bus stabilize — pull-ups charge, OV5647 finishes POR */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // 3. Initialize Camera — programs OV5647 over SCCB bus
     ESP_LOGI(TAG, "Initializing camera...");
     ESP_ERROR_CHECK(camera_init(sccb_handle));
@@ -152,7 +155,7 @@ void app_main(void) {
     // 12. Start RTOS Tasks
     ESP_LOGI(TAG, "Starting tasks...");
     xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      5, NULL);
-    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 4, NULL);
+    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 3, NULL);
 
     ESP_LOGI(TAG, "System running.");
 }
