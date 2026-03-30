@@ -13,6 +13,7 @@
 static const char *TAG = "SENSOR_TASK";
 
 #define SNAPSHOT_INTERVAL_MS  50   /* 20 Hz sensor publish */
+#define TOF_EVERY_N           4    /* ToF at every 4th tick = 5 Hz (keeps WS traffic low) */
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
 
 void task_sensor_snapshot(void *pvParameters)
@@ -25,13 +26,15 @@ void task_sensor_snapshot(void *pvParameters)
 
     uint32_t iteration = 0;
 
-    ESP_LOGI(TAG, "Sensor snapshot task started (%d Hz)", 1000 / SNAPSHOT_INTERVAL_MS);
+    ESP_LOGI(TAG, "Sensor snapshot task started (%d Hz, ToF %d Hz)",
+             1000 / SNAPSHOT_INTERVAL_MS,
+             1000 / SNAPSHOT_INTERVAL_MS / TOF_EVERY_N);
 
     while (true) {
         snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
         snap.timestamp_us = (uint64_t)esp_timer_get_time();
 
-        /* IMU — always available */
+        /* IMU — always available, 20 Hz */
         FusionResult imu;
         fusion_get_result(&imu);
         snap.has_imu     = true;
@@ -39,25 +42,34 @@ void task_sensor_snapshot(void *pvParameters)
         snap.imu.roll    = imu.roll;
         snap.imu.heading = imu.heading;
 
-        /* ToF A */
-        snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
-        if (snap.has_tof_a) {
-            snap.tof_a.valid = true;
-            snap.tof_a.distances_count = 64;
-            for (int i = 0; i < 64; i++) {
-                snap.tof_a.distances[i] =
-                    tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE];
-            }
-        }
+        /* ToF — 5 Hz to keep WS payload small (~1.4KB per full frame) */
+        bool tof_tick = (iteration % TOF_EVERY_N == 0);
 
-        /* ToF B */
-        snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
-        if (snap.has_tof_b) {
-            snap.tof_b.valid = true;
-            snap.tof_b.distances_count = 64;
-            for (int i = 0; i < 64; i++) {
-                snap.tof_b.distances[i] =
-                    tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE];
+        if (tof_tick) {
+            /* ToF A */
+            snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
+            if (snap.has_tof_a) {
+                snap.tof_a.valid = true;
+                snap.tof_a.distances_count = 64;
+                for (int i = 0; i < 64; i++) {
+                    uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                    snap.tof_a.distances[i] = (status != 0 && status != 255)
+                        ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
+                        : 0;
+                }
+            }
+
+            /* ToF B */
+            snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
+            if (snap.has_tof_b) {
+                snap.tof_b.valid = true;
+                snap.tof_b.distances_count = 64;
+                for (int i = 0; i < 64; i++) {
+                    uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                    snap.tof_b.distances[i] = (status != 0 && status != 255)
+                        ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
+                        : 0;
+                }
             }
         }
 
