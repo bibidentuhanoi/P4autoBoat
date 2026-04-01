@@ -158,7 +158,7 @@ void app_main(void) {
     // 12. Start RTOS Tasks
     ESP_LOGI(TAG, "Starting tasks...");
     xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      4, NULL);
-    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 4, NULL);
+    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 12288, &tof_devs, 4, NULL);
 
     ESP_LOGI(TAG, "System running.");
 }
