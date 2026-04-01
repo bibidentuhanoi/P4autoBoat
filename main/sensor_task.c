@@ -46,29 +46,35 @@ void task_sensor_snapshot(void *pvParameters)
         bool tof_tick = (iteration % TOF_EVERY_N == 0);
 
         if (tof_tick) {
-            /* ToF A */
-            snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
-            if (snap.has_tof_a) {
-                snap.tof_a.valid = true;
-                snap.tof_a.distances_count = 64;
-                for (int i = 0; i < 64; i++) {
-                    uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                    snap.tof_a.distances[i] = (status != 0 && status != 255)
-                        ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
-                        : 0;
+            /* ToF A — take/release mutex per sensor to give IMU a read window */
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
+                xSemaphoreGive(g_i2c_mutex);
+                if (snap.has_tof_a) {
+                    snap.tof_a.valid = true;
+                    snap.tof_a.distances_count = 64;
+                    for (int i = 0; i < 64; i++) {
+                        uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                        snap.tof_a.distances[i] = (status != 0 && status != 255)
+                            ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
+                            : 0;
+                    }
                 }
             }
 
-            /* ToF B */
-            snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
-            if (snap.has_tof_b) {
-                snap.tof_b.valid = true;
-                snap.tof_b.distances_count = 64;
-                for (int i = 0; i < 64; i++) {
-                    uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                    snap.tof_b.distances[i] = (status != 0 && status != 255)
-                        ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
-                        : 0;
+            /* ToF B — separate mutex acquisition */
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
+                xSemaphoreGive(g_i2c_mutex);
+                if (snap.has_tof_b) {
+                    snap.tof_b.valid = true;
+                    snap.tof_b.distances_count = 64;
+                    for (int i = 0; i < 64; i++) {
+                        uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                        snap.tof_b.distances[i] = (status != 0 && status != 255)
+                            ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
+                            : 0;
+                    }
                 }
             }
         }
