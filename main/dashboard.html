@@ -68,6 +68,46 @@
   .tof-grid-wrap { text-align: center; }
   .tof-label { font-size: 9px; color: var(--dim); letter-spacing: 1px; margin-bottom: 4px; }
   canvas.tof { border-radius: 4px; image-rendering: pixelated; }
+
+  /* Settings modal */
+  #settings-backdrop {
+    display: none; position: fixed; inset: 0; z-index: 900;
+    background: rgba(0,0,0,0.6); backdrop-filter: blur(2px);
+  }
+  #settings-backdrop.open { display: flex; align-items: center; justify-content: center; }
+  #settings-panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    width: 380px; max-height: 90vh; overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+  }
+  .modal-hdr {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--border);
+  }
+  .modal-hdr span { font-size: 12px; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); }
+  .modal-close { background: none; border: none; color: var(--dim); font-size: 20px; cursor: pointer; line-height: 1; }
+  .modal-close:hover { color: var(--text); }
+  .modal-section { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .modal-section:last-child { border-bottom: none; }
+  .modal-section-title { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); margin-bottom: 10px; }
+  .modal-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .modal-row:last-child { margin-bottom: 0; }
+  .modal-row label { font-size: 11px; color: var(--dim); min-width: 70px; }
+  .modal-row input[type=range] { flex: 1; }
+  .modal-row .val { font-size: 11px; color: var(--text); min-width: 42px; text-align: right; }
+  .modal-row select, .modal-row input[type=checkbox] { accent-color: var(--accent); }
+  .modal-row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; padding: 2px 4px; flex: 1; }
+  .flip-group { display: flex; gap: 12px; }
+  .flip-group label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text); cursor: pointer; min-width: auto; }
+  .btn-toggle {
+    padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 11px; cursor: pointer;
+  }
+  .btn-toggle.active { background: var(--accent); color: #000; border-color: var(--accent); }
+  .btn-sm { padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--dim); font-size: 11px; cursor: pointer; }
+  .btn-sm:hover { color: var(--text); border-color: var(--text); }
+  #gear-btn { background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--dim); font-size: 15px; padding: 3px 8px; cursor: pointer; line-height: 1; }
+  #gear-btn:hover { color: var(--accent); border-color: var(--accent); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/protobufjs@7/dist/protobuf.min.js"></script>
 </head>
@@ -81,37 +121,102 @@
   <span id="sys-rssi" style="color:var(--dim); font-size:11px;"></span>
   <span id="sys-uptime" style="color:var(--dim); font-size:11px;"></span>
   <span id="msg-rate" style="color:var(--dim); font-size:11px;"></span>
-
-  <span style="color:var(--dim); font-size:11px;">Overlay:</span>
-  <select id="overlay-mode" style="background:var(--card);color:var(--text);border:1px solid var(--border);font-size:11px;padding:2px 4px;border-radius:4px;">
-    <option value="off">Off</option>
-    <option value="threshold">Threshold</option>
-    <option value="heatmap">Heatmap</option>
-    <option value="raw" selected>Raw grid</option>
-  </select>
-  <label style="color:var(--dim); font-size:11px; cursor:pointer;">
-    <input type="range" id="thresh-range" min="500" max="4000" value="2000" step="100" style="width:60px;vertical-align:middle;" />
-    <span id="thresh-label">2.0m</span>
-  </label>
-
-  <span style="color:var(--dim); font-size:11px; margin-left:8px;">Flip A:</span>
-  <label style="color:var(--text); font-size:11px;"><input type="checkbox" id="flipHA" /> H</label>
-  <label style="color:var(--text); font-size:11px;"><input type="checkbox" id="flipVA" /> V</label>
-  <label style="color:var(--warn); font-size:11px;" title="Transpose"><input type="checkbox" id="transA" /> T</label>
-  <span style="color:var(--dim); font-size:11px; margin-left:8px;">Flip B:</span>
-  <label style="color:var(--text); font-size:11px;"><input type="checkbox" id="flipHB" checked /> H</label>
-  <label style="color:var(--text); font-size:11px;"><input type="checkbox" id="flipVB" checked /> V</label>
-  <label style="color:var(--warn); font-size:11px;" title="Transpose"><input type="checkbox" id="transB" /> T</label>
-  <span style="color:var(--dim); font-size:11px; margin-left:8px;">Az:</span>
-  <input type="range" id="az-slider" min="-40" max="10" value="-16.7" step="0.1" style="width:50px;vertical-align:middle;" />
-  <span id="az-label" style="color:var(--text); font-size:11px;">-16.7°</span>
-  <span style="color:var(--dim); font-size:11px; margin-left:4px;">El:</span>
-  <input type="range" id="el-slider" min="-10" max="40" value="19.4" step="0.1" style="width:50px;vertical-align:middle;" />
-  <span id="el-label" style="color:var(--text); font-size:11px;">19.4°</span>
-  <span style="color:var(--dim); font-size:11px; margin-left:4px;">Sz:</span>
-  <input type="range" id="sz-slider" min="0.5" max="4" value="1.7" step="0.1" style="width:50px;vertical-align:middle;" />
-  <span id="sz-label" style="color:var(--text); font-size:11px;">1.7×</span>
+  <button id="gear-btn" title="Settings">⚙</button>
 </header>
+
+<!-- Settings modal -->
+<div id="settings-backdrop">
+  <div id="settings-panel">
+    <div class="modal-hdr">
+      <span>Display &amp; Calibration</span>
+      <button class="modal-close" id="modal-close">×</button>
+    </div>
+
+    <!-- Overlay -->
+    <div class="modal-section">
+      <div class="modal-section-title">Overlay</div>
+      <div class="modal-row">
+        <label>Mode</label>
+        <select id="overlay-mode">
+          <option value="off">Off</option>
+          <option value="threshold" selected>Threshold</option>
+          <option value="heatmap">Heatmap</option>
+          <option value="raw">Raw grid</option>
+        </select>
+      </div>
+      <div class="modal-row">
+        <label>Threshold</label>
+        <input type="range" id="thresh-range" min="500" max="4000" value="2000" step="100" />
+        <span class="val" id="thresh-label">2.0m</span>
+      </div>
+      <div class="modal-row">
+        <label>Blend</label>
+        <select id="blend-mode">
+          <option value="closest" selected>Closest</option>
+          <option value="average">Average</option>
+          <option value="both">Both</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Sensors -->
+    <div class="modal-section">
+      <div class="modal-section-title">Sensor Orientation</div>
+      <div class="modal-row">
+        <label>Flip A</label>
+        <div class="flip-group">
+          <label><input type="checkbox" id="flipHA" /> H</label>
+          <label><input type="checkbox" id="flipVA" /> V</label>
+          <label style="color:var(--warn);" title="Transpose"><input type="checkbox" id="transA" /> T</label>
+        </div>
+      </div>
+      <div class="modal-row">
+        <label>Flip B</label>
+        <div class="flip-group">
+          <label><input type="checkbox" id="flipHB" checked /> H</label>
+          <label><input type="checkbox" id="flipVB" checked /> V</label>
+          <label style="color:var(--warn);" title="Transpose"><input type="checkbox" id="transB" /> T</label>
+        </div>
+      </div>
+    </div>
+
+    <!-- Projection -->
+    <div class="modal-section">
+      <div class="modal-section-title">Projection</div>
+      <div class="modal-row">
+        <label>Az offset</label>
+        <input type="range" id="az-slider" min="-40" max="10" value="-16.7" step="0.1" />
+        <span class="val" id="az-label">-16.7°</span>
+      </div>
+      <div class="modal-row">
+        <label>El offset</label>
+        <input type="range" id="el-slider" min="-10" max="40" value="19.4" step="0.1" />
+        <span class="val" id="el-label">19.4°</span>
+      </div>
+      <div class="modal-row">
+        <label>Grid scale</label>
+        <input type="range" id="sz-slider" min="0.5" max="4" value="1.7" step="0.1" />
+        <span class="val" id="sz-label">1.7×</span>
+      </div>
+      <div class="modal-row">
+        <label>Cam scale</label>
+        <input type="range" id="cam-slider" min="0.4" max="1" value="0.72" step="0.02" />
+        <span class="val" id="cam-label">72%</span>
+      </div>
+    </div>
+
+    <!-- Drag -->
+    <div class="modal-section">
+      <div class="modal-section-title">Overlay Drag</div>
+      <div class="modal-row">
+        <label>Drag</label>
+        <button class="btn-toggle active" id="drag-toggle">Enabled</button>
+        <button class="btn-sm" id="drag-reset">Reset</button>
+        <span class="val" id="drag-pos" style="font-size:10px;color:var(--dim);">(116, 45)</span>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="grid">
   <div class="card" id="camera-card">
@@ -173,6 +278,7 @@ const ZONE_STEP = 7.875;           // degrees per zone (63° / 8)
 let AZ_OFFSET = -16.7;             // horizontal axis alignment (deg)
 let EL_OFFSET = 19.4;              // vertical axis alignment (deg)
 let GRID_SCALE = 1.7;              // overlay size multiplier
+let camScale   = 0.72;             // camera image fraction of container (border = pre-alert zone)
 const SENSOR_TZ = 6.78;            // sensor Z offset behind camera (mm)
 const SENSOR_A = { x: -22.8, tilt: -5 };  // left, tilted outward
 const SENSOR_B = { x:  22.8, tilt:  5 };  // right, tilted outward
@@ -182,7 +288,7 @@ const FLIP = {
   flipHB: true,  flipVB: true,  transB: false,
 };
 
-let overlayMode = 'raw';
+let overlayMode = 'threshold';
 let thresholdMM = 2000;
 let imuPitch = 0, imuRoll = 0;
 let lastTofA = null, lastTofB = null;
@@ -251,6 +357,8 @@ function getZoneQuad(sensor, row, col, mm) {
 // Overlay rendering
 // ═══════════════════════════════════════════════════════════════
 let overlayCtx = null, overlayScale = 1, overlayOffX = 0, overlayOffY = 0;
+let camDispRect = { x: 0, y: 0, w: 0, h: 0 };
+let blendMode = 'closest'; // 'closest' | 'average' | 'both'
 
 function updateOverlaySize() {
   const canvas = $('tof-overlay');
@@ -265,26 +373,75 @@ function updateOverlaySize() {
   if (containerAspect > aspect) { drawH = ch; drawW = ch * aspect; }
   else { drawW = cw; drawH = cw / aspect; }
 
-  overlayScale = drawW / CAM.w;
-  overlayOffX = (cw - drawW) / 2;
-  overlayOffY = (ch - drawH) / 2;
+  const scaledW = drawW * camScale;
+  const scaledH = drawH * camScale;
+  overlayScale = scaledW / CAM.w;
+  overlayOffX  = (cw - scaledW) / 2;
+  overlayOffY  = (ch - scaledH) / 2;
+  camDispRect  = { x: overlayOffX, y: overlayOffY, w: scaledW, h: scaledH };
 
   overlayCtx = canvas.getContext('2d');
 
-  // Position camera image to match overlay coordinate space
+  // Position camera image inside the dark-bordered canvas
   img.style.objectFit = 'fill';
   img.style.position = 'absolute';
   img.style.left   = overlayOffX + 'px';
   img.style.top    = overlayOffY + 'px';
-  img.style.width  = drawW + 'px';
-  img.style.height = drawH + 'px';
+  img.style.width  = scaledW + 'px';
+  img.style.height = scaledH + 'px';
   img.style.borderRadius = '2px';
 }
 
-let dragOffX = 27, dragOffY = 48;
+let dragOffX = 116, dragOffY = 45;
 
 function camToDisplay(px, py) {
   return [px * overlayScale + overlayOffX + dragOffX, py * overlayScale + overlayOffY + dragOffY];
+}
+
+// Collect all projected zones from one sensor
+function collectZones(tof, sensor, flipH, flipV, trans, sensorId) {
+  const zones = [];
+  if (!tof || !tof.valid || !tof.distances || tof.distances.length < 64) return zones;
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const mm = readDepth(tof.distances, row, col, flipH, flipV, trans);
+      if (!mm || mm <= 0) continue;
+      const center = getZoneCenter(sensor, row, col, mm);
+      if (!center) continue;
+      const dp = camToDisplay(center[0], center[1]);
+      const quad = getZoneQuad(sensor, row, col, mm);
+      const inFrame = dp[0] >= camDispRect.x && dp[0] <= camDispRect.x + camDispRect.w &&
+                      dp[1] >= camDispRect.y && dp[1] <= camDispRect.y + camDispRect.h;
+      zones.push({ mm, dp, quad, inFrame, sensor: sensorId, row, col });
+    }
+  }
+  return zones;
+}
+
+// Merge zones from A and B per ~40px canvas cell
+function blendZones(zonesA, zonesB) {
+  if (blendMode === 'both') return [...zonesA.map(z => ({...z, blended: false})),
+                                    ...zonesB.map(z => ({...z, blended: false}))];
+  const CELL = 40;
+  const cells = new Map();
+  for (const z of [...zonesA, ...zonesB]) {
+    const key = `${Math.floor(z.dp[0]/CELL)},${Math.floor(z.dp[1]/CELL)}`;
+    if (!cells.has(key)) cells.set(key, []);
+    cells.get(key).push(z);
+  }
+  const result = [];
+  for (const [, group] of cells) {
+    const blended = group.some(z => z.sensor === 'A') && group.some(z => z.sensor === 'B');
+    let best;
+    if (blendMode === 'closest') {
+      best = group.reduce((a, b) => a.mm < b.mm ? a : b);
+    } else {
+      const avg = group.reduce((s, z) => s + z.mm, 0) / group.length;
+      best = { ...group[0], mm: avg };
+    }
+    result.push({ ...best, blended });
+  }
+  return result;
 }
 
 function dangerColor(mm, thresh) {
@@ -322,116 +479,73 @@ function renderOverlay(tofA, tofB) {
 }
 
 function drawThreshold(ctx, tofA, tofB) {
-  const canvas = $('tof-overlay');
-  const cw = canvas.width, ch = canvas.height;
-  let closest = { mm: Infinity, x: 0, y: 0 };
-  // Edge warnings: track closest depth per edge for out-of-frame zones
-  const edges = { left: [], right: [], top: [], bottom: [] };
+  const zonesA = collectZones(tofA, SENSOR_A, FLIP.flipHA, FLIP.flipVA, FLIP.transA, 'A');
+  const zonesB = collectZones(tofB, SENSOR_B, FLIP.flipHB, FLIP.flipVB, FLIP.transB, 'B');
+  const zones  = blendZones(zonesA, zonesB);
+  let closest  = { mm: Infinity, x: 0, y: 0 };
 
-  function drawSensor(grid, sensor, flipH, flipV, trans) {
-    if (!grid || !grid.valid || !grid.distances || grid.distances.length < 64) return;
+  for (const { mm, dp, quad, inFrame, blended } of zones) {
+    if (mm > thresholdMM) continue;
 
-    for (let row = 0; row < 8; row++) {
-      for (let col = 0; col < 8; col++) {
-        const mm = readDepth(grid.distances, row, col, flipH, flipV, trans);
-        if (!mm || mm <= 0) continue;
+    const colors = dangerColor(mm, thresholdMM);
+    const pts = quad ? quad.pts.map(p => camToDisplay(p[0], p[1])) : null;
 
-        const center = getZoneCenter(sensor, row, col, mm);
-        if (!center) continue;
-        const dp = camToDisplay(center[0], center[1]);
-
-        if (center.inFrame && mm <= thresholdMM) {
-          // ── In-frame: colored quad + crosshair ──
-          const quad = getZoneQuad(sensor, row, col, mm);
-          if (quad && quad.inFrame) {
-            const colors = dangerColor(mm, thresholdMM);
-            const pts = quad.pts.map(p => camToDisplay(p[0], p[1]));
-            ctx.globalAlpha = 1.0;
-            ctx.fillStyle = colors.fill;
-            ctx.beginPath();
-            ctx.moveTo(pts[0][0], pts[0][1]);
-            for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
-            ctx.closePath();
-            ctx.fill();
-            ctx.strokeStyle = colors.stroke;
-            ctx.lineWidth = 1;
-            ctx.stroke();
-          }
-
-          // Crosshair marker
-          const sz = 5;
-          ctx.strokeStyle = '#fff';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(dp[0] - sz, dp[1]); ctx.lineTo(dp[0] + sz, dp[1]);
-          ctx.moveTo(dp[0], dp[1] - sz); ctx.lineTo(dp[0], dp[1] + sz);
-          ctx.stroke();
-
-          // Distance label
-          ctx.fillStyle = '#fff';
-          ctx.font = 'bold 10px monospace';
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'bottom';
-          ctx.fillText((mm / 1000).toFixed(1), dp[0], dp[1] - 6);
-
-          if (mm < closest.mm) closest = { mm, x: dp[0], y: dp[1] };
-        } else {
-          // ── Out-of-frame: collect for edge bars ──
-          if (dp[0] < 0) edges.left.push({ mm, pos: dp[1] });
-          else if (dp[0] > cw) edges.right.push({ mm, pos: dp[1] });
-          if (dp[1] < 0) edges.top.push({ mm, pos: dp[0] });
-          else if (dp[1] > ch) edges.bottom.push({ mm, pos: dp[0] });
-        }
+    if (inFrame) {
+      // ── In-frame: solid colored quad + crosshair + label ──
+      if (pts) {
+        ctx.globalAlpha = 1.0;
+        ctx.setLineDash([]);
+        ctx.fillStyle = colors.fill;
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      const sz = 5;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(dp[0]-sz, dp[1]); ctx.lineTo(dp[0]+sz, dp[1]);
+      ctx.moveTo(dp[0], dp[1]-sz); ctx.lineTo(dp[0], dp[1]+sz);
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 10px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText((mm/1000).toFixed(1), dp[0], dp[1]-6);
+    } else {
+      // ── Border zone: dashed outline only — ToF-only pre-alert ──
+      if (pts) {
+        ctx.globalAlpha = 0.75;
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = colors.stroke;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < 4; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1.0;
       }
     }
-  }
 
-  drawSensor(tofA, SENSOR_A, FLIP.flipHA, FLIP.flipVA, FLIP.transA);
-  drawSensor(tofB, SENSOR_B, FLIP.flipHB, FLIP.flipVB, FLIP.transB);
-
-  // ── Edge warning bars ──
-  const BAR = 12;
-  function drawEdge(zones, x, y, w, h, vertical) {
-    if (zones.length === 0) return;
-    const min = Math.min(...zones.map(z => z.mm));
-    const intensity = Math.max(0.15, 1 - min / thresholdMM);
-    const [r, g, b] = distToColor(min);
-    // Glow bar
-    const grad = vertical
-      ? ctx.createLinearGradient(x, y, x + w, y)
-      : ctx.createLinearGradient(x, y, x, y + h);
-    grad.addColorStop(0, `rgba(${r},${g},${b},${(intensity * 0.7).toFixed(2)})`);
-    grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-    ctx.fillStyle = grad;
-    ctx.fillRect(x, y, w, h);
-    // Tick marks for individual zones
-    ctx.fillStyle = `rgba(255,255,255,${intensity.toFixed(2)})`;
-    for (const z of zones) {
-      const t = Math.max(0.2, 1 - z.mm / thresholdMM);
-      ctx.globalAlpha = t;
-      if (vertical) {
-        const py = Math.max(0, Math.min(ch - 3, z.pos));
-        ctx.fillRect(x, py, w, 2);
-      } else {
-        const px = Math.max(0, Math.min(cw - 3, z.pos));
-        ctx.fillRect(px, y, 2, h);
-      }
+    // Yellow dot — A+B sensors agree on this zone
+    if (blended) {
+      ctx.fillStyle = '#FFD700';
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.arc(dp[0], dp[1], 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1.0;
     }
-    ctx.globalAlpha = 1;
-    // Depth label
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 10px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    const label = (min / 1000).toFixed(1) + 'm';
-    if (vertical) ctx.fillText(label, x + w / 2, Math.min(ch - 10, Math.max(10, zones[0].pos)));
-    else ctx.fillText(label, Math.min(cw - 20, Math.max(20, zones[0].pos)), y + h / 2);
-  }
 
-  drawEdge(edges.left,   0,        0,  BAR, ch,  true);
-  drawEdge(edges.right,  cw - BAR, 0,  BAR, ch,  true);
-  drawEdge(edges.top,    0,        0,  cw,  BAR, false);
-  drawEdge(edges.bottom, 0,  ch - BAR, cw,  BAR, false);
+    if (mm < closest.mm) closest = { mm, x: dp[0], y: dp[1] };
+  }
 
   // ── Closest target indicator ──
   if (closest.mm < Infinity) {
@@ -463,7 +577,7 @@ function drawHeatmap(ctx, tofA, tofB) {
         if (!mm || mm <= 0) continue;
 
         const center = getZoneCenter(sensor, row, col, mm);
-        if (!center || !center.inFrame) continue;
+        if (!center) continue;
 
         const dp = camToDisplay(center[0], center[1]);
         const t = Math.min(mm, 4000) / 4000;
@@ -761,10 +875,16 @@ const resizeObs = new ResizeObserver(() => updateOverlaySize());
 resizeObs.observe($('cam-container'));
 
 // ── Drag overlay to calibrate ToF-to-camera alignment ──
+let dragEnabled = true;
+function updateDragPos() {
+  $('drag-pos').textContent = `(${dragOffX.toFixed(0)}, ${dragOffY.toFixed(0)})`;
+}
+updateDragPos();
 {
   const oc = $('tof-overlay');
   let dragging = false, startX = 0, startY = 0, baseX = 0, baseY = 0;
   oc.addEventListener('mousedown', e => {
+    if (!dragEnabled) return;
     dragging = true;
     startX = e.clientX; startY = e.clientY;
     baseX = dragOffX; baseY = dragOffY;
@@ -774,18 +894,36 @@ resizeObs.observe($('cam-container'));
     if (!dragging) return;
     dragOffX = baseX + (e.clientX - startX);
     dragOffY = baseY + (e.clientY - startY);
+    updateDragPos();
     renderOverlay(lastTofA, lastTofB);
   });
   window.addEventListener('mouseup', () => {
     if (!dragging) return;
     dragging = false;
-    oc.style.cursor = 'grab';
-    // Convert pixel offset back to camera-space for sensor config
+    oc.style.cursor = dragEnabled ? 'grab' : 'default';
     const camDx = dragOffX / overlayScale;
     const camDy = dragOffY / overlayScale;
     console.log('[Drag]', `offset px=(${dragOffX.toFixed(0)}, ${dragOffY.toFixed(0)}) cam=(${camDx.toFixed(1)}, ${camDy.toFixed(1)})`);
   });
 }
+
+// ── Modal ──
+$('gear-btn').addEventListener('click', () => $('settings-backdrop').classList.add('open'));
+$('modal-close').addEventListener('click', () => $('settings-backdrop').classList.remove('open'));
+$('settings-backdrop').addEventListener('click', e => { if (e.target === $('settings-backdrop')) $('settings-backdrop').classList.remove('open'); });
+$('drag-toggle').addEventListener('click', () => {
+  dragEnabled = !dragEnabled;
+  const btn = $('drag-toggle');
+  btn.textContent = dragEnabled ? 'Enabled' : 'Disabled';
+  btn.classList.toggle('active', dragEnabled);
+  $('tof-overlay').style.cursor = dragEnabled ? 'grab' : 'default';
+});
+$('drag-reset').addEventListener('click', () => {
+  dragOffX = 116; dragOffY = 45;
+  updateDragPos();
+  renderOverlay(lastTofA, lastTofB);
+  console.log('[Drag]', 'reset to default (116, 45)');
+});
 
 $('az-slider').addEventListener('input', e => {
   AZ_OFFSET = +e.target.value;
@@ -800,6 +938,16 @@ $('el-slider').addEventListener('input', e => {
 $('sz-slider').addEventListener('input', e => {
   GRID_SCALE = +e.target.value;
   $('sz-label').textContent = GRID_SCALE.toFixed(1) + '×';
+  renderOverlay(lastTofA, lastTofB);
+});
+$('cam-slider').addEventListener('input', e => {
+  camScale = +e.target.value;
+  $('cam-label').textContent = Math.round(camScale * 100) + '%';
+  updateOverlaySize();
+  renderOverlay(lastTofA, lastTofB);
+});
+$('blend-mode').addEventListener('change', e => {
+  blendMode = e.target.value;
   renderOverlay(lastTofA, lastTofB);
 });
 
