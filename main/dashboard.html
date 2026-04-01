@@ -220,7 +220,7 @@
 
 <div class="grid">
   <div class="card" id="camera-card">
-    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button></div>
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<span style="display:flex;gap:6px;"><button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button><button id="snap-overlay-btn" style="background:var(--border);color:var(--accent);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap+Overlay</button></span></div>
     <div id="cam-container">
       <img id="cam-img" src="" alt="No stream" />
       <canvas id="tof-overlay"></canvas>
@@ -727,6 +727,7 @@ function startStream() {
   const url = `http://${host}:81/stream`;
   if (img.src === url) return;  // don't restart a working stream
   console.log('[Stream]', `connecting to ${url}`);
+  img.crossOrigin = 'anonymous';  // required for canvas snap export (CORS set on port 81)
   img.src = url;
   img.onload = () => console.log('[Stream]', 'first frame received');
   img.onerror = () => {
@@ -848,6 +849,27 @@ $('snap-btn').addEventListener('click', () => {
     a.click();
     URL.revokeObjectURL(url);
     console.log('[Snap]', `saved ${c.width}x${c.height}`);
+  }, 'image/jpeg', 0.95);
+});
+$('snap-overlay-btn').addEventListener('click', () => {
+  const img = $('cam-img');
+  const overlay = $('tof-overlay');
+  const c = document.createElement('canvas');
+  c.width = overlay.width; c.height = overlay.height;
+  const ctx = c.getContext('2d');
+  // Dark background + camera image at its display rect
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.drawImage(img, camDispRect.x, camDispRect.y, camDispRect.w, camDispRect.h);
+  // ToF overlay on top
+  ctx.drawImage(overlay, 0, 0);
+  c.toBlob(blob => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `snap_overlay_${Date.now()}.jpg`;
+    a.click();
+    URL.revokeObjectURL(url);
+    console.log('[Snap]', `overlay saved ${c.width}x${c.height}`);
   }, 'image/jpeg', 0.95);
 });
 $('overlay-mode').addEventListener('change', e => {
