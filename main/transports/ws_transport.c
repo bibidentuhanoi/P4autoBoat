@@ -7,13 +7,14 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 static const char *TAG = "WS_TRANSPORT";
 
 #define WS_MAX_CLIENTS 4
 #define WS_SLOT_SIZE   1500
 #define WS_TX_STACK    8192
-#define WS_TX_PRIORITY 2
+#define WS_TX_PRIORITY 3  /* below sensor tasks (4), above httpd (1) — consumer yields to producers */
 
 /* ---- Client tracking (mutex-protected) ---- */
 
@@ -137,8 +138,7 @@ static void ws_tx_task(void *arg)
         for (int i = 0; i < count; i++) {
             esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
             if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "Send failed fd=%d: %s — removing stale client",
-                         fds[i], esp_err_to_name(ret));
+                ESP_LOGD(TAG, "Send failed fd=%d: %s", fds[i], esp_err_to_name(ret));
                 remove_client(fds[i]);
             }
         }
@@ -193,6 +193,13 @@ static esp_err_t ws_handler(httpd_req_t *req)
 }
 
 /* ---- Public API ---- */
+
+/* httpd close callback — fires for ALL socket closures (clean or dirty) */
+void ws_transport_close_fd(httpd_handle_t hd, int fd)
+{
+    remove_client(fd);
+    close(fd);
+}
 
 esp_err_t ws_transport_init(httpd_handle_t server)
 {

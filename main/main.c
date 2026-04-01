@@ -44,6 +44,7 @@ static CalibrationData calib_data = {
 };
 
 static tof_devices_t tof_devs;
+SemaphoreHandle_t g_i2c_mutex = NULL;
 
 // ==========================================
 // APP MAIN
@@ -84,6 +85,8 @@ void app_main(void) {
 
     // 4. Create sensor I2C bus on same GPIO7/GPIO8 (GPIO matrix re-routes from I2C_NUM_0)
     ESP_LOGI(TAG, "Initializing sensor I2C bus...");
+    g_i2c_mutex = xSemaphoreCreateMutex();
+    assert(g_i2c_mutex);
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_1,
@@ -154,8 +157,8 @@ void app_main(void) {
 
     // 12. Start RTOS Tasks
     ESP_LOGI(TAG, "Starting tasks...");
-    xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      5, NULL);
-    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 3, NULL);
+    xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      4, NULL);
+    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 4, NULL);
 
     ESP_LOGI(TAG, "System running.");
 }
