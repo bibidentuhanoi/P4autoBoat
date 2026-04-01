@@ -50,21 +50,25 @@ void task_imu_fusion(void *pvParameters) {
         float dt = (float)(now - last_time) / 1000000.0f;
         last_time = now;
 
-        // --- MAG READ & FILTER ---
-        if (imu_read_mag(&raw_mx, &raw_my, &raw_mz) == ESP_OK) {
-            float mx_cal = ((float)raw_mx - calib->m_bias[0]) * calib->m_scale[0];
-            float my_cal = ((float)raw_my - calib->m_bias[1]) * calib->m_scale[1];
-            float mz_cal = ((float)raw_mz - calib->m_bias[2]) * calib->m_scale[2];
-
-            mag_filt[0] += MAG_LPF_ALPHA * (mx_cal - mag_filt[0]);
-            mag_filt[1] += MAG_LPF_ALPHA * (my_cal - mag_filt[1]);
-            mag_filt[2] += MAG_LPF_ALPHA * (mz_cal - mag_filt[2]);
-        }
-
-        // --- ACCEL/GYRO READ ---
+        // --- I2C reads under shared bus mutex ---
         bool read_success = false;
-        if (imu_read_accel_gyro(&raw_ax, &raw_ay, &raw_az, &raw_gx, &raw_gy, &raw_gz) == ESP_OK) {
-            read_success = true;
+        if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            // MAG READ
+            if (imu_read_mag(&raw_mx, &raw_my, &raw_mz) == ESP_OK) {
+                float mx_cal = ((float)raw_mx - calib->m_bias[0]) * calib->m_scale[0];
+                float my_cal = ((float)raw_my - calib->m_bias[1]) * calib->m_scale[1];
+                float mz_cal = ((float)raw_mz - calib->m_bias[2]) * calib->m_scale[2];
+
+                mag_filt[0] += MAG_LPF_ALPHA * (mx_cal - mag_filt[0]);
+                mag_filt[1] += MAG_LPF_ALPHA * (my_cal - mag_filt[1]);
+                mag_filt[2] += MAG_LPF_ALPHA * (mz_cal - mag_filt[2]);
+            }
+
+            // ACCEL/GYRO READ
+            if (imu_read_accel_gyro(&raw_ax, &raw_ay, &raw_az, &raw_gx, &raw_gy, &raw_gz) == ESP_OK) {
+                read_success = true;
+            }
+            xSemaphoreGive(g_i2c_mutex);
         }
 
         // --- FUSION ---

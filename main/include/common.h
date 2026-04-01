@@ -3,6 +3,11 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+// Shared I2C bus mutex — IMU and ToF tasks must hold this during transactions
+extern SemaphoreHandle_t g_i2c_mutex;
 
 // Define constants
 #ifndef PI

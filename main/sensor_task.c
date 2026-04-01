@@ -55,7 +55,7 @@ void task_sensor_snapshot(void *pvParameters)
                     snap.tof_a.distances_count = 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                        snap.tof_a.distances[i] = (status != 0 && status != 255)
+                        snap.tof_a.distances[i] = (status == 5 || status == 9)
                             ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
                             : 0;
                     }
@@ -71,7 +71,7 @@ void task_sensor_snapshot(void *pvParameters)
                     snap.tof_b.distances_count = 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                        snap.tof_b.distances[i] = (status != 0 && status != 255)
+                        snap.tof_b.distances[i] = (status == 5 || status == 9)
                             ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
                             : 0;
                     }

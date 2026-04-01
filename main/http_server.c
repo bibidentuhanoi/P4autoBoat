@@ -4,6 +4,7 @@
 #include "esp_check.h"
 #include "esp_http_server.h"
 #include "sdkconfig.h"
+#include <unistd.h>
 
 static const char *TAG = "HTTP_SERVER";
 
@@ -29,9 +30,10 @@ esp_err_t http_server_start(void)
     cfg.recv_wait_timeout  = 30;   /* WebSocket clients are long-lived, don't kill after 5s */
     cfg.send_wait_timeout  = 10;
     cfg.keep_alive_enable  = true;
-    cfg.keep_alive_idle    = 15;
-    cfg.keep_alive_interval = 5;
-    cfg.keep_alive_count   = 3;
+    cfg.keep_alive_idle    = 5;     /* start probing after 5s idle */
+    cfg.keep_alive_interval = 3;    /* probe every 3s */
+    cfg.keep_alive_count   = 3;     /* drop after 3 missed probes (~14s total) */
+    cfg.close_fn           = ws_transport_close_fd;  /* clean up stale WS clients on any socket close */
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &cfg);

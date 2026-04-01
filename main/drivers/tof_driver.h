@@ -3,6 +3,7 @@
 
 #include "driver/i2c_master.h"
 #include "vl53l5cx_api.h"
+#include "vl53l5cx_plugin_xtalk.h"
 #include "esp_err.h"
 
 // Constants

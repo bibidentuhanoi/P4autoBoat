@@ -69,6 +69,9 @@ static esp_err_t stream_handler(httpd_req_t *req)
         ret = httpd_resp_send_chunk(req, (const char *)frame_buf, (ssize_t)frame_len);
         camera_release_frame();
         if (ret != ESP_OK) break;
+
+        /* Throttle to ~15fps — prevents WiFi TX saturation that starves WebSocket */
+        vTaskDelay(pdMS_TO_TICKS(66));
     }
 
     s_client_streaming = false;
