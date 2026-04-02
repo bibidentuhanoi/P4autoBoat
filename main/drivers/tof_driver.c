@@ -128,6 +128,12 @@ esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
     vl53l5cx_set_ranging_frequency_hz(&devices->dev_a, 20);
     vl53l5cx_set_ranging_frequency_hz(&devices->dev_b, 20);
 
+    vl53l5cx_set_integration_time_ms(&devices->dev_a, 10);
+    vl53l5cx_set_integration_time_ms(&devices->dev_b, 10);
+
+    vl53l5cx_set_target_order(&devices->dev_a, VL53L5CX_TARGET_ORDER_STRONGEST);
+    vl53l5cx_set_target_order(&devices->dev_b, VL53L5CX_TARGET_ORDER_STRONGEST);
+
     vl53l5cx_start_ranging(&devices->dev_a);
     vl53l5cx_start_ranging(&devices->dev_b);
 

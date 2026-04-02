@@ -60,10 +60,10 @@ void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
     msg.payload.sensors = *snap;
 
     /* Encode to stack buffer.
-     * boat_BoatMessage_size (nanopb-computed max) = 1449 bytes.
-     * 1500 bytes gives a small safety margin.
-     * Sensor task stack must be large enough to accommodate this (>=8KB recommended). */
-    uint8_t buf[1500];
+     * boat_BoatMessage_size (nanopb-computed max) = 3637 bytes (includes sigma + target_status + nb_target_detected).
+     * 3800 bytes gives a small safety margin.
+     * Sensor task stack must be large enough to accommodate this (>=12KB recommended). */
+    uint8_t buf[3800];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
 
     if (!pb_encode(&stream, boat_BoatMessage_fields, &msg)) {

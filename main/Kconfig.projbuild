@@ -24,6 +24,17 @@ menu "Board Configuration"
         hex "ToF Sensor B Address"
         default 0x24
 
+    config TOF_SHARPENER_PERCENT
+        int "ToF Sharpener Percent (0=off, 99=max)"
+        default 20
+        range 0 99
+        help
+            VL53L5CX sharpener reduces veiling-glare cross-talk, tightening
+            each zone's effective angular footprint. 0 = disabled (default 5%
+            internally), 50 = recommended for obstacle avoidance. Higher values
+            produce crisper zone boundaries but may reduce sensitivity on
+            low-reflectance targets.
+
     config FUSION_COMPLEMENTARY_ALPHA
         string "Fusion Complementary Alpha"
         default "0.96"

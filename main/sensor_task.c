@@ -12,6 +12,11 @@
 
 static const char *TAG = "SENSOR_TASK";
 
+static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
+    return (a > b) ? ((b > c) ? b : ((a > c) ? c : a))
+                   : ((a > c) ? a : ((b > c) ? c : b));
+}
+
 #define SNAPSHOT_INTERVAL_MS  50   /* 20 Hz sensor publish */
 #define TOF_EVERY_N           4    /* ToF at every 4th tick = 5 Hz (keeps WS traffic low) */
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
@@ -23,6 +28,10 @@ void task_sensor_snapshot(void *pvParameters)
     /* Static allocation — avoids stack overflow risk */
     static boat_SensorSnapshot snap;
     static VL53L5CX_ResultsData tof_res;
+
+    /* 3-frame median filter per zone — kills single-frame spikes */
+    static int16_t med_a[64][3], med_b[64][3];
+    static uint8_t med_idx_a = 0, med_idx_b = 0;
 
     uint32_t iteration = 0;
 
@@ -53,12 +62,21 @@ void task_sensor_snapshot(void *pvParameters)
                 if (snap.has_tof_a) {
                     snap.tof_a.valid = true;
                     snap.tof_a.distances_count = 64;
+                    snap.tof_a.sigma_count = 64;
+                    snap.tof_a.target_status_count = 64;
+                    snap.tof_a.nb_target_detected_count = 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                        snap.tof_a.distances[i] = (status == 5 || status == 9)
+                        int16_t raw = (status == 5 || status == 9)
                             ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
                             : 0;
+                        med_a[i][med_idx_a] = raw;
+                        snap.tof_a.distances[i] = median3(med_a[i][0], med_a[i][1], med_a[i][2]);
+                        snap.tof_a.sigma[i] = tof_res.range_sigma_mm[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                        snap.tof_a.target_status[i] = status;
+                        snap.tof_a.nb_target_detected[i] = tof_res.nb_target_detected[i];
                     }
+                    med_idx_a = (med_idx_a + 1) % 3;
                 }
             }
 
@@ -69,12 +87,21 @@ void task_sensor_snapshot(void *pvParameters)
                 if (snap.has_tof_b) {
                     snap.tof_b.valid = true;
                     snap.tof_b.distances_count = 64;
+                    snap.tof_b.sigma_count = 64;
+                    snap.tof_b.target_status_count = 64;
+                    snap.tof_b.nb_target_detected_count = 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t status = tof_res.target_status[i * VL53L5CX_NB_TARGET_PER_ZONE];
-                        snap.tof_b.distances[i] = (status == 5 || status == 9)
+                        int16_t raw = (status == 5 || status == 9)
                             ? tof_res.distance_mm[i * VL53L5CX_NB_TARGET_PER_ZONE]
                             : 0;
+                        med_b[i][med_idx_b] = raw;
+                        snap.tof_b.distances[i] = median3(med_b[i][0], med_b[i][1], med_b[i][2]);
+                        snap.tof_b.sigma[i] = tof_res.range_sigma_mm[i * VL53L5CX_NB_TARGET_PER_ZONE];
+                        snap.tof_b.target_status[i] = status;
+                        snap.tof_b.nb_target_detected[i] = tof_res.nb_target_detected[i];
                     }
+                    med_idx_b = (med_idx_b + 1) % 3;
                 }
             }
         }

@@ -139,7 +139,8 @@
         <label>Mode</label>
         <select id="overlay-mode">
           <option value="off">Off</option>
-          <option value="threshold" selected>Threshold</option>
+          <option value="threshold">Flat threshold</option>
+          <option value="threshold3d" selected>3D Threshold</option>
           <option value="heatmap">Heatmap</option>
           <option value="raw">Raw grid</option>
         </select>
@@ -152,7 +153,7 @@
       <div class="modal-row">
         <label>Blend</label>
         <select id="blend-mode">
-          <option value="closest" selected>Closest</option>
+          <option value="closest" selected>Best sigma</option>
           <option value="average">Average</option>
           <option value="both">Both</option>
         </select>
@@ -185,18 +186,18 @@
       <div class="modal-section-title">Projection</div>
       <div class="modal-row">
         <label>Az offset</label>
-        <input type="range" id="az-slider" min="-40" max="10" value="-16.7" step="0.1" />
-        <span class="val" id="az-label">-16.7°</span>
+        <input type="range" id="az-slider" min="-20" max="20" value="-3.6" step="0.1" />
+        <span class="val" id="az-label">-3.6°</span>
       </div>
       <div class="modal-row">
         <label>El offset</label>
-        <input type="range" id="el-slider" min="-10" max="40" value="19.4" step="0.1" />
-        <span class="val" id="el-label">19.4°</span>
+        <input type="range" id="el-slider" min="-20" max="20" value="4.1" step="0.1" />
+        <span class="val" id="el-label">4.1°</span>
       </div>
       <div class="modal-row">
         <label>Grid scale</label>
-        <input type="range" id="sz-slider" min="0.5" max="4" value="1.7" step="0.1" />
-        <span class="val" id="sz-label">1.7×</span>
+        <input type="range" id="sz-slider" min="0.5" max="4" value="2.0" step="0.1" />
+        <span class="val" id="sz-label">2.0×</span>
       </div>
       <div class="modal-row">
         <label>Cam scale</label>
@@ -210,9 +211,9 @@
       <div class="modal-section-title">Overlay Drag</div>
       <div class="modal-row">
         <label>Drag</label>
-        <button class="btn-toggle active" id="drag-toggle">Enabled</button>
+        <button class="btn-toggle" id="drag-toggle">Disabled</button>
         <button class="btn-sm" id="drag-reset">Reset</button>
-        <span class="val" id="drag-pos" style="font-size:10px;color:var(--dim);">(116, 45)</span>
+        <span class="val" id="drag-pos" style="font-size:10px;color:var(--dim);">(-304, -177)</span>
       </div>
     </div>
   </div>
@@ -260,7 +261,7 @@ const protoSchema = `
 syntax = "proto3";
 package boat;
 message IMUData { float pitch = 1; float roll = 2; float heading = 3; }
-message ToFGrid { bool valid = 1; repeated int32 distances = 2; }
+message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
 message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; }
 message MotorCommand { float throttle = 1; float rudder = 2; }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; }
@@ -273,22 +274,22 @@ const BoatMessage = root.lookupType('boat.BoatMessage');
 // Projection — direct geometric model (measured from PCB + optics)
 // ═══════════════════════════════════════════════════════════════
 const CAM = { w: 800, h: 640 };
-const FX = 616;                    // camera focal length (pixels)
-const ZONE_STEP = 7.875;           // degrees per zone (63° / 8)
-let AZ_OFFSET = -16.7;             // horizontal axis alignment (deg)
-let EL_OFFSET = 19.4;              // vertical axis alignment (deg)
-let GRID_SCALE = 1.7;              // overlay size multiplier
+const FX = 850;                    // camera focal length (pixels)
+const ZONE_STEP = 5.625;           // degrees per zone (45° / 8)
+let AZ_OFFSET = -3.6;             // sensor-frame horizontal alignment (deg)
+let EL_OFFSET = 4.1;              // sensor-frame vertical alignment (deg)
+let GRID_SCALE = 2.0;              // overlay size multiplier
 let camScale   = 0.72;             // camera image fraction of container (border = pre-alert zone)
 const SENSOR_TZ = 6.78;            // sensor Z offset behind camera (mm)
-const SENSOR_A = { x: -22.8, tilt: -5 };  // left, tilted outward
-const SENSOR_B = { x:  22.8, tilt:  5 };  // right, tilted outward
+const SENSOR_A = { x: -22.8, tilt: -4.2 };   // left, Y-rotation
+const SENSOR_B = { x:  22.8, tilt: 10.2 };   // right, Y-rotation
 
 const FLIP = {
   flipHA: false, flipVA: false, transA: false,
   flipHB: true,  flipVB: true,  transB: false,
 };
 
-let overlayMode = 'threshold';
+let overlayMode = 'threshold3d';
 let thresholdMM = 2000;
 let imuPitch = 0, imuRoll = 0;
 let lastTofA = null, lastTofB = null;
@@ -303,19 +304,45 @@ function readDepth(arr, row, col, flipH, flipV, trans) {
   return arr[trans ? (c * 8 + r) : (r * 8 + c)] || 0;
 }
 
-// Project a zone to camera pixel using direct geometric model
-// sensor: SENSOR_A or SENSOR_B, row/col: zone indices, depth: mm
-function zoneToPixel(sensor, row, col, depth) {
-  const az = (col - 3.5) * ZONE_STEP + sensor.tilt + AZ_OFFSET;
-  const el = (3.5 - row) * ZONE_STEP + EL_OFFSET;
+// Flat projection — original model (tilt baked into azimuth)
+const FLAT = { fx: 616, step: 7.875, az: -16.7, el: 19.4, tiltA: -5, tiltB: 5 };
+
+function zoneToPixelFlat(sensor, row, col, depth) {
+  const tilt = (sensor === SENSOR_A) ? FLAT.tiltA : FLAT.tiltB;
+  const az = (col - 3.5) * FLAT.step + tilt + FLAT.az;
+  const el = (3.5 - row) * FLAT.step + FLAT.el;
   const px = sensor.x + depth * Math.tan(az * DEG2RAD);
   const py = depth * Math.tan(el * DEG2RAD);
   const pz = depth + SENSOR_TZ;
   if (pz <= 1) return null;
-  const u = FX * (px / pz) + 400;
-  const v = -FX * (py / pz) + 320;
-  // Scale around image center
+  const u = FLAT.fx * (px / pz) + 400;
+  const v = -FLAT.fx * (py / pz) + 320;
   return [400 + (u - 400) * GRID_SCALE, 320 + (v - 320) * GRID_SCALE];
+}
+
+// 3D rotation projection — proper Y-axis rotation per sensor
+function zoneToPixel3D(sensor, row, col, depth) {
+  const azL = (col - 3.5) * ZONE_STEP + AZ_OFFSET;
+  const elL = (3.5 - row) * ZONE_STEP + EL_OFFSET;
+  const xL = depth * Math.tan(azL * DEG2RAD);
+  const yL = depth * Math.tan(elL * DEG2RAD);
+  const zL = depth;
+  const cosT = Math.cos(sensor.tilt * DEG2RAD);
+  const sinT = Math.sin(sensor.tilt * DEG2RAD);
+  const wx = sensor.x + xL * cosT + zL * sinT;
+  const wy = yL;
+  const wz = SENSOR_TZ + (-xL * sinT + zL * cosT);
+  if (wz <= 1) return null;
+  const u = FX * (wx / wz) + 400;
+  const v = -FX * (wy / wz) + 320;
+  return [400 + (u - 400) * GRID_SCALE, 320 + (v - 320) * GRID_SCALE];
+}
+
+// Active projection — switches based on overlay mode
+function zoneToPixel(sensor, row, col, depth) {
+  return overlayMode === 'threshold'
+    ? zoneToPixelFlat(sensor, row, col, depth)
+    : zoneToPixel3D(sensor, row, col, depth);
 }
 
 // Get zone center pixel + visibility flag
@@ -329,17 +356,9 @@ function getZoneCenter(sensor, row, col, mm) {
 // Get zone quad (4 corners at half-zone offsets)
 function getZoneQuad(sensor, row, col, mm) {
   const offsets = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
-  const pts = offsets.map(([dr, dc]) => {
-    const az = (col + dc - 3.5) * ZONE_STEP + sensor.tilt + AZ_OFFSET;
-    const el = (3.5 - row - dr) * ZONE_STEP + EL_OFFSET;
-    const px = sensor.x + mm * Math.tan(az * DEG2RAD);
-    const py = mm * Math.tan(el * DEG2RAD);
-    const pz = mm + SENSOR_TZ;
-    if (pz <= 1) return null;
-    const u = FX * (px / pz) + 400;
-    const v = -FX * (py / pz) + 320;
-    return [400 + (u - 400) * GRID_SCALE, 320 + (v - 320) * GRID_SCALE];
-  });
+  const pts = offsets.map(([dr, dc]) =>
+    zoneToPixel(sensor, row + dr, col + dc, mm)
+  );
 
   const valid = pts.filter(p => p !== null);
   if (valid.length < 3) return null;
@@ -392,7 +411,7 @@ function updateOverlaySize() {
   img.style.borderRadius = '2px';
 }
 
-let dragOffX = 116, dragOffY = 45;
+let dragOffX = -304, dragOffY = -177;
 
 function camToDisplay(px, py) {
   return [px * overlayScale + overlayOffX + dragOffX, py * overlayScale + overlayOffY + dragOffY];
@@ -412,7 +431,16 @@ function collectZones(tof, sensor, flipH, flipV, trans, sensorId) {
       const quad = getZoneQuad(sensor, row, col, mm);
       const inFrame = dp[0] >= camDispRect.x && dp[0] <= camDispRect.x + camDispRect.w &&
                       dp[1] >= camDispRect.y && dp[1] <= camDispRect.y + camDispRect.h;
-      zones.push({ mm, dp, quad, inFrame, sensor: sensorId, row, col });
+      // Sigma-based opacity: low sigma = solid (clean surface), high sigma = ghost (edge/noise)
+      const sigmaVal = (tof.sigma && tof.sigma.length >= 64)
+          ? readDepth(tof.sigma, row, col, flipH, flipV, trans) : 0;
+      const opacity = sigmaVal > 0
+          ? Math.max(0.15, Math.min(0.9, 1.0 - sigmaVal / 25.0)) : 0.85;
+      // Edge detection: sensor sees multiple surfaces in this zone
+      const nbTargets = (tof.nbTargetDetected && tof.nbTargetDetected.length >= 64)
+          ? readDepth(tof.nbTargetDetected, row, col, flipH, flipV, trans) : 1;
+      const isEdge = nbTargets > 1;
+      zones.push({ mm, dp, quad, inFrame, sensor: sensorId, row, col, opacity, isEdge });
     }
   }
   return zones;
@@ -434,7 +462,8 @@ function blendZones(zonesA, zonesB) {
     const blended = group.some(z => z.sensor === 'A') && group.some(z => z.sensor === 'B');
     let best;
     if (blendMode === 'closest') {
-      best = group.reduce((a, b) => a.mm < b.mm ? a : b);
+      // Pick zone with lowest sigma — cleaner view wins over nearest
+      best = group.reduce((a, b) => a.opacity > b.opacity ? a : b);
     } else {
       const avg = group.reduce((s, z) => s + z.mm, 0) / group.length;
       best = { ...group[0], mm: avg };
@@ -473,7 +502,7 @@ function renderOverlay(tofA, tofB) {
 
   if (overlayMode === 'off') return;
 
-  if (overlayMode === 'threshold') drawThreshold(ctx, lastTofA, lastTofB);
+  if (overlayMode === 'threshold' || overlayMode === 'threshold3d') drawThreshold(ctx, lastTofA, lastTofB);
   else if (overlayMode === 'heatmap') drawHeatmap(ctx, lastTofA, lastTofB);
   else if (overlayMode === 'raw') drawRawGrid(ctx, lastTofA, lastTofB);
 }
@@ -484,16 +513,16 @@ function drawThreshold(ctx, tofA, tofB) {
   const zones  = blendZones(zonesA, zonesB);
   let closest  = { mm: Infinity, x: 0, y: 0 };
 
-  for (const { mm, dp, quad, inFrame, blended } of zones) {
+  for (const { mm, dp, quad, inFrame, blended, opacity, isEdge } of zones) {
     if (mm > thresholdMM) continue;
 
     const colors = dangerColor(mm, thresholdMM);
     const pts = quad ? quad.pts.map(p => camToDisplay(p[0], p[1])) : null;
 
     if (inFrame) {
-      // ── In-frame: solid colored quad + crosshair + label ──
+      // ── In-frame: sigma-weighted quad + crosshair + label ──
       if (pts) {
-        ctx.globalAlpha = 1.0;
+        ctx.globalAlpha = opacity;
         ctx.setLineDash([]);
         ctx.fillStyle = colors.fill;
         ctx.beginPath();
@@ -517,6 +546,7 @@ function drawThreshold(ctx, tofA, tofB) {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
       ctx.fillText((mm/1000).toFixed(1), dp[0], dp[1]-6);
+      ctx.globalAlpha = 1.0;
     } else {
       // ── Border zone: dashed outline only — ToF-only pre-alert ──
       if (pts) {
@@ -541,6 +571,19 @@ function drawThreshold(ctx, tofA, tofB) {
       ctx.beginPath();
       ctx.arc(dp[0], dp[1], 3, 0, Math.PI * 2);
       ctx.fill();
+      ctx.globalAlpha = 1.0;
+    }
+
+    // Edge zone — sensor sees multiple surfaces, distance is unreliable
+    if (isEdge) {
+      ctx.setLineDash([2, 2]);
+      ctx.strokeStyle = '#FF00FF';
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.8;
+      ctx.beginPath();
+      ctx.arc(dp[0], dp[1], 8, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1.0;
     }
 
@@ -574,12 +617,16 @@ function drawHeatmap(ctx, tofA, tofB) {
     for (let row = 0; row < 8; row++) {
       for (let col = 0; col < 8; col++) {
         const mm = readDepth(grid.distances, row, col, flipH, flipV, trans);
-        if (!mm || mm <= 0) continue;
+        if (!mm || mm <= 0 || mm > thresholdMM) continue;
 
         const center = getZoneCenter(sensor, row, col, mm);
         if (!center) continue;
 
         const dp = camToDisplay(center[0], center[1]);
+        const sigmaVal = (grid.sigma && grid.sigma.length >= 64)
+            ? readDepth(grid.sigma, row, col, flipH, flipV, trans) : 0;
+        const zoneOpacity = sigmaVal > 0
+            ? Math.max(0.15, Math.min(0.9, 1.0 - sigmaVal / 25.0)) : 0.85;
         const t = Math.min(mm, 4000) / 4000;
         let r, g, b;
         if (t < 0.25) { r = 255; g = Math.round(t * 4 * 200); b = 0; }
@@ -590,7 +637,7 @@ function drawHeatmap(ctx, tofA, tofB) {
         // Draw as a soft circle instead of a hard quad
         const radius = Math.max(8, 30 * overlayScale * (1000 / Math.max(mm, 200)));
         const grad = ctx.createRadialGradient(dp[0], dp[1], 0, dp[0], dp[1], radius);
-        grad.addColorStop(0, `rgba(${r},${g},${b},0.6)`);
+        grad.addColorStop(0, `rgba(${r},${g},${b},${(zoneOpacity * 0.7).toFixed(2)})`);
         grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
         ctx.fillStyle = grad;
         ctx.beginPath();
@@ -872,8 +919,21 @@ $('snap-overlay-btn').addEventListener('click', () => {
     console.log('[Snap]', `overlay saved ${c.width}x${c.height}`);
   }, 'image/jpeg', 0.95);
 });
+// Per-mode presets: drag offset + grid scale
+const MODE_PRESETS = {
+  threshold:   { dragX: 116, dragY: 45, scale: 1.7 },
+  threshold3d: { dragX: -304, dragY: -177, scale: 2.0 },
+};
 $('overlay-mode').addEventListener('change', e => {
   overlayMode = e.target.value;
+  const preset = MODE_PRESETS[overlayMode];
+  if (preset) {
+    dragOffX = preset.dragX; dragOffY = preset.dragY;
+    GRID_SCALE = preset.scale;
+    updateDragPos();
+    $('sz-slider').value = GRID_SCALE;
+    $('sz-label').textContent = GRID_SCALE.toFixed(1) + '×';
+  }
   renderOverlay(lastTofA, lastTofB);
 });
 $('thresh-range').addEventListener('input', e => {
@@ -897,7 +957,7 @@ const resizeObs = new ResizeObserver(() => updateOverlaySize());
 resizeObs.observe($('cam-container'));
 
 // ── Drag overlay to calibrate ToF-to-camera alignment ──
-let dragEnabled = true;
+let dragEnabled = false;
 function updateDragPos() {
   $('drag-pos').textContent = `(${dragOffX.toFixed(0)}, ${dragOffY.toFixed(0)})`;
 }
@@ -941,10 +1001,10 @@ $('drag-toggle').addEventListener('click', () => {
   $('tof-overlay').style.cursor = dragEnabled ? 'grab' : 'default';
 });
 $('drag-reset').addEventListener('click', () => {
-  dragOffX = 116; dragOffY = 45;
+  dragOffX = -304; dragOffY = -177;
   updateDragPos();
   renderOverlay(lastTofA, lastTofB);
-  console.log('[Drag]', 'reset to default (116, 45)');
+  console.log('[Drag]', 'reset to default (-304, -177)');
 });
 
 $('az-slider').addEventListener('input', e => {
@@ -1015,7 +1075,7 @@ window.debug = {
     for (let r = 0; r < 8; r++) {
       const row = [];
       for (let c = 0; c < 8; c++) {
-        const az = (c - 3.5) * ZONE_STEP + s.tilt + AZ_OFFSET;
+        const az = (c - 3.5) * ZONE_STEP + AZ_OFFSET;
         const el = (3.5 - r) * ZONE_STEP + EL_OFFSET;
         row.push({ az: +az.toFixed(2), el: +el.toFixed(2) });
       }
