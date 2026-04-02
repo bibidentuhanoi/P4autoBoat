@@ -59,8 +59,8 @@ Sensors → task_sensor_snapshot (protobuf encode) → pipeline → ws_transport
 | Setting | Value |
 |---|---|
 | Resolution | 8x8 (64 zones) |
-| Ranging frequency | 20 Hz |
-| Integration time | 10 ms |
+| Ranging frequency | 10 Hz (Kconfig-tunable) |
+| Integration time | 10 ms (Kconfig-tunable) |
 | Target order | Strongest signal first |
 | Sharpener | 20% (Kconfig-tunable) |
 | Xtalk calibration | NVS-persisted, auto-runs on first boot |

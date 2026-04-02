@@ -24,6 +24,23 @@ menu "Board Configuration"
         hex "ToF Sensor B Address"
         default 0x24
 
+    config TOF_RANGING_FREQ_HZ
+        int "ToF Ranging Frequency (Hz)"
+        default 10
+        range 1 60
+        help
+            VL53L5CX ranging frequency in Hz. Lower frequencies allow longer
+            integration time for better accuracy on dark/distant targets.
+            Must satisfy: integration_time_ms < 1000/freq_hz.
+
+    config TOF_INTEGRATION_TIME_MS
+        int "ToF Integration Time (ms)"
+        default 10
+        range 2 1000
+        help
+            Time the sensor collects photons per measurement. Longer = lower
+            sigma = more accurate, but must fit within the ranging period.
+
     config TOF_SHARPENER_PERCENT
         int "ToF Sharpener Percent (0=off, 99=max)"
         default 20
