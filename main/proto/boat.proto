@@ -9,10 +9,10 @@ message IMUData {
 
 message ToFGrid {
   bool            valid         = 1;
-  repeated int32  distances     = 2;  // 64 values, row-major 8x8
-  repeated uint32 sigma         = 3;  // range_sigma_mm: noise estimate (low=clean, high=edge)
-  repeated uint32 target_status = 4;  // per-zone validity code (5=valid, 9=valid+noisy)
-  repeated uint32 nb_target_detected = 5;  // surfaces detected per zone (>1 = edge zone)
+  repeated int32  distances     = 2;  // 64*NB_TARGET values: zone*ntpp+target, row-major 8x8
+  repeated uint32 sigma         = 3;  // range_sigma_mm per target (low=clean, high=edge)
+  repeated uint32 target_status = 4;  // per-target validity code (5=valid, 9=valid+noisy)
+  repeated uint32 nb_target_detected = 5;  // surfaces detected per zone, always 64 values
 }
 
 message SensorSnapshot {

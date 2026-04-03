@@ -21,7 +21,7 @@ PB_BIND(boat_MotorCommand, boat_MotorCommand, AUTO)
 PB_BIND(boat_SystemStatus, boat_SystemStatus, AUTO)
 
 
-PB_BIND(boat_BoatMessage, boat_BoatMessage, 2)
+PB_BIND(boat_BoatMessage, boat_BoatMessage, 4)
 
 
 

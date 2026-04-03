@@ -19,11 +19,11 @@ typedef struct _boat_IMUData {
 typedef struct _boat_ToFGrid {
     bool valid;
     pb_size_t distances_count;
-    int32_t distances[64];     /* 64 values, row-major 8x8 */
+    int32_t distances[256];    /* 64 zones × 4 targets, row-major 8x8 */
     pb_size_t sigma_count;
-    uint32_t sigma[64];        /* range_sigma_mm: noise estimate (low=clean, high=edge) */
+    uint32_t sigma[256];       /* range_sigma_mm per target (low=clean, high=edge) */
     pb_size_t target_status_count;
-    uint32_t target_status[64]; /* per-zone validity code (5=valid, 9=valid+noisy) */
+    uint32_t target_status[256]; /* per-target validity code (5=valid, 9=valid+noisy) */
     pb_size_t nb_target_detected_count;
     uint32_t nb_target_detected[64]; /* surfaces detected per zone (>1 = edge zone) */
 } boat_ToFGrid;
@@ -168,12 +168,12 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
-#define boat_BoatMessage_size                    3637
+#define boat_BoatMessage_size                    11053
 #define boat_IMUData_size                        15
 #define boat_MotorCommand_size                   10
-#define boat_SensorSnapshot_size                 3634
+#define boat_SensorSnapshot_size                 11050
 #define boat_SystemStatus_size                   28
-#define boat_ToFGrid_size                        1800
+#define boat_ToFGrid_size                        5454
 
 #ifdef __cplusplus
 } /* extern "C" */
