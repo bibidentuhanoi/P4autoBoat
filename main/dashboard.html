@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AutoBoat Dashboard v2</title>
 <link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg:      #05080F;
@@ -490,31 +493,20 @@ function blendZones(zonesA, zonesB) {
 }
 
 function dangerColor(mm, thresh) {
+  // Same stops as distToColor/tof-card: red→orange→green→cyan→blue
   const t = Math.min(mm / thresh, 1);
-  let r, g, b, alpha;
-  if (t < 0.2) {
-    // deep red — critical
-    r = 255; g = 0; b = 0; alpha = 0.55;
-  } else if (t < 0.4) {
-    // orange — danger
-    const u = (t - 0.2) / 0.2;
-    r = 255; g = Math.round(u * 165); b = 0; alpha = 0.50;
-  } else if (t < 0.6) {
-    // yellow — warning
-    const u = (t - 0.4) / 0.2;
-    r = 255; g = Math.round(165 + u * 90); b = 0; alpha = 0.45;
-  } else if (t < 0.8) {
-    // yellow-green — caution
-    const u = (t - 0.6) / 0.2;
-    r = Math.round(255 * (1 - u)); g = 220; b = 0; alpha = 0.38;
-  } else {
-    // blue-green — safe
-    const u = (t - 0.8) / 0.2;
-    r = 0; g = Math.round(180 - u * 80); b = Math.round(u * 255); alpha = 0.30;
-  }
+  const stops = [[255,0,0],[255,180,0],[0,255,80],[0,200,255],[0,60,200]];
+  const scaled = t * (stops.length - 1);
+  const i = Math.floor(scaled), f = scaled - i;
+  const a = stops[Math.min(i, stops.length - 1)];
+  const b = stops[Math.min(i + 1, stops.length - 1)];
+  const r = Math.round(a[0] + (b[0] - a[0]) * f);
+  const g = Math.round(a[1] + (b[1] - a[1]) * f);
+  const bv = Math.round(a[2] + (b[2] - a[2]) * f);
+  const alpha = 0.55 - t * 0.25;
   return {
-    fill: `rgba(${r},${g},${b},${alpha})`,
-    stroke: `rgb(${r},${g},${b})`,
+    fill: `rgba(${r},${g},${bv},${alpha.toFixed(2)})`,
+    stroke: `rgb(${r},${g},${bv})`,
   };
 }
 
@@ -568,14 +560,10 @@ function drawThreshold(ctx, tofA, tofB) {
       ctx.moveTo(dp[0]-sz, dp[1]); ctx.lineTo(dp[0]+sz, dp[1]);
       ctx.moveTo(dp[0], dp[1]-sz); ctx.lineTo(dp[0], dp[1]+sz);
       ctx.stroke();
-      ctx.font = 'bold 12px monospace';
+      ctx.font = '300 11px "Orbitron", sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
       const label = (mm/1000).toFixed(2) + 'm';
-      ctx.strokeStyle = '#000';
-      ctx.lineWidth = 3;
-      ctx.lineJoin = 'round';
-      ctx.strokeText(label, dp[0], dp[1]-6);
       ctx.fillStyle = '#fff';
       ctx.fillText(label, dp[0], dp[1]-6);
       ctx.globalAlpha = 1.0;
@@ -635,7 +623,7 @@ function drawThreshold(ctx, tofA, tofB) {
     const tw = ctx.measureText(tag).width + 12;
     ctx.fillRect(closest.x - tw / 2, closest.y - 32, tw, 18);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 11px monospace';
+    ctx.font = 'bold 11px "Orbitron", sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(tag, closest.x, closest.y - 23);
@@ -704,7 +692,7 @@ function drawRawGrid(ctx, tofA, tofB) {
           ctx.fillStyle = `rgba(${r},${g},${b},0.55)`;
           ctx.fillRect(x, y, cw - 1, ch - 1);
           ctx.fillStyle = '#fff';
-          ctx.font = 'bold 10px monospace';
+          ctx.font = 'bold 10px "Orbitron", sans-serif';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillText(Math.round(mm / 10) + '', dp[0], dp[1]);
@@ -721,7 +709,7 @@ function drawRawGrid(ctx, tofA, tofB) {
       ctx.fillStyle = 'rgba(0,0,0,0.6)';
       ctx.fillRect(ldp[0] - 5, ldp[1] - 26, 30, 14);
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 11px monospace';
+      ctx.font = 'bold 11px "Orbitron", sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText(label, ldp[0], ldp[1] - 20);
     }
