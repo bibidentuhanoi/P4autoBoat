@@ -1,3 +1,16 @@
+/* ═══════════════════════════════════════════════════════════════
+ * CALIBRATION CHECKLIST — When changing housing/lens:
+ * ───────────────────────────────────────────────────────────────
+ * 1. Mount on flat wall (distance 1–3 m)
+ * 2. Run IMU calibration (GPIO 35 at boot)
+ * 3. Check 3D Threshold overlay alignment (dashboard)
+ * 4. Adjust FX (focal length) if FOV is off
+ * 5. Adjust CX/CY (principal point) for center offset
+ * 6. Fine-tune AZ/EL offsets via dashboard sliders
+ * 7. Verify grid scale GRID_SCALE ≈ 1.0
+ * 8. Test drag offset (should be near 0,0)
+ * ═══════════════════════════════════════════════════════════════ */
+
 #include "sensor_task.h"
 #include "pipeline.h"
 #include "sensor_fusion.h"
