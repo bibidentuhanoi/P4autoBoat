@@ -148,7 +148,10 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                           cleanup, TAG, "ppa_register_client failed");
 
         s_ppa_out_buf_size = s_cam_width * s_cam_height * 2;
-        s_ppa_out_buf = heap_caps_aligned_calloc(64, 1, s_ppa_out_buf_size,
+        /* Round size up to L2 cache line (128B) — PPA requires buffer addr AND size
+         * to be cache-line-aligned. L2 line is 128B per CONFIG_CACHE_L2_CACHE_LINE_128B. */
+        s_ppa_out_buf_size = (s_ppa_out_buf_size + 127) & ~((uint32_t)127);
+        s_ppa_out_buf = heap_caps_aligned_calloc(128, 1, s_ppa_out_buf_size,
                                                   MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
         if (!s_ppa_out_buf) {
             ESP_LOGE(TAG, "PPA output buffer alloc failed (%"PRIu32" bytes)", s_ppa_out_buf_size);

@@ -5,9 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AutoBoat Dashboard v2</title>
 <link rel="icon" href="data:,">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg:      #05080F;
@@ -285,7 +282,7 @@ const CAM = { w: 800, h: 640 };
 const FX = 1242;                   // camera focal length (pixels)
 const ZONE_STEP = 5.625;           // degrees per zone (45° / 8)
 let AZ_OFFSET = 2.0;              // sensor-frame horizontal alignment (deg)
-let EL_OFFSET = 2.0;              // sensor-frame vertical alignment (deg)
+let EL_OFFSET = 0.3;              // sensor-frame vertical alignment (deg)
 let GRID_SCALE = 1.0;              // overlay size multiplier (eliminated)
 let camScale   = 0.72;             // camera image fraction of container (border = pre-alert zone)
 const SENSOR_TZ = 6.78;            // sensor Z offset behind camera (mm)
@@ -560,10 +557,14 @@ function drawThreshold(ctx, tofA, tofB) {
       ctx.moveTo(dp[0]-sz, dp[1]); ctx.lineTo(dp[0]+sz, dp[1]);
       ctx.moveTo(dp[0], dp[1]-sz); ctx.lineTo(dp[0], dp[1]+sz);
       ctx.stroke();
-      ctx.font = '300 11px "Orbitron", sans-serif';
+      ctx.font = 'bold 12px monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
       const label = (mm/1000).toFixed(2) + 'm';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 3;
+      ctx.lineJoin = 'round';
+      ctx.strokeText(label, dp[0], dp[1]-6);
       ctx.fillStyle = '#fff';
       ctx.fillText(label, dp[0], dp[1]-6);
       ctx.globalAlpha = 1.0;
@@ -623,7 +624,7 @@ function drawThreshold(ctx, tofA, tofB) {
     const tw = ctx.measureText(tag).width + 12;
     ctx.fillRect(closest.x - tw / 2, closest.y - 32, tw, 18);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 11px "Orbitron", sans-serif';
+    ctx.font = 'bold 11px monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(tag, closest.x, closest.y - 23);
@@ -692,7 +693,7 @@ function drawRawGrid(ctx, tofA, tofB) {
           ctx.fillStyle = `rgba(${r},${g},${b},0.55)`;
           ctx.fillRect(x, y, cw - 1, ch - 1);
           ctx.fillStyle = '#fff';
-          ctx.font = 'bold 10px "Orbitron", sans-serif';
+          ctx.font = 'bold 10px monospace';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           ctx.fillText(Math.round(mm / 10) + '', dp[0], dp[1]);
@@ -709,7 +710,7 @@ function drawRawGrid(ctx, tofA, tofB) {
       ctx.fillStyle = 'rgba(0,0,0,0.6)';
       ctx.fillRect(ldp[0] - 5, ldp[1] - 26, 30, 14);
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 11px "Orbitron", sans-serif';
+      ctx.font = 'bold 11px monospace';
       ctx.textAlign = 'left';
       ctx.fillText(label, ldp[0], ldp[1] - 20);
     }

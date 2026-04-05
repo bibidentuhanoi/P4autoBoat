@@ -1,6 +1,6 @@
 #pragma once
 #include "esp_err.h"
-
+#include <string.h>
 /**
  * @brief Connect to WiFi AP configured via Kconfig (CONFIG_WIFI_SSID / CONFIG_WIFI_PASSWORD).
  *

@@ -80,17 +80,20 @@ void task_sensor_snapshot(void *pvParameters)
                     snap.tof_a.target_status_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
                     snap.tof_a.nb_target_detected_count = 64;
                     for (int i = 0; i < 64; i++) {
+                        uint8_t nb = tof_res.nb_target_detected[i];
                         for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
                             int idx = i * VL53L5CX_NB_TARGET_PER_ZONE + j;
                             uint8_t status = tof_res.target_status[idx];
-                            int16_t raw = (status == 5 || status == 9)
-                                ? tof_res.distance_mm[idx] : 0;
+                            /* Gate on nb_target_detected AND status: slots beyond
+                             * nb_target_detected contain stale driver buffer data. */
+                            bool slot_valid = (j < nb) && (status == 5 || status == 9);
+                            int16_t raw = slot_valid ? tof_res.distance_mm[idx] : 0;
                             med_a[idx][med_idx_a] = raw;
                             snap.tof_a.distances[idx] = median3(med_a[idx][0], med_a[idx][1], med_a[idx][2]);
-                            snap.tof_a.sigma[idx] = tof_res.range_sigma_mm[idx];
-                            snap.tof_a.target_status[idx] = status;
+                            snap.tof_a.sigma[idx] = slot_valid ? tof_res.range_sigma_mm[idx] : 0;
+                            snap.tof_a.target_status[idx] = slot_valid ? status : 0;
                         }
-                        snap.tof_a.nb_target_detected[i] = tof_res.nb_target_detected[i];
+                        snap.tof_a.nb_target_detected[i] = nb;
                     }
                     med_idx_a = (med_idx_a + 1) % 3;
                 }
@@ -107,17 +110,18 @@ void task_sensor_snapshot(void *pvParameters)
                     snap.tof_b.target_status_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
                     snap.tof_b.nb_target_detected_count = 64;
                     for (int i = 0; i < 64; i++) {
+                        uint8_t nb = tof_res.nb_target_detected[i];
                         for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
                             int idx = i * VL53L5CX_NB_TARGET_PER_ZONE + j;
                             uint8_t status = tof_res.target_status[idx];
-                            int16_t raw = (status == 5 || status == 9)
-                                ? tof_res.distance_mm[idx] : 0;
+                            bool slot_valid = (j < nb) && (status == 5 || status == 9);
+                            int16_t raw = slot_valid ? tof_res.distance_mm[idx] : 0;
                             med_b[idx][med_idx_b] = raw;
                             snap.tof_b.distances[idx] = median3(med_b[idx][0], med_b[idx][1], med_b[idx][2]);
-                            snap.tof_b.sigma[idx] = tof_res.range_sigma_mm[idx];
-                            snap.tof_b.target_status[idx] = status;
+                            snap.tof_b.sigma[idx] = slot_valid ? tof_res.range_sigma_mm[idx] : 0;
+                            snap.tof_b.target_status[idx] = slot_valid ? status : 0;
                         }
-                        snap.tof_b.nb_target_detected[i] = tof_res.nb_target_detected[i];
+                        snap.tof_b.nb_target_detected[i] = nb;
                     }
                     med_idx_b = (med_idx_b + 1) % 3;
                 }

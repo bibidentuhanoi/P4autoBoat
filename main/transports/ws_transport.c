@@ -12,7 +12,7 @@
 static const char *TAG = "WS_TRANSPORT";
 
 #define WS_MAX_CLIENTS 4
-#define WS_SLOT_SIZE   1500
+#define WS_SLOT_SIZE   13000
 #define WS_TX_STACK    8192
 #define WS_TX_PRIORITY 3  /* below sensor tasks (4), above httpd (1) — consumer yields to producers */
 

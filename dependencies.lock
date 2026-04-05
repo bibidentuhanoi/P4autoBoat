@@ -223,7 +223,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.3
+    version: 5.4.3
   livekit/nanopb:
     component_hash: 5b3bd915d2eb2ad1a7bb4a3ca655c40f31bab5f4f48e75ec04e300dc9ab78f4d
     dependencies: []
