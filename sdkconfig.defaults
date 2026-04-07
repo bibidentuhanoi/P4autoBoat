@@ -33,15 +33,24 @@ CONFIG_WIFI_RMT_TX_BA_WIN=32
 CONFIG_WIFI_RMT_AMPDU_RX_ENABLED=y
 CONFIG_WIFI_RMT_RX_BA_WIN=32
 
-# --- LWIP tuning for throughput + stability over ESP-Hosted ---
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534
-CONFIG_LWIP_TCP_WND_DEFAULT=65534
+# --- LWIP tuning for stability over ESP-Hosted ---
+# 64KB TCP buffers exhausted internal SRAM → heap corruption under concurrent
+# MJPEG + WebSocket traffic.  4×MSS (5744) is sufficient for chunked MJPEG
+# and 13KB protobuf frames while keeping ~170KB of internal heap free.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
+CONFIG_LWIP_TCP_WND_DEFAULT=5744
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=8192
 CONFIG_LWIP_TCP_MSL=6000
 CONFIG_LWIP_TCP_OVERSIZE_MSS=y
+
+# --- Let lwip fall back to PSRAM when internal SRAM is tight ---
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# --- Heap poisoning (light) — catches corruption early, ~2% overhead ---
+CONFIG_HEAP_POISONING_LIGHT=y
 
 # --- Disable WiFi power save for lower latency / fewer drops ---
 CONFIG_ESP_WIFI_PS_NONE=y

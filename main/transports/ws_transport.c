@@ -136,6 +136,13 @@ static void ws_tx_task(void *arg)
         };
 
         for (int i = 0; i < count; i++) {
+            /* Verify fd is still a valid httpd session before async send.
+             * Between snapshot and here, the socket may have been closed and
+             * the fd recycled — sending to a recycled fd corrupts heap. */
+            if (httpd_sess_update_lru_counter(s_server, fds[i]) == ESP_ERR_NOT_FOUND) {
+                remove_client(fds[i]);
+                continue;
+            }
             esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
             if (ret != ESP_OK) {
                 ESP_LOGD(TAG, "Send failed fd=%d: %s", fds[i], esp_err_to_name(ret));
