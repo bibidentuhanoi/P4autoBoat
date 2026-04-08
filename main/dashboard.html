@@ -792,18 +792,19 @@ let _wsFallback = false;
 function startStream() {
   const img = $('cam-img');
   const host = _wsFallback ? ESP_FALLBACK : ESP_HOST;
-  const url = `http://${host}:81/stream`;
-  if (img.src === url) return;  // don't restart a working stream
-  console.log('[Stream]', `connecting to ${url}`);
+  const base = `http://${host}:81/stream`;
+  // Cache-bust to force browser to re-request (dead streams keep the old URL)
+  const url = `${base}?t=${Date.now()}`;
+  console.log('[Stream]', `connecting to ${base}`);
   img.crossOrigin = 'anonymous';  // required for canvas snap export (CORS set on port 81)
   img.src = url;
-  img.onload = () => console.log('[Stream]', 'first frame received');
+  _streamAlive = Date.now();
+  img.onload = () => { _streamAlive = Date.now(); };
   img.onerror = () => {
     console.log('[Stream]', `error loading from ${host}:81`);
     if (!_wsFallback && ESP_HOST !== ESP_FALLBACK) {
       _wsFallback = true;
-      console.log('[Stream]', `falling back to ${ESP_FALLBACK}:81`);
-      img.src = `http://${ESP_FALLBACK}:81/stream`;
+      startStream();
     }
   };
 }
@@ -891,7 +892,7 @@ setInterval(() => {
   msgCount = 0; lastRateTime = now;
 }, 2000);
 
-// ── Watchdog: detect WS stall only (stream is independent) ───────
+// ── Watchdog: detect WS stall and dead camera stream ─────────
 setInterval(() => {
   const now = Date.now();
   // WS: if no message for 6s but socket thinks it's open, kill it
@@ -899,6 +900,16 @@ setInterval(() => {
     const silent = ((now - _lastMsgAt) / 1000).toFixed(1);
     console.warn('[Watch]', `WS silent for ${silent}s, forcing reconnect`);
     ws.close();
+  }
+  // Stream: check if img is still receiving frames.
+  // For MJPEG, the browser keeps the connection open; if it dies
+  // naturalWidth stays at last value but no new frames arrive.
+  // Use _streamAlive (set on WS message receipt with sensor data)
+  // as proxy — if WS is alive but stream hasn't loaded in 10s, restart.
+  const img = $('cam-img');
+  if (img.src && now - _streamAlive > 10000) {
+    console.warn('[Watch]', 'Camera stream stale, restarting');
+    startStream();
   }
 }, 5000);
 

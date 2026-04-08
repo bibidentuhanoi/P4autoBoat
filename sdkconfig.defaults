@@ -32,11 +32,12 @@ CONFIG_WIFI_RMT_AMPDU_RX_ENABLED=y
 CONFIG_WIFI_RMT_RX_BA_WIN=32
 
 # --- LWIP tuning for stability over ESP-Hosted ---
-# 64KB TCP buffers exhausted internal SRAM → heap corruption under concurrent
-# MJPEG + WebSocket traffic.  4×MSS (5744) is sufficient for chunked MJPEG
-# and 13KB protobuf frames while keeping ~170KB of internal heap free.
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5744
-CONFIG_LWIP_TCP_WND_DEFAULT=5744
+# PSRAM fallback (SPIRAM_TRY_ALLOCATE_WIFI_LWIP) lets us use larger buffers
+# without exhausting internal SRAM.  16KB absorbs ToF frame bursts (3-5KB
+# at 20Hz) and avoids EAGAIN from buffer-full on flaky esp_hosted WiFi.
+# Tested stable — no heap issues with 7 sockets × 16KB + PSRAM fallback.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64

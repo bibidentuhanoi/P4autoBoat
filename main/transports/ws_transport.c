@@ -6,6 +6,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <string.h>
+#include <errno.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -22,6 +24,15 @@ static httpd_handle_t s_server = NULL;
 static int s_client_fds[WS_MAX_CLIENTS];
 static int s_client_count = 0;
 static SemaphoreHandle_t s_client_mutex = NULL;
+
+/* ---- Deferred-close queue (mutex-protected) ----
+ * httpd's close_fn runs in the httpd task while ws_tx_task may be inside
+ * send() on the same fd via esp_hosted.  Concurrent close()+send() corrupts
+ * esp_hosted's internal spinlock → WDT reset.  WS fds are queued here and
+ * closed by ws_tx_task after any in-flight send completes. */
+#define CLOSE_Q_SIZE  (WS_MAX_CLIENTS + 4)
+static int  s_close_fds[CLOSE_Q_SIZE];
+static int  s_close_count = 0;
 
 /* ---- Double-buffer slot: sensor writes one, TX task reads the other ---- */
 
@@ -112,43 +123,71 @@ static void ws_tx_task(void *arg)
     while (true) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
-        /* Snapshot the completed buffer before sensor can overwrite it */
+        /* ---- Send phase ---- */
         int read_idx = s_write_idx ^ 1;
         size_t len = s_slot_len[read_idx];
-        if (len == 0) continue;
-        memcpy(tx_buf, s_slot_buf[read_idx], len);
 
-        /* Snapshot client list under mutex */
-        int fds[WS_MAX_CLIENTS];
-        int count;
-        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-        count = s_client_count;
-        memcpy(fds, s_client_fds, count * sizeof(int));
-        xSemaphoreGive(s_client_mutex);
+        if (len > 0) {
+            memcpy(tx_buf, s_slot_buf[read_idx], len);
 
-        if (count == 0) continue;
+            int fds[WS_MAX_CLIENTS];
+            int count;
+            xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+            count = s_client_count;
+            memcpy(fds, s_client_fds, count * sizeof(int));
+            xSemaphoreGive(s_client_mutex);
 
-        httpd_ws_frame_t frame = {
-            .type    = HTTPD_WS_TYPE_BINARY,
-            .payload = tx_buf,
-            .len     = len,
-            .final   = true,
-        };
+            if (count > 0) {
+                httpd_ws_frame_t frame = {
+                    .type    = HTTPD_WS_TYPE_BINARY,
+                    .payload = tx_buf,
+                    .len     = len,
+                    .final   = true,
+                };
 
-        for (int i = 0; i < count; i++) {
-            /* Verify fd is still a valid httpd session before async send.
-             * Between snapshot and here, the socket may have been closed and
-             * the fd recycled — sending to a recycled fd corrupts heap. */
-            if (httpd_sess_update_lru_counter(s_server, fds[i]) == ESP_ERR_NOT_FOUND) {
-                remove_client(fds[i]);
-                continue;
-            }
-            esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
-            if (ret != ESP_OK) {
-                ESP_LOGD(TAG, "Send failed fd=%d: %s", fds[i], esp_err_to_name(ret));
-                remove_client(fds[i]);
+                for (int i = 0; i < count; i++) {
+                    if (httpd_sess_update_lru_counter(s_server, fds[i]) == ESP_ERR_NOT_FOUND) {
+                        ESP_LOGI(TAG, "Session gone fd=%d, removing", fds[i]);
+                        remove_client(fds[i]);
+                        continue;
+                    }
+
+                    /* Pre-check: is the socket writable?  If the TCP send
+                     * buffer is full, skip this frame entirely — avoids
+                     * triggering httpd's internal error handler which would
+                     * mark the session for teardown. */
+                    struct pollfd pfd = { .fd = fds[i], .events = POLLOUT };
+                    int pret = poll(&pfd, 1, 0);
+                    if (pret <= 0 || !(pfd.revents & POLLOUT)) {
+                        if (pfd.revents & (POLLERR | POLLHUP)) {
+                            ESP_LOGI(TAG, "Socket dead fd=%d (revents=0x%x)", fds[i], pfd.revents);
+                            remove_client(fds[i]);
+                        }
+                        /* else: just not writable yet, skip frame */
+                        continue;
+                    }
+
+                    esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
+                    if (ret != ESP_OK) {
+                        int err = errno;
+                        if (err == EAGAIN || err == EWOULDBLOCK || err == ENOMEM) {
+                            ESP_LOGD(TAG, "Backpressure fd=%d (errno=%d)", fds[i], err);
+                        } else {
+                            ESP_LOGI(TAG, "Send failed fd=%d: errno=%d", fds[i], err);
+                            remove_client(fds[i]);
+                        }
+                    }
+                }
             }
         }
+
+        /* ---- Drain deferred-close queue (safe: no send() in flight) ---- */
+        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+        for (int i = 0; i < s_close_count; i++) {
+            close(s_close_fds[i]);
+        }
+        s_close_count = 0;
+        xSemaphoreGive(s_client_mutex);
     }
 }
 
@@ -201,11 +240,37 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
 /* ---- Public API ---- */
 
-/* httpd close callback — fires for ALL socket closures (clean or dirty) */
+/* httpd close callback — fires for ALL socket closures (clean or dirty).
+ * ALWAYS defer close to ws_tx_task.  Even non-WS fds must be deferred:
+ * once closed, the OS can recycle the fd number for a new connection,
+ * and ws_tx_task might still be mid-send() on a different fd in the
+ * same loop iteration — if httpd accepts a new conn on the recycled fd
+ * while that send is in flight, esp_hosted corrupts. */
 void ws_transport_close_fd(httpd_handle_t hd, int fd)
 {
-    remove_client(fd);
-    close(fd);
+    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+
+    /* Remove from WS client list if present */
+    for (int i = 0; i < s_client_count; i++) {
+        if (s_client_fds[i] == fd) {
+            s_client_fds[i] = s_client_fds[s_client_count - 1];
+            s_client_count--;
+            ESP_LOGI(TAG, "Client removed (fd=%d, total=%d)", fd, s_client_count);
+            break;
+        }
+    }
+
+    /* Always defer — see comment above */
+    if (s_close_count < CLOSE_Q_SIZE) {
+        s_close_fds[s_close_count++] = fd;
+    } else {
+        ESP_LOGW(TAG, "close queue full, closing fd=%d in-place", fd);
+        close(fd);
+    }
+
+    xSemaphoreGive(s_client_mutex);
+
+    if (s_tx_task) xTaskNotifyGive(s_tx_task);
 }
 
 esp_err_t ws_transport_init(httpd_handle_t server)
@@ -216,6 +281,7 @@ esp_err_t ws_transport_init(httpd_handle_t server)
         s_client_mutex = NULL;
     }
     s_client_count = 0;
+    s_close_count  = 0;
     memset(s_client_fds, -1, sizeof(s_client_fds));
 
     s_client_mutex = xSemaphoreCreateMutex();

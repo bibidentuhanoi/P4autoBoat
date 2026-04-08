@@ -74,7 +74,18 @@ esp_err_t wifi_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Max TX power: 20 dBm (param is in 0.25 dBm units → 80) */
+    esp_err_t pwr_err = esp_wifi_set_max_tx_power(80);
+    if (pwr_err != ESP_OK) {
+        ESP_LOGW(TAG, "set_max_tx_power: %s (may need wifi started first)", esp_err_to_name(pwr_err));
+    } else {
+        int8_t actual;
+        esp_wifi_get_max_tx_power(&actual);
+        ESP_LOGI(TAG, "TX power set to %.1f dBm", actual * 0.25);
+    }
 
     ESP_LOGI(TAG, "Connecting to SSID: %s", CONFIG_WIFI_SSID);
 
