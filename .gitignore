@@ -79,6 +79,13 @@ CLAUDE.md
 # Documentation / example projects (not part of firmware)
 docs/
 
+# Vendor drops / nested git repos under tools/ — not part of this firmware's history.
+# tools/sdio_flasher and tools/slave_firmware are tracked and stay that way.
+tools/esp-detection/
+tools/esp-dl/
+tools/espdet_maritime_deploy/
+tools/yolo26n_esp/
+
 # User-specific configuration files
 *.user
 *.workspace # General workspace files, can be from various tools
