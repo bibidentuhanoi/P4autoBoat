@@ -1,4 +1,5 @@
 #include "sensor_fusion.h"
+#include "detect_task.h"
 #include "esp_timer.h"
 #include "math.h"
 #include <stdlib.h>
@@ -53,6 +54,7 @@ void task_imu_fusion(void *pvParameters) {
     int64_t last_time = esp_timer_get_time();
 
     while(1) {
+        while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
         int64_t now = esp_timer_get_time();
         float dt = (float)(now - last_time) / 1000000.0f;
         last_time = now;

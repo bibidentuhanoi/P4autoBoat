@@ -1,4 +1,5 @@
 #include "camera_stream.h"
+#include "detect_task.h"
 #include "drivers/camera_driver.h"
 #include "sdkconfig.h"
 #include "esp_log.h"
@@ -30,6 +31,7 @@ static volatile bool s_client_streaming = false;
 static void camera_drain_task(void *pvParameters)
 {
     while (true) {
+        if (g_inference_active) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
         if (!s_client_streaming) {
             camera_drain_frame();
         }
@@ -50,6 +52,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     while (true) {
+        while (g_inference_active) { vTaskDelay(pdMS_TO_TICKS(50)); } /* yield during inference */
         ret = camera_capture_frame(&frame_buf, &frame_len, NULL, NULL, NULL);
         if (ret != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -76,7 +79,6 @@ static esp_err_t stream_handler(httpd_req_t *req)
     }
 
     s_client_streaming = false;
-
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }

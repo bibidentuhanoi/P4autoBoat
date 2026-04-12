@@ -12,6 +12,7 @@
  * ═══════════════════════════════════════════════════════════════ */
 
 #include "sensor_task.h"
+#include "detect_task.h"
 #include "pipeline.h"
 #include "sensor_fusion.h"
 #include "esp_log.h"
@@ -54,6 +55,9 @@ void task_sensor_snapshot(void *pvParameters)
              1000 / SNAPSHOT_INTERVAL_MS / TOF_EVERY_N);
 
     while (true) {
+        /* Yield while inference is running — avoid DMA/PSRAM contention */
+        while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+
         snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
         snap.timestamp_us = (uint64_t)esp_timer_get_time();
 

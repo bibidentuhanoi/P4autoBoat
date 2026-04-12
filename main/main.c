@@ -77,7 +77,10 @@ void app_main(void) {
 
     // 3. Initialize Camera — programs OV5647 over SCCB bus
     ESP_LOGI(TAG, "Initializing camera...");
-    ESP_ERROR_CHECK(camera_init(sccb_handle));
+    bool camera_ok = (camera_init(sccb_handle) == ESP_OK);
+    if (!camera_ok) {
+        ESP_LOGW(TAG, "Camera init failed — streaming disabled, sensors still run");
+    }
 
     // 3b. esp_video attached its OV5647 device to sccb_handle internally — i2c_del_master_bus
     //     would fail with ESP_ERR_INVALID_STATE. We don't need to delete: once camera_init()
@@ -156,7 +159,9 @@ void app_main(void) {
         ESP_LOGW(TAG, "WiFi unavailable (%s) — camera stream disabled", esp_err_to_name(wifi_ret));
     } else {
         // 11. Start servers — stream on port 81, API/dashboard on port 80
-        ESP_ERROR_CHECK(camera_stream_server_start());
+        if (camera_ok) {
+            ESP_ERROR_CHECK(camera_stream_server_start());
+        }
         ESP_ERROR_CHECK(http_server_start());
     }
 

@@ -20,6 +20,7 @@ extern "C" {
 #include "dl_image_define.hpp"
 #include "dl_image_jpeg.hpp"
 
+volatile bool g_inference_active = false;
 static const char *TAG = "DETECT";
 
 static TaskHandle_t s_detect_task = NULL;
@@ -74,14 +75,29 @@ static void detect_task_fn(void *arg)
         }
 
         ESP_LOGI(TAG, "=== Step 3: decoded %dx%d RGB888 ===", img.width, img.height);
+
+        /* 3a. Rotate 180° — camera is physically inverted (PPA removed).
+         *     Reverse pixel order in-place: swap pixel[i] with pixel[N-1-i]. */
+        {
+            uint8_t *px = (uint8_t *)img.data;
+            int npix = img.width * img.height;
+            for (int i = 0; i < npix / 2; i++) {
+                int j = npix - 1 - i;
+                uint8_t r = px[i*3]; uint8_t g = px[i*3+1]; uint8_t b = px[i*3+2];
+                px[i*3] = px[j*3]; px[i*3+1] = px[j*3+1]; px[i*3+2] = px[j*3+2];
+                px[j*3] = r; px[j*3+1] = g; px[j*3+2] = b;
+            }
+            ESP_LOGI(TAG, "=== Step 3a: rotated 180 ===");
+        }
         LOG_HEAP();
 
-        /* 3. Stop WiFi to eliminate SDIO DMA during inference.
-         *    SDIO DMA corrupts PSRAM heap metadata (TLSF free list)
+        /* 3b. Stop the world — freeze all DMA-touching tasks + WiFi.
+         *    SDIO/ISP/I2C DMA corrupts PSRAM heap metadata (TLSF free list)
          *    when esp-dl allocates scratch buffers concurrently. */
-        ESP_LOGI(TAG, "=== Step 4: stopping WiFi for inference ===");
-        esp_wifi_stop();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "=== Step 4: freezing tasks + disconnecting WiFi ===");
+        g_inference_active = true;
+        esp_wifi_disconnect();  /* stops SDIO data DMA but keeps TCP stack alive */
+        vTaskDelay(pdMS_TO_TICKS(500)); /* let SDIO DMA drain */
 
         ESP_LOGI(TAG, "=== Step 4: running inference ===");
         LOG_HEAP();
@@ -92,9 +108,10 @@ static void detect_task_fn(void *arg)
 
         heap_caps_free(img.data);
 
-        /* Restart WiFi — reconnect happens automatically via event handler */
-        ESP_LOGI(TAG, "=== Step 5: restarting WiFi ===");
-        esp_wifi_start();
+        /* Resume — reconnect WiFi, tasks resume */
+        ESP_LOGI(TAG, "=== Step 5: reconnecting WiFi + resuming tasks ===");
+        esp_wifi_connect();
+        g_inference_active = false;
 
         ESP_LOGI(TAG, "Inference done in %lld ms: %d detections",
                  infer_ms, (int)results.size());
@@ -134,6 +151,7 @@ extern "C" esp_err_t detect_init(void)
     ESP_LOGI(TAG, "Preloading cat_detect model...");
     LOG_HEAP();
     s_detector = new CatDetect();
+    s_detector->set_score_thr(0.3f);
 
     /* Force actual model load with a tiny dummy inference */
     uint8_t dummy_pixel[3] = {0, 0, 0};

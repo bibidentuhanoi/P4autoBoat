@@ -1,5 +1,6 @@
 #include "http_server.h"
 #include "transports/ws_transport.h"
+#include "drivers/camera_driver.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
@@ -17,6 +18,22 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, (const char *)dashboard_html_start,
                            dashboard_html_end - dashboard_html_start);
+}
+
+static esp_err_t snapshot_handler(httpd_req_t *req)
+{
+    void *buf = NULL;
+    size_t len = 0;
+    esp_err_t ret = camera_capture_frame(&buf, &len, NULL, NULL, NULL);
+    if (ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "capture failed");
+        return ret;
+    }
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    ret = httpd_resp_send(req, (const char *)buf, (ssize_t)len);
+    camera_release_frame();
+    return ret;
 }
 
 esp_err_t http_server_start(void)
@@ -53,6 +70,12 @@ esp_err_t http_server_start(void)
         return ret;
     }
 
+    const httpd_uri_t snapshot_uri = {
+        .uri = "/snapshot", .method = HTTP_GET,
+        .handler = snapshot_handler, .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &snapshot_uri);
+
     ret = ws_transport_init(server);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ws_transport_init failed: %s", esp_err_to_name(ret));
@@ -60,7 +83,7 @@ esp_err_t http_server_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "HTTP server ready on port %d: / (dashboard), /ws (protobuf)",
+    ESP_LOGI(TAG, "HTTP server ready on port %d: / /snapshot /ws",
              CONFIG_HTTP_API_PORT);
     return ESP_OK;
 }
