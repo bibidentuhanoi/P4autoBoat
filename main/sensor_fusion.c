@@ -1,6 +1,7 @@
 #include "sensor_fusion.h"
 #include "esp_timer.h"
 #include "math.h"
+#include <stdlib.h>
 #include <string.h>
 
 // Configuration macros will be provided by Kconfig in the future,
@@ -25,6 +26,12 @@ static float alpha;
 void fusion_init(CalibrationData* calib_data) {
     calib = calib_data;
     fusion_mutex = xSemaphoreCreateMutex();
+
+    // Parse alpha once — was strtof() every 20ms tick (Bug 4)
+    alpha = strtof(CONFIG_FUSION_COMPLEMENTARY_ALPHA, NULL);
+    if (alpha <= 0.0f || alpha >= 1.0f) {
+        alpha = 0.96f;
+    }
 
     // Initialize state with tares
     pitch = calib->pitch_tare;
@@ -84,11 +91,7 @@ void task_imu_fusion(void *pvParameters) {
             }
             float acc_pitch = atan2f(-raw_ax, acc_denom) * RAD_TO_DEG;
 
-            // Simple complementary filter
-            alpha = strtof(CONFIG_FUSION_COMPLEMENTARY_ALPHA, NULL);
-            if (alpha <= 0.0f || alpha >= 1.0f) {
-                alpha = 0.96f; // Fallback safety
-            }
+            // Simple complementary filter (alpha parsed once in fusion_init)
 
             roll  = alpha * (roll  + gx_rate * dt) + (1.0f - alpha) * acc_roll;
             pitch = alpha * (pitch + gy_rate * dt) + (1.0f - alpha) * acc_pitch;

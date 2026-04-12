@@ -5,6 +5,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/event_groups.h"
 
 static const char *TAG = "WIFI";
@@ -23,14 +24,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_count < MAX_RETRIES) {
-            esp_wifi_connect();
-            s_retry_count++;
-            ESP_LOGI(TAG, "Retrying WiFi (%d/%d)...", s_retry_count, MAX_RETRIES);
-        } else {
-            xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
-            ESP_LOGE(TAG, "WiFi connection failed after %d retries", MAX_RETRIES);
-        }
+        s_retry_count++;
+        /* Fast retries first, then back off to 10s — never give up */
+        int delay_ms = (s_retry_count <= MAX_RETRIES) ? 1000 : 10000;
+        ESP_LOGI(TAG, "WiFi disconnected, retry %d in %dms...", s_retry_count, delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
@@ -51,7 +50,12 @@ esp_err_t wifi_init(void)
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_err_t wifi_err = esp_wifi_init(&cfg);
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s (esp_hosted slave down?)",
+                 esp_err_to_name(wifi_err));
+        return wifi_err;
+    }
 
     esp_event_handler_instance_t inst_any_id;
     esp_event_handler_instance_t inst_got_ip;

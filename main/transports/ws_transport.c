@@ -39,6 +39,7 @@ static int  s_close_count = 0;
 static uint8_t  s_slot_buf[2][WS_SLOT_SIZE];
 static size_t   s_slot_len[2];
 static volatile int s_write_idx = 0;
+static SemaphoreHandle_t s_slot_mutex = NULL;
 static TaskHandle_t s_tx_task = NULL;
 
 static void add_client(int fd)
@@ -96,12 +97,12 @@ static esp_err_t ws_transport_send(const uint8_t *buf, size_t len, void *ctx)
     (void)ctx;
     if (len > WS_SLOT_SIZE) return ESP_ERR_INVALID_SIZE;
 
+    xSemaphoreTake(s_slot_mutex, portMAX_DELAY);
     int idx = s_write_idx;
     memcpy(s_slot_buf[idx], buf, len);
     s_slot_len[idx] = len;
-
-    /* Flip: TX task will read this buffer; next sensor write goes to the other */
     s_write_idx = idx ^ 1;
+    xSemaphoreGive(s_slot_mutex);
 
     /* Wake TX task */
     if (s_tx_task) {
@@ -109,6 +110,53 @@ static esp_err_t ws_transport_send(const uint8_t *buf, size_t len, void *ctx)
     }
 
     return ESP_OK;
+}
+
+/* ---- Queued send: runs inside httpd task context (thread-safe) ---- */
+
+typedef struct {
+    uint8_t *buf;
+    size_t   len;
+    int      fds[WS_MAX_CLIENTS];
+    int      count;
+} ws_queued_send_arg_t;
+
+static void ws_queued_send(void *arg)
+{
+    ws_queued_send_arg_t *a = (ws_queued_send_arg_t *)arg;
+
+    httpd_ws_frame_t frame = {
+        .type    = HTTPD_WS_TYPE_BINARY,
+        .payload = a->buf,
+        .len     = a->len,
+        .final   = true,
+    };
+
+    for (int i = 0; i < a->count; i++) {
+        /* Session check + send — safe because we're in the httpd task */
+        if (httpd_sess_update_lru_counter(s_server, a->fds[i]) == ESP_ERR_NOT_FOUND) {
+            remove_client(a->fds[i]);
+            continue;
+        }
+
+        /* Pre-check: is the socket writable? */
+        struct pollfd pfd = { .fd = a->fds[i], .events = POLLOUT };
+        int pret = poll(&pfd, 1, 0);
+        if (pret <= 0 || !(pfd.revents & POLLOUT)) {
+            if (pfd.revents & (POLLERR | POLLHUP)) {
+                remove_client(a->fds[i]);
+            }
+            continue;
+        }
+
+        esp_err_t ret = httpd_ws_send_frame_async(s_server, a->fds[i], &frame);
+        if (ret != ESP_OK) {
+            int err = errno;
+            if (err != EAGAIN && err != EWOULDBLOCK && err != ENOMEM) {
+                remove_client(a->fds[i]);
+            }
+        }
+    }
 }
 
 /* ---- TX task: drains the latest slot over WiFi ---- */
@@ -120,16 +168,23 @@ static void ws_tx_task(void *arg)
     /* Local copy — sensor can freely overwrite the slot while we send */
     static uint8_t tx_buf[WS_SLOT_SIZE];
 
+    /* Queued-send argument — static because ws_tx_task waits for
+     * notification before reusing, so it stays alive across the queue call */
+    static ws_queued_send_arg_t send_arg;
+
     while (true) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
-        /* ---- Send phase ---- */
+        /* ---- Copy slot under mutex ---- */
+        xSemaphoreTake(s_slot_mutex, portMAX_DELAY);
         int read_idx = s_write_idx ^ 1;
         size_t len = s_slot_len[read_idx];
-
         if (len > 0) {
             memcpy(tx_buf, s_slot_buf[read_idx], len);
+        }
+        xSemaphoreGive(s_slot_mutex);
 
+        if (len > 0) {
             int fds[WS_MAX_CLIENTS];
             int count;
             xSemaphoreTake(s_client_mutex, portMAX_DELAY);
@@ -138,46 +193,14 @@ static void ws_tx_task(void *arg)
             xSemaphoreGive(s_client_mutex);
 
             if (count > 0) {
-                httpd_ws_frame_t frame = {
-                    .type    = HTTPD_WS_TYPE_BINARY,
-                    .payload = tx_buf,
-                    .len     = len,
-                    .final   = true,
-                };
+                /* Queue the send to run inside the httpd task — avoids
+                 * cross-task access to httpd session internals. */
+                send_arg.buf   = tx_buf;
+                send_arg.len   = len;
+                send_arg.count = count;
+                memcpy(send_arg.fds, fds, count * sizeof(int));
 
-                for (int i = 0; i < count; i++) {
-                    if (httpd_sess_update_lru_counter(s_server, fds[i]) == ESP_ERR_NOT_FOUND) {
-                        ESP_LOGI(TAG, "Session gone fd=%d, removing", fds[i]);
-                        remove_client(fds[i]);
-                        continue;
-                    }
-
-                    /* Pre-check: is the socket writable?  If the TCP send
-                     * buffer is full, skip this frame entirely — avoids
-                     * triggering httpd's internal error handler which would
-                     * mark the session for teardown. */
-                    struct pollfd pfd = { .fd = fds[i], .events = POLLOUT };
-                    int pret = poll(&pfd, 1, 0);
-                    if (pret <= 0 || !(pfd.revents & POLLOUT)) {
-                        if (pfd.revents & (POLLERR | POLLHUP)) {
-                            ESP_LOGI(TAG, "Socket dead fd=%d (revents=0x%x)", fds[i], pfd.revents);
-                            remove_client(fds[i]);
-                        }
-                        /* else: just not writable yet, skip frame */
-                        continue;
-                    }
-
-                    esp_err_t ret = httpd_ws_send_frame_async(s_server, fds[i], &frame);
-                    if (ret != ESP_OK) {
-                        int err = errno;
-                        if (err == EAGAIN || err == EWOULDBLOCK || err == ENOMEM) {
-                            ESP_LOGD(TAG, "Backpressure fd=%d (errno=%d)", fds[i], err);
-                        } else {
-                            ESP_LOGI(TAG, "Send failed fd=%d: errno=%d", fds[i], err);
-                            remove_client(fds[i]);
-                        }
-                    }
-                }
+                httpd_queue_work(s_server, ws_queued_send, &send_arg);
             }
         }
 
@@ -290,6 +313,12 @@ esp_err_t ws_transport_init(httpd_handle_t server)
         return ESP_ERR_NO_MEM;
     }
 
+    s_slot_mutex = xSemaphoreCreateMutex();
+    if (!s_slot_mutex) {
+        ESP_LOGE(TAG, "Failed to create slot mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Register WS URI */
     static const httpd_uri_t ws_uri = {
         .uri            = "/ws",
@@ -319,4 +348,13 @@ esp_err_t ws_transport_init(httpd_handle_t server)
 
     ESP_LOGI(TAG, "WebSocket transport ready on /ws (max %d clients)", WS_MAX_CLIENTS);
     return ESP_OK;
+}
+
+int ws_transport_client_count(void)
+{
+    if (!s_client_mutex) return 0;
+    xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+    int count = s_client_count;
+    xSemaphoreGive(s_client_mutex);
+    return count;
 }

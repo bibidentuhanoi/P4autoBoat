@@ -12,7 +12,8 @@
 #include "esp_video_init.h"
 #include "driver/jpeg_encode.h"
 #include "driver/jpeg_types.h"
-#include "driver/ppa.h"
+/* PPA removed — eliminates 2 DMA hops per frame (PPA read + PPA write).
+ * Rotation handled in dashboard CSS instead. */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "camera_driver.h"
@@ -33,9 +34,6 @@ static jpeg_encoder_handle_t  s_jpeg_enc;
 static uint8_t               *s_jpeg_buf;
 static uint32_t               s_jpeg_buf_size;
 static uint32_t               s_jpeg_out_len;
-static ppa_client_handle_t    s_ppa_srm;
-static uint8_t               *s_ppa_out_buf;
-static uint32_t               s_ppa_out_buf_size;
 static bool                   s_streaming;
 
 esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
@@ -123,14 +121,20 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
         ESP_GOTO_ON_ERROR(jpeg_new_encoder_engine(&eng_cfg, &s_jpeg_enc),
                           cleanup, TAG, "jpeg_new_encoder_engine failed");
 
-        s_jpeg_buf_size = s_cam_width * s_cam_height * 2;
-        s_jpeg_buf = heap_caps_malloc(s_jpeg_buf_size,
-                                      MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM | MALLOC_CAP_CACHE_ALIGNED);
+        /* DMA-aware allocation — jpeg_alloc_encoder_mem returns properly
+         * aligned memory for the JPEG DMA engine (matches simple_video_server). */
+        jpeg_encode_memory_alloc_cfg_t jpeg_mem_cfg = {
+            .buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER,
+        };
+        size_t jpeg_alloc_size = 0;
+        s_jpeg_buf = (uint8_t *)jpeg_alloc_encoder_mem(
+            s_cam_width * s_cam_height * 2, &jpeg_mem_cfg, &jpeg_alloc_size);
         if (!s_jpeg_buf) {
-            ESP_LOGE(TAG, "JPEG output buffer alloc failed (%"PRIu32" bytes)", s_jpeg_buf_size);
+            ESP_LOGE(TAG, "JPEG output buffer alloc failed");
             ret = ESP_ERR_NO_MEM;
             goto cleanup;
         }
+        s_jpeg_buf_size = jpeg_alloc_size;
 
         /* Report format as JPEG to upper layers — stream code checks this. */
         s_cam_pixel_format = V4L2_PIX_FMT_JPEG;
@@ -138,30 +142,7 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
                  CONFIG_CAM_JPEG_QUALITY, s_jpeg_buf_size);
     }
 
-    /* 6. Init PPA SRM client for 180° rotation (mirror_x + mirror_y).
-     *    Runs on dedicated DMA2D hardware — zero CPU cost per frame. */
-    {
-        ppa_client_config_t ppa_cfg = {
-            .oper_type = PPA_OPERATION_SRM,
-        };
-        ESP_GOTO_ON_ERROR(ppa_register_client(&ppa_cfg, &s_ppa_srm),
-                          cleanup, TAG, "ppa_register_client failed");
-
-        s_ppa_out_buf_size = s_cam_width * s_cam_height * 2;
-        /* Round size up to L2 cache line (128B) — PPA requires buffer addr AND size
-         * to be cache-line-aligned. L2 line is 128B per CONFIG_CACHE_L2_CACHE_LINE_128B. */
-        s_ppa_out_buf_size = (s_ppa_out_buf_size + 127) & ~((uint32_t)127);
-        s_ppa_out_buf = heap_caps_aligned_calloc(128, 1, s_ppa_out_buf_size,
-                                                  MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
-        if (!s_ppa_out_buf) {
-            ESP_LOGE(TAG, "PPA output buffer alloc failed (%"PRIu32" bytes)", s_ppa_out_buf_size);
-            ret = ESP_ERR_NO_MEM;
-            goto cleanup;
-        }
-        ESP_LOGI(TAG, "PPA SRM ready for 180 deg rotation");
-    }
-
-    /* 7. Request mmap buffers */
+    /* 6. Request mmap buffers */
     {
         struct v4l2_requestbuffers req;
         memset(&req, 0, sizeof(req));
@@ -209,14 +190,6 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
     return ESP_OK;
 
 cleanup:
-    if (s_ppa_out_buf) {
-        free(s_ppa_out_buf);
-        s_ppa_out_buf = NULL;
-    }
-    if (s_ppa_srm) {
-        ppa_unregister_client(s_ppa_srm);
-        s_ppa_srm = NULL;
-    }
     if (s_jpeg_buf) {
         free(s_jpeg_buf);
         s_jpeg_buf = NULL;
@@ -255,46 +228,10 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    /* Rotate 180° via PPA hardware (mirror_x + mirror_y on RGB565 after ISP). */
+    /* ISP buffer → JPEG directly (no PPA rotation — handled in dashboard CSS).
+     * This eliminates 2 DMA hops per frame vs the old PPA path. */
     uint8_t *rgb_buf = s_cam_buf[s_current_buf.index];
     uint32_t rgb_len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
-    {
-        ppa_srm_oper_config_t srm_cfg = {
-            .in = {
-                .buffer       = rgb_buf,
-                .pic_w        = s_cam_width,
-                .pic_h        = s_cam_height,
-                .block_w      = s_cam_width,
-                .block_h      = s_cam_height,
-                .block_offset_x = 0,
-                .block_offset_y = 0,
-                .srm_cm       = PPA_SRM_COLOR_MODE_RGB565,
-            },
-            .out = {
-                .buffer       = s_ppa_out_buf,
-                .buffer_size  = s_ppa_out_buf_size,
-                .pic_w        = s_cam_width,
-                .pic_h        = s_cam_height,
-                .block_offset_x = 0,
-                .block_offset_y = 0,
-                .srm_cm       = PPA_SRM_COLOR_MODE_RGB565,
-            },
-            .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-            .scale_x        = 1.0,
-            .scale_y        = 1.0,
-            .mirror_x       = true,
-            .mirror_y       = true,
-            .mode           = PPA_TRANS_MODE_BLOCKING,
-        };
-        esp_err_t ppa_ret = ppa_do_scale_rotate_mirror(s_ppa_srm, &srm_cfg);
-        if (ppa_ret != ESP_OK) {
-            ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
-            ESP_LOGW(TAG, "PPA rotate failed: %s", esp_err_to_name(ppa_ret));
-            return ESP_ERR_INVALID_RESPONSE;
-        }
-        rgb_buf = s_ppa_out_buf;
-        rgb_len = s_ppa_out_buf_size;
-    }
 
     /* Encode RGB565 → JPEG using HW encoder. */
     jpeg_encode_cfg_t enc_cfg = {
