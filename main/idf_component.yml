@@ -15,3 +15,7 @@ dependencies:
   ## Protobuf encoding for telemetry pipeline
   livekit/nanopb:
     version: "^0.4.9"
+  ## esp-dl cat detection model (pico 224x224)
+  espressif/cat_detect:
+    version: "*"
+    override_path: "../tools/esp-dl/models/cat_detect"

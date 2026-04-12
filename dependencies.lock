@@ -1,4 +1,13 @@
 dependencies:
+  espressif/cat_detect:
+    dependencies:
+    - name: espressif/esp-dl
+      override_path: ../../esp-dl
+      version: ~3.3.0
+    source:
+      path: /workspaces/BoatEspP4/tools/esp-dl/models/cat_detect
+      type: local
+    version: 0.2.1
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -9,6 +18,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.5.3
+  espressif/dl_fft:
+    component_hash: 7dadbd644c0d7ba4733cc3726ec4cff6edf27b043725e1115861dec1609a3d28
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.3.1
   espressif/eppp_link:
     component_hash: 9472e6825f4bb71eca2b39cf1bc92659c1ac60bfd7416560ad033a7dd8641b17
     dependencies:
@@ -23,6 +42,43 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.4
+  espressif/esp-dl:
+    dependencies:
+    - matches:
+      - if: target in ["esp32", "esp32c2", "esp32c3", "esp32c6", "esp32p4", "esp32s2", "esp32s3"]
+        version: '>=5.3'
+      - if: target == esp32c5
+        version: '>=5.5'
+      name: idf
+    - name: espressif/esp_new_jpeg
+      version: '>=0.6.1'
+    - name: espressif/dl_fft
+      version: '>=0.3.1'
+    - name: espressif/esp-dsp
+      version: ==1.7.0
+    source:
+      path: /workspaces/BoatEspP4/tools/esp-dl/esp-dl
+      type: local
+    targets:
+    - esp32
+    - esp32c2
+    - esp32c3
+    - esp32c5
+    - esp32c6
+    - esp32p4
+    - esp32s2
+    - esp32s3
+    version: 3.3.0
+  espressif/esp-dsp:
+    component_hash: 42dce32d46ac93dc11f60d368e29a830e9661c7345d794b8a45c343479cae636
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.0
   espressif/esp_cam_sensor:
     component_hash: 902c305b77f7c42b60fff5a084e397694f8a3fd6e6b72299996a7c856666e983
     dependencies:
@@ -242,12 +298,13 @@ dependencies:
       type: service
     version: 4.0.0
 direct_dependencies:
+- espressif/cat_detect
 - espressif/esp_new_jpeg
 - espressif/esp_video
 - espressif/esp_wifi_remote
 - idf
 - livekit/nanopb
 - rjrp44/vl53l5cx
-manifest_hash: 2e7feee0624cf0e4c6fa948ea0698200aa5d4f48b71b233cd9e2719f66a13339
+manifest_hash: b5b2ae6436e02a32923b6ed67ddca5b0143873089a62d81ee6820807407d554c
 target: esp32p4
 version: 2.0.0
