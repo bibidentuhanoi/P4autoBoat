@@ -6,12 +6,19 @@ extern "C" {
 #include "proto/boat.pb.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 }
 
+#define LOG_HEAP() ESP_LOGI(TAG, "  heap: internal=%u PSRAM=%u", \
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), \
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM))
+
 #include "cat_detect.hpp"
 #include "dl_image_define.hpp"
+#include "dl_image_jpeg.hpp"
 
 static const char *TAG = "DETECT";
 
@@ -27,54 +34,74 @@ static void detect_task_fn(void *arg)
 
         int64_t t0 = esp_timer_get_time();
 
-        /* Lazy-load model on first trigger */
-        if (!s_detector) {
-            ESP_LOGI(TAG, "Loading cat_detect model (first trigger)...");
-            int64_t load_start = esp_timer_get_time();
-            s_detector = new CatDetect();
-            ESP_LOGI(TAG, "Model loaded in %lld ms",
-                     (esp_timer_get_time() - load_start) / 1000);
+        ESP_LOGI(TAG, "=== Step 0: trigger received ===");
+        LOG_HEAP();
+
+        /* 1. Capture JPEG frame */
+        ESP_LOGI(TAG, "=== Step 2: capturing frame ===");
+        void *jpeg_buf = NULL;
+        size_t jpeg_len = 0;
+        uint32_t width = 0, height = 0, pix_fmt = 0;
+        esp_err_t cap_ret = ESP_FAIL;
+
+        for (int attempt = 0; attempt < 10; attempt++) {
+            cap_ret = camera_capture_frame(&jpeg_buf, &jpeg_len, &width, &height, &pix_fmt);
+            if (cap_ret == ESP_OK) break;
+            ESP_LOGW(TAG, "  capture attempt %d failed", attempt);
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-
-        /* 1. Pause MJPEG streaming */
-        camera_stop_streaming();
-        vTaskDelay(pdMS_TO_TICKS(50));
-
-        /* 2. Restart streaming briefly to get a fresh frame, then capture raw */
-        camera_start_streaming();
-        vTaskDelay(pdMS_TO_TICKS(100));
-
-        void *raw_buf = NULL;
-        size_t raw_len = 0;
-        uint32_t width = 0, height = 0;
-
-        esp_err_t cap_ret = camera_capture_raw(&raw_buf, &raw_len, &width, &height);
         if (cap_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Raw frame capture failed: %s", esp_err_to_name(cap_ret));
-            camera_start_streaming();
+            ESP_LOGE(TAG, "Frame capture failed after retries");
             continue;
         }
 
-        ESP_LOGI(TAG, "Captured raw %" PRIu32 "x%" PRIu32 " RGB565 (%u bytes)",
-                 width, height, (unsigned)raw_len);
+        ESP_LOGI(TAG, "=== Step 2: captured %" PRIu32 "x%" PRIu32 " JPEG (%u bytes) ===",
+                 width, height, (unsigned)jpeg_len);
+        LOG_HEAP();
 
-        /* 3. Run inference */
-        dl::image::img_t img = {
-            .data     = raw_buf,
-            .width    = (uint16_t)width,
-            .height   = (uint16_t)height,
-            .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
+        /* 2. Decode JPEG → RGB888 */
+        ESP_LOGI(TAG, "=== Step 3: decoding JPEG ===");
+        dl::image::jpeg_img_t jpeg_img = {
+            .data = jpeg_buf,
+            .data_len = jpeg_len,
         };
+        auto img = dl::image::sw_decode_jpeg(jpeg_img, dl::image::DL_IMAGE_PIX_TYPE_RGB888);
+        camera_release_frame();
 
+        if (!img.data) {
+            ESP_LOGE(TAG, "JPEG decode returned NULL");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "=== Step 3: decoded %dx%d RGB888 ===", img.width, img.height);
+        LOG_HEAP();
+
+        /* 3. Stop WiFi to eliminate SDIO DMA during inference.
+         *    SDIO DMA corrupts PSRAM heap metadata (TLSF free list)
+         *    when esp-dl allocates scratch buffers concurrently. */
+        ESP_LOGI(TAG, "=== Step 4: stopping WiFi for inference ===");
+        esp_wifi_stop();
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        ESP_LOGI(TAG, "=== Step 4: running inference ===");
+        LOG_HEAP();
         int64_t infer_start = esp_timer_get_time();
         auto &results = s_detector->run(img);
         int64_t infer_ms = (esp_timer_get_time() - infer_start) / 1000;
+        ESP_LOGI(TAG, "=== Step 4: inference done in %lld ms ===", infer_ms);
+
+        heap_caps_free(img.data);
+
+        /* Restart WiFi — reconnect happens automatically via event handler */
+        ESP_LOGI(TAG, "=== Step 5: restarting WiFi ===");
+        esp_wifi_start();
 
         ESP_LOGI(TAG, "Inference done in %lld ms: %d detections",
                  infer_ms, (int)results.size());
 
         /* 4. Package results into protobuf */
-        boat_SensorSnapshot snap = boat_SensorSnapshot_init_zero;
+        static boat_SensorSnapshot snap;
+        memset(&snap, 0, sizeof(snap));
         snap.timestamp_us = (uint64_t)esp_timer_get_time();
         snap.detections_count = 0;
 
@@ -92,11 +119,7 @@ static void detect_task_fn(void *arg)
                      r.category, r.score, r.box[0], r.box[1], r.box[2], r.box[3]);
         }
 
-        /* 5. Release frame and resume streaming */
-        camera_release_frame();
-        camera_start_streaming();
-
-        /* 6. Publish results */
+        /* 5. Publish results */
         pipeline_publish_sensors(&snap);
 
         int64_t total_ms = (esp_timer_get_time() - t0) / 1000;
@@ -106,7 +129,25 @@ static void detect_task_fn(void *arg)
 
 extern "C" esp_err_t detect_init(void)
 {
-    BaseType_t ret = xTaskCreate(detect_task_fn, "Detect", 8192,
+    /* Preload model NOW (before WiFi starts) — allocates PSRAM bulk
+     * blocks without SDIO DMA interference. */
+    ESP_LOGI(TAG, "Preloading cat_detect model...");
+    LOG_HEAP();
+    s_detector = new CatDetect();
+
+    /* Force actual model load with a tiny dummy inference */
+    uint8_t dummy_pixel[3] = {0, 0, 0};
+    dl::image::img_t dummy_img = {
+        .data = dummy_pixel,
+        .width = 1,
+        .height = 1,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
+    };
+    s_detector->run(dummy_img);
+    ESP_LOGI(TAG, "Model preloaded and warm");
+    LOG_HEAP();
+
+    BaseType_t ret = xTaskCreate(detect_task_fn, "Detect", 32768,
                                   NULL, 5, &s_detect_task);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create detect task");

@@ -108,7 +108,10 @@ void pipeline_publish_status(const boat_SystemStatus *status)
 
 void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 {
-    boat_BoatMessage msg = boat_BoatMessage_init_zero;
+    /* Static — boat_BoatMessage is ~6.5KB after ToF array expansion to 256.
+     * httpd task stack is only 4KB. Safe: called only from httpd task context. */
+    static boat_BoatMessage msg;
+    memset(&msg, 0, sizeof(msg));
     pb_istream_t stream = pb_istream_from_buffer(buf, len);
 
     if (!pb_decode(&stream, boat_BoatMessage_fields, &msg)) {
