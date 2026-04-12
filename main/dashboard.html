@@ -226,7 +226,7 @@
 
 <div class="grid">
   <div class="card" id="camera-card">
-    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<span style="display:flex;gap:6px;"><button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button><button id="snap-overlay-btn" style="background:var(--border);color:var(--accent);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap+Overlay</button></span></div>
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<span style="display:flex;gap:6px;"><button id="detect-btn" style="background:var(--border);color:#0f0;border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Detect</button><button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button><button id="snap-overlay-btn" style="background:var(--border);color:var(--accent);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap+Overlay</button></span></div>
     <div id="cam-container">
       <img id="cam-img" src="" alt="No stream" />
       <canvas id="tof-overlay"></canvas>
@@ -267,10 +267,12 @@ syntax = "proto3";
 package boat;
 message IMUData { float pitch = 1; float roll = 2; float heading = 3; }
 message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
-message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; }
+message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
+message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; }
 message MotorCommand { float throttle = 1; float rudder = 2; }
+message DetectCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -855,6 +857,24 @@ function connectWS() {
         if (s.tofA) drawTof('tof-a', s.tofA, FLIP.flipHA, FLIP.flipVA, FLIP.transA);
         if (s.tofB) drawTof('tof-b', s.tofB, FLIP.flipHB, FLIP.flipVB, FLIP.transB);
         if (s.tofA || s.tofB) renderOverlay(s.tofA, s.tofB);
+        if (s.detections && s.detections.length > 0) {
+          const canvas = $('tof-overlay');
+          const ctx = canvas.getContext('2d');
+          const sx = canvas.width / 800;
+          const sy = canvas.height / 640;
+          for (const det of s.detections) {
+            const rx = canvas.width - det.x2 * sx;
+            const ry = canvas.height - det.y2 * sy;
+            const rw = (det.x2 - det.x1) * sx;
+            const rh = (det.y2 - det.y1) * sy;
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(rx, ry, rw, rh);
+            ctx.fillStyle = '#00ff00';
+            ctx.font = '14px monospace';
+            ctx.fillText(`cat ${(det.score * 100).toFixed(0)}%`, rx, ry - 4);
+          }
+        }
       }
       if (msg.status) {
         const st = msg.status;
@@ -916,6 +936,12 @@ setInterval(() => {
 // ═══════════════════════════════════════════════════════════════
 // UI event bindings
 // ═══════════════════════════════════════════════════════════════
+$('detect-btn').addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const msg = BoatMessage.create({ detect: {} });
+  const buf = BoatMessage.encode(msg).finish();
+  ws.send(buf);
+});
 $('snap-btn').addEventListener('click', () => {
   const img = $('cam-img');
   const c = document.createElement('canvas');
