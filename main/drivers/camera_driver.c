@@ -263,6 +263,34 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
     return ESP_OK;
 }
 
+esp_err_t camera_capture_raw(void **buf, size_t *len,
+                              uint32_t *width, uint32_t *height)
+{
+    if (s_cam_fd < 0 || s_frame_held) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memset(&s_current_buf, 0, sizeof(s_current_buf));
+    s_current_buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    s_current_buf.memory = V4L2_MEMORY_MMAP;
+
+    ESP_RETURN_ON_ERROR(ioctl(s_cam_fd, VIDIOC_DQBUF, &s_current_buf),
+                        TAG, "VIDIOC_DQBUF failed");
+
+    if (!(s_current_buf.flags & V4L2_BUF_FLAG_DONE)) {
+        ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    *buf = s_cam_buf[s_current_buf.index];
+    *len = s_current_buf.bytesused ? s_current_buf.bytesused : s_cam_buf_size;
+    if (width)  *width  = s_cam_width;
+    if (height) *height = s_cam_height;
+
+    s_frame_held = true;
+    return ESP_OK;
+}
+
 void camera_release_frame(void)
 {
     if (!s_frame_held || s_cam_fd < 0) return;

@@ -18,6 +18,9 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
                                 uint32_t *width, uint32_t *height,
                                 uint32_t *pixel_fmt);
 
+/** Capture raw RGB565 frame from ISP (no JPEG encode). Call camera_release_frame() when done. */
+esp_err_t camera_capture_raw(void **buf, size_t *len, uint32_t *width, uint32_t *height);
+
 /** @brief Return the held frame buffer back to the driver. */
 void camera_release_frame(void);
 

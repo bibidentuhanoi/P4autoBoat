@@ -25,6 +25,7 @@
 #include "pipeline.h"
 #include "http_server.h"
 #include "sensor_task.h"
+#include "detect_task.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -143,6 +144,10 @@ void app_main(void) {
     // Initialize data pipeline
     ESP_LOGI(TAG, "Initializing data pipeline...");
     ESP_ERROR_CHECK(pipeline_init());
+
+    // Initialize detection task (lazy-loads model on first trigger)
+    ESP_LOGI(TAG, "Initializing detection task...");
+    detect_init();
 
     // 10. Connect to WiFi (blocks until connected or timeout)
     ESP_LOGI(TAG, "Connecting to WiFi...");
