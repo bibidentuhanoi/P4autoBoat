@@ -70,10 +70,11 @@ static esp_err_t stream_handler(httpd_req_t *req)
         camera_release_frame();
         if (ret != ESP_OK) break;
 
-        /* Throttle to ~4-5fps — SDIO link maxes at ~3.3 Mbps; 800x640 JPEG
-         * at quality 60 is ~50KB/frame.  At 5fps = 2 Mbps, leaving headroom
-         * for WS telemetry (~0.5 Mbps) and protocol overhead. */
-        vTaskDelay(pdMS_TO_TICKS(200));
+        /* Throttle to ~15fps — with PPA removed, per-frame DMA cost is halved.
+         * 800x640 JPEG at quality 60 ~40-50KB/frame, 15fps = ~5 Mbps.
+         * SDIO link is ~3.3 Mbps so some frames will get EAGAIN backpressure
+         * (handled gracefully by the WS transport). */
+        vTaskDelay(pdMS_TO_TICKS(66));
     }
 
     s_client_streaming = false;
