@@ -19,14 +19,27 @@ typedef struct _boat_IMUData {
 typedef struct _boat_ToFGrid {
     bool valid;
     pb_size_t distances_count;
-    int32_t distances[256];    /* 64 zones × 4 targets, row-major 8x8 */
+    int32_t distances[64]; /* 64*NB_TARGET values: zone*ntpp+target, row-major 8x8 */
     pb_size_t sigma_count;
-    uint32_t sigma[256];       /* range_sigma_mm per target (low=clean, high=edge) */
+    uint32_t sigma[64]; /* range_sigma_mm per target (low=clean, high=edge) */
     pb_size_t target_status_count;
-    uint32_t target_status[256]; /* per-target validity code (5=valid, 9=valid+noisy) */
+    uint32_t target_status[64]; /* per-target validity code (5=valid, 9=valid+noisy) */
     pb_size_t nb_target_detected_count;
-    uint32_t nb_target_detected[64]; /* surfaces detected per zone (>1 = edge zone) */
+    uint32_t nb_target_detected[64]; /* surfaces detected per zone, always 64 values */
 } boat_ToFGrid;
+
+typedef struct _boat_Detection {
+    int32_t category;
+    float score;
+    int32_t x1;
+    int32_t y1;
+    int32_t x2;
+    int32_t y2;
+} boat_Detection;
+
+typedef struct _boat_DetectCommand {
+    char dummy_field;
+} boat_DetectCommand;
 
 typedef struct _boat_SensorSnapshot {
     uint64_t timestamp_us;
@@ -36,6 +49,8 @@ typedef struct _boat_SensorSnapshot {
     boat_ToFGrid tof_a;
     bool has_tof_b;
     boat_ToFGrid tof_b;
+    pb_size_t detections_count;
+    boat_Detection detections[10];
 } boat_SensorSnapshot;
 
 typedef struct _boat_MotorCommand {
@@ -56,6 +71,7 @@ typedef struct _boat_BoatMessage {
         boat_SensorSnapshot sensors;
         boat_MotorCommand motor;
         boat_SystemStatus status;
+        boat_DetectCommand detect;
     } payload;
 } boat_BoatMessage;
 
@@ -67,13 +83,17 @@ extern "C" {
 /* Initializer values for message structs */
 #define boat_IMUData_init_default                {0, 0, 0}
 #define boat_ToFGrid_init_default                {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
-#define boat_SensorSnapshot_init_default         {0, false, boat_IMUData_init_default, false, boat_ToFGrid_init_default, false, boat_ToFGrid_init_default}
+#define boat_Detection_init_default              {0, 0, 0, 0, 0, 0}
+#define boat_DetectCommand_init_default          {0}
+#define boat_SensorSnapshot_init_default         {0, false, boat_IMUData_init_default, false, boat_ToFGrid_init_default, false, boat_ToFGrid_init_default, 0, {boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default}}
 #define boat_MotorCommand_init_default           {0, 0}
 #define boat_SystemStatus_init_default           {0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
-#define boat_SensorSnapshot_init_zero            {0, false, boat_IMUData_init_zero, false, boat_ToFGrid_init_zero, false, boat_ToFGrid_init_zero}
+#define boat_Detection_init_zero                 {0, 0, 0, 0, 0, 0}
+#define boat_DetectCommand_init_zero             {0}
+#define boat_SensorSnapshot_init_zero            {0, false, boat_IMUData_init_zero, false, boat_ToFGrid_init_zero, false, boat_ToFGrid_init_zero, 0, {boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero}}
 #define boat_MotorCommand_init_zero              {0, 0}
 #define boat_SystemStatus_init_zero              {0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
@@ -87,10 +107,17 @@ extern "C" {
 #define boat_ToFGrid_sigma_tag                   3
 #define boat_ToFGrid_target_status_tag           4
 #define boat_ToFGrid_nb_target_detected_tag      5
+#define boat_Detection_category_tag              1
+#define boat_Detection_score_tag                 2
+#define boat_Detection_x1_tag                    3
+#define boat_Detection_y1_tag                    4
+#define boat_Detection_x2_tag                    5
+#define boat_Detection_y2_tag                    6
 #define boat_SensorSnapshot_timestamp_us_tag     1
 #define boat_SensorSnapshot_imu_tag              2
 #define boat_SensorSnapshot_tof_a_tag            3
 #define boat_SensorSnapshot_tof_b_tag            4
+#define boat_SensorSnapshot_detections_tag       5
 #define boat_MotorCommand_throttle_tag           1
 #define boat_MotorCommand_rudder_tag             2
 #define boat_SystemStatus_heap_free_tag          1
@@ -99,6 +126,7 @@ extern "C" {
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
+#define boat_BoatMessage_detect_tag              4
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -113,20 +141,37 @@ X(a, STATIC,   SINGULAR, BOOL,     valid,             1) \
 X(a, STATIC,   REPEATED, INT32,    distances,         2) \
 X(a, STATIC,   REPEATED, UINT32,   sigma,             3) \
 X(a, STATIC,   REPEATED, UINT32,   target_status,     4) \
-X(a, STATIC,   REPEATED, UINT32,   nb_target_detected, 5)
+X(a, STATIC,   REPEATED, UINT32,   nb_target_detected,   5)
 #define boat_ToFGrid_CALLBACK NULL
 #define boat_ToFGrid_DEFAULT NULL
+
+#define boat_Detection_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, INT32,    category,          1) \
+X(a, STATIC,   SINGULAR, FLOAT,    score,             2) \
+X(a, STATIC,   SINGULAR, INT32,    x1,                3) \
+X(a, STATIC,   SINGULAR, INT32,    y1,                4) \
+X(a, STATIC,   SINGULAR, INT32,    x2,                5) \
+X(a, STATIC,   SINGULAR, INT32,    y2,                6)
+#define boat_Detection_CALLBACK NULL
+#define boat_Detection_DEFAULT NULL
+
+#define boat_DetectCommand_FIELDLIST(X, a) \
+
+#define boat_DetectCommand_CALLBACK NULL
+#define boat_DetectCommand_DEFAULT NULL
 
 #define boat_SensorSnapshot_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT64,   timestamp_us,      1) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  imu,               2) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  tof_a,             3) \
-X(a, STATIC,   OPTIONAL, MESSAGE,  tof_b,             4)
+X(a, STATIC,   OPTIONAL, MESSAGE,  tof_b,             4) \
+X(a, STATIC,   REPEATED, MESSAGE,  detections,        5)
 #define boat_SensorSnapshot_CALLBACK NULL
 #define boat_SensorSnapshot_DEFAULT NULL
 #define boat_SensorSnapshot_imu_MSGTYPE boat_IMUData
 #define boat_SensorSnapshot_tof_a_MSGTYPE boat_ToFGrid
 #define boat_SensorSnapshot_tof_b_MSGTYPE boat_ToFGrid
+#define boat_SensorSnapshot_detections_MSGTYPE boat_Detection
 
 #define boat_MotorCommand_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, FLOAT,    throttle,          1) \
@@ -144,15 +189,19 @@ X(a, STATIC,   SINGULAR, UINT64,   uptime_us,         3)
 #define boat_BoatMessage_FIELDLIST(X, a) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,sensors,payload.sensors),   1) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor,payload.motor),   2) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,status,payload.status),   3)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,status,payload.status),   3) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,detect,payload.detect),   4)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
 #define boat_BoatMessage_payload_motor_MSGTYPE boat_MotorCommand
 #define boat_BoatMessage_payload_status_MSGTYPE boat_SystemStatus
+#define boat_BoatMessage_payload_detect_MSGTYPE boat_DetectCommand
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
+extern const pb_msgdesc_t boat_Detection_msg;
+extern const pb_msgdesc_t boat_DetectCommand_msg;
 extern const pb_msgdesc_t boat_SensorSnapshot_msg;
 extern const pb_msgdesc_t boat_MotorCommand_msg;
 extern const pb_msgdesc_t boat_SystemStatus_msg;
@@ -161,6 +210,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
 #define boat_IMUData_fields &boat_IMUData_msg
 #define boat_ToFGrid_fields &boat_ToFGrid_msg
+#define boat_Detection_fields &boat_Detection_msg
+#define boat_DetectCommand_fields &boat_DetectCommand_msg
 #define boat_SensorSnapshot_fields &boat_SensorSnapshot_msg
 #define boat_MotorCommand_fields &boat_MotorCommand_msg
 #define boat_SystemStatus_fields &boat_SystemStatus_msg
@@ -168,12 +219,14 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
-#define boat_BoatMessage_size                    11053
+#define boat_BoatMessage_size                    4373
+#define boat_DetectCommand_size                  0
+#define boat_Detection_size                      60
 #define boat_IMUData_size                        15
 #define boat_MotorCommand_size                   10
-#define boat_SensorSnapshot_size                 11050
+#define boat_SensorSnapshot_size                 4370
 #define boat_SystemStatus_size                   28
-#define boat_ToFGrid_size                        5454
+#define boat_ToFGrid_size                        1858
 
 #ifdef __cplusplus
 } /* extern "C" */

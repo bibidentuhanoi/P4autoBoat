@@ -15,11 +15,24 @@ message ToFGrid {
   repeated uint32 nb_target_detected = 5;  // surfaces detected per zone, always 64 values
 }
 
+message Detection {
+  int32 category = 1;
+  float score    = 2;
+  int32 x1       = 3;
+  int32 y1       = 4;
+  int32 x2       = 5;
+  int32 y2       = 6;
+}
+
+message DetectCommand {
+}
+
 message SensorSnapshot {
-  uint64  timestamp_us = 1;
-  IMUData imu          = 2;
-  ToFGrid tof_a        = 3;
-  ToFGrid tof_b        = 4;
+  uint64  timestamp_us        = 1;
+  IMUData imu                 = 2;
+  ToFGrid tof_a               = 3;
+  ToFGrid tof_b               = 4;
+  repeated Detection detections = 5;
 }
 
 message MotorCommand {
@@ -39,5 +52,6 @@ message BoatMessage {
     SensorSnapshot sensors  = 1;
     MotorCommand   motor    = 2;
     SystemStatus   status   = 3;
+    DetectCommand  detect   = 4;
   }
 }

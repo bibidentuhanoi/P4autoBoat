@@ -12,6 +12,12 @@ PB_BIND(boat_IMUData, boat_IMUData, AUTO)
 PB_BIND(boat_ToFGrid, boat_ToFGrid, 2)
 
 
+PB_BIND(boat_Detection, boat_Detection, AUTO)
+
+
+PB_BIND(boat_DetectCommand, boat_DetectCommand, AUTO)
+
+
 PB_BIND(boat_SensorSnapshot, boat_SensorSnapshot, 2)
 
 
@@ -21,7 +27,7 @@ PB_BIND(boat_MotorCommand, boat_MotorCommand, AUTO)
 PB_BIND(boat_SystemStatus, boat_SystemStatus, AUTO)
 
 
-PB_BIND(boat_BoatMessage, boat_BoatMessage, 4)
+PB_BIND(boat_BoatMessage, boat_BoatMessage, 2)
 
 
 
