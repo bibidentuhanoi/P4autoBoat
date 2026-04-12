@@ -52,7 +52,12 @@ static esp_err_t stream_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     while (true) {
-        while (g_inference_active) { vTaskDelay(pdMS_TO_TICKS(50)); } /* yield during inference */
+        /* Exit cleanly when inference starts.  Yielding in a loop leaves
+         * a zombie handler + socket parked until the client times out —
+         * after 4 inference cycles, port-81's 4-socket pool is exhausted
+         * and the 5th reconnect fails.  Let the browser reconnect. */
+        if (g_inference_active) break;
+
         ret = camera_capture_frame(&frame_buf, &frame_len, NULL, NULL, NULL);
         if (ret != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(5));
