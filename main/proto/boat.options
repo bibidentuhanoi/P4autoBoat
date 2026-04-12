@@ -1,5 +1,5 @@
-boat.ToFGrid.distances            max_count:64
-boat.ToFGrid.sigma                max_count:64
-boat.ToFGrid.target_status        max_count:64
+boat.ToFGrid.distances            max_count:256
+boat.ToFGrid.sigma                max_count:256
+boat.ToFGrid.target_status        max_count:256
 boat.ToFGrid.nb_target_detected   max_count:64
 boat.SensorSnapshot.detections    max_count:10
