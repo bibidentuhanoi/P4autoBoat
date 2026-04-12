@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include "detect_task.h"
 #include "esp_log.h"
 #include <string.h>
 #include <pb_encode.h>
@@ -122,6 +123,10 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
         } else {
             ESP_LOGW(TAG, "Motor command received but no handler registered");
         }
+        break;
+    case boat_BoatMessage_detect_tag:
+        ESP_LOGI(TAG, "Detect command received");
+        detect_trigger();
         break;
     default:
         ESP_LOGW(TAG, "Unhandled message type: %d", (int)msg.which_payload);
