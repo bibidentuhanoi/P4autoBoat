@@ -1022,8 +1022,17 @@ setInterval(() => {
 // ── Detect: snap-at-click modal ──
 let _detectInFlight = false;
 let _detectTimer = null;
+let _snapTofA  = null;
+let _snapTofB  = null;
+let _snapProj  = null;
 const DETECT_TIMEOUT_MS = 15000;  // covers firmware 1s cycle + up to ~12s browser WS reconnect
 const DETECT_W = 800, DETECT_H = 640;
+
+function captureTofSnapshot() {
+  _snapTofA = lastTofA ? structuredClone(lastTofA) : null;
+  _snapTofB = lastTofB ? structuredClone(lastTofB) : null;
+  _snapProj = captureProjectionParams();
+}
 
 async function snapCamToDetectCanvas() {
   const canvas = $('detect-canvas');
@@ -1101,6 +1110,7 @@ $('detect-btn').addEventListener('click', async () => {
   $('detect-btn').style.opacity = '0.5';
   // Fetch snapshot FIRST — firmware disconnects WiFi ~200ms after receiving
   // DetectCommand, which would kill an in-flight /snapshot request.
+  captureTofSnapshot();
   await snapCamToDetectCanvas();
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     _detectInFlight = false;
