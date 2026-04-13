@@ -101,8 +101,19 @@
   /* Detect result modal */
   #detect-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.72); display: none; z-index: 200; align-items: center; justify-content: center; }
   #detect-backdrop.open { display: flex; }
-  #detect-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
-  #detect-canvas { display: block; max-width: 86vw; max-height: 70vh; background: #000; }
+  #detect-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; max-width: 95vw; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
+  #detect-body  { display: flex; flex-direction: row; align-items: stretch; }
+  #detect-canvas { display: block; max-width: 70vw; max-height: 70vh; background: #000; }
+  #detect-sidepanel { flex: 0 0 200px; padding: 8px 10px; border-left: 1px solid var(--border); overflow-y: auto; font-size: 11px; color: var(--text); }
+  #detect-sidepanel .sp-row { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+  #detect-sidepanel .sp-row:last-child { border-bottom: none; }
+  #detect-sidepanel .sp-class { color: var(--accent); font-weight: bold; }
+  #detect-sidepanel .sp-dist  { color: var(--text); font-size: 14px; }
+  #detect-sidepanel .sp-meta  { color: var(--dim); font-size: 9px; letter-spacing: 1px; }
+  #detect-sidepanel .sp-empty { color: var(--warn); font-style: italic; }
+  #detect-legend { padding: 6px 10px; border-top: 1px solid var(--border); font-size: 9px; color: var(--dim); }
+  #detect-legend .bar { height: 8px; background: linear-gradient(to right, hsl(0,80%,45%), hsl(60,80%,45%), hsl(120,80%,45%), hsl(200,80%,45%)); border-radius: 2px; margin-top: 2px; }
+  #detect-legend .ticks { display: flex; justify-content: space-between; }
   #detect-caption { padding: 6px 12px; font-size: 10px; color: var(--dim); border-top: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; }
   #detect-caption .hit { color: var(--accent); }
   #detect-caption .miss { color: var(--warn); }
@@ -240,7 +251,16 @@
       <span id="detect-title">Detection</span>
       <button class="modal-close" id="detect-close">×</button>
     </div>
-    <canvas id="detect-canvas" width="800" height="640"></canvas>
+    <div id="detect-body">
+      <canvas id="detect-canvas" width="800" height="640"></canvas>
+      <div id="detect-sidepanel">
+        <div class="sp-empty">— no detections yet</div>
+      </div>
+    </div>
+    <div id="detect-legend">
+      <div class="ticks"><span>0 m</span><span>1 m</span><span>2 m</span><span>3 m</span><span>4+ m</span></div>
+      <div class="bar"></div>
+    </div>
     <div id="detect-caption">
       <span id="detect-summary">—</span>
       <span style="color:var(--dim);">frame ≈ click-time (~500ms drift)</span>
