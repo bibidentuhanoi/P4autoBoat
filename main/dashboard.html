@@ -1109,8 +1109,10 @@ setInterval(() => {
 // ── Watchdog: detect WS stall and dead camera stream ─────────
 setInterval(() => {
   const now = Date.now();
-  // WS: if no message for 6s but socket thinks it's open, kill it
-  if (ws && ws.readyState === WebSocket.OPEN && now - _lastMsgAt > 6000) {
+  // WS: if no message for 6s but socket thinks it's open, kill it.
+  // Skip during detect — WiFi is intentionally down for 2-6s and post-recovery
+  // WS reconnect can drag the total silence past 6s without a real fault.
+  if (!_detectInFlight && ws && ws.readyState === WebSocket.OPEN && now - _lastMsgAt > 6000) {
     const silent = ((now - _lastMsgAt) / 1000).toFixed(1);
     console.warn('[Watch]', `WS silent for ${silent}s, forcing reconnect`);
     ws.close();
