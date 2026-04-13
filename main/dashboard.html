@@ -1185,15 +1185,43 @@ function renderDetections(dets) {
     ctx.fillText(label, det.x1 + 3, Math.max(12, det.y1 - 3));
     result.push({ det, pick });
   }
+  result.sort((a, b) => b.det.score - a.det.score);
   return result;
+}
+
+function renderSidePanel(rows) {
+  const sp = $('detect-sidepanel');
+  if (!rows || rows.length === 0) {
+    sp.innerHTML = '<div class="sp-empty">— no detections</div>';
+    return;
+  }
+  sp.innerHTML = '';
+  for (const { det, pick } of rows) {
+    const row = document.createElement('div');
+    row.className = 'sp-row';
+    // Guard against non-finite sigma (Task 3 sets Infinity when sigma data is absent).
+    const sigmaTxt = pick.bestZone && Number.isFinite(pick.bestZone.sigma_mm)
+      ? `±${pick.bestZone.sigma_mm}mm`
+      : `±?`;
+    const dist = pick.bestZone
+      ? `<div class="sp-dist">${(pick.bestZone.distance_mm / 1000).toFixed(2)} m  <span class="sp-meta">best-σ ${sigmaTxt}</span></div>
+         <div class="sp-meta">${pick.count} zones · sensor ${pick.sensor}</div>`
+      : `<div class="sp-empty">— no ToF coverage</div>`;
+    row.innerHTML = `
+      <div class="sp-class">cat${det.category} · ${(det.score * 100).toFixed(0)}%</div>
+      ${dist}`;
+    sp.appendChild(row);
+  }
 }
 
 function openDetectModal(dets) {
   const summary = $('detect-summary');
   if (dets && dets.length > 0) {
-    renderDetections(dets);
+    const rows = renderDetections(dets);
+    renderSidePanel(rows);
     summary.innerHTML = `<span class="hit">${dets.length} detection${dets.length > 1 ? 's' : ''}</span>`;
   } else {
+    renderSidePanel([]);
     summary.innerHTML = `<span class="miss">no detections</span>`;
   }
   $('detect-backdrop').classList.add('open');
