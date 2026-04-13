@@ -1141,7 +1141,7 @@ let _detectTimer = null;
 let _snapTofA  = null;
 let _snapTofB  = null;
 let _snapProj  = null;
-const DETECT_TIMEOUT_MS = 15000;  // covers firmware 1s cycle + up to ~12s browser WS reconnect
+const DETECT_TIMEOUT_MS = 30000;  // covers firmware 1s cycle + post-detect WS reconnect (TCP timeouts can drag to 15-20s)
 const DETECT_W = 800, DETECT_H = 640;
 
 function captureTofSnapshot() {
@@ -1256,11 +1256,12 @@ $('detect-btn').addEventListener('click', async () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (_detectInFlight) return;
   _detectInFlight = true;
-  // Reset WS reconnect backoff — the upcoming WiFi drop is intentional, not
-  // a real failure. Without this, repeated detects keep _reconnectDelay
-  // pinned at 8s and the post-detect WS reconnect outlasts the firmware's
-  // 15s detection cache.
+  // Reset both backoffs — the upcoming WiFi drop is intentional, not a real
+  // failure. Without this, repeated detects keep _reconnectDelay pinned at
+  // 8s and _streamBackoffMs at 15s, so post-detect WS+stream reconnect
+  // outlasts the firmware's detection cache and timeouts cascade.
   _reconnectDelay = 1000;
+  _streamBackoffMs = 0;
   $('detect-btn').disabled = true;
   $('detect-btn').style.opacity = '0.5';
   // Fetch snapshot FIRST — firmware disconnects WiFi ~200ms after receiving
