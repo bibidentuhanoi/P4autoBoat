@@ -1532,13 +1532,19 @@ console.log('[Init]', `host=${ESP_HOST} fallback=${ESP_FALLBACK} local=${_isLoca
 startStream();
 connectWS();
 
-window.addEventListener('beforeunload', () => {
+// Graceful teardown on F5 / tab close / mobile bfcache. pagehide fires in
+// scenarios beforeunload doesn't (iOS swipe-away, bfcache); listen to both,
+// the second fire is a no-op since ws.close on CLOSING/CLOSED returns silently.
+const _dashboardTeardown = () => {
   try {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000, 'page-unload');
+    // Cover both CONNECTING (0) and OPEN (1) — RST during handshake otherwise.
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close(1000, 'page-unload');
   } catch (_) { /* swallow — browser is tearing down */ }
   const img = document.getElementById('cam-img');
-  if (img) img.src = '';
-});
+  if (img) img.removeAttribute('src');
+};
+window.addEventListener('pagehide', _dashboardTeardown);
+window.addEventListener('beforeunload', _dashboardTeardown);
 </script>
 </body>
 </html>
