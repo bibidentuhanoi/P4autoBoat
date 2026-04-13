@@ -396,20 +396,36 @@ function getZoneCenter(sensor, row, col, mm) {
 }
 
 // Get zone quad (4 corners at half-zone offsets)
+// Delegates to projectZone() so all projection math lives in one place.
 function getZoneQuad(sensor, row, col, mm) {
+  const sensorKey = (sensor === SENSOR_A) ? 'A' : 'B';
+  const p = captureProjectionParams();
+  // 3D path (threshold3d / heatmap): delegate to projectZone
+  // Flat path (threshold): fall back to original inline logic
+  if (overlayMode !== 'threshold') {
+    const corners = projectZone(row, col, sensorKey, mm, p);
+    if (!corners) return null;
+    // projectZone returns [{x,y},...]; callers expect [[x,y],...]
+    const pts = corners.map(pt => [pt.x, pt.y]);
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (const pt of pts) {
+      minU = Math.min(minU, pt[0]); maxU = Math.max(maxU, pt[0]);
+      minV = Math.min(minV, pt[1]); maxV = Math.max(maxV, pt[1]);
+    }
+    return { pts, inFrame: maxU >= 0 && minU <= CAM.w && maxV >= 0 && minV <= CAM.h };
+  }
+  // Flat (threshold) mode keeps original zoneToPixelFlat path
   const offsets = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
   const pts = offsets.map(([dr, dc]) =>
-    zoneToPixel(sensor, row + dr, col + dc, mm)
+    zoneToPixelFlat(sensor, row + dr, col + dc, mm)
   );
-
-  const valid = pts.filter(p => p !== null);
+  const valid = pts.filter(pt => pt !== null);
   if (valid.length < 3) return null;
-  const filled = pts.map(p => p || valid[0]);
-
+  const filled = pts.map(pt => pt || valid[0]);
   let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
-  for (const p of filled) {
-    minU = Math.min(minU, p[0]); maxU = Math.max(maxU, p[0]);
-    minV = Math.min(minV, p[1]); maxV = Math.max(maxV, p[1]);
+  for (const pt of filled) {
+    minU = Math.min(minU, pt[0]); maxU = Math.max(maxU, pt[0]);
+    minV = Math.min(minV, pt[1]); maxV = Math.max(maxV, pt[1]);
   }
   return { pts: filled, inFrame: maxU >= 0 && minU <= CAM.w && maxV >= 0 && minV <= CAM.h };
 }
@@ -709,18 +725,22 @@ function drawThreshold(ctx, tofA, tofB) {
 }
 
 function drawHeatmap(ctx, tofA, tofB) {
+  const p = captureProjectionParams();
   function drawSensor(grid, sensor, flipH, flipV, trans) {
     if (!grid || !grid.valid || !grid.distances || grid.distances.length < 64) return;
+    const sensorKey = (sensor === SENSOR_A) ? 'A' : 'B';
 
     for (let row = 0; row < 8; row++) {
       for (let col = 0; col < 8; col++) {
         const mm = readDepth(grid.distances, row, col, flipH, flipV, trans);
         if (!mm || mm <= 0 || mm > thresholdMM) continue;
 
-        const center = getZoneCenter(sensor, row, col, mm);
-        if (!center) continue;
-
-        const dp = camToDisplay(center[0], center[1]);
+        const corners = projectZone(row, col, sensorKey, mm, p);
+        if (!corners) continue;
+        // Compute center as mean of the 4 projected corners
+        const cx = (corners[0].x + corners[1].x + corners[2].x + corners[3].x) / 4;
+        const cy = (corners[0].y + corners[1].y + corners[2].y + corners[3].y) / 4;
+        const dp = camToDisplay(cx, cy);
         const sigmaVal = (grid.sigma && grid.sigma.length >= 64)
             ? readDepth(grid.sigma, row, col, flipH, flipV, trans) : 0;
         const zoneOpacity = sigmaVal > 0
