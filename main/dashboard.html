@@ -1256,6 +1256,11 @@ $('detect-btn').addEventListener('click', async () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (_detectInFlight) return;
   _detectInFlight = true;
+  // Reset WS reconnect backoff — the upcoming WiFi drop is intentional, not
+  // a real failure. Without this, repeated detects keep _reconnectDelay
+  // pinned at 8s and the post-detect WS reconnect outlasts the firmware's
+  // 15s detection cache.
+  _reconnectDelay = 1000;
   $('detect-btn').disabled = true;
   $('detect-btn').style.opacity = '0.5';
   // Fetch snapshot FIRST — firmware disconnects WiFi ~200ms after receiving
