@@ -1047,6 +1047,10 @@ function connectWS() {
   ws.onmessage = (evt) => {
     msgCount++;
     _lastMsgAt = Date.now();
+    // Bump _streamAlive too — MJPEG img.onload only fires on the FIRST frame,
+    // so without this proxy the stream-stale watchdog spams every 10s while
+    // the stream is actually fine. WS flowing = network alive = stream alive.
+    _streamAlive = _lastMsgAt;
     try {
       const msg = BoatMessage.decode(new Uint8Array(evt.data));
       if (msg.sensors) {
