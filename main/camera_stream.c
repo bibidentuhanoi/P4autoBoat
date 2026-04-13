@@ -125,7 +125,8 @@ esp_err_t camera_stream_server_start(void)
     cfg.stack_size       = 8192;
     cfg.max_open_sockets = 7;                      /* was 4 — more headroom for refresh races */
     cfg.send_wait_timeout = 2;                     /* was default 5s — drop slow clients faster */
-    cfg.lru_purge_enable = true;                   /* on pool full, evict oldest instead of refusing new */
+    /* lru_purge_enable left FALSE — it raced close_fn and produced a 0xbaad5678
+     * stack-canary panic when an evicted fd was reused before close_fn fired. */
     cfg.close_fn         = camera_stream_on_close; /* clean fd close on browser FIN/RST */
     cfg.max_uri_handlers = 2;
 
