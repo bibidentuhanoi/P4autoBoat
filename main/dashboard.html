@@ -614,7 +614,9 @@ function projectZonesIntoBbox(tof, bbox, proj, sensorKey) {
       const idx = (row * 8 + col) * 4;  // 4 targets/zone in current proto
       const status = tof.targetStatus ? tof.targetStatus[idx] : 0;
       const dist   = tof.distances    ? tof.distances[idx]    : 0;
-      const sigma  = tof.sigma        ? tof.sigma[idx]        : 0;
+      // sigma missing → Infinity so a zone with real sigma always wins bestZone
+      const sigma  = tof.sigma        ? tof.sigma[idx]        : Infinity;
+      // VL53L5CX status: 5 = 100% valid, 9 = 50% valid (UM2884); others are speculative/invalid
       if (dist <= 0 || (status !== 5 && status !== 9)) continue;
       const poly = projectZone(row, col, sensorKey, dist, proj);
       if (!poly) continue;
