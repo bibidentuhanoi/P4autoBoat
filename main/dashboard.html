@@ -640,9 +640,13 @@ function projectZonesIntoBbox(tof, bbox, proj, sensorKey) {
       if (dist <= 0 || (status !== 5 && status !== 9)) continue;
       const poly = projectZone(row, col, sensorKey, dist, proj);
       if (!poly) continue;
-      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
-      const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
-      if (cx < bbox.x1 || cx > bbox.x2 || cy < bbox.y1 || cy > bbox.y2) continue;
+      // AABB overlap: include zone if its axis-aligned bounding rect intersects the bbox.
+      // Looser than centroid-only — a zone that partially clips the bbox edge still counts.
+      const pMinX = Math.min(poly[0].x, poly[1].x, poly[2].x, poly[3].x);
+      const pMaxX = Math.max(poly[0].x, poly[1].x, poly[2].x, poly[3].x);
+      const pMinY = Math.min(poly[0].y, poly[1].y, poly[2].y, poly[3].y);
+      const pMaxY = Math.max(poly[0].y, poly[1].y, poly[2].y, poly[3].y);
+      if (pMaxX < bbox.x1 || pMinX > bbox.x2 || pMaxY < bbox.y1 || pMinY > bbox.y2) continue;
       polygons.push({ poly, distance_mm: dist, sigma_mm: sigma });
       if (!bestZone || sigma < bestZone.sigma_mm) bestZone = { distance_mm: dist, sigma_mm: sigma };
     }
