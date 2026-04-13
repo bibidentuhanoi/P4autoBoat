@@ -10,7 +10,18 @@ extern "C" {
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <string.h>
 }
+
+/* Cache the most recent detection result so sensor_task can re-emit it
+ * after WS reconnect. Without this, detections sent during the WiFi
+ * teardown window are lost to all clients. */
+#define DETECT_CACHE_MAX 10
+static SemaphoreHandle_t s_cache_mutex = NULL;
+static boat_Detection   s_cache[DETECT_CACHE_MAX];
+static pb_size_t        s_cache_count = 0;
+static int64_t          s_cache_ts_us = 0;
 
 #define LOG_HEAP() ESP_LOGI(TAG, "  heap: internal=%u PSRAM=%u", \
     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), \
@@ -136,7 +147,16 @@ static void detect_task_fn(void *arg)
                      r.category, r.score, r.box[0], r.box[1], r.box[2], r.box[3]);
         }
 
-        /* 5. Publish results */
+        /* 5. Cache results so sensor_task can re-emit them after reconnect,
+         *    then publish once directly for clients already connected. */
+        if (s_cache_mutex) {
+            xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+            memcpy(s_cache, snap.detections,
+                   snap.detections_count * sizeof(boat_Detection));
+            s_cache_count = snap.detections_count;
+            s_cache_ts_us = esp_timer_get_time();
+            xSemaphoreGive(s_cache_mutex);
+        }
         pipeline_publish_sensors(&snap);
 
         int64_t total_ms = (esp_timer_get_time() - t0) / 1000;
@@ -144,8 +164,28 @@ static void detect_task_fn(void *arg)
     }
 }
 
+extern "C" void detect_get_cached_results(boat_Detection *out, pb_size_t *out_count,
+                                           uint32_t max_age_ms)
+{
+    *out_count = 0;
+    if (!s_cache_mutex || !out) return;
+    xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+    int64_t age_us = esp_timer_get_time() - s_cache_ts_us;
+    if (s_cache_count > 0 && age_us < (int64_t)max_age_ms * 1000) {
+        memcpy(out, s_cache, s_cache_count * sizeof(boat_Detection));
+        *out_count = s_cache_count;
+    }
+    xSemaphoreGive(s_cache_mutex);
+}
+
 extern "C" esp_err_t detect_init(void)
 {
+    s_cache_mutex = xSemaphoreCreateMutex();
+    if (!s_cache_mutex) {
+        ESP_LOGE(TAG, "Failed to create detect cache mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Preload model NOW (before WiFi starts) — allocates PSRAM bulk
      * blocks without SDIO DMA interference. */
     ESP_LOGI(TAG, "Preloading cat_detect model...");

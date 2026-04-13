@@ -132,6 +132,10 @@ void task_sensor_snapshot(void *pvParameters)
             }
         }
 
+        /* Re-emit cached detections for up to 15s so the browser gets them
+         * after WS reconnect, regardless of when it comes back. */
+        detect_get_cached_results(snap.detections, &snap.detections_count, 15000);
+
         pipeline_publish_sensors(&snap);
 
         /* SystemStatus at ~1Hz */

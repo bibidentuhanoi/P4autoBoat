@@ -97,6 +97,15 @@
   .modal-row .val { font-size: 11px; color: var(--text); min-width: 42px; text-align: right; }
   .modal-row select, .modal-row input[type=checkbox] { accent-color: var(--accent); }
   .modal-row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; font-size: 11px; padding: 2px 4px; flex: 1; }
+
+  /* Detect result modal */
+  #detect-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.72); display: none; z-index: 200; align-items: center; justify-content: center; }
+  #detect-backdrop.open { display: flex; }
+  #detect-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; max-width: 90vw; max-height: 90vh; display: flex; flex-direction: column; overflow: hidden; }
+  #detect-canvas { display: block; max-width: 86vw; max-height: 70vh; background: #000; }
+  #detect-caption { padding: 6px 12px; font-size: 10px; color: var(--dim); border-top: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; }
+  #detect-caption .hit { color: var(--accent); }
+  #detect-caption .miss { color: var(--warn); }
   .flip-group { display: flex; gap: 12px; }
   .flip-group label { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text); cursor: pointer; min-width: auto; }
   .btn-toggle {
@@ -220,6 +229,21 @@
         <button class="btn-sm" id="drag-reset">Reset</button>
         <span class="val" id="drag-pos" style="font-size:10px;color:var(--dim);">(0, 0)</span>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Detect result modal -->
+<div id="detect-backdrop">
+  <div id="detect-panel">
+    <div class="modal-hdr">
+      <span id="detect-title">Detection</span>
+      <button class="modal-close" id="detect-close">×</button>
+    </div>
+    <canvas id="detect-canvas" width="800" height="640"></canvas>
+    <div id="detect-caption">
+      <span id="detect-summary">—</span>
+      <span style="color:var(--dim);">frame ≈ click-time (~500ms drift)</span>
     </div>
   </div>
 </div>
@@ -798,7 +822,10 @@ function startStream() {
   // Cache-bust to force browser to re-request (dead streams keep the old URL)
   const url = `${base}?t=${Date.now()}`;
   console.log('[Stream]', `connecting to ${base}`);
-  img.crossOrigin = 'anonymous';  // required for canvas snap export (CORS set on port 81)
+  // NOTE: NOT setting img.crossOrigin — Chrome refuses to display multipart/x-mixed-replace
+  // MJPEG streams when CORS is requested, even with Access-Control-Allow-Origin: * set.
+  // Canvas becomes tainted, so snap-btn/snap-overlay-btn (toBlob) will break —
+  // detect modal uses drawImage only, which IS allowed on tainted canvas.
   img.src = url;
   _streamAlive = Date.now();
   img.onload = () => { _streamAlive = Date.now(); };
@@ -857,23 +884,8 @@ function connectWS() {
         if (s.tofA) drawTof('tof-a', s.tofA, FLIP.flipHA, FLIP.flipVA, FLIP.transA);
         if (s.tofB) drawTof('tof-b', s.tofB, FLIP.flipHB, FLIP.flipVB, FLIP.transB);
         if (s.tofA || s.tofB) renderOverlay(s.tofA, s.tofB);
-        if (s.detections && s.detections.length > 0) {
-          const canvas = $('tof-overlay');
-          const ctx = canvas.getContext('2d');
-          const sx = canvas.width / 800;
-          const sy = canvas.height / 640;
-          for (const det of s.detections) {
-            const rx = canvas.width - det.x2 * sx;
-            const ry = canvas.height - det.y2 * sy;
-            const rw = (det.x2 - det.x1) * sx;
-            const rh = (det.y2 - det.y1) * sy;
-            ctx.strokeStyle = '#00ff00';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(rx, ry, rw, rh);
-            ctx.fillStyle = '#00ff00';
-            ctx.font = '14px monospace';
-            ctx.fillText(`cat ${(det.score * 100).toFixed(0)}%`, rx, ry - 4);
-          }
+        if (_detectInFlight && s.detections && s.detections.length > 0) {
+          finishDetect(s.detections);
         }
       }
       if (msg.status) {
@@ -936,11 +948,107 @@ setInterval(() => {
 // ═══════════════════════════════════════════════════════════════
 // UI event bindings
 // ═══════════════════════════════════════════════════════════════
-$('detect-btn').addEventListener('click', () => {
+// ── Detect: snap-at-click modal ──
+let _detectInFlight = false;
+let _detectTimer = null;
+const DETECT_TIMEOUT_MS = 15000;  // covers firmware 1s cycle + up to ~12s browser WS reconnect
+const DETECT_W = 800, DETECT_H = 640;
+
+async function snapCamToDetectCanvas() {
+  const canvas = $('detect-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, DETECT_W, DETECT_H);
+  // Chrome refuses to drawImage() an MJPEG multipart/x-mixed-replace stream,
+  // so fetch a fresh JPEG from the same-origin /snapshot endpoint (port 80).
+  const host = _wsFallback ? ESP_FALLBACK : ESP_HOST;
+  const url = `http://${host}/snapshot?t=${Date.now()}`;
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const bmp = await createImageBitmap(blob);
+    ctx.save();
+    ctx.translate(DETECT_W, DETECT_H);
+    ctx.rotate(Math.PI);
+    ctx.drawImage(bmp, 0, 0, DETECT_W, DETECT_H);
+    ctx.restore();
+    bmp.close();
+  } catch (e) {
+    try { ctx.restore(); } catch {}
+    ctx.fillStyle = '#ff6b35';
+    ctx.font = '14px monospace';
+    ctx.fillText(`snapshot failed: ${e.message}`, 20, 30);
+    console.warn('[Snap]', e);
+  }
+}
+
+function renderDetections(dets) {
+  const canvas = $('detect-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.lineWidth = 2;
+  ctx.font = '14px monospace';
+  for (const det of dets) {
+    const w = det.x2 - det.x1, h = det.y2 - det.y1;
+    ctx.strokeStyle = '#00ff00';
+    ctx.strokeRect(det.x1, det.y1, w, h);
+    const label = `cat${det.category} ${(det.score * 100).toFixed(0)}%`;
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(det.x1, Math.max(0, det.y1 - 16), tw + 6, 16);
+    ctx.fillStyle = '#00ff00';
+    ctx.fillText(label, det.x1 + 3, Math.max(12, det.y1 - 3));
+  }
+}
+
+function openDetectModal(dets) {
+  const summary = $('detect-summary');
+  if (dets && dets.length > 0) {
+    renderDetections(dets);
+    summary.innerHTML = `<span class="hit">${dets.length} detection${dets.length > 1 ? 's' : ''}</span>`;
+  } else {
+    summary.innerHTML = `<span class="miss">no detections</span>`;
+  }
+  $('detect-backdrop').classList.add('open');
+}
+
+function finishDetect(dets) {
+  if (!_detectInFlight) return;
+  _detectInFlight = false;
+  clearTimeout(_detectTimer);
+  _detectTimer = null;
+  $('detect-btn').disabled = false;
+  $('detect-btn').style.opacity = '1';
+  openDetectModal(dets);
+}
+
+$('detect-btn').addEventListener('click', async () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (_detectInFlight) return;
+  _detectInFlight = true;
+  $('detect-btn').disabled = true;
+  $('detect-btn').style.opacity = '0.5';
+  // Fetch snapshot FIRST — firmware disconnects WiFi ~200ms after receiving
+  // DetectCommand, which would kill an in-flight /snapshot request.
+  await snapCamToDetectCanvas();
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    _detectInFlight = false;
+    $('detect-btn').disabled = false;
+    $('detect-btn').style.opacity = '1';
+    return;
+  }
   const msg = BoatMessage.create({ detect: {} });
   const buf = BoatMessage.encode(msg).finish();
   ws.send(buf);
+  _detectTimer = setTimeout(() => {
+    console.warn('[Detect]', `timeout after ${DETECT_TIMEOUT_MS}ms`);
+    _detectInFlight = false;
+    _detectTimer = null;
+    $('detect-btn').disabled = false;
+    $('detect-btn').style.opacity = '1';
+    $('detect-summary').innerHTML = `<span class="miss">timeout — no response</span>`;
+    $('detect-backdrop').classList.add('open');
+  }, DETECT_TIMEOUT_MS);
 });
 $('snap-btn').addEventListener('click', () => {
   const img = $('cam-img');
@@ -1072,6 +1180,8 @@ updateDragPos();
 $('gear-btn').addEventListener('click', () => $('settings-backdrop').classList.add('open'));
 $('modal-close').addEventListener('click', () => $('settings-backdrop').classList.remove('open'));
 $('settings-backdrop').addEventListener('click', e => { if (e.target === $('settings-backdrop')) $('settings-backdrop').classList.remove('open'); });
+$('detect-close').addEventListener('click', () => $('detect-backdrop').classList.remove('open'));
+$('detect-backdrop').addEventListener('click', e => { if (e.target === $('detect-backdrop')) $('detect-backdrop').classList.remove('open'); });
 $('drag-toggle').addEventListener('click', () => {
   dragEnabled = !dragEnabled;
   console.log('[Setting] drag =', dragEnabled);
