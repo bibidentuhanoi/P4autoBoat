@@ -1038,10 +1038,15 @@ function connectWS() {
 
   ws.onopen = () => {
     _lastMsgAt = Date.now();
-    _reconnectDelay = 1000;  // reset backoff on successful connect
+    _reconnectDelay = 1000;     // reset backoff on successful connect
+    _streamBackoffMs = 0;       // pair the stream backoff to WS recovery
     $('status-dot').className = 'ok';
     $('status-label').textContent = 'connected';
     console.log('[WS]', `connected to ${host}:80/ws`);
+    // Force the MJPEG stream to reattach — after a WiFi/WS recovery the old
+    // <img> request is dead but the browser doesn't always fire onerror, so
+    // the stream sits frozen until something explicitly restarts it.
+    startStream();
   };
 
   ws.onmessage = (evt) => {
@@ -1109,10 +1114,11 @@ setInterval(() => {
 // ── Watchdog: detect WS stall and dead camera stream ─────────
 setInterval(() => {
   const now = Date.now();
-  // WS: if no message for 6s but socket thinks it's open, kill it.
-  // Skip during detect — WiFi is intentionally down for 2-6s and post-recovery
-  // WS reconnect can drag the total silence past 6s without a real fault.
-  if (!_detectInFlight && ws && ws.readyState === WebSocket.OPEN && now - _lastMsgAt > 6000) {
+  // WS: if no message for 12s but socket thinks it's open, kill it.
+  // 12s gives a normal detect cycle (2-6s WiFi-down + reconnect) plenty of
+  // margin without needing the _detectInFlight gate, which delayed real
+  // recovery until the 30s detect timeout fired.
+  if (ws && ws.readyState === WebSocket.OPEN && now - _lastMsgAt > 12000) {
     const silent = ((now - _lastMsgAt) / 1000).toFixed(1);
     console.warn('[Watch]', `WS silent for ${silent}s, forcing reconnect`);
     ws.close();
