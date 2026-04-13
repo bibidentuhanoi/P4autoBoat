@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <inttypes.h>
+#include <unistd.h>
 
 static const char *TAG = "CAM_STREAM";
 
@@ -95,6 +96,12 @@ static const httpd_uri_t s_stream_uri = {
     .user_ctx = NULL,
 };
 
+static void camera_stream_on_close(httpd_handle_t hd, int sockfd) {
+    (void)hd;
+    ESP_LOGI(TAG, "socket %d closed", sockfd);
+    close(sockfd);
+}
+
 esp_err_t camera_stream_server_start(void)
 {
     uint32_t width, height, pixel_fmt;
@@ -116,7 +123,10 @@ esp_err_t camera_stream_server_start(void)
     cfg.server_port      = CONFIG_HTTP_STREAM_PORT;
     cfg.ctrl_port        = 32769;  /* must differ from port-80 server (32768) */
     cfg.stack_size       = 8192;
-    cfg.max_open_sockets = 4;
+    cfg.max_open_sockets = 7;                      /* was 4 — more headroom for refresh races */
+    cfg.send_wait_timeout = 2;                     /* was default 5s — drop slow clients faster */
+    cfg.lru_purge_enable = true;                   /* on pool full, evict oldest instead of refusing new */
+    cfg.close_fn         = camera_stream_on_close; /* clean fd close on browser FIN/RST */
     cfg.max_uri_handlers = 2;
 
     httpd_handle_t server = NULL;
