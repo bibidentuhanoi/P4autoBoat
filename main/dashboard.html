@@ -1531,6 +1531,14 @@ updateOverlaySize();
 console.log('[Init]', `host=${ESP_HOST} fallback=${ESP_FALLBACK} local=${_isLocal}`);
 startStream();
 connectWS();
+
+window.addEventListener('beforeunload', () => {
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close(1000, 'page-unload');
+  } catch (_) { /* swallow — browser is tearing down */ }
+  const img = document.getElementById('cam-img');
+  if (img) img.src = '';
+});
 </script>
 </body>
 </html>
