@@ -119,9 +119,10 @@ static void detect_task_fn(void *arg)
 
         heap_caps_free(img.data);
 
-        /* Resume — reconnect WiFi, tasks resume */
-        ESP_LOGI(TAG, "=== Step 5: reconnecting WiFi + resuming tasks ===");
-        esp_wifi_connect();
+        /* Resume — wifi_manager's STA_DISCONNECTED handler owns reconnect.
+         * Calling esp_wifi_connect() here races the handler and produces
+         * ESP_ERR_WIFI_NOT_CONNECT (RPC code 12303) → ~60s stall. */
+        ESP_LOGI(TAG, "=== Step 5: resuming tasks, wifi_manager will reconnect ===");
         g_inference_active = false;
 
         ESP_LOGI(TAG, "Inference done in %lld ms: %d detections",

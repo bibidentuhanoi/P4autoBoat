@@ -4,6 +4,8 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_http_server.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 #include <unistd.h>
 
@@ -24,7 +26,14 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
 {
     void *buf = NULL;
     size_t len = 0;
-    esp_err_t ret = camera_capture_frame(&buf, &len, NULL, NULL, NULL);
+    esp_err_t ret = ESP_FAIL;
+    /* Retry to survive contention with MJPEG stream / detect capture.
+     * Pattern mirrors detect_task.cpp for consistency. */
+    for (int attempt = 0; attempt < 10; attempt++) {
+        ret = camera_capture_frame(&buf, &len, NULL, NULL, NULL);
+        if (ret == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     if (ret != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "capture failed");
         return ret;
