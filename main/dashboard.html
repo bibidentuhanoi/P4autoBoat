@@ -663,6 +663,40 @@ function pickSensorForBbox(bbox) {
   return { sensor: 'A+B', count: merged.length, bestZone: best, polygons: merged };
 }
 
+// Renders ToF zones inside a bbox, 3D-Threshold style (minimal — no labels/markers).
+// polygons: [{poly, distance_mm, sigma_mm}] from pickSensorForBbox / projectZonesIntoBbox.
+// Reuses dangerColor() + the live-overlay sigma-opacity formula for visual parity.
+function renderToFInBbox(ctx, bbox, polygons) {
+  if (!polygons || !polygons.length) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(bbox.x1, bbox.y1, bbox.x2 - bbox.x1, bbox.y2 - bbox.y1);
+  ctx.clip();
+  ctx.setLineDash([]);
+  for (const { poly, distance_mm, sigma_mm } of polygons) {
+    if (distance_mm > thresholdMM) continue;
+    const colors = dangerColor(distance_mm, thresholdMM);
+    // Match drawThreshold's in-frame formula at line ~515: lower sigma → more opaque.
+    // Missing sigma (Infinity from Task 3 guard) collapses to 0.15, which is the
+    // floor of the clamp — a faint ghost, appropriate for unreliable data.
+    const opacity = sigma_mm > 0
+        ? Math.max(0.15, Math.min(0.9, 1.0 - sigma_mm / 25.0))
+        : 0.85;
+    ctx.globalAlpha = opacity;
+    ctx.fillStyle = colors.fill;
+    ctx.beginPath();
+    ctx.moveTo(poly[0].x, poly[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(poly[i].x, poly[i].y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = colors.stroke;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1.0;
+  ctx.restore();
+}
+
 function renderOverlay(tofA, tofB) {
   lastTofA = tofA || lastTofA;
   lastTofB = tofB || lastTofB;
@@ -1131,7 +1165,11 @@ function renderDetections(dets) {
   const ctx = canvas.getContext('2d');
   ctx.lineWidth = 2;
   ctx.font = '14px monospace';
+  const result = [];
   for (const det of dets) {
+    const bbox = { x1: det.x1, y1: det.y1, x2: det.x2, y2: det.y2 };
+    const pick = pickSensorForBbox(bbox);
+    renderToFInBbox(ctx, bbox, pick.polygons);
     const w = det.x2 - det.x1, h = det.y2 - det.y1;
     ctx.strokeStyle = '#00ff00';
     ctx.strokeRect(det.x1, det.y1, w, h);
@@ -1141,7 +1179,9 @@ function renderDetections(dets) {
     ctx.fillRect(det.x1, Math.max(0, det.y1 - 16), tw + 6, 16);
     ctx.fillStyle = '#00ff00';
     ctx.fillText(label, det.x1 + 3, Math.max(12, det.y1 - 3));
+    result.push({ det, pick });
   }
+  return result;
 }
 
 function openDetectModal(dets) {
