@@ -600,6 +600,47 @@ function captureProjectionParams() {
   };
 }
 
+// For one ToF grid + bbox + projection params, returns:
+//   { count, bestZone: {distance_mm, sigma_mm}|null, polygons: [{poly, distance_mm, sigma_mm}, ...] }
+// Filters to zones whose CENTROID lies inside bbox AND target_status in {5,9} AND distance > 0.
+// bbox is {x1, y1, x2, y2} in snapshot pixel coords.
+// sensorKey is 'A' or 'B'.
+function projectZonesIntoBbox(tof, bbox, proj, sensorKey) {
+  if (!tof || !tof.valid || !tof.distances) return { count: 0, bestZone: null, polygons: [] };
+  const polygons = [];
+  let bestZone = null;
+  for (let row = 0; row < 8; row++) {
+    for (let col = 0; col < 8; col++) {
+      const idx = (row * 8 + col) * 4;  // 4 targets/zone in current proto
+      const status = tof.targetStatus ? tof.targetStatus[idx] : 0;
+      const dist   = tof.distances    ? tof.distances[idx]    : 0;
+      const sigma  = tof.sigma        ? tof.sigma[idx]        : 0;
+      if (dist <= 0 || (status !== 5 && status !== 9)) continue;
+      const poly = projectZone(row, col, sensorKey, dist, proj);
+      if (!poly) continue;
+      const cx = (poly[0].x + poly[1].x + poly[2].x + poly[3].x) / 4;
+      const cy = (poly[0].y + poly[1].y + poly[2].y + poly[3].y) / 4;
+      if (cx < bbox.x1 || cx > bbox.x2 || cy < bbox.y1 || cy > bbox.y2) continue;
+      polygons.push({ poly, distance_mm: dist, sigma_mm: sigma });
+      if (!bestZone || sigma < bestZone.sigma_mm) bestZone = { distance_mm: dist, sigma_mm: sigma };
+    }
+  }
+  return { count: polygons.length, bestZone, polygons };
+}
+
+function pickSensorForBbox(bbox) {
+  const a = projectZonesIntoBbox(_snapTofA, bbox, _snapProj, 'A');
+  const b = projectZonesIntoBbox(_snapTofB, bbox, _snapProj, 'B');
+  if (a.count === 0 && b.count === 0) return { sensor: null, count: 0, bestZone: null, polygons: [] };
+  if (a.count > b.count)  return { sensor: 'A', ...a };
+  if (b.count > a.count)  return { sensor: 'B', ...b };
+  // tie (including both > 0 with equal count): merge both pools, recompute bestZone
+  const merged = [...a.polygons, ...b.polygons];
+  let best = null;
+  for (const p of merged) if (!best || p.sigma_mm < best.sigma_mm) best = { distance_mm: p.distance_mm, sigma_mm: p.sigma_mm };
+  return { sensor: 'A+B', count: merged.length, bestZone: best, polygons: merged };
+}
+
 function renderOverlay(tofA, tofB) {
   lastTofA = tofA || lastTofA;
   lastTofB = tofB || lastTofB;
