@@ -533,6 +533,57 @@ function dangerColor(mm, thresh) {
   };
 }
 
+// Pure: maps a ToF zone (row, col) for sensorKey ('A'|'B') into image pixel space.
+// `mm` is the measured depth for this zone (used in 3D projection math).
+// `p` snapshots all projection state so results are reproducible after live slider
+// changes. Returns 4 corner points [{x,y}, ...] in [0..800]x[0..640] image coords
+// (pre-camToDisplay), or null if any corner projects behind the camera (wz <= 1).
+//
+// Mirrors getZoneQuad() exactly but uses p instead of globals, making it usable
+// for both the live overlay and the frozen detect-modal pipeline (Task 3+).
+function projectZone(row, col, sensorKey, mm, p) {
+  const sensorX    = sensorKey === 'A' ? p.sensorAx    : p.sensorBx;
+  const sensorTilt = sensorKey === 'A' ? p.sensorATilt  : p.sensorBTilt;
+  const cosT = Math.cos(sensorTilt * DEG2RAD);
+  const sinT = Math.sin(sensorTilt * DEG2RAD);
+
+  const offsets = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]];
+  const pts = [];
+  for (const [dr, dc] of offsets) {
+    const r = row + dr;
+    const c = col + dc;
+    const azL = (c - 3.5) * p.ZONE_STEP + p.AZ_OFFSET;
+    const elL = (3.5 - r) * p.ZONE_STEP + p.EL_OFFSET;
+    const xL = mm * Math.tan(azL * DEG2RAD);
+    const yL = mm * Math.tan(elL * DEG2RAD);
+    const zL = mm;
+    const wx = sensorX + xL * cosT + zL * sinT;
+    const wy = yL;
+    const wz = SENSOR_TZ + (-xL * sinT + zL * cosT);
+    if (wz <= 1) { pts.push(null); continue; }
+    const u = p.FX * (wx / wz) + p.CX;
+    const v = -p.FX * (wy / wz) + p.CY;
+    pts.push({ x: p.CX + (u - p.CX) * p.GRID_SCALE, y: p.CY + (v - p.CY) * p.GRID_SCALE });
+  }
+
+  const valid = pts.filter(pt => pt !== null);
+  if (valid.length < 3) return null;
+  // Fill any null corner with the nearest valid point (mirrors getZoneQuad fallback)
+  return pts.map(pt => pt || valid[0]);
+}
+
+// Build a params snapshot from current global state for use with projectZone.
+function captureProjectionParams() {
+  return {
+    AZ_OFFSET, EL_OFFSET, CX, CY, GRID_SCALE, FX, ZONE_STEP,
+    sensorAx:    SENSOR_A.x,    sensorATilt: SENSOR_A.tilt,
+    sensorBx:    SENSOR_B.x,    sensorBTilt: SENSOR_B.tilt,
+    flipHA: FLIP.flipHA, flipVA: FLIP.flipVA, transA: FLIP.transA,
+    flipHB: FLIP.flipHB, flipVB: FLIP.flipVB, transB: FLIP.transB,
+    dragOffX, dragOffY,
+  };
+}
+
 function renderOverlay(tofA, tofB) {
   lastTofA = tofA || lastTofA;
   lastTofB = tofB || lastTofB;
