@@ -1117,8 +1117,11 @@ setInterval(() => {
   // Use _streamAlive (set on WS message receipt with sensor data)
   // as proxy — if WS is alive but stream hasn't loaded in 10s, restart.
   const img = $('cam-img');
+  const wsHealthy = ws && ws.readyState === WebSocket.OPEN
+                    && (Date.now() - _lastMsgAt < 5000);
+  if (!wsHealthy) return;
   if (img.src && now - _streamAlive > 10000) {
-    console.warn('[Watch]', 'Camera stream stale, restarting');
+    console.warn('[Watch]', 'Camera stream stale (WS healthy), restarting');
     startStream();
   }
 }, 5000);
