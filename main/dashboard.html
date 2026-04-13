@@ -988,6 +988,9 @@ const ESP_HOST = _params.get('host') || (_isLocal ? ESP_FALLBACK : window.locati
 let _wsFallback = false;
 
 function startStream() {
+  const now = Date.now();
+  if (now - _streamLastAttempt < _streamBackoffMs) return;
+  _streamLastAttempt = now;
   const img = $('cam-img');
   const host = _wsFallback ? ESP_FALLBACK : ESP_HOST;
   const base = `http://${host}:81/stream`;
@@ -1000,8 +1003,9 @@ function startStream() {
   // detect modal uses drawImage only, which IS allowed on tainted canvas.
   img.src = url;
   _streamAlive = Date.now();
-  img.onload = () => { _streamAlive = Date.now(); };
+  img.onload = () => { _streamAlive = Date.now(); _streamBackoffMs = 0; };
   img.onerror = () => {
+    _streamBackoffMs = Math.min((_streamBackoffMs || 500) * 2, 15000);
     console.log('[Stream]', `error loading from ${host}:81`);
     if (!_wsFallback && ESP_HOST !== ESP_FALLBACK) {
       _wsFallback = true;
@@ -1012,6 +1016,8 @@ function startStream() {
 
 let ws = null, msgCount = 0, lastRateTime = Date.now(), reconnectTimer = null;
 let _lastMsgAt = Date.now(), _streamAlive = Date.now();
+let _streamBackoffMs  = 0;    // grows on err, resets on load
+let _streamLastAttempt = 0;
 let _reconnectDelay = 1000;  // exponential backoff: 1s → 2s → 4s → 8s max
 
 function connectWS() {
