@@ -34,7 +34,7 @@
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
-    grid-template-rows: auto auto;
+    grid-template-rows: 1fr 1fr auto;
     gap: 12px; padding: 16px; height: calc(100vh - 52px);
   }
   .card {
@@ -47,7 +47,7 @@
   }
 
   /* Camera card spans left 2 columns, both rows */
-  #camera-card { grid-column: 1 / 3; grid-row: 1 / 3; }
+  #camera-card { grid-column: 1 / 3; grid-row: 1 / 4; }
   #cam-container { position: relative; width: 100%; flex: 1; min-height: 0; background: #000; overflow: hidden; }
   #cam-img { position: absolute; border-radius: 2px; background: #000; transform: rotate(180deg); }
   #tof-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: grab; }
@@ -128,6 +128,28 @@
   .btn-sm:hover { color: var(--text); border-color: var(--text); }
   #gear-btn { background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--dim); font-size: 15px; padding: 3px 8px; cursor: pointer; line-height: 1; }
   #gear-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* Motor control card */
+  #motor-card { grid-column: 3; }
+  .motor-controls { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .motor-state { display: flex; align-items: center; gap: 8px; }
+  .state-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .state-dot.disarmed { background: var(--dim); }
+  .state-dot.arming { background: var(--warn); animation: pulse 1s infinite; }
+  .state-dot.armed { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .btn-arm { padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border); font-size: 10px; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; margin-left: auto; }
+  .btn-arm.arm { background: var(--bg); color: var(--green); border-color: var(--green); }
+  .btn-arm.disarm { background: var(--bg); color: var(--danger); border-color: var(--danger); }
+  .motor-slider-row { display: flex; align-items: center; gap: 8px; }
+  .motor-slider-row label { font-size: 10px; color: var(--dim); min-width: 55px; text-transform: uppercase; letter-spacing: 1px; }
+  .motor-slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .motor-slider-row .val { font-size: 12px; color: var(--accent); min-width: 40px; text-align: right; font-weight: bold; }
+  .motor-bars { display: flex; gap: 16px; justify-content: center; padding-top: 4px; }
+  .motor-bar-wrap { text-align: center; }
+  .motor-bar-label { font-size: 9px; color: var(--dim); letter-spacing: 1px; margin-bottom: 4px; text-transform: uppercase; }
+  .motor-bar { width: 28px; height: 70px; background: var(--bg); border-radius: 4px; border: 1px solid var(--border); position: relative; overflow: hidden; }
+  .motor-bar-fill { position: absolute; left: 0; right: 0; background: var(--accent); transition: height 0.15s, top 0.15s, bottom 0.15s; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/protobufjs@7/dist/protobuf.min.js"></script>
 </head>
@@ -297,6 +319,37 @@
     </div>
     <div id="tof-range-label" style="text-align:center;font-size:10px;color:var(--dim);">0–2000 mm</div>
   </div>
+
+  <div class="card" id="motor-card">
+    <div class="card-title">Motor Control</div>
+    <div class="motor-controls">
+      <div class="motor-state">
+        <div class="state-dot disarmed" id="motor-state-dot"></div>
+        <span id="motor-state-label" style="font-size:11px;color:var(--dim);">DISARMED</span>
+        <button class="btn-arm arm" id="arm-btn">ARM</button>
+      </div>
+      <div class="motor-slider-row">
+        <label>Left</label>
+        <input type="range" id="motor-left" min="-100" max="100" value="0" step="1" disabled />
+        <span class="val" id="motor-left-val">0%</span>
+      </div>
+      <div class="motor-slider-row">
+        <label>Right</label>
+        <input type="range" id="motor-right" min="-100" max="100" value="0" step="1" disabled />
+        <span class="val" id="motor-right-val">0%</span>
+      </div>
+      <div class="motor-bars">
+        <div class="motor-bar-wrap">
+          <div class="motor-bar-label">L</div>
+          <div class="motor-bar" id="motor-bar-left"><div class="motor-bar-fill" id="motor-fill-left"></div></div>
+        </div>
+        <div class="motor-bar-wrap">
+          <div class="motor-bar-label">R</div>
+          <div class="motor-bar" id="motor-bar-right"><div class="motor-bar-fill" id="motor-fill-right"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -313,10 +366,12 @@ message IMUData { float pitch = 1; float roll = 2; float heading = 3; }
 message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
 message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
 message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; }
-message MotorCommand { float throttle = 1; float rudder = 2; }
+message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; float right = 4; }
+message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; }
+message ArmCommand { bool arm = 1; }
 message DetectCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1082,6 +1137,9 @@ function connectWS() {
         const secs = Number(st.uptimeUs) / 1e6;
         $('sys-uptime').textContent = `Up: ${Math.floor(secs/60)}m${Math.floor(secs%60)}s`;
       }
+      if (msg.motorStatus) {
+        updateMotorStatus(msg.motorStatus);
+      }
     } catch (e) { console.error('[Proto]', `decode error: ${e.message}`); }
   };
 
@@ -1538,6 +1596,92 @@ window.debug = {
   },
   imu: () => ({ pitch: imuPitch, roll: imuRoll }),
 };
+
+// ═══════════════════════════════════════════════════════════════
+// Motor Control
+// ═══════════════════════════════════════════════════════════════
+const MOTOR_STATES = ['DISARMED', 'ARMING', 'ARMED'];
+const MOTOR_CLASSES = ['disarmed', 'arming', 'armed'];
+let motorArmed = false;
+
+function updateMotorStatus(ms) {
+  const idx = ms.state || 0;
+  const dot = $('motor-state-dot');
+  dot.className = 'state-dot ' + (MOTOR_CLASSES[idx] || 'disarmed');
+  $('motor-state-label').textContent = MOTOR_STATES[idx] || 'UNKNOWN';
+  motorArmed = (idx === 2);
+
+  const btn = $('arm-btn');
+  if (motorArmed) {
+    btn.textContent = 'DISARM';
+    btn.className = 'btn-arm disarm';
+  } else {
+    btn.textContent = 'ARM';
+    btn.className = 'btn-arm arm';
+  }
+
+  $('motor-left').disabled = !motorArmed;
+  $('motor-right').disabled = !motorArmed;
+
+  updateMotorBar('left', ms.leftThrottle || 0);
+  updateMotorBar('right', ms.rightThrottle || 0);
+}
+
+function updateMotorBar(side, value) {
+  const fill = $('motor-fill-' + side);
+  const bar = $('motor-bar-' + side);
+  const h = bar.clientHeight;
+  const mid = h / 2;
+  const px = Math.abs(value) * mid;
+  if (value >= 0) {
+    fill.style.bottom = mid + 'px';
+    fill.style.top = 'auto';
+    fill.style.height = px + 'px';
+    fill.style.background = 'var(--green)';
+  } else {
+    fill.style.top = mid + 'px';
+    fill.style.bottom = 'auto';
+    fill.style.height = px + 'px';
+    fill.style.background = 'var(--danger)';
+  }
+}
+
+let _motorSendTimer = null;
+function sendMotorCommand() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !motorArmed) return;
+  const left  = parseInt($('motor-left').value) / 100;
+  const right = parseInt($('motor-right').value) / 100;
+  const msg = BoatMessage.create({ motor: { left, right } });
+  const buf = BoatMessage.encode(msg).finish();
+  ws.send(buf);
+}
+
+['motor-left', 'motor-right'].forEach(id => {
+  $(id).addEventListener('input', e => {
+    const lbl = id === 'motor-left' ? 'motor-left-val' : 'motor-right-val';
+    $(lbl).textContent = e.target.value + '%';
+    if (!_motorSendTimer) {
+      _motorSendTimer = setInterval(sendMotorCommand, 100);
+    }
+  });
+  $(id).addEventListener('change', () => {
+    sendMotorCommand();
+    if (_motorSendTimer) { clearInterval(_motorSendTimer); _motorSendTimer = null; }
+  });
+  $(id).addEventListener('dblclick', () => {
+    $(id).value = 0;
+    const lbl = id === 'motor-left' ? 'motor-left-val' : 'motor-right-val';
+    $(lbl).textContent = '0%';
+    sendMotorCommand();
+  });
+});
+
+$('arm-btn').addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const msg = BoatMessage.create({ armCmd: { arm: !motorArmed } });
+  const buf = BoatMessage.encode(msg).finish();
+  ws.send(buf);
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Init
