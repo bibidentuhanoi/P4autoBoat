@@ -46,3 +46,9 @@ typedef void (*motor_command_handler_fn)(const boat_MotorCommand *cmd);
  * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
+
+void pipeline_publish_motor_status(const boat_MotorStatus *mstatus);
+
+typedef void (*arm_command_handler_fn)(bool arm);
+
+void pipeline_register_arm_handler(arm_command_handler_fn handler);

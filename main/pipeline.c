@@ -20,6 +20,7 @@ static int s_transport_count = 0;
 /* ---- Command handler ---- */
 
 static motor_command_handler_fn s_motor_handler = NULL;
+static arm_command_handler_fn s_arm_handler = NULL;
 
 /* ---- Public API ---- */
 
@@ -27,6 +28,7 @@ esp_err_t pipeline_init(void)
 {
     s_transport_count = 0;
     s_motor_handler = NULL;
+    s_arm_handler = NULL;
     ESP_LOGI(TAG, "Pipeline initialized (max %d transports)", PIPELINE_MAX_TRANSPORTS);
     return ESP_OK;
 }
@@ -51,6 +53,11 @@ esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx)
 void pipeline_register_motor_handler(motor_command_handler_fn handler)
 {
     s_motor_handler = handler;
+}
+
+void pipeline_register_arm_handler(arm_command_handler_fn handler)
+{
+    s_arm_handler = handler;
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
@@ -106,6 +113,30 @@ void pipeline_publish_status(const boat_SystemStatus *status)
     }
 }
 
+void pipeline_publish_motor_status(const boat_MotorStatus *mstatus)
+{
+    boat_BoatMessage msg = boat_BoatMessage_init_zero;
+    msg.which_payload = boat_BoatMessage_motor_status_tag;
+    msg.payload.motor_status = *mstatus;
+
+    uint8_t buf[32];
+    pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
+
+    if (!pb_encode(&stream, boat_BoatMessage_fields, &msg)) {
+        ESP_LOGE(TAG, "MotorStatus encode failed: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+
+    size_t len = stream.bytes_written;
+
+    for (int i = 0; i < s_transport_count; i++) {
+        esp_err_t ret = s_transports[i].send(buf, len, s_transports[i].ctx);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Transport %d motor_status send failed: %s", i, esp_err_to_name(ret));
+        }
+    }
+}
+
 void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 {
     /* Static — boat_BoatMessage is ~6.5KB after ToF array expansion to 256.
@@ -130,6 +161,12 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
     case boat_BoatMessage_detect_tag:
         ESP_LOGI(TAG, "Detect command received");
         detect_trigger();
+        break;
+    case boat_BoatMessage_arm_cmd_tag:
+        ESP_LOGI(TAG, "Arm command received: %s", msg.payload.arm_cmd.arm ? "ARM" : "DISARM");
+        if (s_arm_handler) {
+            s_arm_handler(msg.payload.arm_cmd.arm);
+        }
         break;
     default:
         ESP_LOGW(TAG, "Unhandled message type: %d", (int)msg.which_payload);
