@@ -26,6 +26,7 @@
 #include "http_server.h"
 #include "sensor_task.h"
 #include "detect_task.h"
+#include "motor_control.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -56,6 +57,10 @@ void app_main(void) {
     // 1. Initialize NVS
     ESP_LOGI(TAG, "Initializing NVS...");
     fs_init();
+
+    // 1b. Start ESC PWM at neutral — must be running before ESCs see power
+    ESP_LOGI(TAG, "Initializing motor control (neutral PWM)...");
+    ESP_ERROR_CHECK(motor_control_init());
 
     // 2. Create temporary SCCB bus for camera init, then hand off GPIO7/GPIO8 to sensor bus
     ESP_LOGI(TAG, "Initializing camera SCCB bus (temporary)...");
@@ -163,6 +168,14 @@ void app_main(void) {
             ESP_ERROR_CHECK(camera_stream_server_start());
         }
         ESP_ERROR_CHECK(http_server_start());
+
+        // 11b. Arm ESCs (blocking ~3 s — neutral PWM running since step 1b)
+        ESP_LOGI(TAG, "Arming ESCs...");
+        esp_err_t esc_ret = motor_control_arm();
+        if (esc_ret != ESP_OK) {
+            ESP_LOGW(TAG, "ESC arming failed (%s) — arm via dashboard later",
+                     esp_err_to_name(esc_ret));
+        }
     }
 
     // 12. Start RTOS Tasks
