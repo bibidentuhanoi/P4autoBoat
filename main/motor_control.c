@@ -2,6 +2,7 @@
 #include "drivers/esc_driver.h"
 #include "pipeline.h"
 #include "transports/ws_transport.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <math.h>
