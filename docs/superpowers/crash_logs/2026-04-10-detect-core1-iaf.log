@@ -1,0 +1,267 @@
+I (586) esp_image: segment 4: paddr=0031fb08 vaddr=4ff05d08 sizeESP-ROM:esp32p4-eco2-20240710
+Build:Jul 10 2024
+rst:0x17 (CHIP_USB_UART_RESET),boot:0x1c (SPI_FAST_FLASH_BOOT)
+Core0 Saved PC:0x4ff05e4a
+Core1 Saved PC:0x4ff05e4a
+SPI mode:DIO, clock div:1
+load:0x4ff33ce0,len:0x1674
+load:0x4ff2abd0,len:0xe7c
+load:0x4ff2cbd0,len:0x3344
+entry 0x4ff2abda
+I (27) boot: ESP-IDF v5.4.3-1284-g9c4bbcdace-dirty 2nd stage bootloader
+I (28) boot: compile time Apr 10 2026 09:51:59
+I (28) boot: Multicore bootloader
+I (30) boot: chip revision: v1.0
+I (33) boot: efuse block revision: v0.3
+I (36) boot.esp32p4: SPI Speed      : 80MHz
+I (40) boot.esp32p4: SPI Mode       : DIO
+I (44) boot.esp32p4: SPI Flash Size : 16MB
+I (48) boot: Enabling RNG early entropy source...
+I (52) boot: Partition Table:
+I (55) boot: ## Label            Usage          Type ST Offset   Length
+I (61) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (67) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (74) boot:  2 factory          factory app      00 00 00010000 00400000
+I (81) boot:  3 cat_det          Unknown data     01 82 00410000 00100000
+I (88) boot: End of partition table
+I (90) esp_image: segment 0: paddr=00010020 vaddr=48280020 size=8a278h (565880) map
+I (166) esp_image: segment 1: paddr=0009a2a0 vaddr=30100000 size=00068h (   104) load
+I (168) esp_image: segment 2: paddr=0009a310 vaddr=4ff00000 size=05d08h ( 23816) load
+I (174) esp_image: segment 3: paddr=000a0020 vaddr=48000020 size=27fae0h (2620128) map
+I (491) esp_image: segment 4: paddr=0031fb08 vaddr=4ff05d08 size=0fd6ch ( 64876) load
+I (502) esp_image: segment 5: paddr=0032f87c vaddr=4ff15a80 size=04e14h ( 19988) load
+I (511) boot: Loaded app from partition at offset 0x10000
+I (512) boot: Disabling RNG early entropy source...
+I (524) hex_psram: vendor id    : 0x0d (AP)
+I (525) hex_psram: Latency      : 0x01 (Fixed)
+I (525) hex_psram: DriveStr.    : 0x00 (25 Ohm)
+I (526) hex_psram: dev id       : 0x03 (generation 4)
+I (530) hex_psram: density      : 0x07 (256 Mbit)
+I (534) hex_psram: good-die     : 0x06 (Pass)
+I (539) hex_psram: SRF          : 0x02 (Slow Refresh)
+I (543) hex_psram: BurstType    : 0x00 ( Wrap)
+I (547) hex_psram: BurstLen     : 0x03 (2048 Byte)
+I (552) hex_psram: BitMode      : 0x01 (X16 Mode)
+I (556) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)
+I (561) hex_psram: DriveStrength: 0x00 (1/1)
+I (566) MSPI DQS: tuning success, best phase id is 0
+I (738) MSPI DQS: tuning success, best delayline id is 17
+I esp_psram: Found 32MB PSRAM device
+I esp_psram: Speed: 200MHz
+I (782) mmu_psram: .rodata xip on psram
+I (971) mmu_psram: .text xip on psram
+I (972) hex_psram: psram CS IO is dedicated
+I (973) cpu_start: Multicore app
+I (1411) esp_psram: SPI SRAM memory test OK
+I (1421) cpu_start: GPIO 38 and 37 are used as console UART I/O pins
+I (1421) cpu_start: Pro cpu start user code
+I (1421) cpu_start: cpu freq: 360000000 Hz
+I (1423) app_init: Application information:
+I (1427) app_init: Project name:     BoatEspP4
+I (1431) app_init: App version:      e7d779f-dirty
+I (1436) app_init: Compile time:     Apr 10 2026 10:42:31
+I (1441) app_init: ELF file SHA256:  a44e6c3fd...
+I (1445) app_init: ESP-IDF:          v5.4.3-1284-g9c4bbcdace-dirty
+I (1451) efuse_init: Min chip rev:     v1.0
+I (1455) efuse_init: Max chip rev:     v1.99 
+I (1459) efuse_init: Chip rev:         v1.0
+I (1463) heap_init: Initializing. RAM available for dynamic allocation:
+I (1469) heap_init: At 4FF27780 len 00013840 (78 KiB): RETENT_RAM
+I (1475) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM
+I (1480) heap_init: At 4FF47D60 len 000382A0 (224 KiB): RAM
+I (1486) heap_init: At 50108080 len 00007F80 (31 KiB): RTCRAM
+I (1491) heap_init: At 30100068 len 00001F98 (7 KiB): TCM
+I (1496) esp_psram: Adding pool of 29632K of PSRAM memory to heap allocator
+I (1503) esp_psram: Adding pool of 1K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator
+I (1514) esp_psram: Adding pool of 23K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (1526) spi_flash: detected chip: generic
+I (1529) spi_flash: flash io: dio
+I (1600) sleep_gpio: Configure to isolate all GPIO pins in sleep state
+I (1606) sleep_gpio: Enable automatic switching of GPIO sleep configuration
+I (1613) H_SDIO_DRV: sdio_data_to_rx_buf_task started
+I (1613) main_task: Started on CPU0
+I (1623) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (1633) main_task: Calling app_main()
+I (1633) MAIN: === SYSTEM BOOT ===
+I (1633) MAIN: Initializing NVS...
+I (1643) MAIN: Initializing camera SCCB bus (temporary)...
+I (1643) MAIN: SCCB bus: port=0 SCL=8 SDA=7
+I (1693) MAIN: Initializing camera...
+I (1693) ov5647: Detected Camera sensor PID=0x5647
+I (1713) CAM_DRV: CSI format: 800x640 raw=RGBP (0x50424752) — will encode to JPEG
+I (1713) CAM_DRV: JPEG encoder ready: quality=60 buf=1024000 bytes
+I (1723) CAM_DRV: PPA SRM ready for 180 deg rotation
+I (1723) CAM_DRV: Camera ready: 800x640 JPEG
+I (1723) MAIN: Initializing sensor I2C bus...
+W (1733) i2c.common: GPIO 8 is not usable, maybe conflict with others
+W (1733) i2c.common: GPIO 7 is not usable, maybe conflict with others
+I (1743) MAIN: Sensor I2C bus: port=1 SCL=7 SDA=8
+I (1743) MAIN: Initializing IMU...
+I (1773) MAIN: Initializing ToF sensors (uploading firmware, please wait)...
+I (1773) gpio: GPIO[29]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 
+I (1773) gpio: GPIO[52]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 
+I (6373) FS: Xtalk cal [xtalk_a] loaded (776 bytes)
+I (6463) TOF: Sensor A: xtalk cal loaded from NVS
+I (6463) TOF: Sensor B: running xtalk calibration (place 1000mm target)…
+W (15073) TOF: Sensor B: xtalk calibration failed (4), using defaults
+I (15473) MAIN: ToF ready.
+I (15473) MAIN: Press and hold the BOOT button (GPIO 35) NOW to force recalibration...
+I (15473) MAIN: 3...
+I (16473) MAIN: 2...
+I (17473) MAIN: 1...
+I (18473) FS: 
+--- LOADED CALIBRATION FROM NVS ---
+
+I (18473) FS: .g_bias = {-51.67f, -288.27f, -63.95f}
+
+I (18473) FS: .m_bias = {1183.50f, -36.00f, -923.50f}
+
+I (18473) FS: .m_scale = {0.8939f, 1.1088f, 1.0210f}
+
+I (18473) FS: .pitch_tare = -2.46f
+
+I (18483) FS: .roll_tare = -4.66f
+
+I (18483) FS: .heading_tare = 91.75f
+
+I (18483) FS: -----------------------------------
+
+I (18493) MAIN: Valid calibration found in NVS. Skipping calibration.
+I (18493) MAIN: Initializing sensor fusion...
+I (18503) MAIN: Initializing data pipeline...
+I (18503) PIPELINE: Pipeline initialized (max 4 transports)
+I (18513) MAIN: Connecting to WiFi...
+I (18513) transport: Attempt connection with slave: retry[0]
+W (18523) H_SDIO_DRV: Reset slave using GPIO[54]
+I (18523) os_wrapper_esp: GPIO [54] configured
+I (18533) gpio: GPIO[54]| InputEn: 0| OutputEn: 1| OpenDrain: 0| Pullup: 0| Pulldown: 0| Intr:0 
+I (20053) sdio_wrapper: SDIO master: Slot 1, Data-Lines: 4-bit Freq(KHz)[40000 KHz]
+I (20053) sdio_wrapper: GPIOs: CLK[18] CMD[19] D0[14] D1[15] D2[16] D3[17] Slave_Reset[54]
+I (20053) sdio_wrapper: Queues: Tx[20] Rx[20] SDIO-Rx-Mode[1]
+I (20093) gpio: GPIO[15]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (20093) gpio: GPIO[17]| InputEn: 0| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+I (20093) sdio_wrapper: Function 0 Blocksize: 512
+I (20103) sdio_wrapper: Function 1 Blocksize: 512
+I (20203) H_SDIO_DRV: Card init success, TRANSPORT_RX_ACTIVE
+I (20203) transport: set_transport_state: 1
+I (20203) transport: Waiting for esp_hosted slave to be ready
+I (20213) H_SDIO_DRV: SDIO Host operating in STREAMING MODE
+I (20213) H_SDIO_DRV: Open data path at slave
+I (20213) H_SDIO_DRV: Starting SDIO process rx task
+I (20243) H_SDIO_DRV: Received ESP_PRIV_IF type message
+I (20243) transport: Received INIT event from ESP32 peripheral
+I (20243) transport: EVENT: 12
+I (20243) transport: Identified slave [esp32c6]
+I (20243) transport: SDIO mode: slave: streaming, host: streaming
+I (20253) transport: EVENT: 11
+I (20253) transport: capabilities: 0xd
+I (20253) transport: Features supported are:
+I (20263) transport: 	 * WLAN
+I (20263) transport: 	   - HCI over SDIO
+I (20263) transport: 	   - BLE only
+I (20273) transport: EVENT: 13
+I (20273) transport: ESP board type is : 13 
+
+I (20273) transport: Base transport is set-up, TRANSPORT_TX_ACTIVE
+I (20283) H_API: Transport active
+I (20283) transport: Slave chip Id[12]
+I (20293) transport: raw_tp_dir[-], flow_ctrl: low[60] high[80]
+I (20293) transport: transport_delayed_init
+I (20303) esp_cli: Registering command: crash
+I (20303) esp_cli: Registering command: reboot
+I (20303) esp_cli: Registering command: mem-dump
+I (20313) esp_cli: Registering command: task-dump
+I (20313) esp_cli: Registering command: cpu-dump
+I (20323) esp_cli: Registering command: heap-trace
+I (20323) esp_cli: Registering command: sock-dump
+I (20333) esp_cli: Registering command: host-power-save
+I (20333) hci_stub_drv: Host BT Support: Disabled
+I (20343) H_SDIO_DRV: Received INIT event
+I (20343) H_SDIO_DRV: Event type: 0x22
+I (20343) H_SDIO_DRV: Write thread started
+I (20613) RPC_WRAP: Coprocessor Boot-up
+I (20953) RPC_WRAP: ESP Event: wifi station started
+I (20983) H_API: esp_wifi_remote_connect
+I (21003) WIFI: TX power set to 20.0 dBm
+I (21003) WIFI: Connecting to SSID: Bi Bop
+I (21513) RPC_WRAP: ESP Event: Station mode: Connected
+I (21513) esp_wifi_remote: esp_wifi_internal_reg_rxcb: sta: 0x4826058e
+I (22533) esp_netif_handlers: sta ip: 192.168.1.201, mask: 255.255.255.0, gw: 192.168.1.2
+I (22533) WIFI: Got IP: 192.168.1.201
+I (22533) WIFI: WiFi connected
+I (22533) CAM_STREAM: MJPEG stream: 800x640 -> http://<ip>:81/stream
+I (22543) PIPELINE: Transport registered (1/4)
+I (22543) WS_TRANSPORT: WebSocket transport ready on /ws (max 4 clients)
+I (22543) HTTP_SERVER: HTTP server ready on port 80: / (dashboard), /ws (protobuf), /detect (cat JSON), /detect/view (overlay), /detect/image.jpg
+I (22563) MAIN: Starting tasks...
+I (22563) SENSOR_TASK: Sensor snapshot task started (20 Hz, ToF 5 Hz)
+I (22573) MAIN: System running.
+I (22573) main_task: Returned from app_main()
+I (41823) DETECT: first /detect hit — instantiating CatDetect
+I (41923) DETECT: decoded espdet.jpg: 377x500
+I (41923) FbsLoader: The storage free size is 65536 KB
+I (41923) FbsLoader: The partition size is 1024 KB
+W (41923) FbsLoader: There is only one model in the flatbuffers, ignore the input model name!
+W (42273) dl::Model: Minimize() will delete variables not used in model inference, which will make it impossible to test or debug the model.
+I (42333) DETECT: /detect: 1 detections in 412 ms
+I (42413) DETECT: /detect: 1 detections in 56 ms
+I (42493) DETECT: /detect: 1 detections in 56 ms
+Guru Meditation Error: Core  1 panic'ed (Instruction access fault). Exception was unhandled.
+
+Core  1 register dump:
+MEPC    : 0x00222318  RA      : 0x4822e9b6  SP      : 0x4ff35810  GP      : 0x4ff16280  
+TP      : 0x4ff35860  T0      : 0x00000000  T1      : 0x4ff059d6  T2      : 0x00000000  
+S0/FP   : 0x4ff46a00  S1      : 0x00000001  A0      : 0x00000001  A1      : 0x00000000  
+A2      : 0x00000000  A3      : 0x00000000  A4      : 0x00000000  A5      : 0x00222319  
+A6      : 0x00000000  A7      : 0x00000000  S2      : 0x4ff46a0c  S3      : 0x4ff47000  
+S4      : 0x4ff1aa44  S5      : 0x00000000  S6      : 0x4ff47000  S7      : 0x00000000  
+S8      : 0x00000000  S9      : 0x00000000  S10     : 0x00000000  S11     : 0x00000000  
+T3      : 0x00000000  T4      : 0x00000000  T5      : 0x00000000  T6      : 0x00000000  
+MSTATUS : 0x00011880  MTVEC   : 0x4ff00003  MCAUSE  : 0x00000001  MTVAL   : 0x00222318  
+MHARTID : 0x00000001  
+
+Stack memory:
+4ff35810: 0x4ff1aa4c 0x4ff477b4 0x00000000 0x4ff0e648 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35830: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35850: 0x00000000 0xa5a5a5a5 0xa5a5a5a5 0xa5a5a5a5 0x30100000 0x00000068 0x50115737 0x15c72683
+4ff35870: 0x01000637 0x501117b7 0x2e238ed1 0x43b814d7 0x100006b7 0xc3b88f55 0x05378082 0x05133010
+4ff35890: 0x80820305 0x00000000 0x30100064 0x30100038 0x000401c2 0x009a0000 0x010100fa 0x00020002
+4ff358b0: 0x009601c2 0x0104007c 0x001a0002 0x02ad00ac 0x017e0116 0x00170046 0xa5a5a5a5 0xa5a5a5a5
+4ff358d0: 0x00000000 0x4ff352f8 0x4ff352f8 0x00000000 0x00000000 0x00000000 0xa5a5a5a5 0xa5a5a5a5
+4ff358f0: 0xa5a5a5a5 0xa5a5a5a5 0xbaad5678 0x4ff35ccc 0x009896d3 0x00000020 0x4ff357a8 0x0000000e
+4ff35910: 0x00000001 0x00000001 0x4ff35908 0x0000000c 0x00000001 0x00000001 0x4ff35918 0x4ff352e8
+4ff35930: 0x00000160 0xabba1234 0x00000154 0x4ff357a0 0x00000000 0x4ff1aab0 0x4ff35198 0x4ff3593c
+4ff35950: 0x4ff1aaa8 0x00000019 0x00000000 0x00000000 0x4ff3593c 0x00000000 0x00000000 0x4ff352f8
+4ff35970: 0x454c4449 0x00000031 0x00000000 0x00000000 0x00000001 0x4ff358f0 0x00000000 0x00000000
+4ff35990: 0x00000000 0x00000000 0x00000000 0x4ff27dd8 0x4ff27e40 0x4ff27ea8 0x00000000 0x00000000
+4ff359b0: 0x00000001 0x00000000 0x00000000 0x00000000 0x48006914 0x00000000 0x00000000 0x00000000
+4ff359d0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff359f0: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35a10: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35a30: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35a50: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+4ff35a70: 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000200
+4ff35a90: 0xbaad5678 0x0000001c 0xabba1234 0x00000010 0x0008010a 0x00000035 0x00000000 0x4ff3635c
+4ff35ab0: 0xbaad5678 0x0000001c 0xabba1234 0x00000010 0x0001010a 0x00000050 0x00000000 0x4ff35b44
+4ff35ad0: 0xbaad5678 0x00000060 0xabba1234 0x00000054 0x00000000 0x4ff35ae0 0x00000000 0x00000000
+4ff35af0: 0x00000000 0x4ff35af8 0xffffffff 0x4ff35af8 0x4ff35af8 0x00000000 0x4ff35b0c 0xffffffff
+4ff35b10: 0x4ff35b0c 0x4ff35b0c 0x00000001 0x00000001 0x00000000 0x00000000 0x00000000 0xb33fffff
+4ff35b30: 0x00000000 0xbaad5678 0x0000001c 0xabba1234 0x00000010 0x0003010a 0x00000036 0x00000000
+4ff35b50: 0x00000000 0xbaad5678 0x00000060 0xabba1234 0x00000054 0x00000000 0x4ff35b64 0x00000000
+4ff35b70: 0x00000000 0x00000000 0x4ff35b7c 0xffffffff 0x4ff35b7c 0x4ff35b7c 0x00000000 0x4ff35b90
+4ff35b90: 0xffffffff 0x4ff35b90 0x4ff35b90 0x00000001 0x00000001 0x00000000 0x6d2f6d00 0x00000000
+4ff35bb0: 0xb33fffff 0x00000000 0xbaad5678 0x00000030 0xabba1234 0x00000024 0x00000000 0x00000808
+4ff35bd0: 0x00000006 0x4ff48140 0x4ff5013f 0xb33fffff 0x00000000 0x4ff48140 0x4ff27c34 0xbaad5678
+4ff35bf0: 0x00000060 0xabba1234 0x00000054 0x00000000 0x4ff35bfc 0x00000000 0x00000000 0x00000000
+
+Core  0 register dump:
+MEPC    : 0x00000000  RA      : 0x4ff38dbc  SP      : 0x00000000  GP      : 0x00000000  
+TP      : 0x00000000  T0      : 0x4ff38dd4  T1      : 0xffffffff  T2      : 0x4ff38dd4  
+S0/FP   : 0x4ff38dd4  S1      : 0x00000000  A0      : 0x4ff38de8  A1      : 0xffffffff  
+A2      : 0x4ff38de8  A3      : 0x4ff38de8  A4      : 0x00000001  A5      : 0x00000001  
+A6      : 0x00000000  A7      : 0x375f7600  S2      : 0x00000000  S3      : 0xb33fffff  
+S4      : 0x00000000  S5      : 0xbaad5678  S6      : 0x00000024  S7      : 0xabba1234  
+S8      : 0x00000018  S9      : 0x00000030  S10     : 0x50081030  S11     : 0x00000001  
+T3      : 0x4ff0651e  T4      : 0x4830b5bc  T5      : 0x4ff38b0c  T6      : 0xbaad5678  
+MSTATUS : 0x00000060  MTVEC   : 0xabba1234  MCAUSE  : 0x00000054  MTVAL   : 0x00000000  
+MHARTID : 0x4ff38ERR: device reports readiness to read but returned no data (device disconnected or multiple access on port?)
