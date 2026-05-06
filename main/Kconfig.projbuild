@@ -114,6 +114,39 @@ menu "Board Configuration"
 
     endmenu
 
+    menu "ESC Motor Configuration"
+
+        config ESC_PWM_LEFT_PIN
+            int "Left ESC PWM Pin (ESPWM_L)"
+            default 31
+
+        config ESC_PWM_RIGHT_PIN
+            int "Right ESC PWM Pin (ESPWM_R)"
+            default 33
+
+        config ESC_PWM_FREQ_HZ
+            int "ESC PWM Frequency (Hz)"
+            default 50
+            help
+                Standard RC ESC expects 50 Hz (20 ms period).
+
+        config ESC_PULSE_MIN_US
+            int "ESC Pulse Min (us) — full reverse / arm"
+            default 1000
+            range 500 1500
+
+        config ESC_PULSE_MAX_US
+            int "ESC Pulse Max (us) — full forward"
+            default 2000
+            range 1500 2500
+
+        config ESC_PULSE_NEUTRAL_US
+            int "ESC Pulse Neutral (us) — stopped"
+            default 1500
+            range 1000 2000
+
+    endmenu
+
     menu "WiFi Configuration"
 
         config WIFI_SSID
