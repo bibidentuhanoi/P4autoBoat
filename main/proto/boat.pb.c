@@ -24,6 +24,12 @@ PB_BIND(boat_SensorSnapshot, boat_SensorSnapshot, 4)
 PB_BIND(boat_MotorCommand, boat_MotorCommand, AUTO)
 
 
+PB_BIND(boat_MotorStatus, boat_MotorStatus, AUTO)
+
+
+PB_BIND(boat_ArmCommand, boat_ArmCommand, AUTO)
+
+
 PB_BIND(boat_SystemStatus, boat_SystemStatus, AUTO)
 
 

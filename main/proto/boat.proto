@@ -38,6 +38,18 @@ message SensorSnapshot {
 message MotorCommand {
   float throttle = 1;  // -1.0 to 1.0
   float rudder   = 2;  // -1.0 to 1.0
+  float left     = 3;  // left motor -1.0 to 1.0
+  float right    = 4;  // right motor -1.0 to 1.0
+}
+
+message MotorStatus {
+  uint32 state          = 1;  // motor state enum
+  float  left_throttle  = 2;  // current left throttle
+  float  right_throttle = 3;  // current right throttle
+}
+
+message ArmCommand {
+  bool arm = 1;  // true = arm, false = disarm
 }
 
 message SystemStatus {
@@ -49,9 +61,12 @@ message SystemStatus {
 // Envelope — every message on the wire is a BoatMessage
 message BoatMessage {
   oneof payload {
-    SensorSnapshot sensors  = 1;
-    MotorCommand   motor    = 2;
-    SystemStatus   status   = 3;
-    DetectCommand  detect   = 4;
+    SensorSnapshot sensors      = 1;
+    MotorCommand   motor        = 2;
+    SystemStatus   status       = 3;
+    DetectCommand  detect       = 4;
+    // field 5 reserved for GpsCoordinate
+    MotorStatus    motor_status = 6;
+    ArmCommand     arm_cmd      = 7;
   }
 }
