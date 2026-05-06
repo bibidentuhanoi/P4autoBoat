@@ -5,7 +5,10 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <math.h>
+#include <stdint.h>
 
 static const char *TAG = "MOTOR_CTL";
 
@@ -38,17 +41,23 @@ static void motor_command_handler(const boat_MotorCommand *cmd)
     esc_driver_set_throttle(left, right);
 }
 
-static void arm_command_handler(bool arm)
+static void arm_task_fn(void *arg)
 {
-    if (arm) {
-        ESP_LOGI(TAG, "Arm command received");
-        if (esc_driver_get_state() == ESC_STATE_DISARMED) {
-            motor_control_arm();
-        }
+    bool do_arm = (bool)(intptr_t)arg;
+    if (do_arm) {
+        motor_control_arm();
     } else {
-        ESP_LOGI(TAG, "Disarm command received");
         motor_control_disarm();
     }
+    vTaskDelete(NULL);
+}
+
+static void arm_command_handler(bool arm)
+{
+    ESP_LOGI(TAG, "%s command received", arm ? "Arm" : "Disarm");
+    if (arm && esc_driver_get_state() != ESC_STATE_DISARMED) return;
+    if (!arm && esc_driver_get_state() == ESC_STATE_DISARMED) return;
+    xTaskCreate(arm_task_fn, "esc_arm", 2048, (void *)(intptr_t)arm, 5, NULL);
 }
 
 static void publish_status(void)
@@ -77,14 +86,17 @@ static void watchdog_cb(void *arg)
     }
 }
 
-esp_err_t motor_control_init(void)
+esp_err_t motor_control_init_hw(void)
 {
     esp_err_t ret = esc_driver_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ESC driver init failed: %s", esp_err_to_name(ret));
-        return ret;
     }
+    return ret;
+}
 
+esp_err_t motor_control_init(void)
+{
     pipeline_register_motor_handler(motor_command_handler);
     pipeline_register_arm_handler(arm_command_handler);
 

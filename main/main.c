@@ -59,8 +59,8 @@ void app_main(void) {
     fs_init();
 
     // 1b. Start ESC PWM at neutral — must be running before ESCs see power
-    ESP_LOGI(TAG, "Initializing motor control (neutral PWM)...");
-    ESP_ERROR_CHECK(motor_control_init());
+    ESP_LOGI(TAG, "Initializing ESC PWM (neutral)...");
+    ESP_ERROR_CHECK(motor_control_init_hw());
 
     // 2. Create temporary SCCB bus for camera init, then hand off GPIO7/GPIO8 to sensor bus
     ESP_LOGI(TAG, "Initializing camera SCCB bus (temporary)...");
@@ -152,6 +152,10 @@ void app_main(void) {
     // Initialize data pipeline
     ESP_LOGI(TAG, "Initializing data pipeline...");
     ESP_ERROR_CHECK(pipeline_init());
+
+    // Register motor control handlers (after pipeline_init so handlers aren't zeroed)
+    ESP_LOGI(TAG, "Registering motor control handlers...");
+    ESP_ERROR_CHECK(motor_control_init());
 
     // Initialize detection task (lazy-loads model on first trigger)
     ESP_LOGI(TAG, "Initializing detection task...");
