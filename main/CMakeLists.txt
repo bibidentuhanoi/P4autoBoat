@@ -7,6 +7,7 @@ idf_component_register(
         "drivers/imu_driver.c"
         "drivers/tof_driver.c"
         "drivers/camera_driver.c"
+        "drivers/gps_driver.c"
         "drivers/esc_driver.c"
         "wifi_manager.c"
         "camera_stream.c"

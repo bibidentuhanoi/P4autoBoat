@@ -41,6 +41,24 @@ typedef struct _boat_DetectCommand {
     char dummy_field;
 } boat_DetectCommand;
 
+typedef struct _boat_GpsFix {
+    bool valid;
+    double latitude;
+    double longitude;
+    float altitude_m;
+    float speed_mps;
+    float course_deg;
+    uint32_t fix_quality;
+    uint32_t satellites;
+    float hdop;
+    uint64_t utc_ms;
+} boat_GpsFix;
+
+typedef struct _boat_GpsCoordinate {
+    double latitude;
+    double longitude;
+} boat_GpsCoordinate;
+
 typedef struct _boat_SensorSnapshot {
     uint64_t timestamp_us;
     bool has_imu;
@@ -51,6 +69,8 @@ typedef struct _boat_SensorSnapshot {
     boat_ToFGrid tof_b;
     pb_size_t detections_count;
     boat_Detection detections[10];
+    bool has_gps;
+    boat_GpsFix gps;
 } boat_SensorSnapshot;
 
 typedef struct _boat_MotorCommand {
@@ -84,6 +104,7 @@ typedef struct _boat_BoatMessage {
         boat_MotorCommand motor;
         boat_SystemStatus status;
         boat_DetectCommand detect;
+        boat_GpsCoordinate coord;
         boat_MotorStatus motor_status;
         boat_ArmCommand arm_cmd;
     } payload;
@@ -99,7 +120,9 @@ extern "C" {
 #define boat_ToFGrid_init_default                {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 #define boat_Detection_init_default              {0, 0, 0, 0, 0, 0}
 #define boat_DetectCommand_init_default          {0}
-#define boat_SensorSnapshot_init_default         {0, false, boat_IMUData_init_default, false, boat_ToFGrid_init_default, false, boat_ToFGrid_init_default, 0, {boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default}}
+#define boat_GpsFix_init_default                 {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_GpsCoordinate_init_default          {0, 0}
+#define boat_SensorSnapshot_init_default         {0, false, boat_IMUData_init_default, false, boat_ToFGrid_init_default, false, boat_ToFGrid_init_default, 0, {boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default}, false, boat_GpsFix_init_default}
 #define boat_MotorCommand_init_default           {0, 0, 0, 0}
 #define boat_MotorStatus_init_default            {0, 0, 0}
 #define boat_ArmCommand_init_default             {0}
@@ -109,7 +132,9 @@ extern "C" {
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 #define boat_Detection_init_zero                 {0, 0, 0, 0, 0, 0}
 #define boat_DetectCommand_init_zero             {0}
-#define boat_SensorSnapshot_init_zero            {0, false, boat_IMUData_init_zero, false, boat_ToFGrid_init_zero, false, boat_ToFGrid_init_zero, 0, {boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero}}
+#define boat_GpsFix_init_zero                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_GpsCoordinate_init_zero             {0, 0}
+#define boat_SensorSnapshot_init_zero            {0, false, boat_IMUData_init_zero, false, boat_ToFGrid_init_zero, false, boat_ToFGrid_init_zero, 0, {boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero}, false, boat_GpsFix_init_zero}
 #define boat_MotorCommand_init_zero              {0, 0, 0, 0}
 #define boat_MotorStatus_init_zero               {0, 0, 0}
 #define boat_ArmCommand_init_zero                {0}
@@ -131,11 +156,24 @@ extern "C" {
 #define boat_Detection_y1_tag                    4
 #define boat_Detection_x2_tag                    5
 #define boat_Detection_y2_tag                    6
+#define boat_GpsFix_valid_tag                    1
+#define boat_GpsFix_latitude_tag                 2
+#define boat_GpsFix_longitude_tag                3
+#define boat_GpsFix_altitude_m_tag               4
+#define boat_GpsFix_speed_mps_tag                5
+#define boat_GpsFix_course_deg_tag               6
+#define boat_GpsFix_fix_quality_tag              7
+#define boat_GpsFix_satellites_tag               8
+#define boat_GpsFix_hdop_tag                     9
+#define boat_GpsFix_utc_ms_tag                   10
+#define boat_GpsCoordinate_latitude_tag          1
+#define boat_GpsCoordinate_longitude_tag         2
 #define boat_SensorSnapshot_timestamp_us_tag     1
 #define boat_SensorSnapshot_imu_tag              2
 #define boat_SensorSnapshot_tof_a_tag            3
 #define boat_SensorSnapshot_tof_b_tag            4
 #define boat_SensorSnapshot_detections_tag       5
+#define boat_SensorSnapshot_gps_tag              6
 #define boat_MotorCommand_throttle_tag           1
 #define boat_MotorCommand_rudder_tag             2
 #define boat_MotorCommand_left_tag               3
@@ -151,6 +189,7 @@ extern "C" {
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
 #define boat_BoatMessage_detect_tag              4
+#define boat_BoatMessage_coord_tag               5
 #define boat_BoatMessage_motor_status_tag        6
 #define boat_BoatMessage_arm_cmd_tag             7
 
@@ -186,18 +225,40 @@ X(a, STATIC,   SINGULAR, INT32,    y2,                6)
 #define boat_DetectCommand_CALLBACK NULL
 #define boat_DetectCommand_DEFAULT NULL
 
+#define boat_GpsFix_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     valid,             1) \
+X(a, STATIC,   SINGULAR, DOUBLE,   latitude,          2) \
+X(a, STATIC,   SINGULAR, DOUBLE,   longitude,         3) \
+X(a, STATIC,   SINGULAR, FLOAT,    altitude_m,        4) \
+X(a, STATIC,   SINGULAR, FLOAT,    speed_mps,         5) \
+X(a, STATIC,   SINGULAR, FLOAT,    course_deg,        6) \
+X(a, STATIC,   SINGULAR, UINT32,   fix_quality,       7) \
+X(a, STATIC,   SINGULAR, UINT32,   satellites,        8) \
+X(a, STATIC,   SINGULAR, FLOAT,    hdop,              9) \
+X(a, STATIC,   SINGULAR, UINT64,   utc_ms,           10)
+#define boat_GpsFix_CALLBACK NULL
+#define boat_GpsFix_DEFAULT NULL
+
+#define boat_GpsCoordinate_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, DOUBLE,   latitude,          1) \
+X(a, STATIC,   SINGULAR, DOUBLE,   longitude,         2)
+#define boat_GpsCoordinate_CALLBACK NULL
+#define boat_GpsCoordinate_DEFAULT NULL
+
 #define boat_SensorSnapshot_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT64,   timestamp_us,      1) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  imu,               2) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  tof_a,             3) \
 X(a, STATIC,   OPTIONAL, MESSAGE,  tof_b,             4) \
-X(a, STATIC,   REPEATED, MESSAGE,  detections,        5)
+X(a, STATIC,   REPEATED, MESSAGE,  detections,        5) \
+X(a, STATIC,   OPTIONAL, MESSAGE,  gps,               6)
 #define boat_SensorSnapshot_CALLBACK NULL
 #define boat_SensorSnapshot_DEFAULT NULL
 #define boat_SensorSnapshot_imu_MSGTYPE boat_IMUData
 #define boat_SensorSnapshot_tof_a_MSGTYPE boat_ToFGrid
 #define boat_SensorSnapshot_tof_b_MSGTYPE boat_ToFGrid
 #define boat_SensorSnapshot_detections_MSGTYPE boat_Detection
+#define boat_SensorSnapshot_gps_MSGTYPE boat_GpsFix
 
 #define boat_MotorCommand_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, FLOAT,    throttle,          1) \
@@ -231,6 +292,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,sensors,payload.sensors),           
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor,payload.motor),                 2) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,status,payload.status),               3) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,detect,payload.detect),               4) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,coord,payload.coord),                   5) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor_status,payload.motor_status),   6) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,arm_cmd,payload.arm_cmd),             7)
 #define boat_BoatMessage_CALLBACK NULL
@@ -239,6 +301,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,arm_cmd,payload.arm_cmd),           
 #define boat_BoatMessage_payload_motor_MSGTYPE boat_MotorCommand
 #define boat_BoatMessage_payload_status_MSGTYPE boat_SystemStatus
 #define boat_BoatMessage_payload_detect_MSGTYPE boat_DetectCommand
+#define boat_BoatMessage_payload_coord_MSGTYPE boat_GpsCoordinate
 #define boat_BoatMessage_payload_motor_status_MSGTYPE boat_MotorStatus
 #define boat_BoatMessage_payload_arm_cmd_MSGTYPE boat_ArmCommand
 
@@ -246,6 +309,8 @@ extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
 extern const pb_msgdesc_t boat_Detection_msg;
 extern const pb_msgdesc_t boat_DetectCommand_msg;
+extern const pb_msgdesc_t boat_GpsFix_msg;
+extern const pb_msgdesc_t boat_GpsCoordinate_msg;
 extern const pb_msgdesc_t boat_SensorSnapshot_msg;
 extern const pb_msgdesc_t boat_MotorCommand_msg;
 extern const pb_msgdesc_t boat_MotorStatus_msg;
@@ -258,6 +323,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_ToFGrid_fields &boat_ToFGrid_msg
 #define boat_Detection_fields &boat_Detection_msg
 #define boat_DetectCommand_fields &boat_DetectCommand_msg
+#define boat_GpsFix_fields &boat_GpsFix_msg
+#define boat_GpsCoordinate_fields &boat_GpsCoordinate_msg
 #define boat_SensorSnapshot_fields &boat_SensorSnapshot_msg
 #define boat_MotorCommand_fields &boat_MotorCommand_msg
 #define boat_MotorStatus_fields &boat_MotorStatus_msg
@@ -271,6 +338,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_ArmCommand_size                     2
 #define boat_DetectCommand_size                  0
 #define boat_Detection_size                      60
+#define boat_GpsFix_size                         63
+#define boat_GpsCoordinate_size                  18
 #define boat_IMUData_size                        15
 #define boat_MotorCommand_size                   20
 #define boat_MotorStatus_size                    17

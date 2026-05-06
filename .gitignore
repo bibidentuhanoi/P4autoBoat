@@ -86,6 +86,10 @@ tools/esp-dl/
 tools/espdet_maritime_deploy/
 tools/yolo26n_esp/
 
+# Report generation / output (bao cao NCKH)
+tools/report_gen/
+report_output/
+
 # User-specific configuration files
 *.user
 *.workspace # General workspace files, can be from various tools

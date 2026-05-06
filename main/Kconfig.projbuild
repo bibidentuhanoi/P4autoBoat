@@ -147,6 +147,27 @@ menu "Board Configuration"
 
     endmenu
 
+    menu "GPS Configuration"
+
+        config GPS_UART_NUM
+            int "GPS UART peripheral number"
+            default 1
+            range 1 4
+
+        config GPS_RX_PIN
+            int "GPS UART RX Pin (MCU receive, = GPS TX)"
+            default 37
+
+        config GPS_TX_PIN
+            int "GPS UART TX Pin (MCU transmit, = GPS RX)"
+            default 38
+
+        config GPS_BAUD
+            int "GPS UART Baud Rate"
+            default 9600
+
+    endmenu
+
     menu "WiFi Configuration"
 
         config WIFI_SSID

@@ -27,12 +27,31 @@ message Detection {
 message DetectCommand {
 }
 
+message GpsFix {
+  bool   valid       = 1;
+  double latitude    = 2;
+  double longitude   = 3;
+  float  altitude_m  = 4;
+  float  speed_mps   = 5;
+  float  course_deg  = 6;
+  uint32 fix_quality = 7;
+  uint32 satellites  = 8;
+  float  hdop        = 9;
+  uint64 utc_ms      = 10;
+}
+
+message GpsCoordinate {
+  double latitude  = 1;
+  double longitude = 2;
+}
+
 message SensorSnapshot {
   uint64  timestamp_us        = 1;
   IMUData imu                 = 2;
   ToFGrid tof_a               = 3;
   ToFGrid tof_b               = 4;
   repeated Detection detections = 5;
+  GpsFix  gps                 = 6;
 }
 
 message MotorCommand {
@@ -65,7 +84,7 @@ message BoatMessage {
     MotorCommand   motor        = 2;
     SystemStatus   status       = 3;
     DetectCommand  detect       = 4;
-    // field 5 reserved for GpsCoordinate
+    GpsCoordinate  coord        = 5;
     MotorStatus    motor_status = 6;
     ArmCommand     arm_cmd      = 7;
   }

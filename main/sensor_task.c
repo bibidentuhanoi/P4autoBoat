@@ -15,6 +15,7 @@
 #include "detect_task.h"
 #include "pipeline.h"
 #include "sensor_fusion.h"
+#include "drivers/gps_driver.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -136,6 +137,21 @@ void task_sensor_snapshot(void *pvParameters)
          * after WS reconnect — was 15s but post-detect WS reconnect can drag
          * 15-20s on slow TCP timeouts, dropping the cached result on the floor. */
         detect_get_cached_results(snap.detections, &snap.detections_count, 30000);
+
+        gps_fix_t gps;
+        if (gps_driver_get_fix(&gps) == ESP_OK && gps.last_update_us != 0) {
+            snap.has_gps         = true;
+            snap.gps.valid       = gps.valid;
+            snap.gps.latitude    = gps.latitude;
+            snap.gps.longitude   = gps.longitude;
+            snap.gps.altitude_m  = gps.altitude_m;
+            snap.gps.speed_mps   = gps.speed_mps;
+            snap.gps.course_deg  = gps.course_deg;
+            snap.gps.fix_quality = gps.fix_quality;
+            snap.gps.satellites  = gps.satellites;
+            snap.gps.hdop        = gps.hdop;
+            snap.gps.utc_ms      = gps.utc_ms;
+        }
 
         pipeline_publish_sensors(&snap);
 

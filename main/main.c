@@ -18,6 +18,7 @@
 #include "drivers/imu_driver.h"
 #include "drivers/tof_driver.h"
 #include "drivers/camera_driver.h"
+#include "drivers/gps_driver.h"
 
 // Connectivity
 #include "wifi_manager.h"
@@ -148,6 +149,18 @@ void app_main(void) {
     // 9. Initialize Sensor Fusion
     ESP_LOGI(TAG, "Initializing sensor fusion...");
     fusion_init(&calib_data);
+
+    // 9b. Initialize GPS (UART, soft-optional)
+    ESP_LOGI(TAG, "Initializing GPS (UART%d RX=%d TX=%d @ %d baud)...",
+             CONFIG_GPS_UART_NUM, CONFIG_GPS_RX_PIN, CONFIG_GPS_TX_PIN, CONFIG_GPS_BAUD);
+    esp_err_t gps_ret = gps_driver_init(CONFIG_GPS_UART_NUM,
+                                         CONFIG_GPS_RX_PIN,
+                                         CONFIG_GPS_TX_PIN,
+                                         CONFIG_GPS_BAUD);
+    if (gps_ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPS init failed (%s) — snapshots will omit GPS fix",
+                 esp_err_to_name(gps_ret));
+    }
 
     // Initialize data pipeline
     ESP_LOGI(TAG, "Initializing data pipeline...");

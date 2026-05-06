@@ -18,6 +18,12 @@ PB_BIND(boat_Detection, boat_Detection, AUTO)
 PB_BIND(boat_DetectCommand, boat_DetectCommand, AUTO)
 
 
+PB_BIND(boat_GpsFix, boat_GpsFix, AUTO)
+
+
+PB_BIND(boat_GpsCoordinate, boat_GpsCoordinate, AUTO)
+
+
 PB_BIND(boat_SensorSnapshot, boat_SensorSnapshot, 4)
 
 
