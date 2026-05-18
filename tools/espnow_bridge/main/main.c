@@ -249,23 +249,17 @@ static void espnow_init(void)
 
 static void usb_cdc_init(void)
 {
-    const tinyusb_config_t tusb_cfg = {
-        .device_descriptor = NULL,   /* use default */
-        .string_descriptor = NULL,
-        .external_phy      = false,
-    };
+    const tinyusb_config_t tusb_cfg = { 0 };
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     tinyusb_config_cdcacm_t acm_cfg = {
-        .usb_dev  = TINYUSB_USBDEV_0,
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .rx_unread_buf_sz = 64,
         .callback_rx      = &cdc_rx_callback,
         .callback_rx_wanted_char     = NULL,
         .callback_line_state_changed = NULL,
         .callback_line_coding_changed = NULL,
     };
-    ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
+    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
 }
 
 /* ========================================================================== */
