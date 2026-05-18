@@ -16,6 +16,7 @@ idf_component_register(
         "http_server.c"
         "sensor_task.c"
         "transports/ws_transport.c"
+        "transports/espnow_transport.c"
         "proto/boat.pb.c"
         "detect_task.cpp"
     PRIV_REQUIRES

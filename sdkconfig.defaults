@@ -57,3 +57,7 @@ CONFIG_HEAP_POISONING_LIGHT=y
 
 # --- Disable WiFi power save for lower latency / fewer drops ---
 CONFIG_ESP_WIFI_PS_NONE=y
+
+# --- ESP-NOW field mode ---
+CONFIG_ESPNOW_ENABLED=y
+CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8

@@ -189,3 +189,36 @@ menu "Board Configuration"
     endmenu
 
 endmenu
+
+menu "ESP-NOW Field Mode"
+
+    config ESPNOW_ENABLED
+        bool "Enable ESP-NOW field mode"
+        default y
+
+    config ESPNOW_WIFI_TIMEOUT_S
+        int "WiFi connect timeout before ESP-NOW fallback (seconds)"
+        default 10
+        depends on ESPNOW_ENABLED
+
+    config ESPNOW_JPEG_QUALITY
+        int "JPEG quality for ESP-NOW (1-63, lower=smaller)"
+        default 12
+        depends on ESPNOW_ENABLED
+        help
+            Controls JPEG compression for ESP-NOW streaming.
+            Lower value = smaller frames = higher FPS but worse quality.
+            At quality 12, native 800x640 frames are ~15-25KB giving 3-5 fps.
+
+    config ESPNOW_CHANNEL
+        int "ESP-NOW WiFi channel"
+        default 6
+        range 1 14
+        depends on ESPNOW_ENABLED
+
+    config ESPNOW_PEER_MAC
+        string "ESP32-S3 bridge MAC address (hex, colon-separated)"
+        default "FF:FF:FF:FF:FF:FF"
+        depends on ESPNOW_ENABLED
+
+endmenu
