@@ -28,6 +28,7 @@
 #include "sensor_task.h"
 #include "detect_task.h"
 #include "motor_control.h"
+#include "transports/espnow_transport.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -177,9 +178,20 @@ void app_main(void) {
     // 10. Connect to WiFi (blocks until connected or timeout)
     ESP_LOGI(TAG, "Connecting to WiFi...");
     esp_err_t wifi_ret = wifi_init();
+
+#if CONFIG_ESPNOW_ENABLED
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi unavailable — switching to ESP-NOW field mode");
+        esp_err_t en_ret = espnow_transport_init();
+        if (en_ret != ESP_OK) {
+            ESP_LOGE(TAG, "ESP-NOW init failed (%s) — no connectivity", esp_err_to_name(en_ret));
+        }
+    } else {
+#else
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi unavailable (%s) — camera stream disabled", esp_err_to_name(wifi_ret));
     } else {
+#endif
         // 11. Start servers — stream on port 81, API/dashboard on port 80
         if (camera_ok) {
             ESP_ERROR_CHECK(camera_stream_server_start());
