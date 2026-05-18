@@ -1,4 +1,6 @@
 import sys
+import argparse
+import struct
 import threading
 import numpy as np
 import matplotlib
@@ -18,7 +20,15 @@ from PIL import Image
 # ==========================================
 # CONFIGURATION
 # ==========================================
-ESP32_IP     = sys.argv[1] if len(sys.argv) > 1 else '192.168.1.201'
+parser = argparse.ArgumentParser(description='BoatEspP4 Visualizer')
+parser.add_argument('ip', nargs='?', default='192.168.1.201',
+                    help='ESP32 IP address')
+parser.add_argument('--serial', type=str, default=None,
+                    help='Serial port for ESP-NOW mode (e.g. /dev/ttyACM0)')
+args = parser.parse_args()
+
+ESP32_IP     = args.ip
+SERIAL_MODE  = args.serial is not None
 STREAM_URL   = f'http://{ESP32_IP}/stream'
 IMU_URL      = f'http://{ESP32_IP}/api/imu'
 SNAPSHOT_URL = f'http://{ESP32_IP}/api/snapshot'
@@ -124,6 +134,119 @@ def snapshot_poller():
             print(f"Snapshot poll error: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 5)
+
+# ==========================================
+# SERIAL / COBS / ESP-NOW INPUT
+# ==========================================
+def cobs_decode(data: bytes) -> bytes:
+    """Decode a COBS-encoded frame (without the trailing 0x00 delimiter)."""
+    out = bytearray()
+    idx = 0
+    while idx < len(data):
+        code = data[idx]; idx += 1
+        if code == 0:
+            return bytes()
+        num = code - 1
+        if idx + num > len(data):
+            return bytes()
+        out.extend(data[idx:idx + num])
+        idx += num
+        if code < 0xFF and idx < len(data):
+            out.append(0)
+    return bytes(out)
+
+
+# JPEG reassembly state
+_jpeg_buf = bytearray()
+_jpeg_seq = 0
+
+MSG_JPEG_CHUNK = 0x01
+MSG_SENSOR     = 0x02
+JPEG_MAX_CHUNK = 8162
+
+
+def parse_sensor_snapshot(data):
+    """Decode a BoatMessage protobuf containing a SensorSnapshot."""
+    try:
+        from proto import boat_pb2
+    except ImportError:
+        return  # protobuf library or compiled module not available
+
+    msg = boat_pb2.BoatMessage()
+    msg.ParseFromString(data)
+    if not msg.HasField('sensors'):
+        return
+    s = msg.sensors
+
+    with imu_lock:
+        imu_data['pitch']   = s.imu.pitch
+        imu_data['roll']    = s.imu.roll
+        imu_data['heading'] = s.imu.heading
+
+    with snapshot_lock:
+        if s.tof_a.valid and len(s.tof_a.distances) >= 64:
+            for r in range(8):
+                for c in range(8):
+                    grid_A[r][c] = s.tof_a.distances[r * 8 + c]
+        if s.tof_b.valid and len(s.tof_b.distances) >= 64:
+            for r in range(8):
+                for c in range(8):
+                    grid_B[r][c] = s.tof_b.distances[r * 8 + c]
+
+
+def handle_serial_packet(data):
+    """Parse espnow_pkt_hdr_t and dispatch by msg_type."""
+    global _jpeg_buf, _jpeg_seq, latest_frame
+
+    if len(data) < 4:
+        return
+
+    msg_type, payload_len, seq = struct.unpack('<BHB', data[:4])
+    payload = data[4:4 + payload_len]
+
+    if msg_type == MSG_JPEG_CHUNK:
+        if seq != _jpeg_seq:
+            _jpeg_buf = bytearray()
+            _jpeg_seq = seq
+        _jpeg_buf.extend(payload)
+        # Last chunk indicated by payload shorter than max chunk size
+        if payload_len < JPEG_MAX_CHUNK:
+            try:
+                img = Image.open(io.BytesIO(bytes(_jpeg_buf)))
+                arr = np.array(img)
+                with frame_lock:
+                    latest_frame = arr
+            except Exception:
+                pass
+            _jpeg_buf = bytearray()
+
+    elif msg_type == MSG_SENSOR:
+        try:
+            parse_sensor_snapshot(payload)
+        except Exception:
+            pass
+
+
+def serial_reader(port, baud=921600):
+    """Read COBS-framed packets from USB CDC serial, dispatch to handlers."""
+    import serial as pyserial
+    ser = pyserial.Serial(port, baud, timeout=0.1)
+    buf = bytearray()
+
+    while True:
+        chunk = ser.read(4096)
+        if not chunk:
+            continue
+        buf.extend(chunk)
+
+        while b'\x00' in buf:
+            delim = buf.index(b'\x00')
+            if delim > 0:
+                decoded = cobs_decode(bytes(buf[:delim]))
+                if len(decoded) >= 4:
+                    handle_serial_packet(decoded)
+            buf = buf[delim + 1:]
+
 
 # ==========================================
 # 3D BOX MATH
@@ -600,13 +723,17 @@ def update_plot(frame):
 # MAIN
 # ==========================================
 if __name__ == '__main__':
-    print(f'Connecting to ESP32 at {ESP32_IP}...')
-    print(f'  MJPEG:    {STREAM_URL}')
-    print(f'  IMU:      {IMU_URL}')
-    print(f'  Snapshot: {SNAPSHOT_URL}')
-
-    for target in [mjpeg_reader, imu_poller, snapshot_poller]:
-        threading.Thread(target=target, daemon=True).start()
+    if SERIAL_MODE:
+        print(f'[Serial] Reading from {args.serial}')
+        threading.Thread(target=serial_reader, args=(args.serial,),
+                         daemon=True).start()
+    else:
+        print(f'Connecting to ESP32 at {ESP32_IP}...')
+        print(f'  MJPEG:    {STREAM_URL}')
+        print(f'  IMU:      {IMU_URL}')
+        print(f'  Snapshot: {SNAPSHOT_URL}')
+        for target in [mjpeg_reader, imu_poller, snapshot_poller]:
+            threading.Thread(target=target, daemon=True).start()
 
     print('AutoBoat visualizer running... (close window to stop)')
     ani = animation.FuncAnimation(
