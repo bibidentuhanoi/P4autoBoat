@@ -34,26 +34,36 @@ cp "$SCRIPT_DIR/espnow_bridge.c" main/espnow_bridge.c
 cp "$SCRIPT_DIR/espnow_bridge.h" main/espnow_bridge.h
 
 # Patch main/CMakeLists.txt to include espnow_bridge.c in SRCS.
-# WARNING: This sed pattern targets the idf_component_register(SRCS form produced
-# by create-project-from-example.  If the generated template changes its
-# CMakeLists.txt layout this substitution may silently fail.  Verify by
-# inspecting main/CMakeLists.txt after patching.
-sed -i 's/idf_component_register(SRCS/idf_component_register(SRCS "espnow_bridge.c"/' main/CMakeLists.txt
+# The template uses set(COMPONENT_SRCS ...) + list(APPEND ...) style.
+# We append our file unconditionally after the base SRCS list.
+sed -i '/^set(COMPONENT_SRCS/,/)/ { /)/ a\list(APPEND COMPONENT_SRCS "espnow_bridge.c")
+}' main/CMakeLists.txt
 
-# Enable ESP-NOW custom-message support
-echo "CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8" >> sdkconfig.defaults
+# Verify the patch took effect
+if ! grep -q 'espnow_bridge.c' main/CMakeLists.txt; then
+    echo "WARNING: CMakeLists.txt patch failed — adding fallback"
+    echo 'list(APPEND COMPONENT_SRCS "espnow_bridge.c")' >> main/CMakeLists.txt
+fi
 
-# NOTE: espnow_bridge_init() must be called once at startup from the slave
-# application.  The generated slave template exposes an init hook (often in
-# app_main() inside main/app_main.c or similar).  Add the call there after
-# the hosted slave stack is initialised, e.g.:
-#
-#   #include "espnow_bridge.h"
-#   ...
-#   espnow_bridge_init();
-#
-# The exact file and call-site depend on the esp-hosted version being built.
-# ────────────────────────────────────────────────────────────────────────────
+# Enable peer data transfer + bump handler count + add esp_now dependency
+cat >> sdkconfig.defaults << 'SDKEOF'
+CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8
+CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
+SDKEOF
+
+# Auto-patch: call espnow_bridge_init() from the peer data example init hook.
+# The slave template has example_peer_data_transfer.c which is compiled when
+# CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y. We inject our init there.
+# If that doesn't exist, we patch esp_hosted_coprocessor.c (the slave's main).
+if [ -f main/example_peer_data_transfer.c ]; then
+    # Add include at top (after the existing includes)
+    sed -i '/#include.*slave_control/a #include "espnow_bridge.h"' main/example_peer_data_transfer.c
+    # Add init call at end of the example init function
+    sed -i '/ESP_LOGI.*peer_data_transfer.*ready\|return ESP_OK;/{
+        /return ESP_OK;/i\    espnow_bridge_init();
+        b
+    }' main/example_peer_data_transfer.c
+fi
 
 idf.py build
 
