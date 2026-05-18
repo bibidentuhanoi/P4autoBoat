@@ -25,5 +25,6 @@ idf_component_register(
         esp_http_server esp_driver_jpeg
         livekit__nanopb
         espressif__cat_detect espressif__esp-dl
+        espressif__esp_hosted
     INCLUDE_DIRS "include" "drivers" "." "proto"
     EMBED_TXTFILES "dashboard.html")
