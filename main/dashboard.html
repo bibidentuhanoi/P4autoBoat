@@ -34,7 +34,7 @@
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr 1fr;
-    grid-template-rows: 1fr 1fr auto;
+    grid-template-rows: 1fr 1fr 1fr auto;
     gap: 12px; padding: 16px; height: calc(100vh - 52px);
   }
   .card {
@@ -47,13 +47,13 @@
   }
 
   /* Camera card spans left 2 columns, both rows */
-  #camera-card { grid-column: 1 / 3; grid-row: 1 / 4; }
+  #camera-card { grid-column: 1 / 3; grid-row: 1 / 5; }
   #cam-container { position: relative; width: 100%; flex: 1; min-height: 0; background: #000; overflow: hidden; }
   #cam-img { position: absolute; border-radius: 2px; background: #000; transform: rotate(180deg); }
   #tof-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: grab; }
 
   /* IMU card */
-  #imu-card { grid-column: 3; grid-row: 1; }
+  #imu-card { grid-column: 3; grid-row: 3; }
   .imu-vals { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; flex: 1; }
   .imu-val { background: var(--bg); border-radius: 6px; padding: 10px 6px; text-align: center; }
   .imu-label { font-size: 9px; letter-spacing: 1px; color: var(--dim); text-transform: uppercase; }
@@ -63,7 +63,7 @@
   canvas.horizon { border-radius: 50%; border: 2px solid var(--border); }
 
   /* ToF grids card */
-  #tof-card { grid-column: 3; grid-row: 2; }
+  #tof-card { grid-column: 3; grid-row: 4; }
   .tof-grids { display: flex; gap: 12px; flex: 1; align-items: center; justify-content: center; }
   .tof-grid-wrap { text-align: center; }
   .tof-label { font-size: 9px; color: var(--dim); letter-spacing: 1px; margin-bottom: 4px; }
@@ -130,7 +130,8 @@
   #gear-btn:hover { color: var(--accent); border-color: var(--accent); }
 
   /* Motor control card */
-  #motor-card { grid-column: 3; }
+  #motor-card { grid-column: 3; grid-row: 1; }
+  #winch-card { grid-column: 3; grid-row: 2; }
   .motor-controls { display: flex; flex-direction: column; gap: 8px; flex: 1; }
   .motor-state { display: flex; align-items: center; gap: 8px; }
   .state-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
@@ -150,6 +151,19 @@
   .motor-bar-label { font-size: 9px; color: var(--dim); letter-spacing: 1px; margin-bottom: 4px; text-transform: uppercase; }
   .motor-bar { width: 28px; height: 70px; background: var(--bg); border-radius: 4px; border: 1px solid var(--border); position: relative; overflow: hidden; }
   .motor-bar-fill { position: absolute; left: 0; right: 0; background: var(--accent); transition: height 0.15s, top 0.15s, bottom 0.15s; }
+  /* Winch control card */
+  #winch-card .winch-controls { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+  .winch-jog { display: flex; gap: 8px; }
+  .winch-btn { flex: 1; padding: 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 11px; cursor: pointer; user-select: none; touch-action: none; text-transform: uppercase; letter-spacing: 1px; }
+  .winch-btn:active:not(:disabled) { background: var(--accent); color: #000; }
+  .winch-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .winch-slider-row { display: flex; align-items: center; gap: 8px; }
+  .winch-slider-row label { font-size: 10px; color: var(--dim); min-width: 55px; text-transform: uppercase; letter-spacing: 1px; }
+  .winch-slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .winch-slider-row .val { font-size: 12px; color: var(--accent); min-width: 40px; text-align: right; font-weight: bold; }
+  .win-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; vertical-align: middle; }
+  .win-dot.off { background: var(--dim); }
+  .win-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/protobufjs@7/dist/protobuf.min.js"></script>
 </head>
@@ -350,6 +364,20 @@
       </div>
     </div>
   </div>
+  <div class="card" id="winch-card">
+    <div class="card-title">Winch<span class="win-dot off" id="winch-power-dot" title="servo power"></span></div>
+    <div class="winch-controls">
+      <div class="winch-jog">
+        <button class="winch-btn" id="winch-up" disabled>&#9650; Up (CCW)</button>
+        <button class="winch-btn" id="winch-down" disabled>&#9660; Down (CW)</button>
+      </div>
+      <div class="winch-slider-row">
+        <label>Speed</label>
+        <input type="range" id="winch-speed" min="-100" max="100" value="0" step="1" disabled />
+        <span class="val" id="winch-speed-val">0%</span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -367,11 +395,12 @@ message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 
 message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
 message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; }
 message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; float right = 4; }
-message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; }
+message WinchCommand { float speed = 1; }
+message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; }
 message ArmCommand { bool arm = 1; }
 message DetectCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1623,6 +1652,11 @@ function updateMotorStatus(ms) {
   $('motor-left').disabled = !motorArmed;
   $('motor-right').disabled = !motorArmed;
 
+  $('winch-up').disabled = !motorArmed;
+  $('winch-down').disabled = !motorArmed;
+  $('winch-speed').disabled = !motorArmed;
+  $('winch-power-dot').className = 'win-dot ' + (motorArmed ? 'on' : 'off');
+
   updateMotorBar('left', ms.leftThrottle || 0);
   updateMotorBar('right', ms.rightThrottle || 0);
 }
@@ -1675,6 +1709,42 @@ function sendMotorCommand() {
     sendMotorCommand();
   });
 });
+
+// ── Winch control ──────────────────────────────────────────────
+const WINCH_JOG = 0.6;   // fixed jog magnitude for the momentary buttons
+
+function sendWinchCommand(speed) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !motorArmed) return;
+  const msg = BoatMessage.create({ winch: { speed } });
+  ws.send(BoatMessage.encode(msg).finish());
+}
+
+// Momentary jog: press = move, release/leave = stop. up = CCW (negative), down = CW (positive).
+[['winch-up', -WINCH_JOG], ['winch-down', WINCH_JOG]].forEach(([id, sp]) => {
+  const el = $(id);
+  const start = (e) => { e.preventDefault(); sendWinchCommand(sp); };
+  const stop  = () => sendWinchCommand(0);
+  el.addEventListener('pointerdown', start);
+  el.addEventListener('pointerup', stop);
+  el.addEventListener('pointerleave', stop);
+  el.addEventListener('pointercancel', stop);
+  el.addEventListener('blur', stop);
+});
+
+// Speed slider: live while dragging, springs back to center (stop) on release.
+(() => {
+  const el = $('winch-speed');
+  el.addEventListener('input', (e) => {
+    const v = parseInt(e.target.value);
+    $('winch-speed-val').textContent = v + '%';
+    sendWinchCommand(v / 100);
+  });
+  el.addEventListener('change', () => {
+    el.value = 0;
+    $('winch-speed-val').textContent = '0%';
+    sendWinchCommand(0);
+  });
+})();
 
 $('arm-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
