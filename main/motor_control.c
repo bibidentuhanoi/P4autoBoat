@@ -1,5 +1,6 @@
 #include "motor_control.h"
 #include "drivers/esc_driver.h"
+#include "drivers/winch_driver.h"
 #include "pipeline.h"
 #include "transports/ws_transport.h"
 #include "esp_check.h"
@@ -41,6 +42,11 @@ static void motor_command_handler(const boat_MotorCommand *cmd)
     esc_driver_set_throttle(left, right);
 }
 
+static void winch_command_handler(const boat_WinchCommand *cmd)
+{
+    winch_driver_set_speed(cmd->speed);
+}
+
 static void arm_task_fn(void *arg)
 {
     bool do_arm = (bool)(intptr_t)arg;
@@ -65,6 +71,7 @@ static void publish_status(void)
     boat_MotorStatus ms = boat_MotorStatus_init_zero;
     ms.state = (uint32_t)esc_driver_get_state();
     esc_driver_get_throttle(&ms.left_throttle, &ms.right_throttle);
+    ms.winch_speed = winch_driver_get_speed();
     pipeline_publish_motor_status(&ms);
 }
 
@@ -73,11 +80,19 @@ static void watchdog_cb(void *arg)
     (void)arg;
     static int tick = 0;
 
-    if (esc_driver_get_state() == ESC_STATE_ARMED && s_was_nonzero) {
-        if (ws_transport_client_count() == 0) {
-            ESP_LOGW(TAG, "WS disconnected — stopping motors");
+    if (esc_driver_get_state() == ESC_STATE_ARMED && ws_transport_client_count() == 0) {
+        bool acted = false;
+        if (s_was_nonzero) {
             esc_driver_set_throttle(0.0f, 0.0f);
             s_was_nonzero = false;
+            acted = true;
+        }
+        if (winch_driver_get_speed() != 0.0f) {
+            winch_driver_set_speed(0.0f);
+            acted = true;
+        }
+        if (acted) {
+            ESP_LOGW(TAG, "WS disconnected — stopping motors + winch");
         }
     }
 
@@ -99,6 +114,7 @@ esp_err_t motor_control_init(void)
 {
     pipeline_register_motor_handler(motor_command_handler);
     pipeline_register_arm_handler(arm_command_handler);
+    pipeline_register_winch_handler(winch_command_handler);
 
     const esp_timer_create_args_t timer_args = {
         .callback = watchdog_cb,
@@ -113,11 +129,17 @@ esp_err_t motor_control_init(void)
 
 esp_err_t motor_control_arm(void)
 {
-    return esc_driver_arm();
+    esp_err_t ret = esc_driver_arm();
+    if (ret == ESP_OK) {
+        winch_driver_set_power(true);   /* servo rail live only while armed */
+    }
+    return ret;
 }
 
 esp_err_t motor_control_disarm(void)
 {
     s_was_nonzero = false;
+    winch_driver_set_speed(0.0f);       /* stop the winch */
+    winch_driver_set_power(false);      /* cut servo power */
     return esc_driver_disarm();
 }
