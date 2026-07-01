@@ -9,6 +9,7 @@ idf_component_register(
         "drivers/camera_driver.c"
         "drivers/gps_driver.c"
         "drivers/esc_driver.c"
+        "drivers/winch_driver.c"
         "wifi_manager.c"
         "camera_stream.c"
         "pipeline.c"
