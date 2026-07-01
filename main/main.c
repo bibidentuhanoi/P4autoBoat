@@ -50,6 +50,7 @@ static CalibrationData calib_data = {
 
 static tof_devices_t tof_devs;
 SemaphoreHandle_t g_i2c_mutex = NULL;
+volatile bool g_camera_ok = false;
 
 // ==========================================
 // APP MAIN
@@ -86,6 +87,7 @@ void app_main(void) {
     // 3. Initialize Camera — programs OV5647 over SCCB bus
     ESP_LOGI(TAG, "Initializing camera...");
     bool camera_ok = (camera_init(sccb_handle) == ESP_OK);
+    g_camera_ok = camera_ok;
     if (!camera_ok) {
         ESP_LOGW(TAG, "Camera init failed — streaming disabled, sensors still run");
     }
@@ -115,10 +117,16 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing IMU...");
     ESP_ERROR_CHECK(imu_init(bus_handle));
 
-    // 6. Initialize ToF (sensor bus — slow, uploads ~84KB firmware)
+    // 6. Initialize ToF (sensor bus — slow, uploads ~84KB firmware).
+    //     Fault-tolerant: a missing sensor is logged and skipped; boot continues.
     ESP_LOGI(TAG, "Initializing ToF sensors (uploading firmware, please wait)...");
-    ESP_ERROR_CHECK(tof_init(bus_handle, &tof_devs));
-    ESP_LOGI(TAG, "ToF ready.");
+    tof_init(bus_handle, &tof_devs);
+    if (!tof_devs.a_ok || !tof_devs.b_ok) {
+        ESP_LOGW(TAG, "ToF degraded: A=%s B=%s — continuing without missing sensor(s)",
+                 tof_devs.a_ok ? "ok" : "MISSING", tof_devs.b_ok ? "ok" : "MISSING");
+    } else {
+        ESP_LOGI(TAG, "ToF ready.");
+    }
 
     // 7. Hardware Override Check (BOOT button)
     gpio_set_direction(BOOT_BUTTON_PIN, GPIO_MODE_INPUT);

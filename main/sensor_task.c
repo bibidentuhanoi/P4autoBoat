@@ -16,6 +16,7 @@
 #include "pipeline.h"
 #include "sensor_fusion.h"
 #include "drivers/gps_driver.h"
+#include "common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_system.h"
@@ -75,7 +76,7 @@ void task_sensor_snapshot(void *pvParameters)
 
         if (tof_tick) {
             /* ToF A — take/release mutex per sensor to give IMU a read window */
-            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (devs->a_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
                 xSemaphoreGive(g_i2c_mutex);
                 if (snap.has_tof_a) {
@@ -105,7 +106,7 @@ void task_sensor_snapshot(void *pvParameters)
             }
 
             /* ToF B — separate mutex acquisition */
-            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (devs->b_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
                 xSemaphoreGive(g_i2c_mutex);
                 if (snap.has_tof_b) {
@@ -165,6 +166,10 @@ void task_sensor_snapshot(void *pvParameters)
             if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                 sys.wifi_rssi = ap.rssi;
             }
+
+            sys.camera_ok = g_camera_ok;
+            sys.tof_a_ok  = devs->a_ok;
+            sys.tof_b_ok  = devs->b_ok;
 
             pipeline_publish_status(&sys);
         }

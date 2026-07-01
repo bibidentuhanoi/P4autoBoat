@@ -2,12 +2,17 @@
 #define COMMON_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 // Shared I2C bus mutex — IMU and ToF tasks must hold this during transactions
 extern SemaphoreHandle_t g_i2c_mutex;
+
+// Camera presence flag — set once at boot (false if camera_init failed).
+// Read by sensor_task to report status; dashboard shows a warning when false.
+extern volatile bool g_camera_ok;
 
 // Define constants
 #ifndef PI

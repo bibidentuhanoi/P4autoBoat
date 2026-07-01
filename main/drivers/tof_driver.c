@@ -58,7 +58,81 @@ calibrate:
 #define TOF_A_ADDR    CONFIG_TOF_A_ADDR
 #define TOF_B_ADDR    CONFIG_TOF_B_ADDR
 
+/*
+ * Probe and bring up one VL53L5CX. Returns true only if the sensor is present
+ * and fully started. On any failure it logs a warning, releases the i2c handle,
+ * and returns false so the caller can keep booting without this sensor.
+ *
+ * The sensor's LPN pin must already be driven high by the caller (and the OTHER
+ * sensor still moved off the default address / held in reset) before this runs,
+ * so exactly one device answers at VL53_DEFAULT_ADDR.
+ */
+static bool tof_init_one(i2c_master_bus_handle_t bus, VL53L5CX_Configuration *dev,
+                         uint8_t new_addr, const char *nvs_key, const char *label)
+{
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = VL53_DEFAULT_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    i2c_master_dev_handle_t h_init = NULL;
+    if (i2c_master_bus_add_device(bus, &cfg, &h_init) != ESP_OK) {
+        ESP_LOGW(TAG, "Sensor %s: i2c add failed", label);
+        return false;
+    }
+    dev->platform.handle = h_init;
+
+    /* Presence probe — this is the check that lets us survive a missing sensor. */
+    uint8_t alive = 0;
+    if (vl53l5cx_is_alive(dev, &alive) != 0 || !alive) {
+        ESP_LOGW(TAG, "Sensor %s: NOT DETECTED — skipping", label);
+        i2c_master_bus_rm_device(h_init);
+        dev->platform.handle = NULL;
+        return false;
+    }
+
+    /* Move to its unique address so the two sensors don't clash on the bus. */
+    if (vl53l5cx_set_i2c_address(dev, (uint16_t)(new_addr << 1)) != 0) {
+        ESP_LOGW(TAG, "Sensor %s: set i2c address failed", label);
+        i2c_master_bus_rm_device(h_init);
+        dev->platform.handle = NULL;
+        return false;
+    }
+    i2c_master_bus_rm_device(h_init);
+    cfg.device_address = new_addr;
+    if (i2c_master_bus_add_device(bus, &cfg, &dev->platform.handle) != ESP_OK) {
+        ESP_LOGW(TAG, "Sensor %s: i2c re-add at 0x%02X failed", label, new_addr);
+        dev->platform.handle = NULL;
+        return false;
+    }
+
+    /* Upload firmware (~84KB). */
+    if (vl53l5cx_init(dev) != 0) {
+        ESP_LOGW(TAG, "Sensor %s: firmware init failed", label);
+        return false;
+    }
+
+    /* Xtalk is best-effort — never fatal. */
+    tof_apply_xtalk(dev, nvs_key, label);
+
+    vl53l5cx_set_resolution(dev, VL53L5CX_RESOLUTION_8X8);
+    vl53l5cx_set_ranging_frequency_hz(dev, CONFIG_TOF_RANGING_FREQ_HZ);
+    vl53l5cx_set_integration_time_ms(dev, CONFIG_TOF_INTEGRATION_TIME_MS);
+    vl53l5cx_set_target_order(dev, VL53L5CX_TARGET_ORDER_STRONGEST);
+
+    if (vl53l5cx_start_ranging(dev) != 0) {
+        ESP_LOGW(TAG, "Sensor %s: start_ranging failed", label);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Sensor %s: ready (addr 0x%02X)", label, new_addr);
+    return true;
+}
+
 esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
+    devices->a_ok = false;
+    devices->b_ok = false;
+
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << TOF_A_LPN_PIN) | (1ULL << TOF_B_LPN_PIN),
         .mode = GPIO_MODE_OUTPUT,
@@ -73,70 +147,20 @@ esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
     gpio_set_level(TOF_B_LPN_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Enable Sensor A
+    // Sensor A — enable and bring up while B is still held in reset.
     gpio_set_level(TOF_A_LPN_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
+    devices->a_ok = tof_init_one(bus_handle, &devices->dev_a, TOF_A_ADDR, "xtalk_a", "A");
 
-    i2c_device_config_t dev_cfg_a = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = VL53_DEFAULT_ADDR,
-        .scl_speed_hz = 400000
-    };
-    i2c_master_dev_handle_t hA_init;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg_a, &hA_init));
-    devices->dev_a.platform.handle = hA_init;
-
-    // Change address of Sensor A
-    vl53l5cx_set_i2c_address(&devices->dev_a, TOF_A_ADDR << 1);
-
-    // Re-add device with new address
-    ESP_ERROR_CHECK(i2c_master_bus_rm_device(hA_init));
-    dev_cfg_a.device_address = TOF_A_ADDR;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg_a, &devices->dev_a.platform.handle));
-
-    // Enable Sensor B
+    // Sensor B — enable now that A (if present) has moved off the default address.
     gpio_set_level(TOF_B_LPN_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
+    devices->b_ok = tof_init_one(bus_handle, &devices->dev_b, TOF_B_ADDR, "xtalk_b", "B");
 
-    i2c_device_config_t dev_cfg_b = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = VL53_DEFAULT_ADDR,
-        .scl_speed_hz = 400000
-    };
-    i2c_master_dev_handle_t hB_init;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg_b, &hB_init));
-    devices->dev_b.platform.handle = hB_init;
+    ESP_LOGI(TAG, "ToF init: A=%s B=%s",
+             devices->a_ok ? "OK" : "absent", devices->b_ok ? "OK" : "absent");
 
-    // Change address of Sensor B
-    vl53l5cx_set_i2c_address(&devices->dev_b, TOF_B_ADDR << 1);
-
-    // Re-add device with new address
-    ESP_ERROR_CHECK(i2c_master_bus_rm_device(hB_init));
-    dev_cfg_b.device_address = TOF_B_ADDR;
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg_b, &devices->dev_b.platform.handle));
-
-    // Initialize Firmware
-    vl53l5cx_init(&devices->dev_a);
-    vl53l5cx_init(&devices->dev_b);
-
-    // Xtalk calibration — load from NVS or run live
-    tof_apply_xtalk(&devices->dev_a, "xtalk_a", "A");
-    tof_apply_xtalk(&devices->dev_b, "xtalk_b", "B");
-
-    vl53l5cx_set_resolution(&devices->dev_a, VL53L5CX_RESOLUTION_8X8);
-    vl53l5cx_set_resolution(&devices->dev_b, VL53L5CX_RESOLUTION_8X8);
-    vl53l5cx_set_ranging_frequency_hz(&devices->dev_a, CONFIG_TOF_RANGING_FREQ_HZ);
-    vl53l5cx_set_ranging_frequency_hz(&devices->dev_b, CONFIG_TOF_RANGING_FREQ_HZ);
-
-    vl53l5cx_set_integration_time_ms(&devices->dev_a, CONFIG_TOF_INTEGRATION_TIME_MS);
-    vl53l5cx_set_integration_time_ms(&devices->dev_b, CONFIG_TOF_INTEGRATION_TIME_MS);
-
-    vl53l5cx_set_target_order(&devices->dev_a, VL53L5CX_TARGET_ORDER_STRONGEST);
-    vl53l5cx_set_target_order(&devices->dev_b, VL53L5CX_TARGET_ORDER_STRONGEST);
-
-    vl53l5cx_start_ranging(&devices->dev_a);
-    vl53l5cx_start_ranging(&devices->dev_b);
-
+    // Always OK — a missing sensor is non-fatal; presence is reported via a_ok/b_ok.
     return ESP_OK;
 }
 

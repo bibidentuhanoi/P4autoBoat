@@ -5,6 +5,7 @@
 #include "vl53l5cx_api.h"
 #include "vl53l5cx_plugin_xtalk.h"
 #include "esp_err.h"
+#include <stdbool.h>
 
 // Constants
 #define VL53_DEFAULT_ADDR   0x29
@@ -13,6 +14,8 @@
 typedef struct {
     VL53L5CX_Configuration dev_a;
     VL53L5CX_Configuration dev_b;
+    bool a_ok;   /* sensor A detected + initialised */
+    bool b_ok;   /* sensor B detected + initialised */
 } tof_devices_t;
 
 esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices);

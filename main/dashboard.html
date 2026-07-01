@@ -173,6 +173,7 @@
   <h1>AutoBoat v2</h1>
   <div id="status-dot"></div>
   <span id="status-label">disconnected</span>
+  <span id="hw-warn" style="color:var(--danger);font-size:11px;font-weight:bold;margin-left:16px;"></span>
   <span id="sys-heap" style="margin-left:auto; color:var(--dim); font-size:11px;"></span>
   <span id="sys-rssi" style="color:var(--dim); font-size:11px;"></span>
   <span id="sys-uptime" style="color:var(--dim); font-size:11px;"></span>
@@ -399,7 +400,7 @@ message WinchCommand { float speed = 1; }
 message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; }
 message ArmCommand { bool arm = 1; }
 message DetectCommand { }
-message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; }
+message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; }
 message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; } }
 `;
 const root = protobuf.parse(protoSchema).root;
@@ -1165,6 +1166,11 @@ function connectWS() {
         $('sys-rssi').textContent = st.wifiRssi ? `RSSI: ${st.wifiRssi} dBm` : '';
         const secs = Number(st.uptimeUs) / 1e6;
         $('sys-uptime').textContent = `Up: ${Math.floor(secs/60)}m${Math.floor(secs%60)}s`;
+        const missing = [];
+        if (!st.cameraOk) missing.push('CAMERA');
+        if (!st.tofAOk)   missing.push('ToF-A');
+        if (!st.tofBOk)   missing.push('ToF-B');
+        $('hw-warn').textContent = missing.length ? ('⚠ ' + missing.join(' · ') + ' not detected') : '';
       }
       if (msg.motorStatus) {
         updateMotorStatus(msg.motorStatus);
