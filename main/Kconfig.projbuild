@@ -147,6 +147,47 @@ menu "Board Configuration"
 
     endmenu
 
+    menu "Winch / Servo Configuration"
+
+        config WINCH_PWM_PIN
+            int "Winch Servo PWM Pin (dual-use with BOOT button)"
+            default 35
+            help
+                GPIO for the winch servo PWM. Shared with the BOOT/recalibration
+                button: read as a button during the 3 s boot window, then
+                reconfigured as an MCPWM output.
+
+        config WINCH_PWM_FREQ_HZ
+            int "Winch PWM Frequency (Hz)"
+            default 50
+
+        config WINCH_PULSE_MIN_US
+            int "Winch Pulse Min (us) — full CCW / up"
+            default 1000
+            range 500 1500
+
+        config WINCH_PULSE_NEUTRAL_US
+            int "Winch Pulse Neutral (us) — stop (trim for your servo)"
+            default 1500
+            range 1000 2000
+
+        config WINCH_PULSE_MAX_US
+            int "Winch Pulse Max (us) — full CW / down"
+            default 2000
+            range 1500 2500
+
+        config SERVO_ENABLE_PIN
+            int "Servo Power Enable Pin"
+            default 36
+
+        config SERVO_ENABLE_ACTIVE_LOW
+            bool "Servo Enable is Active-Low"
+            default n
+            help
+                Enable if the servo power MOSFET/relay conducts when the pin is LOW.
+
+    endmenu
+
     menu "GPS Configuration"
 
         config GPS_UART_NUM
