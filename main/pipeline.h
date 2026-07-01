@@ -52,3 +52,14 @@ void pipeline_publish_motor_status(const boat_MotorStatus *mstatus);
 typedef void (*arm_command_handler_fn)(bool arm);
 
 void pipeline_register_arm_handler(arm_command_handler_fn handler);
+
+/**
+ * @brief Winch command handler callback type.
+ */
+typedef void (*winch_command_handler_fn)(const boat_WinchCommand *cmd);
+
+/**
+ * @brief Register a handler for incoming WinchCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
+ */
+void pipeline_register_winch_handler(winch_command_handler_fn handler);
