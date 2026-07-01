@@ -336,7 +336,7 @@
   </div>
 
   <div class="card" id="motor-card">
-    <div class="card-title">Motor Control</div>
+    <div class="card-title">Drive &amp; Steer</div>
     <div class="motor-controls">
       <div class="motor-state">
         <div class="state-dot disarmed" id="motor-state-dot"></div>
@@ -352,6 +352,20 @@
         <label>Right</label>
         <input type="range" id="motor-right" min="-100" max="100" value="0" step="1" disabled />
         <span class="val" id="motor-right-val">0%</span>
+      </div>
+      <div class="motor-slider-row" style="border-top:1px solid var(--border);padding-top:8px;margin-top:2px;">
+        <label>Steer</label>
+        <button class="btn-toggle on" id="steer-link">🔗 Linked</button>
+      </div>
+      <div class="motor-slider-row">
+        <label>Rudder L</label>
+        <input type="range" id="rudder-l" min="-100" max="100" value="0" step="1" />
+        <span class="val" id="rudder-l-val">0</span>
+      </div>
+      <div class="motor-slider-row">
+        <label>Rudder R</label>
+        <input type="range" id="rudder-r" min="-100" max="100" value="0" step="1" />
+        <span class="val" id="rudder-r-val">0</span>
       </div>
       <div class="motor-bars">
         <div class="motor-bar-wrap">
@@ -397,11 +411,12 @@ message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 
 message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; }
 message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; float right = 4; }
 message WinchCommand { float speed = 1; }
+message SteerCommand { float left = 1; float right = 2; }
 message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; }
 message ArmCommand { bool arm = 1; }
 message DetectCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1751,6 +1766,39 @@ function sendWinchCommand(speed) {
     sendWinchCommand(0);
   });
 })();
+
+// ── Steering (2 rudder servos, link toggle) ─────────────────────
+let steerLinked = true;
+function sendSteerCommand() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const left  = parseInt($('rudder-l').value) / 100;
+  const right = parseInt($('rudder-r').value) / 100;
+  ws.send(BoatMessage.encode(BoatMessage.create({ steer: { left, right } })).finish());
+}
+function setRudder(side, v) {
+  $('rudder-' + side).value = v;
+  $('rudder-' + side + '-val').textContent = v;
+}
+['l', 'r'].forEach(side => {
+  $('rudder-' + side).addEventListener('input', (e) => {
+    const v = parseInt(e.target.value);
+    $('rudder-' + side + '-val').textContent = v;
+    if (steerLinked) setRudder(side === 'l' ? 'r' : 'l', v);
+    sendSteerCommand();
+  });
+  $('rudder-' + side).addEventListener('dblclick', () => {
+    setRudder(side, 0);
+    if (steerLinked) setRudder(side === 'l' ? 'r' : 'l', 0);
+    sendSteerCommand();
+  });
+});
+$('steer-link').addEventListener('click', () => {
+  steerLinked = !steerLinked;
+  const b = $('steer-link');
+  b.textContent = steerLinked ? '🔗 Linked' : '⛓ Split';
+  b.classList.toggle('on', steerLinked);
+  if (steerLinked) { setRudder('r', parseInt($('rudder-l').value)); sendSteerCommand(); }
+});
 
 $('arm-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;

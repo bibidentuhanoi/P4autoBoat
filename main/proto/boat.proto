@@ -65,6 +65,11 @@ message WinchCommand {
   float speed = 1;  // -1..1 : + = CW/down (pay out), - = CCW/up (reel in), 0 = stop
 }
 
+message SteerCommand {
+  float left  = 1;  // left rudder  : -1 = full left, +1 = full right, 0 = center
+  float right = 2;  // right rudder : -1 = full left, +1 = full right, 0 = center
+}
+
 message MotorStatus {
   uint32 state          = 1;  // motor state enum
   float  left_throttle  = 2;  // current left throttle
@@ -96,5 +101,6 @@ message BoatMessage {
     MotorStatus    motor_status = 6;
     ArmCommand     arm_cmd      = 7;
     WinchCommand   winch        = 8;
+    SteerCommand   steer        = 9;
   }
 }

@@ -20,6 +20,7 @@
 #include "drivers/camera_driver.h"
 #include "drivers/gps_driver.h"
 #include "drivers/winch_driver.h"
+#include "drivers/steer_driver.h"
 
 // Connectivity
 #include "wifi_manager.h"
@@ -161,6 +162,10 @@ void app_main(void) {
     //     from input to MCPWM output (neutral/stop) and GPIO36 to output (off).
     ESP_LOGI(TAG, "Initializing winch servo + servo power...");
     ESP_ERROR_CHECK(winch_driver_init());
+
+    // 8c. Steering rudder servos (GPIO32/34, MCPWM group 1) — center on boot.
+    ESP_LOGI(TAG, "Initializing steering servos...");
+    ESP_ERROR_CHECK(steer_driver_init());
 
     // 9. Initialize Sensor Fusion
     ESP_LOGI(TAG, "Initializing sensor fusion...");

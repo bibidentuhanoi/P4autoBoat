@@ -22,6 +22,7 @@ static int s_transport_count = 0;
 static motor_command_handler_fn s_motor_handler = NULL;
 static arm_command_handler_fn s_arm_handler = NULL;
 static winch_command_handler_fn s_winch_handler = NULL;
+static steer_command_handler_fn s_steer_handler = NULL;
 
 /* ---- Public API ---- */
 
@@ -31,6 +32,7 @@ esp_err_t pipeline_init(void)
     s_motor_handler = NULL;
     s_arm_handler = NULL;
     s_winch_handler = NULL;
+    s_steer_handler = NULL;
     ESP_LOGI(TAG, "Pipeline initialized (max %d transports)", PIPELINE_MAX_TRANSPORTS);
     return ESP_OK;
 }
@@ -65,6 +67,11 @@ void pipeline_register_arm_handler(arm_command_handler_fn handler)
 void pipeline_register_winch_handler(winch_command_handler_fn handler)
 {
     s_winch_handler = handler;
+}
+
+void pipeline_register_steer_handler(steer_command_handler_fn handler)
+{
+    s_steer_handler = handler;
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
@@ -180,6 +187,13 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
             s_winch_handler(&msg.payload.winch);
         } else {
             ESP_LOGW(TAG, "Winch command received but no handler registered");
+        }
+        break;
+    case boat_BoatMessage_steer_tag:
+        if (s_steer_handler) {
+            s_steer_handler(&msg.payload.steer);
+        } else {
+            ESP_LOGW(TAG, "Steer command received but no handler registered");
         }
         break;
     default:

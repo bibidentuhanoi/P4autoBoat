@@ -186,6 +186,45 @@ menu "Board Configuration"
             help
                 Enable if the servo power MOSFET/relay conducts when the pin is LOW.
 
+        config STEER_LEFT_PIN
+            int "Left Steering Servo PWM Pin (rudder)"
+            default 32
+
+        config STEER_RIGHT_PIN
+            int "Right Steering Servo PWM Pin (rudder)"
+            default 34
+
+        config STEER_PWM_FREQ_HZ
+            int "Steering PWM Frequency (Hz)"
+            default 50
+
+        config STEER_PULSE_MIN_US
+            int "Steering Pulse Min (us) — full left"
+            default 1000
+            range 500 1500
+
+        config STEER_PULSE_NEUTRAL_US
+            int "Steering Pulse Neutral (us) — centered"
+            default 1500
+            range 1000 2000
+
+        config STEER_PULSE_MAX_US
+            int "Steering Pulse Max (us) — full right"
+            default 2000
+            range 1500 2500
+
+        config STEER_LEFT_REVERSE
+            bool "Reverse Left Steering Servo"
+            default n
+            help
+                Flip if the left rudder servo is mounted mirrored (deflects the wrong way).
+
+        config STEER_RIGHT_REVERSE
+            bool "Reverse Right Steering Servo"
+            default n
+            help
+                Flip if the right rudder servo is mounted mirrored (deflects the wrong way).
+
     endmenu
 
     menu "GPS Configuration"

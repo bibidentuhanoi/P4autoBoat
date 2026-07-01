@@ -63,3 +63,14 @@ typedef void (*winch_command_handler_fn)(const boat_WinchCommand *cmd);
  * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_winch_handler(winch_command_handler_fn handler);
+
+/**
+ * @brief Steering command handler callback type.
+ */
+typedef void (*steer_command_handler_fn)(const boat_SteerCommand *cmd);
+
+/**
+ * @brief Register a handler for incoming SteerCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
+ */
+void pipeline_register_steer_handler(steer_command_handler_fn handler);

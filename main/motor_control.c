@@ -1,6 +1,7 @@
 #include "motor_control.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
+#include "drivers/steer_driver.h"
 #include "pipeline.h"
 #include "transports/ws_transport.h"
 #include "esp_check.h"
@@ -47,6 +48,11 @@ static void winch_command_handler(const boat_WinchCommand *cmd)
     winch_driver_set_speed(cmd->speed);
 }
 
+static void steer_command_handler(const boat_SteerCommand *cmd)
+{
+    steer_driver_set(cmd->left, cmd->right);
+}
+
 static void arm_task_fn(void *arg)
 {
     bool do_arm = (bool)(intptr_t)arg;
@@ -91,8 +97,12 @@ static void watchdog_cb(void *arg)
             winch_driver_set_speed(0.0f);
             acted = true;
         }
+        if (steer_driver_get_left() != 0.0f || steer_driver_get_right() != 0.0f) {
+            steer_driver_set(0.0f, 0.0f);
+            acted = true;
+        }
         if (acted) {
-            ESP_LOGW(TAG, "WS disconnected — stopping motors + winch");
+            ESP_LOGW(TAG, "WS disconnected — stopping motors + winch, centering rudder");
         }
     }
 
@@ -115,6 +125,7 @@ esp_err_t motor_control_init(void)
     pipeline_register_motor_handler(motor_command_handler);
     pipeline_register_arm_handler(arm_command_handler);
     pipeline_register_winch_handler(winch_command_handler);
+    pipeline_register_steer_handler(steer_command_handler);
 
     const esp_timer_create_args_t timer_args = {
         .callback = watchdog_cb,
