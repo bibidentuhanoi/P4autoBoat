@@ -61,10 +61,15 @@ message MotorCommand {
   float right    = 4;  // right motor -1.0 to 1.0
 }
 
+message WinchCommand {
+  float speed = 1;  // -1..1 : + = CW/down (pay out), - = CCW/up (reel in), 0 = stop
+}
+
 message MotorStatus {
   uint32 state          = 1;  // motor state enum
   float  left_throttle  = 2;  // current left throttle
   float  right_throttle = 3;  // current right throttle
+  float  winch_speed    = 4;  // current winch speed (-1..1)
 }
 
 message ArmCommand {
@@ -87,5 +92,6 @@ message BoatMessage {
     GpsCoordinate  coord        = 5;
     MotorStatus    motor_status = 6;
     ArmCommand     arm_cmd      = 7;
+    WinchCommand   winch        = 8;
   }
 }
