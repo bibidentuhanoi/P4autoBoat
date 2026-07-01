@@ -218,13 +218,9 @@ void app_main(void) {
         }
         ESP_ERROR_CHECK(http_server_start());
 
-        // 11b. Arm ESCs (blocking ~3 s — neutral PWM running since step 1b)
-        ESP_LOGI(TAG, "Arming ESCs...");
-        esp_err_t esc_ret = motor_control_arm();
-        if (esc_ret != ESP_OK) {
-            ESP_LOGW(TAG, "ESC arming failed (%s) — arm via dashboard later",
-                     esp_err_to_name(esc_ret));
-        }
+        // 11b. ESCs stay DISARMED at boot. Arming is gated on a GPS lock and
+        //      requested by the user from the dashboard (bench override available).
+        ESP_LOGI(TAG, "ESCs disarmed — arm from dashboard once GPS locks (or override).");
     }
 
     // 12. Start RTOS Tasks

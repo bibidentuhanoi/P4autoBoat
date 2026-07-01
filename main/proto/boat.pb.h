@@ -98,6 +98,7 @@ typedef struct _boat_MotorStatus {
 
 typedef struct _boat_ArmCommand {
     bool arm; /* true = arm, false = disarm */
+    bool force; /* arm despite no GPS lock (manual bench/indoor override) */
 } boat_ArmCommand;
 
 typedef struct _boat_SystemStatus {
@@ -142,7 +143,7 @@ extern "C" {
 #define boat_WinchCommand_init_default           {0}
 #define boat_SteerCommand_init_default           {0, 0}
 #define boat_MotorStatus_init_default            {0, 0, 0, 0}
-#define boat_ArmCommand_init_default             {0}
+#define boat_ArmCommand_init_default             {0, 0}
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0}
@@ -156,7 +157,7 @@ extern "C" {
 #define boat_WinchCommand_init_zero              {0}
 #define boat_SteerCommand_init_zero              {0, 0}
 #define boat_MotorStatus_init_zero               {0, 0, 0, 0}
-#define boat_ArmCommand_init_zero                {0}
+#define boat_ArmCommand_init_zero                {0, 0}
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
@@ -205,6 +206,7 @@ extern "C" {
 #define boat_MotorStatus_right_throttle_tag      3
 #define boat_MotorStatus_winch_speed_tag         4
 #define boat_ArmCommand_arm_tag                  1
+#define boat_ArmCommand_force_tag                2
 #define boat_SystemStatus_heap_free_tag          1
 #define boat_SystemStatus_wifi_rssi_tag          2
 #define boat_SystemStatus_uptime_us_tag          3
@@ -316,7 +318,8 @@ X(a, STATIC,   SINGULAR, FLOAT,    winch_speed,       4)
 #define boat_MotorStatus_DEFAULT NULL
 
 #define boat_ArmCommand_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, BOOL,     arm,               1)
+X(a, STATIC,   SINGULAR, BOOL,     arm,               1) \
+X(a, STATIC,   SINGULAR, BOOL,     force,             2)
 #define boat_ArmCommand_CALLBACK NULL
 #define boat_ArmCommand_DEFAULT NULL
 
@@ -385,7 +388,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
-#define boat_ArmCommand_size                     2
+#define boat_ArmCommand_size                     4
 #define boat_BoatMessage_size                    13270
 #define boat_DetectCommand_size                  0
 #define boat_Detection_size                      60

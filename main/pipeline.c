@@ -177,9 +177,11 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
         detect_trigger();
         break;
     case boat_BoatMessage_arm_cmd_tag:
-        ESP_LOGI(TAG, "Arm command received: %s", msg.payload.arm_cmd.arm ? "ARM" : "DISARM");
+        ESP_LOGI(TAG, "Arm command received: %s%s",
+                 msg.payload.arm_cmd.arm ? "ARM" : "DISARM",
+                 msg.payload.arm_cmd.force ? " (force)" : "");
         if (s_arm_handler) {
-            s_arm_handler(msg.payload.arm_cmd.arm);
+            s_arm_handler(msg.payload.arm_cmd.arm, msg.payload.arm_cmd.force);
         }
         break;
     case boat_BoatMessage_winch_tag:

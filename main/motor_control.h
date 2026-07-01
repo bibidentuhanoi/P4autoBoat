@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,7 +18,7 @@ esp_err_t motor_control_init_hw(void);
  */
 esp_err_t motor_control_init(void);
 
-esp_err_t motor_control_arm(void);
+esp_err_t motor_control_arm(bool force);
 esp_err_t motor_control_disarm(void);
 
 #ifdef __cplusplus

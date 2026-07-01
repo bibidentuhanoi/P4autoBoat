@@ -45,6 +45,12 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud);
  */
 esp_err_t gps_driver_get_fix(gps_fix_t *out);
 
+/**
+ * True when there is a usable, fresh fix (valid + >= min satellites) — the
+ * gate for arming propulsion. Bench/indoor use the manual override instead.
+ */
+bool gps_driver_has_lock(void);
+
 #ifdef __cplusplus
 }
 #endif

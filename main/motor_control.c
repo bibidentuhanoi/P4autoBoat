@@ -2,6 +2,7 @@
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
+#include "drivers/gps_driver.h"
 #include "pipeline.h"
 #include "transports/ws_transport.h"
 #include "esp_check.h"
@@ -55,21 +56,25 @@ static void steer_command_handler(const boat_SteerCommand *cmd)
 
 static void arm_task_fn(void *arg)
 {
-    bool do_arm = (bool)(intptr_t)arg;
+    intptr_t v = (intptr_t)arg;
+    bool do_arm = (v & 1) != 0;
+    bool force  = (v & 2) != 0;
     if (do_arm) {
-        motor_control_arm();
+        motor_control_arm(force);
     } else {
         motor_control_disarm();
     }
     vTaskDelete(NULL);
 }
 
-static void arm_command_handler(bool arm)
+static void arm_command_handler(bool arm, bool force)
 {
-    ESP_LOGI(TAG, "%s command received", arm ? "Arm" : "Disarm");
+    ESP_LOGI(TAG, "%s command received%s", arm ? "Arm" : "Disarm",
+             (arm && force) ? " (GPS override)" : "");
     if (arm && esc_driver_get_state() != ESC_STATE_DISARMED) return;
     if (!arm && esc_driver_get_state() == ESC_STATE_DISARMED) return;
-    xTaskCreate(arm_task_fn, "esc_arm", 2048, (void *)(intptr_t)arm, 5, NULL);
+    intptr_t v = (arm ? 1 : 0) | (force ? 2 : 0);
+    xTaskCreate(arm_task_fn, "esc_arm", 2048, (void *)v, 5, NULL);
 }
 
 static void publish_status(void)
@@ -138,8 +143,12 @@ esp_err_t motor_control_init(void)
     return ESP_OK;
 }
 
-esp_err_t motor_control_arm(void)
+esp_err_t motor_control_arm(bool force)
 {
+    if (!force && !gps_driver_has_lock()) {
+        ESP_LOGW(TAG, "Arm refused — waiting for GPS lock (use override to bypass)");
+        return ESP_ERR_INVALID_STATE;
+    }
     esp_err_t ret = esc_driver_arm();
     if (ret == ESP_OK) {
         winch_driver_set_power(true);   /* servo rail live only while armed */

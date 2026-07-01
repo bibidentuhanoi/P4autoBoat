@@ -341,7 +341,11 @@
       <div class="motor-state">
         <div class="state-dot disarmed" id="motor-state-dot"></div>
         <span id="motor-state-label" style="font-size:11px;color:var(--dim);">DISARMED</span>
-        <button class="btn-arm arm" id="arm-btn">ARM</button>
+        <button class="btn-arm arm" id="arm-btn" disabled>ARM</button>
+      </div>
+      <div class="motor-state" style="justify-content:space-between;">
+        <span id="gps-lock" style="font-size:10px;color:var(--warn);">GPS ○ acquiring…</span>
+        <label style="font-size:9px;color:var(--dim);cursor:pointer;user-select:none;"><input type="checkbox" id="gps-override" style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
       </div>
       <div class="motor-slider-row">
         <label>Left</label>
@@ -413,7 +417,7 @@ message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; flo
 message WinchCommand { float speed = 1; }
 message SteerCommand { float left = 1; float right = 2; }
 message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; }
-message ArmCommand { bool arm = 1; }
+message ArmCommand { bool arm = 1; bool force = 2; }
 message DetectCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; }
 message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; } }
@@ -1171,6 +1175,17 @@ function connectWS() {
         if (s.tofA) drawTof('tof-a', s.tofA, FLIP.flipHA, FLIP.flipVA, FLIP.transA);
         if (s.tofB) drawTof('tof-b', s.tofB, FLIP.flipHB, FLIP.flipVB, FLIP.transB);
         if (s.tofA || s.tofB) renderOverlay(s.tofA, s.tofB);
+        {
+          const g = s.gps;
+          const sats = (g && g.satellites) || 0;
+          gpsLocked = !!(g && g.valid) && sats >= 5;
+          const gl = $('gps-lock');
+          if (gl) {
+            gl.textContent = gpsLocked ? `GPS ● locked (${sats})` : `GPS ○ acquiring (${sats})`;
+            gl.style.color = gpsLocked ? 'var(--green)' : 'var(--warn)';
+          }
+          updateArmEnable();
+        }
         if (_detectInFlight && s.detections && s.detections.length > 0) {
           finishDetect(s.detections);
         }
@@ -1653,6 +1668,11 @@ window.debug = {
 const MOTOR_STATES = ['DISARMED', 'ARMING', 'ARMED'];
 const MOTOR_CLASSES = ['disarmed', 'arming', 'armed'];
 let motorArmed = false;
+let gpsLocked = false;
+function updateArmEnable() {
+  const override = $('gps-override').checked;
+  $('arm-btn').disabled = motorArmed ? false : !(gpsLocked || override);
+}
 
 function updateMotorStatus(ms) {
   const idx = ms.state || 0;
@@ -1669,6 +1689,7 @@ function updateMotorStatus(ms) {
     btn.textContent = 'ARM';
     btn.className = 'btn-arm arm';
   }
+  updateArmEnable();
 
   $('motor-left').disabled = !motorArmed;
   $('motor-right').disabled = !motorArmed;
@@ -1802,10 +1823,13 @@ $('steer-link').addEventListener('click', () => {
 
 $('arm-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const msg = BoatMessage.create({ armCmd: { arm: !motorArmed } });
+  const force = $('gps-override').checked;
+  if (!motorArmed && !gpsLocked && !force) return;   // gated on GPS lock
+  const msg = BoatMessage.create({ armCmd: { arm: !motorArmed, force } });
   const buf = BoatMessage.encode(msg).finish();
   ws.send(buf);
 });
+$('gps-override').addEventListener('change', updateArmEnable);
 
 // ═══════════════════════════════════════════════════════════════
 // Init

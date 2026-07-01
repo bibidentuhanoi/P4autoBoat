@@ -25,6 +25,7 @@ static const char *TAG = "GPS";
 #define UBX_CLASS_NAV     0x01
 #define UBX_ID_NAV_PVT    0x07
 #define UBX_NAV_PVT_LEN   92
+#define GPS_LOCK_MIN_SATS 5     /* valid fix + this many sats = "locked" for arming */
 
 static int              s_uart_num = -1;
 static SemaphoreHandle_t s_mutex   = NULL;
@@ -428,4 +429,10 @@ esp_err_t gps_driver_get_fix(gps_fix_t *out) {
         out->valid = false;
     }
     return ESP_OK;
+}
+
+bool gps_driver_has_lock(void) {
+    gps_fix_t f;
+    gps_driver_get_fix(&f);   /* copies + applies staleness */
+    return f.valid && f.satellites >= GPS_LOCK_MIN_SATS;
 }

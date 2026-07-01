@@ -78,7 +78,8 @@ message MotorStatus {
 }
 
 message ArmCommand {
-  bool arm = 1;  // true = arm, false = disarm
+  bool arm   = 1;  // true = arm, false = disarm
+  bool force = 2;  // arm despite no GPS lock (manual bench/indoor override)
 }
 
 message SystemStatus {
