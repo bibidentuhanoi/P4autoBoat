@@ -15,7 +15,11 @@ typedef struct {
     float    altitude_m;      // Mean sea level altitude (metres, from GGA).
     float    speed_mps;       // Ground speed (m/s, converted from RMC knots).
     float    course_deg;      // Course over ground (deg true, 0..360).
-    uint8_t  fix_quality;     // NMEA GGA fix quality: 0=invalid, 1=GPS, 2=DGPS...
+    float    speed_acc_mps;   // Speed accuracy estimate (m/s, UBX sAcc); 0 = unknown.
+    float    vel_n_mps;       // NED velocity North (m/s, UBX NAV-PVT).
+    float    vel_e_mps;       // NED velocity East  (m/s, UBX NAV-PVT).
+    float    vel_d_mps;       // NED velocity Down  (m/s, UBX NAV-PVT).
+    uint8_t  fix_quality;     // Fix type/quality (UBX fixType, or NMEA GGA quality).
     uint8_t  satellites;      // Satellites in use.
     float    hdop;            // Horizontal dilution of precision.
     uint64_t utc_ms;          // ms since Unix epoch (UTC), 0 = unknown.

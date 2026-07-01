@@ -243,8 +243,25 @@ menu "Board Configuration"
             default 38
 
         config GPS_BAUD
-            int "GPS UART Baud Rate"
+            int "GPS UART Power-on Baud Rate"
             default 9600
+            help
+                The baud the module boots at (u-blox default 9600). The driver
+                sends UBX CFG-PRT at this baud, then switches to GPS_HIGH_BAUD.
+
+        config GPS_HIGH_BAUD
+            int "GPS UART Target Baud Rate (after UBX config)"
+            default 115200
+            help
+                Baud the driver switches the u-blox module to so NAV-PVT fits at
+                the configured rate. 9600 cannot carry NAV-PVT at 10 Hz.
+
+        config GPS_MEAS_RATE_HZ
+            int "GPS Measurement Rate (Hz)"
+            default 10
+            range 1 10
+            help
+                u-blox nav-solution rate (UBX CFG-RATE). NEO-M8N supports up to 10 Hz.
 
     endmenu
 

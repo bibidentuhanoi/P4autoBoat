@@ -9,20 +9,36 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
+#include "sdkconfig.h"
 #include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "GPS";
 
 #define NMEA_MAX_LINE     100   /* NMEA 0183 caps at 82 chars incl CRLF; 100 is safe. */
-#define UART_RX_BUF       1024
+#define UART_RX_BUF       2048
 #define GPS_TASK_STACK    4096
 #define GPS_TASK_PRIORITY 3
+
+#define UBX_SYNC1         0xB5
+#define UBX_SYNC2         0x62
+#define UBX_CLASS_NAV     0x01
+#define UBX_ID_NAV_PVT    0x07
+#define UBX_NAV_PVT_LEN   92
 
 static int              s_uart_num = -1;
 static SemaphoreHandle_t s_mutex   = NULL;
 static TaskHandle_t     s_task     = NULL;
 static gps_fix_t        s_fix      = {0};
+/* When NAV-PVT is flowing it is authoritative; NMEA is ignored while fresh. */
+static int64_t          s_last_ubx_us = 0;
+
+/* ---------- little-endian readers ---------- */
+static inline uint16_t rd_u16(const uint8_t *p){ return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint32_t rd_u32(const uint8_t *p){
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline int32_t  rd_i32(const uint8_t *p){ return (int32_t)rd_u32(p); }
 
 /* ---------- NMEA helpers ---------- */
 
@@ -95,7 +111,49 @@ static uint64_t utc_to_epoch_ms(int year, int mon, int day,
     return secs * 1000ull + (uint64_t)(frac * 1000.0);
 }
 
-/* ---------- Sentence parsers (caller holds s_mutex). ---------- */
+/* ---------- UBX NAV-PVT parser (primary) ---------- */
+
+static void parse_navpvt(const uint8_t *p) {
+    uint8_t  fixType = p[20];
+    uint8_t  flags   = p[21];
+    uint8_t  numSV   = p[23];
+    int32_t  lon     = rd_i32(p + 24);   /* 1e-7 deg */
+    int32_t  lat     = rd_i32(p + 28);   /* 1e-7 deg */
+    int32_t  hMSL    = rd_i32(p + 36);   /* mm */
+    int32_t  velN    = rd_i32(p + 48);   /* mm/s */
+    int32_t  velE    = rd_i32(p + 52);   /* mm/s */
+    int32_t  velD    = rd_i32(p + 56);   /* mm/s */
+    int32_t  gSpeed  = rd_i32(p + 60);   /* mm/s ground speed */
+    int32_t  headMot = rd_i32(p + 64);   /* 1e-5 deg */
+    uint32_t sAcc    = rd_u32(p + 68);   /* mm/s speed accuracy */
+    uint16_t pDOP    = rd_u16(p + 76);   /* 0.01 */
+    bool     fixOk   = (flags & 0x01) != 0;
+
+    uint16_t year = rd_u16(p + 4);
+    int mon = p[6], day = p[7], hh = p[8], mm = p[9], ss = p[10];
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_fix.valid         = fixOk && (fixType == 2 || fixType == 3);
+    s_fix.latitude      = (double)lat * 1e-7;
+    s_fix.longitude     = (double)lon * 1e-7;
+    s_fix.altitude_m    = (float)hMSL / 1000.0f;
+    s_fix.speed_mps     = (float)gSpeed / 1000.0f;
+    s_fix.course_deg    = (float)headMot * 1e-5f;
+    s_fix.speed_acc_mps = (float)sAcc / 1000.0f;
+    s_fix.vel_n_mps     = (float)velN / 1000.0f;
+    s_fix.vel_e_mps     = (float)velE / 1000.0f;
+    s_fix.vel_d_mps     = (float)velD / 1000.0f;
+    s_fix.fix_quality   = fixType;
+    s_fix.satellites    = numSV;
+    s_fix.hdop          = (float)pDOP * 0.01f;   /* position DOP as a proxy */
+    uint64_t ms = utc_to_epoch_ms(year, mon, day, hh, mm, ss, 0.0);
+    if (ms) s_fix.utc_ms = ms;
+    s_fix.last_update_us = esp_timer_get_time();
+    s_last_ubx_us = s_fix.last_update_us;
+    xSemaphoreGive(s_mutex);
+}
+
+/* ---------- NMEA sentence parsers (fallback; caller holds s_mutex) ---------- */
 
 static void parse_gga(char *body, gps_fix_t *fix) {
     char *p = body;
@@ -119,7 +177,6 @@ static void parse_gga(char *body, gps_fix_t *fix) {
     if (q > 0 && lat && *lat && ns && *ns && lon && *lon && ew && *ew) {
         fix->latitude  = nmea_to_deg(lat, *ns);
         fix->longitude = nmea_to_deg(lon, *ew);
-        /* GGA alone is enough to mark valid; RMC may override. */
         fix->valid = true;
     } else if (q == 0) {
         fix->valid = false;
@@ -151,7 +208,6 @@ static void parse_rmc(char *body, gps_fix_t *fix) {
         if (course && *course) fix->course_deg = strtof(course, NULL);
     }
 
-    /* Combine date + time into UTC epoch. */
     if (date && strlen(date) == 6 && time && strlen(time) >= 6) {
         int d  = (date[0] - '0') * 10 + (date[1] - '0');
         int mo = (date[2] - '0') * 10 + (date[3] - '0');
@@ -165,12 +221,13 @@ static void parse_rmc(char *body, gps_fix_t *fix) {
     }
 }
 
-/* Dispatch a validated, null-terminated payload (no '$', no '*cs'). */
+/* Dispatch a validated, null-terminated NMEA payload (no '$', no '*cs'). */
 static void dispatch_sentence(char *body) {
-    /* Talker is 2 chars (GP/GN/GL/GA/BD/QZ...), sentence id is next 3. */
     if (strlen(body) < 5) return;
-    const char *sent = body + 2;
+    /* NAV-PVT is authoritative while fresh — ignore NMEA to avoid fighting. */
+    if (s_last_ubx_us != 0 && (esp_timer_get_time() - s_last_ubx_us) < 2000000) return;
 
+    const char *sent = body + 2;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if      (!strncmp(sent, "GGA", 3)) parse_gga(body, &s_fix);
     else if (!strncmp(sent, "RMC", 3)) parse_rmc(body, &s_fix);
@@ -182,34 +239,124 @@ static void dispatch_sentence(char *body) {
     xSemaphoreGive(s_mutex);
 }
 
-/* ---------- UART task ---------- */
+/* ---------- u-blox UBX configuration ---------- */
+
+static void ubx_send(int uart, uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
+    uint8_t hdr[6] = { UBX_SYNC1, UBX_SYNC2, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 6; i++) { a += hdr[i]; b += a; }
+    for (int i = 0; i < len; i++) { a += pl[i]; b += a; }
+    uint8_t ck[2] = { a, b };
+    uart_write_bytes(uart, hdr, 6);
+    if (len) uart_write_bytes(uart, pl, len);
+    uart_write_bytes(uart, ck, 2);
+    uart_wait_tx_done(uart, pdMS_TO_TICKS(100));
+}
+
+/* Switch the module to the target baud + rate and enable NAV-PVT. Best-effort:
+ * if it fails the module keeps emitting NMEA and the fallback parser copes. */
+static void gps_configure_ublox(int uart) {
+    uint32_t hb = (uint32_t)CONFIG_GPS_HIGH_BAUD;
+
+    /* CFG-PRT (0x06 0x00): UART1, 8N1, target baud, in/out = UBX + NMEA. */
+    uint8_t prt[20] = {0};
+    prt[0]  = 0x01;                       /* portID = UART1 */
+    prt[4]  = 0xD0; prt[5] = 0x08;        /* mode 0x000008D0 (8 data, no parity, 1 stop) */
+    prt[8]  = (uint8_t)(hb & 0xFF);
+    prt[9]  = (uint8_t)((hb >> 8) & 0xFF);
+    prt[10] = (uint8_t)((hb >> 16) & 0xFF);
+    prt[11] = (uint8_t)((hb >> 24) & 0xFF);
+    prt[12] = 0x03;                       /* inProtoMask  = UBX + NMEA */
+    prt[14] = 0x03;                       /* outProtoMask = UBX + NMEA */
+    ubx_send(uart, 0x06, 0x00, prt, 20);
+    vTaskDelay(pdMS_TO_TICKS(120));
+
+    /* Follow the module to the new baud. */
+    uart_flush_input(uart);
+    uart_set_baudrate(uart, hb);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    /* CFG-RATE (0x06 0x08): measRate ms, navRate 1, timeRef = GPS(1). */
+    uint16_t meas = (uint16_t)(1000 / CONFIG_GPS_MEAS_RATE_HZ);
+    uint8_t rate[6] = { (uint8_t)(meas & 0xFF), (uint8_t)(meas >> 8), 0x01, 0x00, 0x01, 0x00 };
+    ubx_send(uart, 0x06, 0x08, rate, 6);
+
+    /* CFG-MSG (0x06 0x01): enable NAV-PVT at rate 1 on the current port. */
+    uint8_t msg[3] = { UBX_CLASS_NAV, UBX_ID_NAV_PVT, 0x01 };
+    ubx_send(uart, 0x06, 0x01, msg, 3);
+
+    ESP_LOGI(TAG, "u-blox configured: %u baud, %d Hz, NAV-PVT enabled",
+             (unsigned)hb, CONFIG_GPS_MEAS_RATE_HZ);
+}
+
+/* ---------- UART task: hybrid UBX (primary) + NMEA (fallback) ---------- */
 
 static void gps_task(void *arg) {
-    uint8_t rx_chunk[128];
-    char    line[NMEA_MAX_LINE];
-    size_t  line_len = 0;
+    uint8_t rx[256];
+    /* NMEA line accumulator */
+    char   line[NMEA_MAX_LINE];
+    size_t line_len = 0;
+    bool   in_nmea = false;
+    /* UBX frame state machine */
+    enum { U_IDLE, U_S2, U_CLS, U_ID, U_L1, U_L2, U_PL, U_CKA, U_CKB } ust = U_IDLE;
+    uint8_t  ucls = 0, uid = 0, ucka = 0, uckb = 0, rcka = 0;
+    uint16_t ulen = 0, uidx = 0;
+    static uint8_t upayload[128];
 
     ESP_LOGI(TAG, "GPS task started on UART%d", s_uart_num);
 
     while (true) {
-        int n = uart_read_bytes(s_uart_num, rx_chunk, sizeof(rx_chunk),
-                                pdMS_TO_TICKS(200));
+        int n = uart_read_bytes(s_uart_num, rx, sizeof(rx), pdMS_TO_TICKS(200));
         if (n <= 0) continue;
 
         for (int i = 0; i < n; i++) {
-            char c = (char)rx_chunk[i];
-            if (c == '\r' || c == '\n') {
-                if (line_len > 0) {
+            uint8_t b = rx[i];
+
+            /* --- inside a UBX frame: consume until complete --- */
+            if (ust != U_IDLE) {
+                switch (ust) {
+                case U_S2:  ust = (b == UBX_SYNC2) ? U_CLS : U_IDLE; break;
+                case U_CLS: ucls = b; ucka = b; uckb = b; ust = U_ID;  break;
+                case U_ID:  uid  = b; ucka += b; uckb += ucka; ust = U_L1; break;
+                case U_L1:  ulen = b; ucka += b; uckb += ucka; ust = U_L2; break;
+                case U_L2:
+                    ulen |= (uint16_t)b << 8; ucka += b; uckb += ucka; uidx = 0;
+                    ust = (ulen == 0) ? U_CKA
+                        : (ulen <= sizeof(upayload) ? U_PL : U_IDLE);
+                    break;
+                case U_PL:
+                    upayload[uidx++] = b; ucka += b; uckb += ucka;
+                    if (uidx >= ulen) ust = U_CKA;
+                    break;
+                case U_CKA: rcka = b; ust = U_CKB; break;
+                case U_CKB:
+                    if (rcka == ucka && b == uckb &&
+                        ucls == UBX_CLASS_NAV && uid == UBX_ID_NAV_PVT &&
+                        ulen >= UBX_NAV_PVT_LEN) {
+                        parse_navpvt(upayload);
+                    }
+                    ust = U_IDLE;
+                    break;
+                default: ust = U_IDLE; break;
+                }
+                continue;
+            }
+
+            /* --- idle: look for a UBX sync or an NMEA '$' --- */
+            if (b == UBX_SYNC1) { ust = U_S2; in_nmea = false; line_len = 0; continue; }
+            if (b == '$')       { in_nmea = true; line_len = 0; line[line_len++] = '$'; continue; }
+
+            if (in_nmea) {
+                if (b == '\r' || b == '\n') {
                     line[line_len] = 0;
                     char *body = nmea_validate(line, line_len);
                     if (body) dispatch_sentence(body);
-                    line_len = 0;
+                    in_nmea = false; line_len = 0;
+                } else if (line_len < sizeof(line) - 1) {
+                    line[line_len++] = (char)b;
+                } else {
+                    in_nmea = false; line_len = 0;   /* overflow — reset */
                 }
-            } else if (line_len < sizeof(line) - 1) {
-                line[line_len++] = c;
-            } else {
-                /* overflow — reset accumulator */
-                line_len = 0;
             }
         }
     }
@@ -227,7 +374,7 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
     if (!s_mutex) return ESP_ERR_NO_MEM;
 
     const uart_config_t cfg = {
-        .baud_rate           = baud,
+        .baud_rate           = baud,          /* module's power-on baud (9600) */
         .data_bits           = UART_DATA_8_BITS,
         .parity              = UART_PARITY_DISABLE,
         .stop_bits           = UART_STOP_BITS_1,
@@ -246,6 +393,10 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
 
     s_uart_num = uart_num;
 
+    /* Configure the u-blox module: switch to high baud + rate, enable NAV-PVT.
+     * Best-effort — on failure the NMEA fallback parser keeps a fix flowing. */
+    gps_configure_ublox(uart_num);
+
     BaseType_t ok = xTaskCreate(gps_task, "GPS_Task", GPS_TASK_STACK,
                                  NULL, GPS_TASK_PRIORITY, &s_task);
     if (ok != pdPASS) {
@@ -253,8 +404,8 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "GPS init OK (UART%d RX=%d TX=%d @ %d baud)",
-             uart_num, rx_pin, tx_pin, baud);
+    ESP_LOGI(TAG, "GPS init OK (UART%d RX=%d TX=%d, %d->%d baud, %d Hz NAV-PVT)",
+             uart_num, rx_pin, tx_pin, baud, CONFIG_GPS_HIGH_BAUD, CONFIG_GPS_MEAS_RATE_HZ);
     return ESP_OK;
 }
 
