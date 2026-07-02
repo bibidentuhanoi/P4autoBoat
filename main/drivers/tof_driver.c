@@ -91,17 +91,26 @@ static bool tof_init_one(i2c_master_bus_handle_t bus, VL53L5CX_Configuration *de
         return false;
     }
 
-    /* Move to its unique address so the two sensors don't clash on the bus. */
-    if (vl53l5cx_set_i2c_address(dev, (uint16_t)(new_addr << 1)) != 0) {
-        ESP_LOGW(TAG, "Sensor %s: set i2c address failed", label);
-        i2c_master_bus_rm_device(h_init);
-        dev->platform.handle = NULL;
-        return false;
-    }
+    /* Move to its unique address so the two sensors don't clash on the bus.
+     * The ULD's return status is unreliable here: its post-write verification
+     * read still goes through the old-address handle, so it reports failure
+     * even when the chip DID switch (this port keeps the address in the ESP
+     * i2c handle, not in dev->platform). Ignore it — is_alive at the NEW
+     * address below is the real check. */
+    (void)vl53l5cx_set_i2c_address(dev, (uint16_t)(new_addr << 1));
     i2c_master_bus_rm_device(h_init);
     cfg.device_address = new_addr;
     if (i2c_master_bus_add_device(bus, &cfg, &dev->platform.handle) != ESP_OK) {
         ESP_LOGW(TAG, "Sensor %s: i2c re-add at 0x%02X failed", label, new_addr);
+        dev->platform.handle = NULL;
+        return false;
+    }
+
+    /* Verify the sensor actually answers at its new address. */
+    alive = 0;
+    if (vl53l5cx_is_alive(dev, &alive) != 0 || !alive) {
+        ESP_LOGW(TAG, "Sensor %s: not responding at 0x%02X after address change", label, new_addr);
+        i2c_master_bus_rm_device(dev->platform.handle);
         dev->platform.handle = NULL;
         return false;
     }
