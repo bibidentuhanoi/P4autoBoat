@@ -187,6 +187,19 @@ extern "C" esp_err_t detect_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Create the task BEFORE the model preload: its 32KB stack needs one
+     * contiguous internal block, and the esp-dl preload fragments the heap
+     * badly enough that grabbing it afterwards fails (seen on hardware with
+     * 214KB free but no 32KB block). The task parks on ulTaskNotifyTake and
+     * cannot run until a WS trigger — long after this function returns. */
+    BaseType_t ret = xTaskCreate(detect_task_fn, "Detect", 32768,
+                                  NULL, 5, &s_detect_task);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create detect task (largest internal block: %u B)",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+
     /* Preload model NOW (before WiFi starts) — allocates PSRAM bulk
      * blocks without SDIO DMA interference. */
     ESP_LOGI(TAG, "Preloading cat_detect model...");
@@ -206,12 +219,6 @@ extern "C" esp_err_t detect_init(void)
     ESP_LOGI(TAG, "Model preloaded and warm");
     LOG_HEAP();
 
-    BaseType_t ret = xTaskCreate(detect_task_fn, "Detect", 32768,
-                                  NULL, 5, &s_detect_task);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create detect task");
-        return ESP_ERR_NO_MEM;
-    }
     ESP_LOGI(TAG, "Detect task ready (trigger via WS command)");
     return ESP_OK;
 }
