@@ -8,13 +8,19 @@ static const char *TAG = "IMU";
 static i2c_master_dev_handle_t h_qmc;
 static i2c_master_dev_handle_t h_icm;
 
+/* Bounded timeout — a marginal/shorted bus with -1 (wait forever) can wedge
+ * the whole boot (seen on hardware: hung mid ToF-B bring-up while the IMU
+ * module was loading the bus). 100ms is orders of magnitude above any legit
+ * transaction at 400kHz. */
+#define IMU_I2C_TIMEOUT_MS 100
+
 static esp_err_t i2c_write_byte(i2c_master_dev_handle_t handle, uint8_t reg, uint8_t data) {
     uint8_t buf[2] = {reg, data};
-    return i2c_master_transmit(handle, buf, 2, -1);
+    return i2c_master_transmit(handle, buf, 2, IMU_I2C_TIMEOUT_MS);
 }
 
 static esp_err_t i2c_read_bytes(i2c_master_dev_handle_t handle, uint8_t reg, uint8_t *data, size_t len) {
-    return i2c_master_transmit_receive(handle, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(handle, &reg, 1, data, len, IMU_I2C_TIMEOUT_MS);
 }
 
 esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
