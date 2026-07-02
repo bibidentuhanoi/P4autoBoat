@@ -47,15 +47,27 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
 
-    /* WHO_AM_I check (bank 0, reg 0x00) — ICM20948 answers 0xEA. */
+    /* WHO_AM_I check (bank 0, reg 0x00) — ICM20948 answers 0xEA.
+     * The AD0 strap selects the address: high/floating = 0x69, GND = 0x68.
+     * Probe 0x69 first, fall back to 0x68 so either strap works. */
     i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
     uint8_t whoami = 0;
     esp_err_t icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
     if (icm_probe != ESP_OK) {
-        ESP_LOGE(TAG, "ICM20948 (0x%02X) NOT RESPONDING (%s) — pitch/roll will be dead",
-                 ICM20948_ADDR, esp_err_to_name(icm_probe));
+        i2c_master_bus_rm_device(h_icm);
+        icm_cfg.device_address = ICM20948_ADDR_ALT;
+        ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
+        i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+        icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+        if (icm_probe == ESP_OK) {
+            ESP_LOGW(TAG, "ICM20948 found at 0x%02X (AD0 low) — using it", ICM20948_ADDR_ALT);
+        }
+    }
+    if (icm_probe != ESP_OK) {
+        ESP_LOGE(TAG, "ICM20948 NOT RESPONDING at 0x%02X or 0x%02X (%s) — pitch/roll will be dead",
+                 ICM20948_ADDR, ICM20948_ADDR_ALT, esp_err_to_name(icm_probe));
     } else if (whoami != 0xEA) {
-        ESP_LOGW(TAG, "ICM20948 WHO_AM_I=0x%02X (expected 0xEA) — wrong/impostor chip?", whoami);
+        ESP_LOGW(TAG, "IMU WHO_AM_I=0x%02X (ICM20948 expects 0xEA) — different chip?", whoami);
     } else {
         ESP_LOGI(TAG, "ICM20948 detected (WHO_AM_I=0xEA)");
     }

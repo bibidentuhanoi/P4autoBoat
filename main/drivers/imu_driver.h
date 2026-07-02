@@ -6,7 +6,8 @@
 
 // Register Addresses
 #define QMC5883L_ADDR       0x0D
-#define ICM20948_ADDR       0x69
+#define ICM20948_ADDR       0x69   /* AD0 high/floating (breakout default) */
+#define ICM20948_ADDR_ALT   0x68   /* AD0 bridged to GND */
 
 #define REG_BANK_SEL        0x7F
 #define USER_CTRL           0x03
