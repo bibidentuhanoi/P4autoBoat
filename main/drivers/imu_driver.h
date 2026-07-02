@@ -22,5 +22,8 @@
 esp_err_t imu_init(i2c_master_bus_handle_t bus_handle);
 esp_err_t imu_read_accel_gyro(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz);
 esp_err_t imu_read_mag(int16_t* mx, int16_t* my, int16_t* mz);
+/* Re-apply chip config after a lost-connection recovery (see imu_driver.c). */
+esp_err_t imu_reinit_mag(void);
+esp_err_t imu_reinit_accel_gyro(void);
 
 #endif // IMU_DRIVER_H

@@ -95,7 +95,14 @@ void task_imu_fusion(void *pvParameters) {
                          (unsigned long)mag_fails);
             }
         } else if (mag_fails) {
-            ESP_LOGI(FUSION_TAG, "mag reads recovered after %lu fails", (unsigned long)mag_fails);
+            /* Connection came back — the chip may have missed its boot config
+             * (standby => stale zeros), so re-apply it before trusting data. */
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                imu_reinit_mag();
+                xSemaphoreGive(g_i2c_mutex);
+            }
+            ESP_LOGI(FUSION_TAG, "mag recovered after %lu fails — reconfigured",
+                     (unsigned long)mag_fails);
             mag_fails = 0;
         }
         if (!read_success) {
@@ -104,7 +111,13 @@ void task_imu_fusion(void *pvParameters) {
                          (unsigned long)ag_fails);
             }
         } else if (ag_fails) {
-            ESP_LOGI(FUSION_TAG, "accel/gyro reads recovered after %lu fails", (unsigned long)ag_fails);
+            /* Same recovery path: wake the chip (it boots asleep) + set range. */
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                imu_reinit_accel_gyro();
+                xSemaphoreGive(g_i2c_mutex);
+            }
+            ESP_LOGI(FUSION_TAG, "accel/gyro recovered after %lu fails — reconfigured",
+                     (unsigned long)ag_fails);
             ag_fails = 0;
         }
 

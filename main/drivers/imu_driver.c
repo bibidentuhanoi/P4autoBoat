@@ -91,6 +91,30 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
     return ESP_OK;
 }
 
+/* Re-apply the QMC5883L config (soft reset -> continuous mode). Needed when
+ * the chip was unreachable during imu_init (flaky wiring seen on hardware):
+ * unconfigured it sits in standby and returns stale zeros despite ACKing. */
+esp_err_t imu_reinit_mag(void) {
+    esp_err_t e0 = i2c_write_byte(h_qmc, 0x0A, 0x80);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_err_t e1 = i2c_write_byte(h_qmc, 0x09, 0x05); // ±2G, 50Hz, OSR=512, continuous
+    esp_err_t e2 = i2c_write_byte(h_qmc, 0x0B, 0x01);
+    return (e0 == ESP_OK && e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+/* Re-apply the ICM20948 config (wake + gyro range). Unconfigured, the chip
+ * boots ASLEEP (PWR_MGMT_1=0x41) and returns zeros despite ACKing. */
+esp_err_t imu_reinit_accel_gyro(void) {
+    esp_err_t e0 = i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+    esp_err_t e1 = i2c_write_byte(h_icm, PWR_MGMT_1, 0x01);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    i2c_write_byte(h_icm, USER_CTRL, 0x00);
+    i2c_write_byte(h_icm, REG_BANK_SEL, 0x20);
+    i2c_write_byte(h_icm, GYRO_CONFIG_1, 0x00); // 250 dps
+    esp_err_t e2 = i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+    return (e0 == ESP_OK && e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t imu_read_accel_gyro(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx, int16_t* gy, int16_t* gz) {
     uint8_t buf[6];
     esp_err_t ret = ESP_OK;
