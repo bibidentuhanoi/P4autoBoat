@@ -1,6 +1,9 @@
 #include "imu_driver.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_log.h"
+
+static const char *TAG = "IMU";
 
 static i2c_master_dev_handle_t h_qmc;
 static i2c_master_dev_handle_t h_icm;
@@ -23,6 +26,14 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &qmc_cfg, &h_qmc));
 
+    /* Presence check: any successful read means the mag answers on the bus. */
+    uint8_t qmc_status = 0;
+    esp_err_t qmc_probe = i2c_read_bytes(h_qmc, 0x06, &qmc_status, 1);
+    if (qmc_probe != ESP_OK) {
+        ESP_LOGE(TAG, "QMC5883L (0x%02X) NOT RESPONDING (%s) — heading will be dead",
+                 QMC5883L_ADDR, esp_err_to_name(qmc_probe));
+    }
+
     i2c_write_byte(h_qmc, 0x0A, 0x80);
     vTaskDelay(pdMS_TO_TICKS(10));
     i2c_write_byte(h_qmc, 0x09, 0x05); // ±2G, 50Hz, OSR=512, continuous
@@ -35,6 +46,19 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         .scl_speed_hz = 400000
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
+
+    /* WHO_AM_I check (bank 0, reg 0x00) — ICM20948 answers 0xEA. */
+    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+    uint8_t whoami = 0;
+    esp_err_t icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+    if (icm_probe != ESP_OK) {
+        ESP_LOGE(TAG, "ICM20948 (0x%02X) NOT RESPONDING (%s) — pitch/roll will be dead",
+                 ICM20948_ADDR, esp_err_to_name(icm_probe));
+    } else if (whoami != 0xEA) {
+        ESP_LOGW(TAG, "ICM20948 WHO_AM_I=0x%02X (expected 0xEA) — wrong/impostor chip?", whoami);
+    } else {
+        ESP_LOGI(TAG, "ICM20948 detected (WHO_AM_I=0xEA)");
+    }
 
     i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
     i2c_write_byte(h_icm, PWR_MGMT_1, 0x01);

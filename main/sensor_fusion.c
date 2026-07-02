@@ -1,9 +1,12 @@
 #include "sensor_fusion.h"
 #include "detect_task.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "math.h"
 #include <stdlib.h>
 #include <string.h>
+
+static const char *FUSION_TAG = "FUSION";
 
 // Configuration macros will be provided by Kconfig in the future,
 // for now we use the ones defined in sdkconfig or default if missing
@@ -60,10 +63,16 @@ void task_imu_fusion(void *pvParameters) {
         last_time = now;
 
         // --- I2C reads under shared bus mutex ---
+        // Failure visibility: a dead IMU used to freeze the outputs at zero
+        // with no trace in the logs. Count failures and report ~every 2s.
+        static uint32_t ag_fails = 0, mag_fails = 0;
+        bool mag_ok = false;
+
         bool read_success = false;
         if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             // MAG READ
-            if (imu_read_mag(&raw_mx, &raw_my, &raw_mz) == ESP_OK) {
+            mag_ok = (imu_read_mag(&raw_mx, &raw_my, &raw_mz) == ESP_OK);
+            if (mag_ok) {
                 float mx_cal = ((float)raw_mx - calib->m_bias[0]) * calib->m_scale[0];
                 float my_cal = ((float)raw_my - calib->m_bias[1]) * calib->m_scale[1];
                 float mz_cal = ((float)raw_mz - calib->m_bias[2]) * calib->m_scale[2];
@@ -78,6 +87,25 @@ void task_imu_fusion(void *pvParameters) {
                 read_success = true;
             }
             xSemaphoreGive(g_i2c_mutex);
+        }
+
+        if (!mag_ok) {
+            if ((++mag_fails % 100) == 1) {
+                ESP_LOGW(FUSION_TAG, "QMC5883L mag read failing (%lu fails) — heading frozen",
+                         (unsigned long)mag_fails);
+            }
+        } else if (mag_fails) {
+            ESP_LOGI(FUSION_TAG, "mag reads recovered after %lu fails", (unsigned long)mag_fails);
+            mag_fails = 0;
+        }
+        if (!read_success) {
+            if ((++ag_fails % 100) == 1) {
+                ESP_LOGW(FUSION_TAG, "ICM20948 accel/gyro read failing (%lu fails) — pitch/roll frozen",
+                         (unsigned long)ag_fails);
+            }
+        } else if (ag_fails) {
+            ESP_LOGI(FUSION_TAG, "accel/gyro reads recovered after %lu fails", (unsigned long)ag_fails);
+            ag_fails = 0;
         }
 
         // --- FUSION ---
