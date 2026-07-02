@@ -58,60 +58,59 @@ calibrate:
 #define TOF_A_ADDR    CONFIG_TOF_A_ADDR
 #define TOF_B_ADDR    CONFIG_TOF_B_ADDR
 
+/* Add the device at `addr` and check it answers. On success the handle is left
+ * in dev->platform.handle; on failure the handle is released and NULLed. */
+static bool tof_probe_at(i2c_master_bus_handle_t bus, VL53L5CX_Configuration *dev, uint8_t addr)
+{
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = addr,
+        .scl_speed_hz    = 400000,
+    };
+    if (i2c_master_bus_add_device(bus, &cfg, &dev->platform.handle) != ESP_OK) {
+        dev->platform.handle = NULL;
+        return false;
+    }
+    uint8_t alive = 0;
+    if (vl53l5cx_is_alive(dev, &alive) == 0 && alive) {
+        return true;
+    }
+    i2c_master_bus_rm_device(dev->platform.handle);
+    dev->platform.handle = NULL;
+    return false;
+}
+
 /*
  * Probe and bring up one VL53L5CX. Returns true only if the sensor is present
  * and fully started. On any failure it logs a warning, releases the i2c handle,
  * and returns false so the caller can keep booting without this sensor.
  *
  * The sensor's LPN pin must already be driven high by the caller (and the OTHER
- * sensor still moved off the default address / held in reset) before this runs,
- * so exactly one device answers at VL53_DEFAULT_ADDR.
+ * sensor still moved off the default address / held in reset) before this runs.
+ *
+ * Probe order matters: the I2C address survives soft resets (LPn gates comms,
+ * it does NOT reset the chip — only a power cycle does), so on a warm boot the
+ * sensor already sits at its target address. Check there first, then default.
  */
 static bool tof_init_one(i2c_master_bus_handle_t bus, VL53L5CX_Configuration *dev,
                          uint8_t new_addr, const char *nvs_key, const char *label)
 {
-    i2c_device_config_t cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = VL53_DEFAULT_ADDR,
-        .scl_speed_hz    = 400000,
-    };
-    i2c_master_dev_handle_t h_init = NULL;
-    if (i2c_master_bus_add_device(bus, &cfg, &h_init) != ESP_OK) {
-        ESP_LOGW(TAG, "Sensor %s: i2c add failed", label);
-        return false;
-    }
-    dev->platform.handle = h_init;
-
-    /* Presence probe — this is the check that lets us survive a missing sensor. */
-    uint8_t alive = 0;
-    if (vl53l5cx_is_alive(dev, &alive) != 0 || !alive) {
-        ESP_LOGW(TAG, "Sensor %s: NOT DETECTED — skipping", label);
-        i2c_master_bus_rm_device(h_init);
-        dev->platform.handle = NULL;
-        return false;
-    }
-
-    /* Move to its unique address so the two sensors don't clash on the bus.
-     * The ULD's return status is unreliable here: its post-write verification
-     * read still goes through the old-address handle, so it reports failure
-     * even when the chip DID switch (this port keeps the address in the ESP
-     * i2c handle, not in dev->platform). Ignore it — is_alive at the NEW
-     * address below is the real check. */
-    (void)vl53l5cx_set_i2c_address(dev, (uint16_t)(new_addr << 1));
-    i2c_master_bus_rm_device(h_init);
-    cfg.device_address = new_addr;
-    if (i2c_master_bus_add_device(bus, &cfg, &dev->platform.handle) != ESP_OK) {
-        ESP_LOGW(TAG, "Sensor %s: i2c re-add at 0x%02X failed", label, new_addr);
-        dev->platform.handle = NULL;
-        return false;
-    }
-
-    /* Verify the sensor actually answers at its new address. */
-    alive = 0;
-    if (vl53l5cx_is_alive(dev, &alive) != 0 || !alive) {
-        ESP_LOGW(TAG, "Sensor %s: not responding at 0x%02X after address change", label, new_addr);
+    if (tof_probe_at(bus, dev, new_addr)) {
+        ESP_LOGI(TAG, "Sensor %s: already at 0x%02X (warm boot)", label, new_addr);
+    } else if (tof_probe_at(bus, dev, VL53_DEFAULT_ADDR)) {
+        /* Cold boot: at the default address — move it. The ULD's return status
+         * is unreliable here (its verification read still uses the old-address
+         * handle), so ignore it; the re-probe below is the real check. */
+        (void)vl53l5cx_set_i2c_address(dev, (uint16_t)(new_addr << 1));
         i2c_master_bus_rm_device(dev->platform.handle);
         dev->platform.handle = NULL;
+        if (!tof_probe_at(bus, dev, new_addr)) {
+            ESP_LOGW(TAG, "Sensor %s: no response at 0x%02X after address change", label, new_addr);
+            return false;
+        }
+    } else {
+        ESP_LOGW(TAG, "Sensor %s: NOT DETECTED (0x%02X or 0x%02X) — skipping",
+                 label, new_addr, VL53_DEFAULT_ADDR);
         return false;
     }
 
