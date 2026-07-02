@@ -58,6 +58,13 @@ CONFIG_LWIP_TCP_OVERSIZE_MSS=y
 # --- Let lwip fall back to PSRAM when internal SRAM is tight ---
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
+# --- Protect internal RAM for DMA/internal-only allocations ---
+# esp_hosted's SDIO RX buffers are MALLOC_CAP_INTERNAL-only and its pool grows
+# on demand; under an RX burst with internal RAM tight the alloc returned NULL
+# and sdio_drv.c:928 assert-rebooted the boat (seen on hardware while
+# streaming). 64KB reserve makes generic mallocs spill to PSRAM sooner.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+
 # --- Heap poisoning (light) — catches corruption early, ~2% overhead ---
 CONFIG_HEAP_POISONING_LIGHT=y
 
