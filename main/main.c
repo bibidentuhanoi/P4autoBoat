@@ -223,10 +223,15 @@ void app_main(void) {
         ESP_LOGI(TAG, "ESCs disarmed — arm from dashboard once GPS locks (or override).");
     }
 
-    // 12. Start RTOS Tasks
+    // 12. Start RTOS Tasks — loud failure: a silent Snap_Task death means no
+    //     telemetry at all (dashboard shows no IMU/ToF/GPS and arming stays locked).
     ESP_LOGI(TAG, "Starting tasks...");
-    xTaskCreate(task_imu_fusion,       "IMU_Task",  4096,  NULL,      4, NULL);
-    xTaskCreate(task_sensor_snapshot,  "Snap_Task", 16384, &tof_devs, 4, NULL);
+    if (xTaskCreate(task_imu_fusion, "IMU_Task", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
+    }
+    if (xTaskCreate(task_sensor_snapshot, "Snap_Task", 16384, &tof_devs, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "FATAL: Snap_Task create failed (out of internal RAM) — no telemetry");
+    }
 
     ESP_LOGI(TAG, "System running.");
 }
