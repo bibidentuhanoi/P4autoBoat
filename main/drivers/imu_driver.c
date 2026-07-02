@@ -24,20 +24,28 @@ static esp_err_t i2c_read_bytes(i2c_master_dev_handle_t handle, uint8_t reg, uin
 }
 
 esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
-    // QMC5883L Init
+    // QMC5883L Init — 100 kHz: the IMU sits on a long wire run and a marginal
+    // joint that passes at 100 kHz (Arduino scanner default) fails at 400 kHz.
+    // 6-byte reads every 20 ms need < 1 ms even at 100 kHz.
     i2c_device_config_t qmc_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = QMC5883L_ADDR,
-        .scl_speed_hz = 400000
+        .scl_speed_hz = 100000
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &qmc_cfg, &h_qmc));
 
-    /* Presence check: any successful read means the mag answers on the bus. */
+    /* Presence check with retries: any successful read means the mag answers. */
     uint8_t qmc_status = 0;
-    esp_err_t qmc_probe = i2c_read_bytes(h_qmc, 0x06, &qmc_status, 1);
+    esp_err_t qmc_probe = ESP_FAIL;
+    for (int attempt = 0; attempt < 3 && qmc_probe != ESP_OK; attempt++) {
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(20));
+        qmc_probe = i2c_read_bytes(h_qmc, 0x06, &qmc_status, 1);
+    }
     if (qmc_probe != ESP_OK) {
         ESP_LOGE(TAG, "QMC5883L (0x%02X) NOT RESPONDING (%s) — heading will be dead",
                  QMC5883L_ADDR, esp_err_to_name(qmc_probe));
+    } else {
+        ESP_LOGI(TAG, "QMC5883L detected");
     }
 
     i2c_write_byte(h_qmc, 0x0A, 0x80);
@@ -49,22 +57,29 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
     i2c_device_config_t icm_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = ICM20948_ADDR,
-        .scl_speed_hz = 400000
+        .scl_speed_hz = 100000   /* see QMC comment — robustness over long wires */
     };
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
 
     /* WHO_AM_I check (bank 0, reg 0x00) — ICM20948 answers 0xEA.
      * The AD0 strap selects the address: high/floating = 0x69, GND = 0x68.
-     * Probe 0x69 first, fall back to 0x68 so either strap works. */
-    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+     * Probe 0x69 first (with retries), fall back to 0x68 so either strap works. */
     uint8_t whoami = 0;
-    esp_err_t icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+    esp_err_t icm_probe = ESP_FAIL;
+    for (int attempt = 0; attempt < 3 && icm_probe != ESP_OK; attempt++) {
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(20));
+        i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+        icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+    }
     if (icm_probe != ESP_OK) {
         i2c_master_bus_rm_device(h_icm);
         icm_cfg.device_address = ICM20948_ADDR_ALT;
         ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
-        i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
-        icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+        for (int attempt = 0; attempt < 3 && icm_probe != ESP_OK; attempt++) {
+            if (attempt) vTaskDelay(pdMS_TO_TICKS(20));
+            i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+            icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
+        }
         if (icm_probe == ESP_OK) {
             ESP_LOGW(TAG, "ICM20948 found at 0x%02X (AD0 low) — using it", ICM20948_ADDR_ALT);
         }
