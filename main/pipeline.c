@@ -105,7 +105,11 @@ void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
 
 void pipeline_publish_status(const boat_SystemStatus *status)
 {
-    boat_BoatMessage msg = boat_BoatMessage_init_zero;
+    /* Static: boat_BoatMessage is ~6.5KB (its SensorSnapshot union member), too
+     * big for a stack copy. Single caller (sensor task), so a function-static is
+     * safe and keeps it off the stack. */
+    static boat_BoatMessage msg;
+    memset(&msg, 0, sizeof(msg));
     msg.which_payload = boat_BoatMessage_status_tag;
     msg.payload.status = *status;
 
@@ -129,7 +133,11 @@ void pipeline_publish_status(const boat_SystemStatus *status)
 
 void pipeline_publish_motor_status(const boat_MotorStatus *mstatus)
 {
-    boat_BoatMessage msg = boat_BoatMessage_init_zero;
+    /* Static + memset: boat_BoatMessage is a ~6.5KB union, but this runs in the
+     * esp_timer task (~4KB stack) — a stack copy overflows it and trips the
+     * stack-protection canary. Single caller (motor watchdog), so static is safe. */
+    static boat_BoatMessage msg;
+    memset(&msg, 0, sizeof(msg));
     msg.which_payload = boat_BoatMessage_motor_status_tag;
     msg.payload.motor_status = *mstatus;
 
