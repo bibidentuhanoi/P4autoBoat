@@ -25,8 +25,14 @@ CONFIG_CAMERA_OV5647_MIPI_DEFAULT_FMT_RAW8_800X640_50FPS=y
 CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+# --- esp_hosted slave: ESP32-C6 over SDIO ---
+# Seed BOTH the legacy and current choice-symbol names: kconfgen regens have
+# been observed collapsing the slave-target choice to ESP32-H2 (a no-WiFi
+# chip), which silently erases every WIFI_RMT_*/SDIO symbol from sdkconfig.
 CONFIG_SLAVE_IDF_TARGET_ESP32C6=y
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
 CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 CONFIG_WIFI_RMT_STATIC_RX_BUFFER_NUM=16
 CONFIG_WIFI_RMT_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_WIFI_RMT_DYNAMIC_TX_BUFFER_NUM=64
@@ -56,7 +62,9 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_HEAP_POISONING_LIGHT=y
 
 # --- Disable WiFi power save for lower latency / fewer drops ---
-CONFIG_ESP_WIFI_PS_NONE=y
+# (CONFIG_ESP_WIFI_PS_NONE is a dead symbol on esp_hosted — kconfgen warned
+#  "unknown symbol" every regen. PS_NONE is applied at runtime instead via
+#  esp_wifi_set_ps() in wifi_manager.c.)
 
 # --- ESP-NOW field mode ---
 CONFIG_ESPNOW_ENABLED=y

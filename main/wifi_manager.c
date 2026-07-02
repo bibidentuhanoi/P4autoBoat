@@ -91,6 +91,17 @@ esp_err_t wifi_init(void)
         ESP_LOGI(TAG, "TX power set to %.1f dBm", actual * 0.25);
     }
 
+    /* Disable modem power save on the C6 slave (RPC via esp_wifi_remote).
+     * The old CONFIG_ESP_WIFI_PS_NONE line in sdkconfig.defaults was a dead
+     * symbol on esp_hosted — this runtime call is what actually applies it.
+     * PS off = lower latency + far fewer drops for WS control + MJPEG. */
+    esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (ps_err != ESP_OK) {
+        ESP_LOGW(TAG, "set_ps(NONE): %s", esp_err_to_name(ps_err));
+    } else {
+        ESP_LOGI(TAG, "WiFi power save disabled (PS_NONE)");
+    }
+
     ESP_LOGI(TAG, "Connecting to SSID: %s", CONFIG_WIFI_SSID);
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
