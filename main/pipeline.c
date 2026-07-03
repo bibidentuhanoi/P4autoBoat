@@ -121,10 +121,12 @@ void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
 {
     if (!s_msg_mutex) return;
 
-    /* Encode buffer — static to avoid stack overflow.
-     * boat_BoatMessage_size (nanopb-computed max) = 11053 bytes (4 targets/zone × 256 entries).
-     * 12000 bytes gives a small safety margin. Guarded by s_msg_mutex like s_msg. */
-    static uint8_t buf[12000];
+    /* Encode buffer — static to avoid stack overflow. Sized from the
+     * nanopb-computed worst case so it can never drift below the schema
+     * again (a hardcoded 12000 sat under a 13270 max after GpsFix grew the
+     * snapshot — worst-case frames would have been silently dropped).
+     * Guarded by s_msg_mutex like s_msg. */
+    static uint8_t buf[boat_BoatMessage_size + 16];
 
     xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
     /* No memset needed: which_payload selects the only member nanopb reads,
