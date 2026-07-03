@@ -352,7 +352,7 @@
       </div>
       <div class="motor-state" style="justify-content:space-between;">
         <span id="gps-lock" style="font-size:10px;color:var(--warn);">GPS ○ acquiring…</span>
-        <label id="gps-override-label" style="font-size:11px;color:var(--warn);cursor:pointer;user-select:none;padding:2px 4px;border-radius:3px;"><input type="checkbox" id="gps-override" checked style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
+        <label id="gps-override-label" style="font-size:11px;color:var(--warn);cursor:pointer;user-select:none;padding:2px 4px;border-radius:3px;"><input type="checkbox" id="gps-override" style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
       </div>
       <div id="arm-hint" style="font-size:10px;color:var(--danger);min-height:12px;"></div>
       <div class="motor-slider-row">
@@ -1697,6 +1697,7 @@ const MOTOR_CLASSES = ['disarmed', 'arming', 'armed'];
 let motorArmed = false;
 let gpsLocked = false;
 let servoPower = false;   // servo rail (pin 36) actual state, from MotorStatus
+let railCutByUser = false; // true after an explicit PWR-OFF — suppresses the auto-power UX
 let wsConnected = false;
 let _armSentAt = 0;       // pending-arm timestamp, for refusal feedback
 
@@ -1706,12 +1707,16 @@ let _armSentAt = 0;       // pending-arm timestamp, for refusal feedback
 // happens at ARM click-time WITH feedback, never as a silently-dead button.
 function applyControlEnable() {
   const conn = wsConnected;
+  // Servos are live whenever connected — the boat auto-powers the rail on the
+  // first command. EXCEPT after an explicit PWR-OFF: grey them until PWR-ON, so a
+  // deliberately-cut rail reads as off rather than as a silently-dead control.
+  const servoOn = conn && !(railCutByUser && !servoPower);
   $('arm-btn').disabled     = !conn;
-  $('winch-up').disabled    = !conn;
-  $('winch-down').disabled  = !conn;
-  $('winch-speed').disabled = !conn;
-  $('rudder-l').disabled    = !conn;
-  $('rudder-r').disabled    = !conn;
+  $('winch-up').disabled    = !servoOn;
+  $('winch-down').disabled  = !servoOn;
+  $('winch-speed').disabled = !servoOn;
+  $('rudder-l').disabled    = !servoOn;
+  $('rudder-r').disabled    = !servoOn;
   $('motor-left').disabled  = !motorArmed;
   $('motor-right').disabled = !motorArmed;
 }
@@ -1739,6 +1744,7 @@ function updateMotorStatus(ms) {
   $('motor-state-label').textContent = MOTOR_STATES[idx] || 'UNKNOWN';
   motorArmed = (idx === 2);
   servoPower = !!ms.servoPower;
+  if (servoPower) railCutByUser = false;   // rail is on ⇒ not cut
 
   // Arm-refusal feedback: we sent ARM but the boat still reports DISARMED.
   if (idx !== 0) {
@@ -1908,9 +1914,12 @@ $('gps-override').addEventListener('change', () => {
 });
 
 // Servo rail switch — works without arming, so winch/rudders can be bench-tested.
+// An explicit PWR-OFF latches (here and on the boat) so the kill actually holds.
 $('servo-pwr-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  railCutByUser = servoPower;   // currently on ⇒ this click cuts it
   ws.send(BoatMessage.encode(BoatMessage.create({ servoPower: { on: !servoPower } })).finish());
+  applyControlEnable();         // reflect immediately, don't wait for the status tick
 });
 
 // If a disabled control is poked, say why. Servos only need a connection now;
@@ -1929,7 +1938,7 @@ $('motor-card').addEventListener('pointerdown', (e) => {
 // ═══════════════════════════════════════════════════════════════
 // Version stamp — bump when this file changes. Shown in the header + console
 // so a stale cached dashboard (the old silent killer) is spottable at a glance.
-const UI_BUILD = 'ui-v4 2026-07-03';
+const UI_BUILD = 'ui-v5 2026-07-03';
 $('ui-ver').textContent = UI_BUILD;
 drawHorizon(0, 0);
 drawTof('tof-a', null, false, false, false);

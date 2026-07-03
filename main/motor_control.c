@@ -18,6 +18,24 @@ static const char *TAG = "MOTOR_CTL";
 #define WATCHDOG_INTERVAL_US (250 * 1000)
 #define STATUS_DIVIDER       4
 
+/* ── Manual-driving control & safety model (settle it here, don't let it drift) ─
+ *  Two independent power domains:
+ *    • Thrusters (ESC pins 31/33): live ONLY in ARMED. Arming needs a GPS lock
+ *      unless the dashboard sends force=true (bench override — OFF by default,
+ *      a deliberate tick, so nothing arms unattended without a fix).
+ *    • Servo rail (pin 36 → winch + both rudders): auto-powers on the first
+ *      NON-ZERO winch/steer command, so manual driving has zero friction.
+ *  Rail power rules:
+ *    • Auto-power is suppressed after an explicit PWR-OFF (s_rail_cut) until an
+ *      explicit PWR-ON — the operator's kill actually holds.
+ *    • A zero/stop command never powers the rail (spring-back-to-0 must not
+ *      re-energise it).
+ *    • ARM powers the rail and clears the cut; DISARM cuts rail power.
+ *    • WS-loss failsafe (250 ms) zeroes throttle + winch, centres rudders, and
+ *      DE-ENERGISES the rail — loss of the control link returns to a safe,
+ *      unpowered state, not a hot rail holding torque forever.
+ * ───────────────────────────────────────────────────────────────────────────── */
+
 static bool s_was_nonzero = false;
 static esp_timer_handle_t s_watchdog = NULL;
 
@@ -26,6 +44,11 @@ static esp_timer_handle_t s_watchdog = NULL;
  * from an incoming-command handler would deadlock — that path holds the shared
  * pipeline envelope mutex that publish also takes. */
 static volatile bool s_status_dirty = false;
+
+/* True after an explicit PWR-OFF: suppresses auto-power until an explicit PWR-ON
+ * (or ARM). Without it the rail re-energised on the very next command — even a
+ * spring-back-to-zero winch stop — so the operator's kill never held. */
+static volatile bool s_rail_cut = false;
 
 static void motor_command_handler(const boat_MotorCommand *cmd)
 {
@@ -50,34 +73,35 @@ static void motor_command_handler(const boat_MotorCommand *cmd)
     esc_driver_set_throttle(left, right);
 }
 
-/* Winch + rudders share the pin-36 servo rail. Zero-friction manual driving:
- * the first command auto-powers the rail, so a servo moves the instant the user
- * touches a control — no arming, no separate power switch to find first. */
+/* Winch + rudders share the pin-36 servo rail. A non-zero command auto-powers
+ * it (zero-friction manual driving) — unless the operator explicitly cut it. */
 static void ensure_servo_rail(void)
 {
+    if (s_rail_cut) return;                 /* respect an explicit PWR-OFF */
     if (!winch_driver_get_power()) {
         winch_driver_set_power(true);
-        s_status_dirty = true;   /* reflect PWR-on to the dashboard next tick */
+        s_status_dirty = true;              /* reflect PWR-on to the dashboard next tick */
     }
 }
 
 static void winch_command_handler(const boat_WinchCommand *cmd)
 {
-    ensure_servo_rail();
+    if (cmd->speed != 0.0f) ensure_servo_rail();   /* a stop never powers the rail */
     winch_driver_set_speed(cmd->speed);
 }
 
 static void steer_command_handler(const boat_SteerCommand *cmd)
 {
-    ensure_servo_rail();
+    if (cmd->left != 0.0f || cmd->right != 0.0f) ensure_servo_rail();
     steer_driver_set(cmd->left, cmd->right);
 }
 
-/* Explicit servo-rail switch — mainly to CUT power (a command auto-powers it on).
- * Turning it off also zeroes the commanded winch/steer so reported state stays
- * honest. */
+/* Explicit servo-rail switch. PWR-OFF latches s_rail_cut so auto-power stays off
+ * until PWR-ON — the operator's kill holds. Off also zeroes the commanded
+ * winch/steer so reported state stays honest. */
 static void servo_power_command_handler(bool on)
 {
+    s_rail_cut = !on;
     if (winch_driver_set_power(on) == ESP_OK && !on) {
         winch_driver_set_speed(0.0f);   /* rail off ⇒ make commanded state match */
         steer_driver_set(0.0f, 0.0f);
@@ -123,8 +147,8 @@ static void watchdog_cb(void *arg)
     (void)arg;
     static int tick = 0;
 
-    /* Failsafe on WS loss: covers ARMED, and also the bench case where the
-     * servo rail was switched on manually while disarmed. */
+    /* Failsafe on WS loss: covers ARMED, and the bench case where the servo rail
+     * is powered while disarmed. Return to a safe, DE-ENERGISED state. */
     if ((esc_driver_get_state() == ESC_STATE_ARMED || winch_driver_get_power()) &&
         ws_transport_client_count() == 0) {
         bool acted = false;
@@ -141,8 +165,13 @@ static void watchdog_cb(void *arg)
             steer_driver_set(0.0f, 0.0f);
             acted = true;
         }
+        if (winch_driver_get_power()) {
+            winch_driver_set_power(false);   /* de-energise the rail — don't hold torque forever */
+            acted = true;
+        }
         if (acted) {
-            ESP_LOGW(TAG, "WS disconnected — stopping motors + winch, centering rudder");
+            ESP_LOGW(TAG, "WS lost — throttle 0, winch 0, rudders centred, servo rail cut");
+            s_status_dirty = true;
         }
     }
 
@@ -189,6 +218,7 @@ esp_err_t motor_control_arm(bool force)
     }
     esp_err_t ret = esc_driver_arm();
     if (ret == ESP_OK) {
+        s_rail_cut = false;             /* arming = go live: re-enable the rail */
         winch_driver_set_power(true);   /* arming always powers the servo rail */
     }
     s_status_dirty = true;
