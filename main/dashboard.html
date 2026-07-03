@@ -352,7 +352,7 @@
       </div>
       <div class="motor-state" style="justify-content:space-between;">
         <span id="gps-lock" style="font-size:10px;color:var(--warn);">GPS ○ acquiring…</span>
-        <label id="gps-override-label" style="font-size:11px;color:var(--warn);cursor:pointer;user-select:none;padding:2px 4px;border-radius:3px;"><input type="checkbox" id="gps-override" style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
+        <label id="gps-override-label" style="font-size:11px;color:var(--warn);cursor:pointer;user-select:none;padding:2px 4px;border-radius:3px;"><input type="checkbox" id="gps-override" checked style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
       </div>
       <div id="arm-hint" style="font-size:10px;color:var(--danger);min-height:12px;"></div>
       <div class="motor-slider-row">
@@ -1700,12 +1700,22 @@ let servoPower = false;   // servo rail (pin 36) actual state, from MotorStatus
 let wsConnected = false;
 let _armSentAt = 0;       // pending-arm timestamp, for refusal feedback
 
-// ARM is clickable whenever we can talk to the boat. GPS gating happens at
-// click time WITH feedback — a silently-disabled button is how the whole UI
-// dead-locked before (gpsLocked could never turn true, nothing said why).
-function updateArmEnable() {
-  $('arm-btn').disabled = !wsConnected;
+// Controls follow the connection. Servos (winch + rudders) are live whenever
+// we're connected — the boat powers the rail on the first command. Thrusters
+// stay behind ARM (the ESC protocol needs the arming pulse train). GPS gating
+// happens at ARM click-time WITH feedback, never as a silently-dead button.
+function applyControlEnable() {
+  const conn = wsConnected;
+  $('arm-btn').disabled     = !conn;
+  $('winch-up').disabled    = !conn;
+  $('winch-down').disabled  = !conn;
+  $('winch-speed').disabled = !conn;
+  $('rudder-l').disabled    = !conn;
+  $('rudder-r').disabled    = !conn;
+  $('motor-left').disabled  = !motorArmed;
+  $('motor-right').disabled = !motorArmed;
 }
+function updateArmEnable() { applyControlEnable(); }
 
 let _hintTimer = null;
 function armHint(text) {
@@ -1749,16 +1759,8 @@ function updateMotorStatus(ms) {
   }
   updateArmEnable();
 
-  // Thrusters need the ESCs armed…
-  $('motor-left').disabled = !motorArmed;
-  $('motor-right').disabled = !motorArmed;
-
-  // …but winch + rudders ride the servo rail, which has its own switch.
-  $('winch-up').disabled = !servoPower;
-  $('winch-down').disabled = !servoPower;
-  $('winch-speed').disabled = !servoPower;
-  $('rudder-l').disabled = !servoPower;
-  $('rudder-r').disabled = !servoPower;
+  // Re-apply enable state (motorArmed just changed); servos ride the connection.
+  applyControlEnable();
   $('winch-power-dot').className = 'win-dot ' + (servoPower ? 'on' : 'off');
   const pb = $('servo-pwr-btn');
   pb.textContent = servoPower ? 'PWR ON' : 'PWR OFF';
@@ -1821,7 +1823,7 @@ function sendMotorCommand() {
 const WINCH_JOG = 0.6;   // fixed jog magnitude for the momentary buttons
 
 function sendWinchCommand(speed) {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !servoPower) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;   // boat auto-powers the rail
   const msg = BoatMessage.create({ winch: { speed } });
   ws.send(BoatMessage.encode(msg).finish());
 }
@@ -1856,7 +1858,7 @@ function sendWinchCommand(speed) {
 // ── Steering (2 rudder servos, link toggle) ─────────────────────
 let steerLinked = true;
 function sendSteerCommand() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !servoPower) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;   // boat auto-powers the rail
   const left  = parseInt($('rudder-l').value) / 100;
   const right = parseInt($('rudder-r').value) / 100;
   ws.send(BoatMessage.encode(BoatMessage.create({ steer: { left, right } })).finish());
@@ -1911,19 +1913,14 @@ $('servo-pwr-btn').addEventListener('click', () => {
   ws.send(BoatMessage.encode(BoatMessage.create({ servoPower: { on: !servoPower } })).finish());
 });
 
-// Poking a disabled control flashes the switch that unlocks it — a greyed-out
-// slider with no explanation is how this UI read as "broken".
-$('winch-card').addEventListener('pointerdown', (e) => {
-  if (!servoPower && !e.target.closest('#servo-pwr-btn')) flashEl('servo-pwr-btn');
-});
+// If a disabled control is poked, say why. Servos only need a connection now;
+// thrusters need ARM (bench mode is on by default, so ARM works indoors).
 $('motor-card').addEventListener('pointerdown', (e) => {
   const row = e.target.closest('.motor-slider-row');
   if (!row) return;
-  if (row.querySelector('#rudder-l, #rudder-r')) {
-    if (!servoPower) { flashEl('servo-pwr-btn'); armHint('rudders need the servo rail — switch PWR on (winch card)'); }
-  } else if (row.querySelector('#motor-left, #motor-right') && !motorArmed) {
+  if (row.querySelector('#motor-left, #motor-right') && !motorArmed) {
     flashEl('arm-btn');
-    armHint('thrusters need ARM');
+    armHint(wsConnected ? 'thrusters need ARM — click ARM' : 'not connected to the boat');
   }
 });
 
@@ -1932,7 +1929,7 @@ $('motor-card').addEventListener('pointerdown', (e) => {
 // ═══════════════════════════════════════════════════════════════
 // Version stamp — bump when this file changes. Shown in the header + console
 // so a stale cached dashboard (the old silent killer) is spottable at a glance.
-const UI_BUILD = 'ui-v3 2026-07-03';
+const UI_BUILD = 'ui-v4 2026-07-03';
 $('ui-ver').textContent = UI_BUILD;
 drawHorizon(0, 0);
 drawTof('tof-a', null, false, false, false);

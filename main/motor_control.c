@@ -21,6 +21,12 @@ static const char *TAG = "MOTOR_CTL";
 static bool s_was_nonzero = false;
 static esp_timer_handle_t s_watchdog = NULL;
 
+/* Set when motor/servo state changes so the next 250ms watchdog tick publishes
+ * status immediately (vs the ~1s cadence). Only the timer publishes it: doing so
+ * from an incoming-command handler would deadlock — that path holds the shared
+ * pipeline envelope mutex that publish also takes. */
+static volatile bool s_status_dirty = false;
+
 static void motor_command_handler(const boat_MotorCommand *cmd)
 {
     float left, right;
@@ -44,23 +50,32 @@ static void motor_command_handler(const boat_MotorCommand *cmd)
     esc_driver_set_throttle(left, right);
 }
 
+/* Winch + rudders share the pin-36 servo rail. Zero-friction manual driving:
+ * the first command auto-powers the rail, so a servo moves the instant the user
+ * touches a control — no arming, no separate power switch to find first. */
+static void ensure_servo_rail(void)
+{
+    if (!winch_driver_get_power()) {
+        winch_driver_set_power(true);
+        s_status_dirty = true;   /* reflect PWR-on to the dashboard next tick */
+    }
+}
+
 static void winch_command_handler(const boat_WinchCommand *cmd)
 {
+    ensure_servo_rail();
     winch_driver_set_speed(cmd->speed);
 }
 
 static void steer_command_handler(const boat_SteerCommand *cmd)
 {
+    ensure_servo_rail();
     steer_driver_set(cmd->left, cmd->right);
 }
 
-/* Set when the rail is switched so the next watchdog tick (250ms) publishes
- * status immediately instead of the ~1s cadence. Publishing directly from
- * here would DEADLOCK: this runs inside pipeline_handle_incoming, which holds
- * the shared-envelope mutex that pipeline_publish_motor_status also takes. */
-static volatile bool s_status_dirty = false;
-
-/* Manual servo-rail switch (bench testing without arming the ESCs). */
+/* Explicit servo-rail switch — mainly to CUT power (a command auto-powers it on).
+ * Turning it off also zeroes the commanded winch/steer so reported state stays
+ * honest. */
 static void servo_power_command_handler(bool on)
 {
     if (winch_driver_set_power(on) == ESP_OK && !on) {
