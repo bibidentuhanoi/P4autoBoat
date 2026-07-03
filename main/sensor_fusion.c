@@ -90,7 +90,9 @@ void task_imu_fusion(void *pvParameters) {
         }
 
         if (!mag_ok) {
-            if ((++mag_fails % 100) == 1) {
+            ++mag_fails;
+            if (mag_fails == 50) imu_set_mag_ok(false);   /* ~1s dead → report it */
+            if ((mag_fails % 100) == 1) {
                 ESP_LOGW(FUSION_TAG, "QMC5883L mag read failing (%lu fails) — heading frozen",
                          (unsigned long)mag_fails);
             }
@@ -103,10 +105,13 @@ void task_imu_fusion(void *pvParameters) {
             }
             ESP_LOGI(FUSION_TAG, "mag recovered after %lu fails — reconfigured",
                      (unsigned long)mag_fails);
+            imu_set_mag_ok(true);
             mag_fails = 0;
         }
         if (!read_success) {
-            if ((++ag_fails % 100) == 1) {
+            ++ag_fails;
+            if (ag_fails == 50) imu_set_icm_ok(false);    /* ~1s dead → report it */
+            if ((ag_fails % 100) == 1) {
                 ESP_LOGW(FUSION_TAG, "ICM20948 accel/gyro read failing (%lu fails) — pitch/roll frozen",
                          (unsigned long)ag_fails);
             }
@@ -118,6 +123,7 @@ void task_imu_fusion(void *pvParameters) {
             }
             ESP_LOGI(FUSION_TAG, "accel/gyro recovered after %lu fails — reconfigured",
                      (unsigned long)ag_fails);
+            imu_set_icm_ok(true);
             ag_fails = 0;
         }
 

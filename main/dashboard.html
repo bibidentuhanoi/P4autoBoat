@@ -164,6 +164,11 @@
   .win-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; vertical-align: middle; }
   .win-dot.off { background: var(--dim); }
   .win-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .btn-pwr { margin-left: auto; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--dim); font-size: 10px; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; }
+  .btn-pwr.on { color: var(--green); border-color: var(--green); }
+  /* Attention flash — points the user at the switch that unlocks a control */
+  .flash { animation: flashk 0.35s 3; }
+  @keyframes flashk { 50% { background: var(--warn); color: #000; border-color: var(--warn); } }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/protobufjs@7/dist/protobuf.min.js"></script>
 </head>
@@ -178,6 +183,7 @@
   <span id="sys-rssi" style="color:var(--dim); font-size:11px;"></span>
   <span id="sys-uptime" style="color:var(--dim); font-size:11px;"></span>
   <span id="msg-rate" style="color:var(--dim); font-size:11px;"></span>
+  <span id="ui-ver" style="color:var(--dim); font-size:10px;"></span>
   <button id="gear-btn" title="Settings">⚙</button>
 </header>
 
@@ -316,6 +322,7 @@
 
   <div class="card" id="imu-card">
     <div class="card-title">IMU — ICM20948</div>
+    <div id="imu-warn" style="font-size:9px;color:var(--danger);text-align:center;min-height:11px;"></div>
     <div id="horizon-wrap">
       <canvas class="horizon" id="horizon" width="120" height="120"></canvas>
     </div>
@@ -345,8 +352,9 @@
       </div>
       <div class="motor-state" style="justify-content:space-between;">
         <span id="gps-lock" style="font-size:10px;color:var(--warn);">GPS ○ acquiring…</span>
-        <label style="font-size:9px;color:var(--dim);cursor:pointer;user-select:none;"><input type="checkbox" id="gps-override" style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
+        <label id="gps-override-label" style="font-size:11px;color:var(--warn);cursor:pointer;user-select:none;padding:2px 4px;border-radius:3px;"><input type="checkbox" id="gps-override" style="vertical-align:middle;margin-right:3px;">bench (no GPS)</label>
       </div>
+      <div id="arm-hint" style="font-size:10px;color:var(--danger);min-height:12px;"></div>
       <div class="motor-slider-row">
         <label>Left</label>
         <input type="range" id="motor-left" min="-100" max="100" value="0" step="1" disabled />
@@ -363,12 +371,12 @@
       </div>
       <div class="motor-slider-row">
         <label>Rudder L</label>
-        <input type="range" id="rudder-l" min="-100" max="100" value="0" step="1" />
+        <input type="range" id="rudder-l" min="-100" max="100" value="0" step="1" disabled />
         <span class="val" id="rudder-l-val">0</span>
       </div>
       <div class="motor-slider-row">
         <label>Rudder R</label>
-        <input type="range" id="rudder-r" min="-100" max="100" value="0" step="1" />
+        <input type="range" id="rudder-r" min="-100" max="100" value="0" step="1" disabled />
         <span class="val" id="rudder-r-val">0</span>
       </div>
       <div class="motor-bars">
@@ -384,7 +392,7 @@
     </div>
   </div>
   <div class="card" id="winch-card">
-    <div class="card-title">Winch<span class="win-dot off" id="winch-power-dot" title="servo power"></span></div>
+    <div class="card-title" style="display:flex;align-items:center;">Winch<span class="win-dot off" id="winch-power-dot" title="servo rail state"></span><button class="btn-pwr" id="servo-pwr-btn" title="servo rail switch (pin 36) — powers winch + rudders, no ESC arming needed">PWR OFF</button></div>
     <div class="winch-controls">
       <div class="winch-jog">
         <button class="winch-btn" id="winch-up" disabled>&#9650; Up (CCW)</button>
@@ -404,7 +412,11 @@ const $ = id => document.getElementById(id);
 const DEG2RAD = Math.PI / 180;
 
 // ═══════════════════════════════════════════════════════════════
-// Proto schema (matches boat.proto)
+// Proto schema — ⚠ MUST mirror main/proto/boat.proto EXACTLY.
+// protobuf.js silently DROPS fields it doesn't know: a missing
+// `GpsFix gps = 6` here made gpsLocked permanently false and
+// dead-locked the whole ARM → controls chain. When boat.proto
+// changes, change THIS STRING in the same commit.
 // ═══════════════════════════════════════════════════════════════
 const protoSchema = `
 syntax = "proto3";
@@ -412,15 +424,18 @@ package boat;
 message IMUData { float pitch = 1; float roll = 2; float heading = 3; }
 message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
 message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
-message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; }
+message GpsFix { bool valid = 1; double latitude = 2; double longitude = 3; float altitude_m = 4; float speed_mps = 5; float course_deg = 6; uint32 fix_quality = 7; uint32 satellites = 8; float hdop = 9; uint64 utc_ms = 10; }
+message GpsCoordinate { double latitude = 1; double longitude = 2; }
+message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; GpsFix gps = 6; }
 message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; float right = 4; }
 message WinchCommand { float speed = 1; }
 message SteerCommand { float left = 1; float right = 2; }
-message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; }
+message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; bool servo_power = 5; }
 message ArmCommand { bool arm = 1; bool force = 2; }
+message ServoPowerCommand { bool on = 1; }
 message DetectCommand { }
-message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; } }
+message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1144,6 +1159,8 @@ function connectWS() {
     _lastMsgAt = Date.now();
     _reconnectDelay = 1000;     // reset backoff on successful connect
     _streamBackoffMs = 0;       // pair the stream backoff to WS recovery
+    wsConnected = true;
+    updateArmEnable();
     $('status-dot').className = 'ok';
     $('status-label').textContent = 'connected';
     console.log('[WS]', `connected to ${host}:80/ws`);
@@ -1200,7 +1217,15 @@ function connectWS() {
         if (!st.cameraOk) missing.push('CAMERA');
         if (!st.tofAOk)   missing.push('ToF-A');
         if (!st.tofBOk)   missing.push('ToF-B');
+        if (!st.imuOk)    missing.push('IMU');
+        if (!st.magOk)    missing.push('COMPASS');
         $('hw-warn').textContent = missing.length ? ('⚠ ' + missing.join(' · ') + ' not detected') : '';
+        const dead = [];
+        if (!st.imuOk) dead.push('ICM20948');
+        if (!st.magOk) dead.push('QMC5883L');
+        $('imu-warn').textContent = dead.length
+          ? (dead.join(' + ') + ' not responding — values frozen, check wiring')
+          : '';
       }
       if (msg.motorStatus) {
         updateMotorStatus(msg.motorStatus);
@@ -1220,6 +1245,8 @@ function connectWS() {
     const reason = ev.code === 1000 ? 'clean' : ev.code === 1006 ? 'abnormal (no close frame)' : `code ${ev.code}`;
     console.log('[WS]', `closed — ${reason}, reason: "${ev.reason || 'none'}", retry in ${_reconnectDelay}ms`);
     ws = null;
+    wsConnected = false;
+    updateArmEnable();
     $('status-dot').className = 'err';
     $('status-label').textContent = 'disconnected';
     reconnectTimer = setTimeout(connectWS, _reconnectDelay);
@@ -1669,9 +1696,30 @@ const MOTOR_STATES = ['DISARMED', 'ARMING', 'ARMED'];
 const MOTOR_CLASSES = ['disarmed', 'arming', 'armed'];
 let motorArmed = false;
 let gpsLocked = false;
+let servoPower = false;   // servo rail (pin 36) actual state, from MotorStatus
+let wsConnected = false;
+let _armSentAt = 0;       // pending-arm timestamp, for refusal feedback
+
+// ARM is clickable whenever we can talk to the boat. GPS gating happens at
+// click time WITH feedback — a silently-disabled button is how the whole UI
+// dead-locked before (gpsLocked could never turn true, nothing said why).
 function updateArmEnable() {
-  const override = $('gps-override').checked;
-  $('arm-btn').disabled = motorArmed ? false : !(gpsLocked || override);
+  $('arm-btn').disabled = !wsConnected;
+}
+
+let _hintTimer = null;
+function armHint(text) {
+  $('arm-hint').textContent = text;
+  clearTimeout(_hintTimer);
+  _hintTimer = setTimeout(() => { $('arm-hint').textContent = ''; }, 5000);
+}
+
+function flashEl(id) {
+  const el = $(id);
+  if (!el) return;
+  el.classList.remove('flash');
+  void el.offsetWidth;          // restart the animation
+  el.classList.add('flash');
 }
 
 function updateMotorStatus(ms) {
@@ -1680,6 +1728,16 @@ function updateMotorStatus(ms) {
   dot.className = 'state-dot ' + (MOTOR_CLASSES[idx] || 'disarmed');
   $('motor-state-label').textContent = MOTOR_STATES[idx] || 'UNKNOWN';
   motorArmed = (idx === 2);
+  servoPower = !!ms.servoPower;
+
+  // Arm-refusal feedback: we sent ARM but the boat still reports DISARMED.
+  if (idx !== 0) {
+    _armSentAt = 0;
+  } else if (_armSentAt && Date.now() - _armSentAt > 2500) {
+    _armSentAt = 0;
+    armHint('arm refused — no GPS lock? tick "bench (no GPS)", or check serial log');
+    flashEl('gps-override-label');
+  }
 
   const btn = $('arm-btn');
   if (motorArmed) {
@@ -1691,13 +1749,20 @@ function updateMotorStatus(ms) {
   }
   updateArmEnable();
 
+  // Thrusters need the ESCs armed…
   $('motor-left').disabled = !motorArmed;
   $('motor-right').disabled = !motorArmed;
 
-  $('winch-up').disabled = !motorArmed;
-  $('winch-down').disabled = !motorArmed;
-  $('winch-speed').disabled = !motorArmed;
-  $('winch-power-dot').className = 'win-dot ' + (motorArmed ? 'on' : 'off');
+  // …but winch + rudders ride the servo rail, which has its own switch.
+  $('winch-up').disabled = !servoPower;
+  $('winch-down').disabled = !servoPower;
+  $('winch-speed').disabled = !servoPower;
+  $('rudder-l').disabled = !servoPower;
+  $('rudder-r').disabled = !servoPower;
+  $('winch-power-dot').className = 'win-dot ' + (servoPower ? 'on' : 'off');
+  const pb = $('servo-pwr-btn');
+  pb.textContent = servoPower ? 'PWR ON' : 'PWR OFF';
+  pb.classList.toggle('on', servoPower);
 
   updateMotorBar('left', ms.leftThrottle || 0);
   updateMotorBar('right', ms.rightThrottle || 0);
@@ -1756,7 +1821,7 @@ function sendMotorCommand() {
 const WINCH_JOG = 0.6;   // fixed jog magnitude for the momentary buttons
 
 function sendWinchCommand(speed) {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !motorArmed) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !servoPower) return;
   const msg = BoatMessage.create({ winch: { speed } });
   ws.send(BoatMessage.encode(msg).finish());
 }
@@ -1791,7 +1856,7 @@ function sendWinchCommand(speed) {
 // ── Steering (2 rudder servos, link toggle) ─────────────────────
 let steerLinked = true;
 function sendSteerCommand() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !servoPower) return;
   const left  = parseInt($('rudder-l').value) / 100;
   const right = parseInt($('rudder-r').value) / 100;
   ws.send(BoatMessage.encode(BoatMessage.create({ steer: { left, right } })).finish());
@@ -1824,21 +1889,56 @@ $('steer-link').addEventListener('click', () => {
 $('arm-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const force = $('gps-override').checked;
-  if (!motorArmed && !gpsLocked && !force) return;   // gated on GPS lock
+  if (!motorArmed && !gpsLocked && !force) {
+    // GPS gate: don't send a command the boat will refuse — say what to do.
+    armHint('no GPS lock — tick "bench (no GPS)" to arm indoors');
+    flashEl('gps-override-label');
+    return;
+  }
+  _armSentAt = motorArmed ? 0 : Date.now();
   const msg = BoatMessage.create({ armCmd: { arm: !motorArmed, force } });
   const buf = BoatMessage.encode(msg).finish();
   ws.send(buf);
 });
-$('gps-override').addEventListener('change', updateArmEnable);
+$('gps-override').addEventListener('change', () => {
+  $('arm-hint').textContent = '';
+  updateArmEnable();
+});
+
+// Servo rail switch — works without arming, so winch/rudders can be bench-tested.
+$('servo-pwr-btn').addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(BoatMessage.encode(BoatMessage.create({ servoPower: { on: !servoPower } })).finish());
+});
+
+// Poking a disabled control flashes the switch that unlocks it — a greyed-out
+// slider with no explanation is how this UI read as "broken".
+$('winch-card').addEventListener('pointerdown', (e) => {
+  if (!servoPower && !e.target.closest('#servo-pwr-btn')) flashEl('servo-pwr-btn');
+});
+$('motor-card').addEventListener('pointerdown', (e) => {
+  const row = e.target.closest('.motor-slider-row');
+  if (!row) return;
+  if (row.querySelector('#rudder-l, #rudder-r')) {
+    if (!servoPower) { flashEl('servo-pwr-btn'); armHint('rudders need the servo rail — switch PWR on (winch card)'); }
+  } else if (row.querySelector('#motor-left, #motor-right') && !motorArmed) {
+    flashEl('arm-btn');
+    armHint('thrusters need ARM');
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════════════
+// Version stamp — bump when this file changes. Shown in the header + console
+// so a stale cached dashboard (the old silent killer) is spottable at a glance.
+const UI_BUILD = 'ui-v3 2026-07-03';
+$('ui-ver').textContent = UI_BUILD;
 drawHorizon(0, 0);
 drawTof('tof-a', null, false, false, false);
 drawTof('tof-b', null, false, false, false);
 updateOverlaySize();
-console.log('[Init]', `host=${ESP_HOST} fallback=${ESP_FALLBACK} local=${_isLocal}`);
+console.log('[Init]', `${UI_BUILD} host=${ESP_HOST} fallback=${ESP_FALLBACK} local=${_isLocal}`);
 startStream();
 connectWS();
 

@@ -16,6 +16,7 @@
 #include "pipeline.h"
 #include "sensor_fusion.h"
 #include "drivers/gps_driver.h"
+#include "drivers/imu_driver.h"
 #include "common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -170,6 +171,8 @@ void task_sensor_snapshot(void *pvParameters)
             sys.camera_ok = g_camera_ok;
             sys.tof_a_ok  = devs->a_ok;
             sys.tof_b_ok  = devs->b_ok;
+            sys.imu_ok    = imu_icm_ok();
+            sys.mag_ok    = imu_mag_ok();
 
             pipeline_publish_status(&sys);
         }

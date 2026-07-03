@@ -18,6 +18,11 @@ extern const uint8_t dashboard_html_end[]   asm("_binary_dashboard_html_end");
 static esp_err_t dashboard_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    /* no-store: the dashboard is embedded in the firmware image — a cached
+     * copy silently survives reflashes and runs STALE JS against new firmware
+     * (seen on hardware: controls dead because the cached page predated the
+     * bench-override / proto changes). Page is ~80KB over LAN; refetch is cheap. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, (const char *)dashboard_html_start,
                            dashboard_html_end - dashboard_html_start);
 }

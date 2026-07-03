@@ -8,6 +8,17 @@ static const char *TAG = "IMU";
 static i2c_master_dev_handle_t h_qmc;
 static i2c_master_dev_handle_t h_icm;
 
+/* Health flags: seeded by the boot probes below, kept current by the fusion
+ * task (sustained failures ⇒ false, recovery ⇒ true). Plain bool writes are
+ * atomic on this target — no locking needed for status reporting. */
+static volatile bool s_icm_ok = false;
+static volatile bool s_mag_ok = false;
+
+bool imu_icm_ok(void)          { return s_icm_ok; }
+bool imu_mag_ok(void)          { return s_mag_ok; }
+void imu_set_icm_ok(bool ok)   { s_icm_ok = ok; }
+void imu_set_mag_ok(bool ok)   { s_mag_ok = ok; }
+
 /* Bounded timeout — a marginal/shorted bus with -1 (wait forever) can wedge
  * the whole boot (seen on hardware: hung mid ToF-B bring-up while the IMU
  * module was loading the bus). 100ms is orders of magnitude above any legit
@@ -41,6 +52,7 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         if (attempt) vTaskDelay(pdMS_TO_TICKS(20));
         qmc_probe = i2c_read_bytes(h_qmc, 0x06, &qmc_status, 1);
     }
+    s_mag_ok = (qmc_probe == ESP_OK);
     if (qmc_probe != ESP_OK) {
         ESP_LOGE(TAG, "QMC5883L (0x%02X) NOT RESPONDING (%s) — heading will be dead",
                  QMC5883L_ADDR, esp_err_to_name(qmc_probe));
@@ -84,6 +96,7 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
             ESP_LOGW(TAG, "ICM20948 found at 0x%02X (AD0 low) — using it", ICM20948_ADDR_ALT);
         }
     }
+    s_icm_ok = (icm_probe == ESP_OK);
     if (icm_probe != ESP_OK) {
         ESP_LOGE(TAG, "ICM20948 NOT RESPONDING at 0x%02X or 0x%02X (%s) — pitch/roll will be dead",
                  ICM20948_ADDR, ICM20948_ADDR_ALT, esp_err_to_name(icm_probe));

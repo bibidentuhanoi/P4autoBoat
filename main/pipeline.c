@@ -25,6 +25,7 @@ static motor_command_handler_fn s_motor_handler = NULL;
 static arm_command_handler_fn s_arm_handler = NULL;
 static winch_command_handler_fn s_winch_handler = NULL;
 static steer_command_handler_fn s_steer_handler = NULL;
+static servo_power_handler_fn s_servo_power_handler = NULL;
 
 /* ---- Shared protobuf envelope ----
  * boat_BoatMessage is a ~7KB union (SensorSnapshot member holds the 256-entry
@@ -62,6 +63,7 @@ esp_err_t pipeline_init(void)
     s_arm_handler = NULL;
     s_winch_handler = NULL;
     s_steer_handler = NULL;
+    s_servo_power_handler = NULL;
     if (!s_msg_mutex) {
         s_msg_mutex = xSemaphoreCreateMutex();
         if (!s_msg_mutex) {
@@ -108,6 +110,11 @@ void pipeline_register_winch_handler(winch_command_handler_fn handler)
 void pipeline_register_steer_handler(steer_command_handler_fn handler)
 {
     s_steer_handler = handler;
+}
+
+void pipeline_register_servo_power_handler(servo_power_handler_fn handler)
+{
+    s_servo_power_handler = handler;
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
@@ -200,6 +207,14 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
             s_steer_handler(&s_msg.payload.steer);
         } else {
             ESP_LOGW(TAG, "Steer command received but no handler registered");
+        }
+        break;
+    case boat_BoatMessage_servo_power_tag:
+        ESP_LOGI(TAG, "Servo power command: %s", s_msg.payload.servo_power.on ? "ON" : "OFF");
+        if (s_servo_power_handler) {
+            s_servo_power_handler(s_msg.payload.servo_power.on);
+        } else {
+            ESP_LOGW(TAG, "Servo power command received but no handler registered");
         }
         break;
     default:

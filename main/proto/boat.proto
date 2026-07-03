@@ -75,11 +75,19 @@ message MotorStatus {
   float  left_throttle  = 2;  // current left throttle
   float  right_throttle = 3;  // current right throttle
   float  winch_speed    = 4;  // current winch speed (-1..1)
+  bool   servo_power    = 5;  // servo rail (winch + rudders) actually powered
 }
 
 message ArmCommand {
   bool arm   = 1;  // true = arm, false = disarm
   bool force = 2;  // arm despite no GPS lock (manual bench/indoor override)
+}
+
+// Servo rail (pin 36) switch — independent of ESC arming so winch/rudders can
+// be bench-tested without spinning up the thrusters. Arming still forces the
+// rail on; disarming cuts it.
+message ServoPowerCommand {
+  bool on = 1;
 }
 
 message SystemStatus {
@@ -89,6 +97,8 @@ message SystemStatus {
   bool   camera_ok    = 4;  // camera detected at boot
   bool   tof_a_ok     = 5;  // ToF sensor A detected at boot
   bool   tof_b_ok     = 6;  // ToF sensor B detected at boot
+  bool   imu_ok       = 7;  // ICM20948 responding (live, self-heal aware)
+  bool   mag_ok       = 8;  // QMC5883L responding (live, self-heal aware)
 }
 
 // Envelope — every message on the wire is a BoatMessage
@@ -103,5 +113,6 @@ message BoatMessage {
     ArmCommand     arm_cmd      = 7;
     WinchCommand   winch        = 8;
     SteerCommand   steer        = 9;
+    ServoPowerCommand servo_power = 10;
   }
 }

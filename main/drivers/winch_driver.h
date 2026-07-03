@@ -24,6 +24,9 @@ esp_err_t winch_driver_set_speed(float speed);
 /** Enable/disable the servo power rail (respects SERVO_ENABLE_ACTIVE_LOW). */
 esp_err_t winch_driver_set_power(bool on);
 
+/** Current servo rail state (safe from any context). */
+bool winch_driver_get_power(void);
+
 /** Last commanded winch speed (safe from any context). */
 float winch_driver_get_speed(void);
 

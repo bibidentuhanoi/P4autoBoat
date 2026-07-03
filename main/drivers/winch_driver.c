@@ -31,6 +31,7 @@ static mcpwm_cmpr_handle_t  s_cmp    = NULL;
 static mcpwm_gen_handle_t   s_gen    = NULL;
 static SemaphoreHandle_t    s_mutex  = NULL;
 static float                s_speed  = 0.0f;
+static bool                 s_power  = false;
 static bool                 s_inited = false;
 
 /* Map speed [-1,1] -> pulse us. 0 -> neutral, +1 -> max (CW/down), -1 -> min (CCW/up). */
@@ -143,7 +144,14 @@ esp_err_t winch_driver_set_power(bool on)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
     servo_power_write(on);
+    s_power = on;
+    ESP_LOGI(TAG, "servo rail %s (GPIO%d)", on ? "ON" : "OFF", CONFIG_SERVO_ENABLE_PIN);
     return ESP_OK;
+}
+
+bool winch_driver_get_power(void)
+{
+    return s_power;
 }
 
 float winch_driver_get_speed(void)

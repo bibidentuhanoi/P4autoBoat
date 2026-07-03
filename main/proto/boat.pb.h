@@ -94,12 +94,20 @@ typedef struct _boat_MotorStatus {
     float left_throttle; /* current left throttle */
     float right_throttle; /* current right throttle */
     float winch_speed; /* current winch speed (-1..1) */
+    bool servo_power; /* servo rail (winch + rudders) actually powered */
 } boat_MotorStatus;
 
 typedef struct _boat_ArmCommand {
     bool arm; /* true = arm, false = disarm */
     bool force; /* arm despite no GPS lock (manual bench/indoor override) */
 } boat_ArmCommand;
+
+/* Servo rail (pin 36) switch — independent of ESC arming so winch/rudders can
+ be bench-tested without spinning up the thrusters. Arming still forces the
+ rail on; disarming cuts it. */
+typedef struct _boat_ServoPowerCommand {
+    bool on;
+} boat_ServoPowerCommand;
 
 typedef struct _boat_SystemStatus {
     uint32_t heap_free;
@@ -108,6 +116,8 @@ typedef struct _boat_SystemStatus {
     bool camera_ok; /* camera detected at boot */
     bool tof_a_ok; /* ToF sensor A detected at boot */
     bool tof_b_ok; /* ToF sensor B detected at boot */
+    bool imu_ok; /* ICM20948 responding (live, self-heal aware) */
+    bool mag_ok; /* QMC5883L responding (live, self-heal aware) */
 } boat_SystemStatus;
 
 /* Envelope — every message on the wire is a BoatMessage */
@@ -123,6 +133,7 @@ typedef struct _boat_BoatMessage {
         boat_ArmCommand arm_cmd;
         boat_WinchCommand winch;
         boat_SteerCommand steer;
+        boat_ServoPowerCommand servo_power;
     } payload;
 } boat_BoatMessage;
 
@@ -142,9 +153,10 @@ extern "C" {
 #define boat_MotorCommand_init_default           {0, 0, 0, 0}
 #define boat_WinchCommand_init_default           {0}
 #define boat_SteerCommand_init_default           {0, 0}
-#define boat_MotorStatus_init_default            {0, 0, 0, 0}
+#define boat_MotorStatus_init_default            {0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_default             {0, 0}
-#define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0}
+#define boat_ServoPowerCommand_init_default      {0}
+#define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
@@ -156,9 +168,10 @@ extern "C" {
 #define boat_MotorCommand_init_zero              {0, 0, 0, 0}
 #define boat_WinchCommand_init_zero              {0}
 #define boat_SteerCommand_init_zero              {0, 0}
-#define boat_MotorStatus_init_zero               {0, 0, 0, 0}
+#define boat_MotorStatus_init_zero               {0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_zero                {0, 0}
-#define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0}
+#define boat_ServoPowerCommand_init_zero         {0}
+#define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -205,14 +218,18 @@ extern "C" {
 #define boat_MotorStatus_left_throttle_tag       2
 #define boat_MotorStatus_right_throttle_tag      3
 #define boat_MotorStatus_winch_speed_tag         4
+#define boat_MotorStatus_servo_power_tag         5
 #define boat_ArmCommand_arm_tag                  1
 #define boat_ArmCommand_force_tag                2
+#define boat_ServoPowerCommand_on_tag            1
 #define boat_SystemStatus_heap_free_tag          1
 #define boat_SystemStatus_wifi_rssi_tag          2
 #define boat_SystemStatus_uptime_us_tag          3
 #define boat_SystemStatus_camera_ok_tag          4
 #define boat_SystemStatus_tof_a_ok_tag           5
 #define boat_SystemStatus_tof_b_ok_tag           6
+#define boat_SystemStatus_imu_ok_tag             7
+#define boat_SystemStatus_mag_ok_tag             8
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
@@ -222,6 +239,7 @@ extern "C" {
 #define boat_BoatMessage_arm_cmd_tag             7
 #define boat_BoatMessage_winch_tag               8
 #define boat_BoatMessage_steer_tag               9
+#define boat_BoatMessage_servo_power_tag         10
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -313,7 +331,8 @@ X(a, STATIC,   SINGULAR, FLOAT,    right,             2)
 X(a, STATIC,   SINGULAR, UINT32,   state,             1) \
 X(a, STATIC,   SINGULAR, FLOAT,    left_throttle,     2) \
 X(a, STATIC,   SINGULAR, FLOAT,    right_throttle,    3) \
-X(a, STATIC,   SINGULAR, FLOAT,    winch_speed,       4)
+X(a, STATIC,   SINGULAR, FLOAT,    winch_speed,       4) \
+X(a, STATIC,   SINGULAR, BOOL,     servo_power,       5)
 #define boat_MotorStatus_CALLBACK NULL
 #define boat_MotorStatus_DEFAULT NULL
 
@@ -323,13 +342,20 @@ X(a, STATIC,   SINGULAR, BOOL,     force,             2)
 #define boat_ArmCommand_CALLBACK NULL
 #define boat_ArmCommand_DEFAULT NULL
 
+#define boat_ServoPowerCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     on,                1)
+#define boat_ServoPowerCommand_CALLBACK NULL
+#define boat_ServoPowerCommand_DEFAULT NULL
+
 #define boat_SystemStatus_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   heap_free,         1) \
 X(a, STATIC,   SINGULAR, INT32,    wifi_rssi,         2) \
 X(a, STATIC,   SINGULAR, UINT64,   uptime_us,         3) \
 X(a, STATIC,   SINGULAR, BOOL,     camera_ok,         4) \
 X(a, STATIC,   SINGULAR, BOOL,     tof_a_ok,          5) \
-X(a, STATIC,   SINGULAR, BOOL,     tof_b_ok,          6)
+X(a, STATIC,   SINGULAR, BOOL,     tof_b_ok,          6) \
+X(a, STATIC,   SINGULAR, BOOL,     imu_ok,            7) \
+X(a, STATIC,   SINGULAR, BOOL,     mag_ok,            8)
 #define boat_SystemStatus_CALLBACK NULL
 #define boat_SystemStatus_DEFAULT NULL
 
@@ -342,7 +368,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,coord,payload.coord),   5) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor_status,payload.motor_status),   6) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,arm_cmd,payload.arm_cmd),   7) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,winch,payload.winch),   8) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer,payload.steer),   9)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer,payload.steer),   9) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,servo_power,payload.servo_power),  10)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -354,6 +381,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer,payload.steer),   9)
 #define boat_BoatMessage_payload_arm_cmd_MSGTYPE boat_ArmCommand
 #define boat_BoatMessage_payload_winch_MSGTYPE boat_WinchCommand
 #define boat_BoatMessage_payload_steer_MSGTYPE boat_SteerCommand
+#define boat_BoatMessage_payload_servo_power_MSGTYPE boat_ServoPowerCommand
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
@@ -367,6 +395,7 @@ extern const pb_msgdesc_t boat_WinchCommand_msg;
 extern const pb_msgdesc_t boat_SteerCommand_msg;
 extern const pb_msgdesc_t boat_MotorStatus_msg;
 extern const pb_msgdesc_t boat_ArmCommand_msg;
+extern const pb_msgdesc_t boat_ServoPowerCommand_msg;
 extern const pb_msgdesc_t boat_SystemStatus_msg;
 extern const pb_msgdesc_t boat_BoatMessage_msg;
 
@@ -383,6 +412,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_SteerCommand_fields &boat_SteerCommand_msg
 #define boat_MotorStatus_fields &boat_MotorStatus_msg
 #define boat_ArmCommand_fields &boat_ArmCommand_msg
+#define boat_ServoPowerCommand_fields &boat_ServoPowerCommand_msg
 #define boat_SystemStatus_fields &boat_SystemStatus_msg
 #define boat_BoatMessage_fields &boat_BoatMessage_msg
 
@@ -396,10 +426,11 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_GpsFix_size                         63
 #define boat_IMUData_size                        15
 #define boat_MotorCommand_size                   20
-#define boat_MotorStatus_size                    21
+#define boat_MotorStatus_size                    23
 #define boat_SensorSnapshot_size                 13267
+#define boat_ServoPowerCommand_size              2
 #define boat_SteerCommand_size                   10
-#define boat_SystemStatus_size                   34
+#define boat_SystemStatus_size                   38
 #define boat_ToFGrid_size                        6274
 #define boat_WinchCommand_size                   5
 

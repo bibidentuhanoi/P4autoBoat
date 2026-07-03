@@ -42,6 +42,9 @@ PB_BIND(boat_MotorStatus, boat_MotorStatus, AUTO)
 PB_BIND(boat_ArmCommand, boat_ArmCommand, AUTO)
 
 
+PB_BIND(boat_ServoPowerCommand, boat_ServoPowerCommand, AUTO)
+
+
 PB_BIND(boat_SystemStatus, boat_SystemStatus, AUTO)
 
 

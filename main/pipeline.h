@@ -74,3 +74,14 @@ typedef void (*steer_command_handler_fn)(const boat_SteerCommand *cmd);
  * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_steer_handler(steer_command_handler_fn handler);
+
+/**
+ * @brief Servo rail power handler callback type.
+ */
+typedef void (*servo_power_handler_fn)(bool on);
+
+/**
+ * @brief Register a handler for incoming ServoPowerCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
+ */
+void pipeline_register_servo_power_handler(servo_power_handler_fn handler);

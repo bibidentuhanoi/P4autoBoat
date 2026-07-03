@@ -54,6 +54,22 @@ static void steer_command_handler(const boat_SteerCommand *cmd)
     steer_driver_set(cmd->left, cmd->right);
 }
 
+/* Set when the rail is switched so the next watchdog tick (250ms) publishes
+ * status immediately instead of the ~1s cadence. Publishing directly from
+ * here would DEADLOCK: this runs inside pipeline_handle_incoming, which holds
+ * the shared-envelope mutex that pipeline_publish_motor_status also takes. */
+static volatile bool s_status_dirty = false;
+
+/* Manual servo-rail switch (bench testing without arming the ESCs). */
+static void servo_power_command_handler(bool on)
+{
+    if (winch_driver_set_power(on) == ESP_OK && !on) {
+        winch_driver_set_speed(0.0f);   /* rail off ⇒ make commanded state match */
+        steer_driver_set(0.0f, 0.0f);
+    }
+    s_status_dirty = true;
+}
+
 static void arm_task_fn(void *arg)
 {
     intptr_t v = (intptr_t)arg;
@@ -83,6 +99,7 @@ static void publish_status(void)
     ms.state = (uint32_t)esc_driver_get_state();
     esc_driver_get_throttle(&ms.left_throttle, &ms.right_throttle);
     ms.winch_speed = winch_driver_get_speed();
+    ms.servo_power = winch_driver_get_power();
     pipeline_publish_motor_status(&ms);
 }
 
@@ -91,7 +108,10 @@ static void watchdog_cb(void *arg)
     (void)arg;
     static int tick = 0;
 
-    if (esc_driver_get_state() == ESC_STATE_ARMED && ws_transport_client_count() == 0) {
+    /* Failsafe on WS loss: covers ARMED, and also the bench case where the
+     * servo rail was switched on manually while disarmed. */
+    if ((esc_driver_get_state() == ESC_STATE_ARMED || winch_driver_get_power()) &&
+        ws_transport_client_count() == 0) {
         bool acted = false;
         if (s_was_nonzero) {
             esc_driver_set_throttle(0.0f, 0.0f);
@@ -111,7 +131,9 @@ static void watchdog_cb(void *arg)
         }
     }
 
-    if (++tick % STATUS_DIVIDER == 0) {
+    ++tick;
+    if (s_status_dirty || (tick % STATUS_DIVIDER) == 0) {
+        s_status_dirty = false;
         publish_status();
     }
 }
@@ -131,6 +153,7 @@ esp_err_t motor_control_init(void)
     pipeline_register_arm_handler(arm_command_handler);
     pipeline_register_winch_handler(winch_command_handler);
     pipeline_register_steer_handler(steer_command_handler);
+    pipeline_register_servo_power_handler(servo_power_command_handler);
 
     const esp_timer_create_args_t timer_args = {
         .callback = watchdog_cb,
@@ -151,8 +174,9 @@ esp_err_t motor_control_arm(bool force)
     }
     esp_err_t ret = esc_driver_arm();
     if (ret == ESP_OK) {
-        winch_driver_set_power(true);   /* servo rail live only while armed */
+        winch_driver_set_power(true);   /* arming always powers the servo rail */
     }
+    s_status_dirty = true;
     return ret;
 }
 
@@ -161,5 +185,7 @@ esp_err_t motor_control_disarm(void)
     s_was_nonzero = false;
     winch_driver_set_speed(0.0f);       /* stop the winch */
     winch_driver_set_power(false);      /* cut servo power */
+    steer_driver_set(0.0f, 0.0f);       /* rail is off — command state to match */
+    s_status_dirty = true;
     return esc_driver_disarm();
 }
