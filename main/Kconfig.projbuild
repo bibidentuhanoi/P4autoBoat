@@ -186,6 +186,20 @@ menu "Board Configuration"
             help
                 Enable if the servo power MOSFET/relay conducts when the pin is LOW.
 
+        config STATUS_LED_PIN
+            int "User Status LED Pin (calibration indicator)"
+            default 3
+            help
+                GPIO for the user LED that signals the boot-button calibration
+                window and which calibration phase is running. Dark otherwise.
+
+        config STATUS_LED_ACTIVE_LOW
+            bool "Status LED is Active-Low"
+            default n
+            help
+                Enable if the LED lights when the pin is driven LOW (cathode to
+                the pin, anode to 3V3).
+
         config STEER_LEFT_PIN
             int "Left Steering Servo PWM Pin (rudder)"
             default 32

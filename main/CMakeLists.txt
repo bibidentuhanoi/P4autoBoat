@@ -11,6 +11,7 @@ idf_component_register(
         "drivers/esc_driver.c"
         "drivers/winch_driver.c"
         "drivers/steer_driver.c"
+        "drivers/status_led.c"
         "wifi_manager.c"
         "camera_stream.c"
         "pipeline.c"

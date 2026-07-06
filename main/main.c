@@ -21,6 +21,7 @@
 #include "drivers/gps_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
+#include "drivers/status_led.h"
 
 // Connectivity
 #include "wifi_manager.h"
@@ -133,6 +134,11 @@ void app_main(void) {
     gpio_set_direction(BOOT_BUTTON_PIN, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BOOT_BUTTON_PIN, GPIO_PULLUP_ONLY);
 
+    // User LED (GPIO3): blink through the button window so the operator knows —
+    // without a serial terminal — that pressing BOOT now forces recalibration.
+    status_led_init();
+    status_led_set(STATUS_LED_CAL_WINDOW);
+
     bool force_calib_via_button = false;
     ESP_LOGI(TAG, "Press and hold the BOOT button (GPIO 35) NOW to force recalibration...");
     for (int i = 3; i > 0; i--) {
@@ -155,6 +161,7 @@ void app_main(void) {
         fs_save_calibration(&calib_data);
     } else {
         ESP_LOGI(TAG, "Valid calibration found in NVS. Skipping calibration.");
+        status_led_set(STATUS_LED_OFF);   // cal-only LED: dark once we're running
     }
 
     // 8b. Winch servo + servo power. GPIO35 is dual-use with the BOOT button,

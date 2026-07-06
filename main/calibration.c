@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "math.h"
 #include "sdkconfig.h"
+#include "drivers/status_led.h"
 
 static const char* TAG = "CALIB";
 
@@ -134,6 +135,7 @@ static void print_quality_report(const CalibQuality* q) {
 // ============================================================
 
 static bool phase1_gyro_level(CalibrationData* out, CalibQuality* quality) {
+    status_led_set(STATUS_LED_CAL_STILL);   // LED solid: hold flat & still
     ESP_LOGI(TAG, " ");
     ESP_LOGI(TAG, "################################################");
     ESP_LOGI(TAG, "   PHASE 1: GYRO & LEVEL");
@@ -235,6 +237,7 @@ static bool phase1_gyro_level(CalibrationData* out, CalibQuality* quality) {
 // ============================================================
 
 static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
+    status_led_set(STATUS_LED_CAL_MOVE);    // LED blips: pick up & figure-8
     ESP_LOGI(TAG, " ");
     ESP_LOGI(TAG, "################################################");
     ESP_LOGI(TAG, "   PHASE 2: COMPASS FIGURE-8");
@@ -377,6 +380,7 @@ static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
 // ============================================================
 
 static bool phase3_alignment(CalibrationData* out, CalibQuality* quality) {
+    status_led_set(STATUS_LED_CAL_POINT);   // LED slow blink: point at bow & hold
     ESP_LOGI(TAG, " ");
     ESP_LOGI(TAG, "################################################");
     ESP_LOGI(TAG, "   PHASE 3: ALIGNMENT (Set Zero Heading)");
@@ -469,6 +473,10 @@ void perform_calibration_routine(CalibrationData* output_calib) {
     if (score < 0) { score = 0; }
 
     quality.score = score;
+
+    // LED verdict (auto-returns to OFF after the flash): steady triple = good,
+    // rapid flutter = redo. 60 mirrors print_quality_report's "recalibrate" line.
+    status_led_set(score >= 60 ? STATUS_LED_CAL_DONE_OK : STATUS_LED_CAL_DONE_FAIL);
 
     print_quality_report(&quality);
 }
