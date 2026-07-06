@@ -66,12 +66,16 @@ void task_imu_fusion(void *pvParameters) {
         // Failure visibility: a dead IMU used to freeze the outputs at zero
         // with no trace in the logs. Count failures and report ~every 2s.
         static uint32_t ag_fails = 0, mag_fails = 0;
+        static bool bus_scanned = false;   /* one-shot ground-truth scan on first sustained fault */
         bool mag_ok = false;
+        esp_err_t mag_err = ESP_FAIL;   /* real I2C error, surfaced in the failure log */
+        esp_err_t ag_err  = ESP_FAIL;
 
         bool read_success = false;
         if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             // MAG READ
-            mag_ok = (imu_read_mag(&raw_mx, &raw_my, &raw_mz) == ESP_OK);
+            mag_err = imu_read_mag(&raw_mx, &raw_my, &raw_mz);
+            mag_ok  = (mag_err == ESP_OK);
             if (mag_ok) {
                 float mx_cal = ((float)raw_mx - calib->m_bias[0]) * calib->m_scale[0];
                 float my_cal = ((float)raw_my - calib->m_bias[1]) * calib->m_scale[1];
@@ -83,22 +87,43 @@ void task_imu_fusion(void *pvParameters) {
             }
 
             // ACCEL/GYRO READ
-            if (imu_read_accel_gyro(&raw_ax, &raw_ay, &raw_az, &raw_gx, &raw_gy, &raw_gz) == ESP_OK) {
-                read_success = true;
-            }
+            ag_err = imu_read_accel_gyro(&raw_ax, &raw_ay, &raw_az, &raw_gx, &raw_gy, &raw_gz);
+            read_success = (ag_err == ESP_OK);
             xSemaphoreGive(g_i2c_mutex);
         }
 
         if (!mag_ok) {
             ++mag_fails;
             if (mag_fails == 50) imu_set_mag_ok(false);   /* ~1s dead → report it */
+            /* Ground-truth scan on first sustained mag fault too (not just ICM),
+             * so a dead mag on a working bus is settled, not guessed. */
+            if (mag_fails == 50 && !bus_scanned &&
+                xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                bus_scanned = true;
+                imu_bus_scan();
+                xSemaphoreGive(g_i2c_mutex);
+            }
             if ((mag_fails % 100) == 1) {
-                ESP_LOGW(FUSION_TAG, "QMC5883L mag read failing (%lu fails) — heading frozen",
-                         (unsigned long)mag_fails);
+                ESP_LOGW(FUSION_TAG, "QMC5883L mag read failing (%lu fails, %s) — heading frozen",
+                         (unsigned long)mag_fails, esp_err_to_name(mag_err));
+            }
+            /* Sustained NACK never returns ESP_OK, so the recover-after-success
+             * path below can't fire. Force a full re-add + reconfigure every
+             * ~2s so a chip that dropped off the bus can rejoin. */
+            if ((mag_fails % 100) == 0 &&
+                xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                esp_err_t rec = imu_recover_mag();
+                xSemaphoreGive(g_i2c_mutex);
+                if (rec == ESP_OK) {
+                    ESP_LOGI(FUSION_TAG, "mag recovered after %lu fails — re-added + reconfigured",
+                             (unsigned long)mag_fails);
+                    imu_set_mag_ok(true);
+                    mag_fails = 0;
+                }
             }
         } else if (mag_fails) {
-            /* Connection came back — the chip may have missed its boot config
-             * (standby => stale zeros), so re-apply it before trusting data. */
+            /* Came back on its own (chip ACKs again) — it may have missed its
+             * boot config (standby => stale zeros), so re-apply before trusting. */
             if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 imu_reinit_mag();
                 xSemaphoreGive(g_i2c_mutex);
@@ -111,12 +136,34 @@ void task_imu_fusion(void *pvParameters) {
         if (!read_success) {
             ++ag_fails;
             if (ag_fails == 50) imu_set_icm_ok(false);    /* ~1s dead → report it */
+            /* Once, when the bus is known-good at runtime (mag reading fine),
+             * dump who actually ACKs — settles chip-absent vs read-path bug. */
+            if (ag_fails == 50 && !bus_scanned &&
+                xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                bus_scanned = true;
+                imu_bus_scan();
+                xSemaphoreGive(g_i2c_mutex);
+            }
             if ((ag_fails % 100) == 1) {
-                ESP_LOGW(FUSION_TAG, "ICM20948 accel/gyro read failing (%lu fails) — pitch/roll frozen",
-                         (unsigned long)ag_fails);
+                ESP_LOGW(FUSION_TAG, "ICM20948 accel/gyro read failing (%lu fails, %s) — pitch/roll frozen",
+                         (unsigned long)ag_fails, esp_err_to_name(ag_err));
+            }
+            /* Sustained NACK never returns ESP_OK, so the recover-after-success
+             * path below can't fire. Force a full re-probe (both straps) +
+             * reconfigure every ~2s so a reset / address-moved chip can return. */
+            if ((ag_fails % 100) == 0 &&
+                xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                esp_err_t rec = imu_recover_accel_gyro();
+                xSemaphoreGive(g_i2c_mutex);
+                if (rec == ESP_OK) {
+                    ESP_LOGI(FUSION_TAG, "accel/gyro recovered after %lu fails — reprobed + reconfigured",
+                             (unsigned long)ag_fails);
+                    imu_set_icm_ok(true);
+                    ag_fails = 0;
+                }
             }
         } else if (ag_fails) {
-            /* Same recovery path: wake the chip (it boots asleep) + set range. */
+            /* Came back on its own (chip ACKs again): wake it (boots asleep) + range. */
             if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 imu_reinit_accel_gyro();
                 xSemaphoreGive(g_i2c_mutex);

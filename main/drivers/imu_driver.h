@@ -14,7 +14,7 @@
 #define PWR_MGMT_1          0x06
 #define ACCEL_XOUT_H        0x2D
 #define GYRO_XOUT_H         0x33
-#define GYRO_CONFIG_1       0x1B
+#define GYRO_CONFIG_1       0x01   /* bank 2. 0x1B was the MPU-9250 address — wrong chip */
 
 // Constants
 #define GYRO_SCALE_250DPS   131.0f
@@ -27,6 +27,18 @@ esp_err_t imu_read_mag(int16_t* mx, int16_t* my, int16_t* mz);
 /* Re-apply chip config after a lost-connection recovery (see imu_driver.c). */
 esp_err_t imu_reinit_mag(void);
 esp_err_t imu_reinit_accel_gyro(void);
+
+/* Full recovery for a chip that has gone fully unresponsive (sustained NACK).
+ * Tears down and re-adds the I2C device — the ICM re-probes BOTH AD0 straps
+ * (0x69, then 0x68) in case a brownout/reset moved the address — then re-applies
+ * config. Returns ESP_OK once the chip answers again; leaves the device handle
+ * NULL (reads self-guard) if it is still gone. Call under g_i2c_mutex. */
+esp_err_t imu_recover_mag(void);
+esp_err_t imu_recover_accel_gyro(void);
+
+/* Probe every address on the sensor bus and log who ACKs — ground-truth I2C
+ * scan, independent of the read path. Call under g_i2c_mutex. */
+void imu_bus_scan(void);
 
 /* Live chip health — set by the boot probes, updated by the fusion task on
  * sustained read failure / recovery. Reported to the dashboard so a dead or
