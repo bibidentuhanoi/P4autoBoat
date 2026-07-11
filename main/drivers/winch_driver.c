@@ -95,8 +95,15 @@ esp_err_t winch_driver_init(void)
     mcpwm_comparator_config_t cmp_cfg = { .flags.update_cmp_on_tez = true };
     ESP_RETURN_ON_ERROR(mcpwm_new_comparator(s_oper, &cmp_cfg, &s_cmp), TAG, "new_comparator");
 
+    /* GPIO35 boots HELD + sleep-isolated (see esc_driver.c); it's also the boot
+     * button, doubling the stale state. Release the hold + clean-reset before MCPWM
+     * attaches, then exclude the pad from sleep-switching after so the winch signal
+     * survives WiFi modem-sleep. */
+    gpio_hold_dis(CONFIG_WINCH_PWM_PIN);
+    gpio_reset_pin(CONFIG_WINCH_PWM_PIN);
     mcpwm_generator_config_t gen_cfg = { .gen_gpio_num = CONFIG_WINCH_PWM_PIN };
     ESP_RETURN_ON_ERROR(mcpwm_new_generator(s_oper, &gen_cfg, &s_gen), TAG, "new_generator");
+    gpio_sleep_sel_dis(CONFIG_WINCH_PWM_PIN);
 
     /* HIGH at period start, LOW at compare match. */
     ESP_RETURN_ON_ERROR(

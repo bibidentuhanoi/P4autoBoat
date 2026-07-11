@@ -6,6 +6,7 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "sdkconfig.h"
 
 // Logic Layers
@@ -92,12 +93,25 @@ void app_main(void) {
     g_camera_ok = camera_ok;
     if (!camera_ok) {
         ESP_LOGW(TAG, "Camera init failed — streaming disabled, sensors still run");
+        /* Camera absent ⇒ esp_video attached NO device to the SCCB bus, so we
+         * CAN delete it. That releases GPIO7/8 so the sensor bus (I2C_NUM_1)
+         * below is the SOLE controller on those pins. Leaving I2C_NUM_0 bound to
+         * the same pins made both sensors glitch in lockstep (two controllers,
+         * one pin pair). Falls back to the old shared-pin path if delete fails. */
+        esp_err_t del = i2c_del_master_bus(sccb_handle);
+        if (del == ESP_OK) {
+            sccb_handle = NULL;
+            ESP_LOGI(TAG, "SCCB bus released — GPIO7/8 now owned solely by the sensor bus");
+        } else {
+            ESP_LOGW(TAG, "SCCB bus delete failed (%s) — sensor bus will share the pins",
+                     esp_err_to_name(del));
+        }
     }
 
-    // 3b. esp_video attached its OV5647 device to sccb_handle internally — i2c_del_master_bus
-    //     would fail with ESP_ERR_INVALID_STATE. We don't need to delete: once camera_init()
-    //     returns, SCCB is done forever (camera streams via MIPI CSI). I2C_NUM_0 stays alive
-    //     but idle. I2C_NUM_1 below will re-route GPIO7/GPIO8 via the GPIO matrix.
+    // 3b. If the camera IS present, esp_video attached its OV5647 device to
+    //     sccb_handle, so i2c_del_master_bus returns ESP_ERR_INVALID_STATE and
+    //     I2C_NUM_0 stays alive. The sensor bus below then re-routes GPIO7/GPIO8
+    //     via the GPIO matrix, and the boot settle-delay in imu_init covers it.
 
     // 4. Create sensor I2C bus on same GPIO7/GPIO8 (GPIO matrix re-routes from I2C_NUM_0)
     ESP_LOGI(TAG, "Initializing sensor I2C bus...");
@@ -229,6 +243,17 @@ void app_main(void) {
         //      requested by the user from the dashboard (bench override available).
         ESP_LOGI(TAG, "ESCs disarmed — arm from dashboard once GPS locks (or override).");
     }
+
+    /* GPIO sleep-switching: the IDF enables it at boot (SleepSelEn=1 on every pad).
+     * This boat never sleeps (WiFi PS_NONE, no PM), so kill the switching globally
+     * HERE — after every stage that could turn it back on — so actuator outputs stay
+     * solid, and release any hold a later stage re-applied to the actuator pads. */
+    esp_sleep_enable_gpio_switch(false);
+    gpio_hold_dis(CONFIG_ESC_PWM_LEFT_PIN);
+    gpio_hold_dis(CONFIG_ESC_PWM_RIGHT_PIN);
+    gpio_hold_dis(CONFIG_STEER_LEFT_PIN);
+    gpio_hold_dis(CONFIG_STEER_RIGHT_PIN);
+    gpio_hold_dis(CONFIG_WINCH_PWM_PIN);
 
     // 12. Start RTOS Tasks — loud failure: a silent Snap_Task death means no
     //     telemetry at all (dashboard shows no IMU/ToF/GPS and arming stays locked).

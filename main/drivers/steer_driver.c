@@ -1,6 +1,7 @@
 #include "steer_driver.h"
 
 #include "driver/mcpwm_prelude.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -60,8 +61,14 @@ static esp_err_t steer_make_output(mcpwm_cmpr_handle_t *cmp, mcpwm_gen_handle_t 
     mcpwm_comparator_config_t cmp_cfg = { .flags.update_cmp_on_tez = true };
     ESP_RETURN_ON_ERROR(mcpwm_new_comparator(s_oper, &cmp_cfg, cmp), TAG, "new_comparator");
 
+    /* GPIO32 boots HELD + sleep-isolated (see esc_driver.c). Release the hold +
+     * clean-reset before MCPWM attaches, then exclude the pad from sleep-switching
+     * after so the servo signal survives WiFi modem-sleep. */
+    gpio_hold_dis(gpio);
+    gpio_reset_pin(gpio);
     mcpwm_generator_config_t gen_cfg = { .gen_gpio_num = gpio };
     ESP_RETURN_ON_ERROR(mcpwm_new_generator(s_oper, &gen_cfg, gen), TAG, "new_generator");
+    gpio_sleep_sel_dis(gpio);
 
     ESP_RETURN_ON_ERROR(
         mcpwm_generator_set_action_on_timer_event(

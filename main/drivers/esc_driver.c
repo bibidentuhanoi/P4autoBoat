@@ -1,82 +1,110 @@
 #include "esc_driver.h"
 
 #include "driver/mcpwm_prelude.h"
+#include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 
 #include "sdkconfig.h"
-#include <string.h>
 
 static const char *TAG = "ESC";
 
-/* ---------- Compile-time constants from Kconfig ---------- */
+/* ---------------------------------------------------------------------------
+ * Driven with MCPWM, not LEDC.
+ *
+ * History: LEDC drives GPIO31 fine in a bare Arduino sketch, but inside THIS
+ * firmware the LEDC signal on GPIO31 came out corrupted (the ESC never saw a
+ * clean arm pulse and kept warning-beeping) once the rest of the system was up —
+ * for a reason no GPIO/LEDC register dump could show (pad, duty=62259, routing
+ * and channel were all byte-identical to the working GPIO33). The winch and
+ * steering servos run cleanly on MCPWM on neighbouring pins in the same firmware,
+ * so the ESC uses MCPWM too and the problem is gone.
+ *
+ * HW-517: needs an INVERTED (active-low) servo pulse — LOW for `pulse_us`, HIGH
+ * for the rest of the 20ms frame (matches the old LEDC MAX-d inversion).
+ * Unidirectional, arms at MINIMUM (1000us). Own MCPWM timer+operator in group 0;
+ * one operator, two comparators/generators, so left and right are independent.
+ * Public API (esc_driver_init/arm/disarm/set_throttle/get_state/get_throttle) is
+ * unchanged — motor_control.c is untouched.
+ * ------------------------------------------------------------------------- */
 
-#define ESC_MCPWM_GROUP      0
-#define ESC_TIMER_RESOLUTION 1000000U   /* 1 MHz → 1 µs per tick */
-#define ESC_PERIOD_TICKS     (ESC_TIMER_RESOLUTION / CONFIG_ESC_PWM_FREQ_HZ)
+#define ESC_MCPWM_GROUP        0
+#define ESC_TIMER_RESOLUTION   1000000U   /* 1 MHz => 1 us/tick */
+#define ESC_PERIOD_TICKS       (ESC_TIMER_RESOLUTION / CONFIG_ESC_PWM_FREQ_HZ)   /* 20000 @ 50Hz */
+#define ESC_ARMING_DELAY_MS    3000
 
-#define ESC_ARMING_DELAY_MS  3000
+static mcpwm_timer_handle_t s_timer  = NULL;
+static mcpwm_oper_handle_t  s_oper   = NULL;
+static mcpwm_cmpr_handle_t  s_cmp_l  = NULL;
+static mcpwm_cmpr_handle_t  s_cmp_r  = NULL;
+static mcpwm_gen_handle_t   s_gen_l  = NULL;
+static mcpwm_gen_handle_t   s_gen_r  = NULL;
 
-/* ---------- Static state ---------- */
+static volatile esc_state_t s_state     = ESC_STATE_DISARMED;
+static float                s_thr_left  = 0.0f;
+static float                s_thr_right = 0.0f;
+static SemaphoreHandle_t    s_mutex     = NULL;
+static bool                 s_inited    = false;
 
-static mcpwm_timer_handle_t   s_timer     = NULL;
-static mcpwm_oper_handle_t    s_operator  = NULL;
-static mcpwm_cmpr_handle_t    s_cmp_left  = NULL;
-static mcpwm_cmpr_handle_t    s_cmp_right = NULL;
-static mcpwm_gen_handle_t     s_gen_left  = NULL;
-static mcpwm_gen_handle_t     s_gen_right = NULL;
-
-static volatile esc_state_t   s_state     = ESC_STATE_DISARMED;
-static float                  s_thr_left  = 0.0f;
-static float                  s_thr_right = 0.0f;
-static SemaphoreHandle_t      s_mutex     = NULL;
-static bool                   s_inited    = false;
-
-/* ---------- Helpers ---------- */
-
-/**
- * Map float throttle [-1.0, 1.0] → pulse width in microseconds.
- * 0.0 maps to CONFIG_ESC_PULSE_NEUTRAL_US (centre of the range).
- * Values outside [-1, 1] are clamped.
- */
+/* Unidirectional ESC (HW-517 arms at min): 0 = MIN (off/stop), 1 = MAX (full).
+ * No reverse — negative throttle clamps to stop. */
 static uint32_t throttle_to_us(float t)
 {
-    if (t < -1.0f) t = -1.0f;
-    if (t >  1.0f) t =  1.0f;
-
-    /* neutral is the midpoint between min and max in config */
-    uint32_t neutral = CONFIG_ESC_PULSE_NEUTRAL_US;
-    uint32_t min_us  = CONFIG_ESC_PULSE_MIN_US;
-    uint32_t max_us  = CONFIG_ESC_PULSE_MAX_US;
-
-    uint32_t us;
-    if (t >= 0.0f) {
-        /* 0 → neutral, +1 → max */
-        us = (uint32_t)(neutral + t * (float)(max_us - neutral) + 0.5f);
-    } else {
-        /* 0 → neutral, -1 → min */
-        us = (uint32_t)(neutral + t * (float)(neutral - min_us) + 0.5f);
-    }
-    return us;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    uint32_t min_us = CONFIG_ESC_PULSE_MIN_US;
+    uint32_t max_us = CONFIG_ESC_PULSE_MAX_US;
+    return (uint32_t)(min_us + t * (float)(max_us - min_us) + 0.5f);
 }
 
-/** Write a pulse width directly to both comparators. */
+/* Set both channels' pulse width (us == MCPWM ticks at 1 MHz). */
 static esp_err_t set_pulse_us(uint32_t left_us, uint32_t right_us)
 {
-    ESP_RETURN_ON_ERROR(mcpwm_comparator_set_compare_value(s_cmp_left,  left_us),
-                        TAG, "cmp_left set");
-    ESP_RETURN_ON_ERROR(mcpwm_comparator_set_compare_value(s_cmp_right, right_us),
-                        TAG, "cmp_right set");
+    ESP_RETURN_ON_ERROR(mcpwm_comparator_set_compare_value(s_cmp_l, left_us),  TAG, "left");
+    ESP_RETURN_ON_ERROR(mcpwm_comparator_set_compare_value(s_cmp_r, right_us), TAG, "right");
     return ESP_OK;
 }
 
-/* ---------- Arming ---------- */
+/* Create one comparator + generator on the shared operator for a channel.
+ * INVERTED (active-low) for the HW-517: LOW at period start (timer empty), HIGH at
+ * the compare match — so the pad is LOW for `pulse_us` then HIGH for the rest. */
+static esp_err_t esc_make_output(mcpwm_cmpr_handle_t *cmp, mcpwm_gen_handle_t *gen, int gpio)
+{
+    /* GPIO31 boots HELD + sleep-isolated on this board (see the long saga). Release
+     * the hold + clean-reset BEFORE attaching, exclude from sleep-switching AFTER. */
+    gpio_hold_dis(gpio);
+    gpio_reset_pin(gpio);
 
-/* ---------- Public API ---------- */
+    mcpwm_comparator_config_t cmp_cfg = { .flags.update_cmp_on_tez = true };
+    ESP_RETURN_ON_ERROR(mcpwm_new_comparator(s_oper, &cmp_cfg, cmp), TAG, "new_comparator");
+
+    mcpwm_generator_config_t gen_cfg = { .gen_gpio_num = gpio };
+    ESP_RETURN_ON_ERROR(mcpwm_new_generator(s_oper, &gen_cfg, gen), TAG, "new_generator");
+    gpio_sleep_sel_dis(gpio);
+    /* Max drive strength (40mA vs 20mA default): GPIO31 is loaded on this board once
+     * the full system powers up; the strongest pad driver gives the best shot at a
+     * clean edge into that load. Harmless on the unloaded right pin. */
+    gpio_set_drive_capability(gpio, GPIO_DRIVE_CAP_3);
+
+    ESP_RETURN_ON_ERROR(
+        mcpwm_generator_set_action_on_timer_event(
+            *gen,
+            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                         MCPWM_TIMER_EVENT_EMPTY,
+                                         MCPWM_GEN_ACTION_LOW)),
+        TAG, "gen action timer");
+    ESP_RETURN_ON_ERROR(
+        mcpwm_generator_set_action_on_compare_event(
+            *gen,
+            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                           *cmp,
+                                           MCPWM_GEN_ACTION_HIGH)),
+        TAG, "gen action cmp");
+    return ESP_OK;
+}
 
 esp_err_t esc_driver_init(void)
 {
@@ -88,7 +116,6 @@ esp_err_t esc_driver_init(void)
     s_mutex = xSemaphoreCreateMutex();
     if (!s_mutex) return ESP_ERR_NO_MEM;
 
-    /* Timer */
     mcpwm_timer_config_t timer_cfg = {
         .group_id      = ESC_MCPWM_GROUP,
         .clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT,
@@ -96,88 +123,30 @@ esp_err_t esc_driver_init(void)
         .period_ticks  = ESC_PERIOD_TICKS,
         .count_mode    = MCPWM_TIMER_COUNT_MODE_UP,
     };
-    ESP_RETURN_ON_ERROR(mcpwm_new_timer(&timer_cfg, &s_timer),
-                        TAG, "new_timer");
+    ESP_RETURN_ON_ERROR(mcpwm_new_timer(&timer_cfg, &s_timer), TAG, "new_timer");
 
-    /* Operator */
-    mcpwm_operator_config_t oper_cfg = {
-        .group_id = ESC_MCPWM_GROUP,
-    };
-    ESP_RETURN_ON_ERROR(mcpwm_new_operator(&oper_cfg, &s_operator),
-                        TAG, "new_operator");
+    mcpwm_operator_config_t oper_cfg = { .group_id = ESC_MCPWM_GROUP };
+    ESP_RETURN_ON_ERROR(mcpwm_new_operator(&oper_cfg, &s_oper), TAG, "new_operator");
+    ESP_RETURN_ON_ERROR(mcpwm_operator_connect_timer(s_oper, s_timer), TAG, "connect_timer");
 
-    ESP_RETURN_ON_ERROR(mcpwm_operator_connect_timer(s_operator, s_timer),
-                        TAG, "connect_timer");
+    ESP_RETURN_ON_ERROR(esc_make_output(&s_cmp_l, &s_gen_l, CONFIG_ESC_PWM_LEFT_PIN),  TAG, "left output");
+    ESP_RETURN_ON_ERROR(esc_make_output(&s_cmp_r, &s_gen_r, CONFIG_ESC_PWM_RIGHT_PIN), TAG, "right output");
 
-    /* Comparators */
-    mcpwm_comparator_config_t cmp_cfg = {
-        .flags.update_cmp_on_tez = true,
-    };
-    ESP_RETURN_ON_ERROR(mcpwm_new_comparator(s_operator, &cmp_cfg, &s_cmp_left),
-                        TAG, "new_cmp_left");
-    ESP_RETURN_ON_ERROR(mcpwm_new_comparator(s_operator, &cmp_cfg, &s_cmp_right),
-                        TAG, "new_cmp_right");
-
-    /* Generators */
-    mcpwm_generator_config_t gen_left_cfg = {
-        .gen_gpio_num = CONFIG_ESC_PWM_LEFT_PIN,
-    };
-    mcpwm_generator_config_t gen_right_cfg = {
-        .gen_gpio_num = CONFIG_ESC_PWM_RIGHT_PIN,
-    };
-    ESP_RETURN_ON_ERROR(mcpwm_new_generator(s_operator, &gen_left_cfg,  &s_gen_left),
-                        TAG, "new_gen_left");
-    ESP_RETURN_ON_ERROR(mcpwm_new_generator(s_operator, &gen_right_cfg, &s_gen_right),
-                        TAG, "new_gen_right");
-
-    /* Generator actions: HIGH on timer empty (start of period), LOW on comparator match */
-    ESP_RETURN_ON_ERROR(
-        mcpwm_generator_set_action_on_timer_event(
-            s_gen_left,
-            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                         MCPWM_TIMER_EVENT_EMPTY,
-                                         MCPWM_GEN_ACTION_HIGH)),
-        TAG, "gen_left action timer");
-    ESP_RETURN_ON_ERROR(
-        mcpwm_generator_set_action_on_compare_event(
-            s_gen_left,
-            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                            s_cmp_left,
-                                            MCPWM_GEN_ACTION_LOW)),
-        TAG, "gen_left action cmp");
-
-    ESP_RETURN_ON_ERROR(
-        mcpwm_generator_set_action_on_timer_event(
-            s_gen_right,
-            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                         MCPWM_TIMER_EVENT_EMPTY,
-                                         MCPWM_GEN_ACTION_HIGH)),
-        TAG, "gen_right action timer");
-    ESP_RETURN_ON_ERROR(
-        mcpwm_generator_set_action_on_compare_event(
-            s_gen_right,
-            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                            s_cmp_right,
-                                            MCPWM_GEN_ACTION_LOW)),
-        TAG, "gen_right action cmp");
-
-    /* Output neutral before starting the timer so the ESC never sees garbage. */
-    uint32_t neutral_us = CONFIG_ESC_PULSE_NEUTRAL_US;
-    ESP_RETURN_ON_ERROR(set_pulse_us(neutral_us, neutral_us), TAG, "init neutral");
-
-    /* Start timer (continuous). */
+    /* Output MINIMUM (off) before starting — the unidirectional ESC arms at min and
+     * treats min as off (neutral would be half throttle on this ESC). */
+    uint32_t off_us = CONFIG_ESC_PULSE_MIN_US;
+    ESP_RETURN_ON_ERROR(set_pulse_us(off_us, off_us), TAG, "init min");
     ESP_RETURN_ON_ERROR(mcpwm_timer_enable(s_timer), TAG, "timer_enable");
-    ESP_RETURN_ON_ERROR(mcpwm_timer_start_stop(s_timer, MCPWM_TIMER_START_NO_STOP),
-                        TAG, "timer_start");
+    ESP_RETURN_ON_ERROR(mcpwm_timer_start_stop(s_timer, MCPWM_TIMER_START_NO_STOP), TAG, "timer_start");
 
     s_thr_left  = 0.0f;
     s_thr_right = 0.0f;
     s_state     = ESC_STATE_DISARMED;
     s_inited    = true;
 
-    ESP_LOGI(TAG, "ESC init OK (L=GPIO%d R=GPIO%d %uHz neutral=%uus)",
+    ESP_LOGI(TAG, "ESC init OK (MCPWM L=GPIO%d R=GPIO%d %uHz off=%uus, inverted/unidirectional)",
              CONFIG_ESC_PWM_LEFT_PIN, CONFIG_ESC_PWM_RIGHT_PIN,
-             (unsigned)CONFIG_ESC_PWM_FREQ_HZ, (unsigned)neutral_us);
+             (unsigned)CONFIG_ESC_PWM_FREQ_HZ, (unsigned)off_us);
     return ESP_OK;
 }
 
@@ -191,15 +160,15 @@ esp_err_t esc_driver_arm(void)
         ESP_LOGW(TAG, "arm() ignored — state=%d", (int)s_state);
         return ESP_ERR_INVALID_STATE;
     }
-    /* Ensure neutral while arming. */
-    uint32_t neutral_us = CONFIG_ESC_PULSE_NEUTRAL_US;
-    set_pulse_us(neutral_us, neutral_us);
+    /* Arm at MINIMUM throttle on BOTH channels (the HW-517 arm point). */
+    uint32_t off_us = CONFIG_ESC_PULSE_MIN_US;
+    set_pulse_us(off_us, off_us);
     s_thr_left  = 0.0f;
     s_thr_right = 0.0f;
     s_state     = ESC_STATE_ARMING;
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "ESC arming (holding neutral %d ms)...", ESC_ARMING_DELAY_MS);
+    ESP_LOGI(TAG, "ESC arming (holding min %d ms)...", ESC_ARMING_DELAY_MS);
 
     vTaskDelay(pdMS_TO_TICKS(ESC_ARMING_DELAY_MS));
 
@@ -234,8 +203,8 @@ esp_err_t esc_driver_disarm(void)
     if (!s_inited) return ESP_ERR_INVALID_STATE;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    uint32_t neutral_us = CONFIG_ESC_PULSE_NEUTRAL_US;
-    set_pulse_us(neutral_us, neutral_us);
+    uint32_t off_us = CONFIG_ESC_PULSE_MIN_US;
+    set_pulse_us(off_us, off_us);
     s_thr_left  = 0.0f;
     s_thr_right = 0.0f;
     s_state     = ESC_STATE_DISARMED;
