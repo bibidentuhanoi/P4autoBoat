@@ -28,6 +28,15 @@ esp_err_t imu_read_mag(int16_t* mx, int16_t* my, int16_t* mz);
 esp_err_t imu_reinit_mag(void);
 esp_err_t imu_reinit_accel_gyro(void);
 
+/* Gently re-arm QMC continuous mode (no soft reset) — for when the mag ACKs but
+ * sits in standby returning frozen data. Verifies the mode reg read-back. Call
+ * under g_i2c_mutex. */
+esp_err_t imu_mag_ensure_continuous(void);
+
+/* Read the QMC control register 0x09 (0x05 = continuous, 0x00 = standby) for the
+ * fusion task's wiring-vs-firmware diagnostic. Call under g_i2c_mutex. */
+esp_err_t imu_mag_read_ctrl(uint8_t *ctrl09);
+
 /* Full recovery for a chip that has gone fully unresponsive (sustained NACK).
  * Tears down and re-adds the I2C device — the ICM re-probes BOTH AD0 straps
  * (0x69, then 0x68) in case a brownout/reset moved the address — then re-applies

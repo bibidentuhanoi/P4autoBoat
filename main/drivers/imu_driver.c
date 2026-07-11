@@ -53,7 +53,15 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         .device_address = QMC5883L_ADDR,
         .scl_speed_hz = 100000
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &qmc_cfg, &h_qmc));
+    /* Registering the device only fails on OOM/invalid-arg, but if it ever does,
+     * DON'T abort the whole boot (ESP_ERROR_CHECK): the boat must still run
+     * manual-drive, servos and camera. Null the handle instead — every mag read
+     * and config below self-guards on it (imu_read_mag / imu_reinit_mag), exactly
+     * like imu_recover_mag(). A flaky compass wire degrades; it never bricks. */
+    if (i2c_master_bus_add_device(bus_handle, &qmc_cfg, &h_qmc) != ESP_OK) {
+        ESP_LOGE(TAG, "QMC5883L bus-add failed — mag disabled, boot continues");
+        h_qmc = NULL;
+    }
 
     /* Presence check with retries: any successful read means the mag answers. */
     uint8_t qmc_status = 0;
@@ -70,10 +78,59 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         ESP_LOGI(TAG, "QMC5883L detected");
     }
 
-    i2c_write_byte(h_qmc, 0x0A, 0x80);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_write_byte(h_qmc, 0x09, 0x05); // ±2G, 50Hz, OSR=512, continuous
-    i2c_write_byte(h_qmc, 0x0B, 0x01);
+    /* Confirm the silicon is really a QMC5883L, not a QMC5883P or clone. The two
+     * share the "QMC5883" name but have TOTALLY different register maps: the L
+     * (addr 0x0D, this driver) has data at 0x00-0x05 and control at 0x09; the P
+     * (addr 0x2C) has a chip-ID at 0x00 and data at 0x01-0x06. If a mismatched
+     * part were populated, this driver would read static config bytes as "mag
+     * data" and the heading would sit frozen — a software (wrong-map) fault, not
+     * wiring. The L's chip-ID register 0x0D reads 0xFF; log it either way so the
+     * boot record proves driver-matches-silicon before we trust any heading. */
+    if (qmc_probe == ESP_OK) {
+        uint8_t chip_id = 0;
+        if (i2c_read_bytes(h_qmc, 0x0D, &chip_id, 1) == ESP_OK) {
+            if (chip_id == 0xFF) {
+                ESP_LOGI(TAG, "QMC5883L chip ID (0x0D)=0xFF confirmed — register map matches silicon");
+            } else {
+                ESP_LOGW(TAG, "QMC5883 chip ID (0x0D)=0x%02X, QMC5883L expects 0xFF — likely a QMC5883P/clone "
+                              "with a DIFFERENT register map; a frozen heading here is SOFTWARE (wrong map), not wiring",
+                         chip_id);
+            }
+        }
+    }
+
+    /* Configure via the verified path (soft reset -> SET/RESET period ->
+     * continuous, with 0x09 read back). On this boat's long/marginal I2C run a
+     * config write can silently NACK and leave the QMC in standby, where it
+     * returns the LAST sample forever — the classic "heading stuck at one value"
+     * fault. If the config will not read back after retries the writes are not
+     * landing: a wiring/solder/pull-up fault, not firmware — say so out loud. */
+    if (qmc_probe == ESP_OK && imu_reinit_mag() != ESP_OK) {
+        ESP_LOGE(TAG, "QMC5883L config did NOT stick (0x09 won't read back 0x05) — "
+                      "writes not landing on the bus (wiring/solder/pull-ups); heading will freeze");
+        s_mag_ok = false;
+    }
+
+    /* Boot-time liveness verdict (no dashboard, no rotation needed): a configured,
+     * measuring QMC refreshes its data registers at 50Hz, so two reads ~60ms apart
+     * MUST differ by sensor noise. If they are byte-identical the chip is not
+     * measuring — standby / bad config / wiring — and the heading will be frozen.
+     * This is the earliest wiring-vs-firmware signal; the fusion task's periodic
+     * "mag raw=" line then confirms it live. Boot is single-threaded here, so no
+     * bus mutex is needed. */
+    if (s_mag_ok) {
+        int16_t x0 = 0, y0 = 0, z0 = 0, x1 = 0, y1 = 0, z1 = 0;
+        imu_read_mag(&x0, &y0, &z0);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        imu_read_mag(&x1, &y1, &z1);
+        if (x0 == x1 && y0 == y1 && z0 == z1) {
+            ESP_LOGW(TAG, "QMC5883L raw NOT changing at boot (%d,%d,%d) — chip not measuring "
+                          "(standby/wiring), heading WILL be frozen; check the wire, not the code", x0, y0, z0);
+        } else {
+            ESP_LOGI(TAG, "QMC5883L live: raw moving (%d,%d,%d)->(%d,%d,%d) — sensor+wiring good",
+                     x0, y0, z0, x1, y1, z1);
+        }
+    }
 
     // ICM20948 Init
     i2c_device_config_t icm_cfg = {
@@ -81,7 +138,10 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         .device_address = ICM20948_ADDR,
         .scl_speed_hz = 100000   /* see QMC comment — robustness over long wires */
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
+    if (i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm) != ESP_OK) {
+        ESP_LOGE(TAG, "ICM20948 bus-add failed — accel/gyro disabled, boot continues");
+        h_icm = NULL;
+    }
 
     /* WHO_AM_I check (bank 0, reg 0x00) — ICM20948 answers 0xEA.
      * The AD0 strap selects the address: high/floating = 0x69, GND = 0x68.
@@ -94,9 +154,12 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         icm_probe = i2c_read_bytes(h_icm, 0x00, &whoami, 1);
     }
     if (icm_probe != ESP_OK) {
-        i2c_master_bus_rm_device(h_icm);
+        if (h_icm) { i2c_master_bus_rm_device(h_icm); h_icm = NULL; }
         icm_cfg.device_address = ICM20948_ADDR_ALT;
-        ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm));
+        if (i2c_master_bus_add_device(bus_handle, &icm_cfg, &h_icm) != ESP_OK) {
+            ESP_LOGE(TAG, "ICM20948 bus-add (alt addr) failed — accel/gyro disabled, boot continues");
+            h_icm = NULL;
+        }
         for (int attempt = 0; attempt < 3 && icm_probe != ESP_OK; attempt++) {
             if (attempt) vTaskDelay(pdMS_TO_TICKS(20));
             i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
@@ -126,6 +189,24 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
     i2c_write_byte(h_icm, GYRO_CONFIG_1, 0x01); // 250 dps, DLPF on (bank-2 reg 0x01)
     i2c_write_byte(h_icm, REG_BANK_SEL, 0x00); // Switch back to Bank 0
 
+    /* Boot-time liveness verdict for accel/gyro (mirror of the mag check): an
+     * awake ICM reports live accel (~1g gravity, always dithering); an ICM that
+     * never woke returns frozen zeros. Two reads ~60ms apart settle it — the same
+     * wiring-vs-firmware signal for the other chip. Read-only; no config change. */
+    if (s_icm_ok) {
+        int16_t ax0=0, ay0=0, az0=0, ax1=0, ay1=0, az1=0, g=0;
+        imu_read_accel_gyro(&ax0, &ay0, &az0, &g, &g, &g);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        imu_read_accel_gyro(&ax1, &ay1, &az1, &g, &g, &g);
+        if (ax0 == ax1 && ay0 == ay1 && az0 == az1) {
+            ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) — chip asleep/not measuring "
+                          "(wiring), pitch/roll WILL be frozen", ax0, ay0, az0);
+        } else {
+            ESP_LOGI(TAG, "ICM20948 live: accel moving (%d,%d,%d)->(%d,%d,%d) — sensor+wiring good",
+                     ax0, ay0, az0, ax1, ay1, az1);
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -133,11 +214,22 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
  * the chip was unreachable during imu_init (flaky wiring seen on hardware):
  * unconfigured it sits in standby and returns stale zeros despite ACKing. */
 esp_err_t imu_reinit_mag(void) {
-    esp_err_t e0 = i2c_write_byte(h_qmc, 0x0A, 0x80);
+    if (!h_qmc) return ESP_ERR_INVALID_STATE;
+    i2c_write_byte(h_qmc, 0x0A, 0x80);              /* soft reset -> regs default (standby) */
     vTaskDelay(pdMS_TO_TICKS(10));
-    esp_err_t e1 = i2c_write_byte(h_qmc, 0x09, 0x05); // ±2G, 50Hz, OSR=512, continuous
-    esp_err_t e2 = i2c_write_byte(h_qmc, 0x0B, 0x01);
-    return (e0 == ESP_OK && e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : ESP_FAIL;
+    /* Datasheet order: SET/RESET period (0x0B=0x01) before the mode register.
+     * Then VERIFY 0x09 reads back — a silently-dropped 0x09 write is exactly the
+     * standby / frozen-heading fault. Retry a few times over a marginal bus. */
+    for (int attempt = 0; attempt < 4; attempt++) {
+        i2c_write_byte(h_qmc, 0x0B, 0x01);          /* SET/RESET period */
+        i2c_write_byte(h_qmc, 0x09, 0x05);          /* continuous, 50Hz, ±2G, OSR512 */
+        uint8_t rb = 0;
+        if (i2c_read_bytes(h_qmc, 0x09, &rb, 1) == ESP_OK && rb == 0x05) {
+            return ESP_OK;                          /* config confirmed live */
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return ESP_FAIL;                                /* config never stuck — wiring/chip, not code */
 }
 
 /* Re-apply the ICM20948 config (wake + gyro range). Unconfigured, the chip
@@ -278,6 +370,25 @@ esp_err_t imu_read_accel_gyro(int16_t* ax, int16_t* ay, int16_t* az, int16_t* gx
     }
 
     return (e_acc != ESP_OK) ? e_acc : e_gyr;   /* first failure wins */
+}
+
+/* Re-arm QMC continuous measurement WITHOUT a disruptive soft reset. Used when
+ * the chip ACKs but has fallen into standby (frozen data) — e.g. its boot config
+ * write was lost on a marginal bus. Writes are no-ops if already configured. */
+esp_err_t imu_mag_ensure_continuous(void) {
+    if (!h_qmc) return ESP_ERR_INVALID_STATE;
+    i2c_write_byte(h_qmc, 0x0B, 0x01);                  /* SET/RESET period */
+    i2c_write_byte(h_qmc, 0x09, 0x05);                  /* continuous, 50Hz, ±2G, OSR512 */
+    uint8_t rb = 0;                                     /* confirm the mode reg actually took */
+    esp_err_t e = i2c_read_bytes(h_qmc, 0x09, &rb, 1);
+    return (e == ESP_OK && rb == 0x05) ? ESP_OK : ESP_FAIL;
+}
+
+/* Read back the QMC control register 0x09 (0x05 = continuous, 0x00 = standby)
+ * for the fusion task's wiring-vs-firmware diagnostic. Call under g_i2c_mutex. */
+esp_err_t imu_mag_read_ctrl(uint8_t *ctrl09) {
+    if (!h_qmc || !ctrl09) return ESP_ERR_INVALID_STATE;
+    return i2c_read_bytes(h_qmc, 0x09, ctrl09, 1);
 }
 
 esp_err_t imu_read_mag(int16_t* mx, int16_t* my, int16_t* mz) {
