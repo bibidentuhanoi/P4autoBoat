@@ -85,3 +85,14 @@ typedef void (*servo_power_handler_fn)(bool on);
  * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_servo_power_handler(servo_power_handler_fn handler);
+
+/**
+ * @brief Raw steer calibration command handler callback type.
+ */
+typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *cmd);
+
+/**
+ * @brief Register a handler for incoming SteerRawCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
+ */
+void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);

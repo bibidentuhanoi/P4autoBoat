@@ -70,6 +70,13 @@ message SteerCommand {
   float right = 2;  // right rudder : -1 = full left, +1 = full right, 0 = center
 }
 
+// Calibration-only: bypasses STEER_PULSE_MIN/NEUTRAL/MAX entirely, writes the
+// MCPWM compare value directly so the operator can probe past the currently
+// configured range to find a servo's true mechanical stop.
+message SteerRawCommand {
+  uint32 pulse_us = 1;
+}
+
 message MotorStatus {
   uint32 state          = 1;  // motor state enum
   float  left_throttle  = 2;  // current left throttle
@@ -99,6 +106,14 @@ message SystemStatus {
   bool   tof_b_ok     = 6;  // ToF sensor B detected at boot
   bool   imu_ok       = 7;  // ICM20948 responding (live, self-heal aware)
   bool   mag_ok       = 8;  // QMC5883L responding (live, self-heal aware)
+  bool   gps_ok       = 9;  // GPS module responding to UART (live, freshness-based;
+                             // independent of having a satellite fix)
+  uint32 gps_detected_baud = 16;  // boot-time auto-scan hit, or fallback if no hit
+  bool   gps_baud_confirmed = 17;  // true = actual scan hit, false = unverified fallback
+  // Fields 10-15,18 (config-ack/raw-byte-preview debug telemetry) retired
+  // 2026-08-05 once GPS was confirmed working — that debugging apparatus
+  // did its job; see the serial log (gps_driver.c ESP_LOGI calls, unchanged)
+  // for the same info if this ever needs re-diagnosing.
 }
 
 // Envelope — every message on the wire is a BoatMessage
@@ -114,5 +129,6 @@ message BoatMessage {
     WinchCommand   winch        = 8;
     SteerCommand   steer        = 9;
     ServoPowerCommand servo_power = 10;
+    SteerRawCommand steer_raw   = 11;
   }
 }

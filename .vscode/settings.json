@@ -4,7 +4,7 @@
     "board/esp32p4-builtin.cfg"
   ],
   "idf.port": "/dev/ttyACM0",
-  "idf.currentSetup": "/home/barryallen/esp/v5.4.3/esp-idf",
+  "idf.currentSetup": "/opt/esp/idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32p4"
   },

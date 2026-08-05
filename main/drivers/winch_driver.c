@@ -34,7 +34,11 @@ static float                s_speed  = 0.0f;
 static bool                 s_power  = false;
 static bool                 s_inited = false;
 
-/* Map speed [-1,1] -> pulse us. 0 -> neutral, +1 -> max (CW/down), -1 -> min (CCW/up). */
+/* Map speed [-1,1] -> pulse us. 0 -> neutral (stop), +1 -> max (CW/down), -1 -> min (CCW/up).
+ * Dead-band compensated: a continuous-rotation servo ignores pulses within ~db us of
+ * neutral (the winch sat dead until ~9% slider). So exactly 0 = neutral, but ANY non-zero
+ * command jumps straight past the dead-band — the winch responds at the very bottom of the
+ * slider and the whole |speed| 0..1 maps to real motion instead of wasting the first ~9%. */
 static uint32_t speed_to_us(float s)
 {
     if (s < -1.0f) s = -1.0f;
@@ -42,10 +46,15 @@ static uint32_t speed_to_us(float s)
     uint32_t neutral = CONFIG_WINCH_PULSE_NEUTRAL_US;
     uint32_t min_us  = CONFIG_WINCH_PULSE_MIN_US;
     uint32_t max_us  = CONFIG_WINCH_PULSE_MAX_US;
-    if (s >= 0.0f) {
-        return (uint32_t)(neutral + s * (float)(max_us - neutral) + 0.5f);
+    uint32_t db      = CONFIG_WINCH_DEADBAND_US;
+
+    if (s > 0.0f) {
+        return (uint32_t)(neutral + db + s * (float)(max_us - neutral - db) + 0.5f);
     }
-    return (uint32_t)(neutral + s * (float)(neutral - min_us) + 0.5f);
+    if (s < 0.0f) {
+        return (uint32_t)(neutral - db + s * (float)(neutral - db - min_us) + 0.5f);
+    }
+    return neutral;
 }
 
 static void servo_power_write(bool on)
@@ -142,8 +151,11 @@ esp_err_t winch_driver_set_speed(float speed)
     if (!s_inited) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_speed = (speed < -1.0f) ? -1.0f : (speed > 1.0f ? 1.0f : speed);
-    esp_err_t ret = mcpwm_comparator_set_compare_value(s_cmp, speed_to_us(s_speed));
+    uint32_t us = speed_to_us(s_speed);
+    esp_err_t ret = mcpwm_comparator_set_compare_value(s_cmp, us);
     xSemaphoreGive(s_mutex);
+    ESP_LOGI(TAG, "set_speed: speed=%.2f -> %uus, rail=%s, mcpwm_ret=%s",   /* DIAG */
+             s_speed, (unsigned)us, s_power ? "ON" : "OFF", esp_err_to_name(ret));
     return ret;
 }
 

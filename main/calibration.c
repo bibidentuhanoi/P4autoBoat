@@ -65,6 +65,29 @@ static float compute_variance(float* arr, int n) {
     return var / n;
 }
 
+/* Solve the 4x4 linear system A x = b in place (Gaussian elimination + partial
+ * pivot). Returns false if singular. Used by the magnetometer sphere fit. */
+static bool solve4(double A[4][4], double b[4], double x[4]) {
+    for (int col = 0; col < 4; col++) {
+        int piv = col;
+        for (int r = col + 1; r < 4; r++)
+            if (fabs(A[r][col]) > fabs(A[piv][col])) piv = r;
+        if (fabs(A[piv][col]) < 1e-9) return false;
+        if (piv != col) {
+            for (int c = 0; c < 4; c++) { double t = A[col][c]; A[col][c] = A[piv][c]; A[piv][c] = t; }
+            double t = b[col]; b[col] = b[piv]; b[piv] = t;
+        }
+        for (int r = 0; r < 4; r++) {
+            if (r == col) continue;
+            double f = A[r][col] / A[col][col];
+            for (int c = col; c < 4; c++) A[r][c] -= f * A[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    for (int i = 0; i < 4; i++) x[i] = b[i] / A[i][i];
+    return true;
+}
+
 static void countdown(int seconds) {
     for (int i = seconds; i > 0; i--) {
         ESP_LOGI(TAG, "%d...", i);
@@ -253,6 +276,12 @@ static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
     int16_t m_min[3] = { 30000,  30000,  30000};
     int16_t m_max[3] = {-30000, -30000, -30000};
 
+    /* Least-squares sphere-fit accumulators. Doubles: samples ~1e4, summed over
+     * thousands of points => ~1e11, well within double precision. */
+    double Sx=0, Sy=0, Sz=0, Sxx=0, Syy=0, Szz=0, Sxy=0, Sxz=0, Syz=0;
+    double Sxw=0, Syw=0, Szw=0, Sw=0;
+    long   Nfit=0;
+
     int64_t start_time       = esp_timer_get_time();
     int64_t last_update_time = start_time;
     int64_t last_print_time  = start_time;
@@ -284,6 +313,11 @@ static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
         bool updated = false;
         if (imu_read_mag(&mx, &my, &mz) == ESP_OK) {
             total_samples++;
+            /* Feed the sphere fit (uses every sample, not just the extremes). */
+            double x=mx, y=my, z=mz, w=x*x + y*y + z*z;
+            Sx+=x; Sy+=y; Sz+=z;
+            Sxx+=x*x; Syy+=y*y; Szz+=z*z; Sxy+=x*y; Sxz+=x*z; Syz+=y*z;
+            Sxw+=x*w; Syw+=y*w; Szw+=z*w; Sw+=w; Nfit++;
             if (mx < m_min[0]) { m_min[0] = mx; updated = true; }
             if (mx > m_max[0]) { m_max[0] = mx; updated = true; }
             if (my < m_min[1]) { m_min[1] = my; updated = true; }
@@ -330,39 +364,51 @@ static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    // --- Compute bias and scale ---
-    out->m_bias[0] = (m_max[0] + m_min[0]) / 2.0f;
-    out->m_bias[1] = (m_max[1] + m_min[1]) / 2.0f;
-    out->m_bias[2] = (m_max[2] + m_min[2]) / 2.0f;
+    // --- Robust centre (bias) via least-squares SPHERE FIT over ALL samples ---
+    // Min/max trusts only the 6 extreme points, so one noisy sweep => wrong centre
+    // (the "heading sticks then jumps" saga). A sphere fit uses every sample and is
+    // stable even with poor Z-tilt coverage (validated: cx,cy within ~1 LSB). The
+    // field on this boat is a clean sphere (no soft-iron), so the model is centre +
+    // unit scale; per-axis m_scale stays 1.0. Min/max is kept as a fallback only.
+    quality->mag_chord[0] = (float)(m_max[0] - m_min[0]);
+    quality->mag_chord[1] = (float)(m_max[1] - m_min[1]);
+    quality->mag_chord[2] = (float)(m_max[2] - m_min[2]);
 
-    float chord_x = (float)(m_max[0] - m_min[0]) / 2.0f;
-    float chord_y = (float)(m_max[1] - m_min[1]) / 2.0f;
-    float chord_z = (float)(m_max[2] - m_min[2]) / 2.0f;
-
-    quality->mag_chord[0] = chord_x * 2.0f;
-    quality->mag_chord[1] = chord_y * 2.0f;
-    quality->mag_chord[2] = chord_z * 2.0f;
-
-    if (chord_x < 1.0f) { chord_x = 1.0f; }
-    if (chord_y < 1.0f) { chord_y = 1.0f; }
-    if (chord_z < 1.0f) { chord_z = 1.0f; }
-
-    float avg_chord = (chord_x + chord_y + chord_z) / 3.0f;
-
-    out->m_scale[0] = avg_chord / chord_x;
-    out->m_scale[1] = avg_chord / chord_y;
-    out->m_scale[2] = avg_chord / chord_z;
+    bool sphere_ok = false;
+    if (Nfit >= 20) {
+        double A[4][4] = { {Sxx,Sxy,Sxz,Sx}, {Sxy,Syy,Syz,Sy},
+                           {Sxz,Syz,Szz,Sz}, {Sx ,Sy ,Sz ,(double)Nfit} };
+        double b[4] = { Sxw, Syw, Szw, Sw };
+        double s[4];
+        if (solve4(A, b, s)) {
+            float cx = (float)(s[0] * 0.5), cy = (float)(s[1] * 0.5), cz = (float)(s[2] * 0.5);
+            double r2 = s[3] + (double)cx*cx + (double)cy*cy + (double)cz*cz;
+            /* Sane only if the centre sits inside the sampled cloud and R>0. */
+            if (r2 > 1.0 &&
+                cx > m_min[0] - 1 && cx < m_max[0] + 1 &&
+                cy > m_min[1] - 1 && cy < m_max[1] + 1) {
+                out->m_bias[0] = cx; out->m_bias[1] = cy; out->m_bias[2] = cz;
+                out->m_scale[0] = out->m_scale[1] = out->m_scale[2] = 1.0f;
+                sphere_ok = true;
+                ESP_LOGI(TAG, ">> Sphere fit OK: centre=(%.0f,%.0f,%.0f) R=%.0f  (%ld pts)",
+                         cx, cy, cz, sqrt(r2), Nfit);
+            }
+        }
+    }
+    if (!sphere_ok) {
+        ESP_LOGW(TAG, ">> Sphere fit rejected (thin/degenerate data) — using min/max centre");
+        out->m_bias[0] = (m_max[0] + m_min[0]) / 2.0f;
+        out->m_bias[1] = (m_max[1] + m_min[1]) / 2.0f;
+        out->m_bias[2] = (m_max[2] + m_min[2]) / 2.0f;
+        out->m_scale[0] = out->m_scale[1] = out->m_scale[2] = 1.0f;
+    }
 
     bool coverage_ok = (quality->mag_chord[0] >= MAG_MIN_AXIS_RANGE_LSB) &&
                        (quality->mag_chord[1] >= MAG_MIN_AXIS_RANGE_LSB) &&
                        (quality->mag_chord[2] >= MAG_MIN_AXIS_RANGE_LSB);
 
-    bool scale_ok = (out->m_scale[0] >= MAG_SCALE_SANITY_MIN && out->m_scale[0] <= MAG_SCALE_SANITY_MAX) &&
-                    (out->m_scale[1] >= MAG_SCALE_SANITY_MIN && out->m_scale[1] <= MAG_SCALE_SANITY_MAX) &&
-                    (out->m_scale[2] >= MAG_SCALE_SANITY_MIN && out->m_scale[2] <= MAG_SCALE_SANITY_MAX);
-
     quality->mag_coverage_ok = coverage_ok;
-    quality->mag_scale_ok    = scale_ok;
+    quality->mag_scale_ok    = sphere_ok;   /* robust fit succeeded (vs min/max fallback) */
 
     ESP_LOGI(TAG, ">> Mag Bias:    X=%.1f  Y=%.1f  Z=%.1f",
              out->m_bias[0], out->m_bias[1], out->m_bias[2]);

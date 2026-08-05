@@ -173,6 +173,8 @@ void task_sensor_snapshot(void *pvParameters)
             sys.tof_b_ok  = devs->b_ok;
             sys.imu_ok    = imu_icm_ok();
             sys.mag_ok    = imu_mag_ok();
+            sys.gps_ok    = gps_driver_is_alive();
+            sys.gps_detected_baud = gps_driver_get_detected_baud(&sys.gps_baud_confirmed);
 
             pipeline_publish_status(&sys);
         }

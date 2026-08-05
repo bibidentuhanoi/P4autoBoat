@@ -56,6 +56,22 @@ menu "Board Configuration"
         string "Fusion Complementary Alpha"
         default "0.96"
 
+    config FUSION_YAW_ALPHA
+        string "Yaw gyro/mag complementary weight (0-1, higher = trust gyro more)"
+        default "0.98"
+        help
+            Weight of the gyro in the heading complementary filter. The gyro
+            provides the smooth, tilt-immune short-term heading; the magnetometer
+            corrects the slow gyro drift with weight (1 - this). 0.98 at 50 Hz
+            gives a ~1 s mag-correction time constant.
+
+    config HEADING_DECLINATION_DEG
+        string "Magnetic declination (deg, +E / -W) for true north"
+        default "0.0"
+        help
+            Added to the magnetic heading to report TRUE north. Hanoi is ~0 deg,
+            so the default 0.0 is fine. Look up your local declination if needed.
+
     config CALIB_GYRO_SAMPLES
         int "Gyro Calibration Samples"
         default 500
@@ -147,6 +163,58 @@ menu "Board Configuration"
 
     endmenu
 
+    menu "Manual Heading Assist"
+
+        config HEADING_ASSIST_DRY_RUN
+            int "Heading assist dry-run mode (1=log only, 0=off)"
+            default 1
+            range 0 1
+            help
+                Bench-safe heading-hold experiment mode. When enabled, firmware
+                computes target heading, heading error, yaw-rate damping,
+                adaptive rudder trim, rudder assist, and small differential
+                thrust, then logs CTRL_DRY lines. It does NOT apply those
+                corrections to the rudder or ESCs.
+
+        config HEADING_ASSIST_BAND_DEG
+            string "Heading assist deadband around target (deg)"
+            default "4.0"
+            help
+                Half-width of the quiet heading window. A value of 4.0 means a
+                target heading of 245 accepts 241..249 before proportional
+                correction starts. Yaw damping can still act inside the band.
+
+        config HEADING_ASSIST_CAPTURE_DELAY_MS
+            int "Heading assist target capture delay after centered rudder (ms)"
+            default 500
+            range 100 3000
+            help
+                After the pilot releases the rudder to center, wait this long
+                before capturing the current fused heading as the target.
+
+        config HEADING_ASSIST_RUDDER_DEADBAND
+            string "Manual rudder center deadband for heading capture"
+            default "0.08"
+            help
+                Absolute normalized rudder input below this value counts as
+                centered. Above it, pilot override disables heading hold.
+
+        config HEADING_ASSIST_MAX_RUDDER
+            string "Maximum computed rudder assist"
+            default "0.25"
+            help
+                Hard cap for dry-run rudder correction in normalized rudder
+                units. This is only logged while dry-run mode is enabled.
+
+        config HEADING_ASSIST_MAX_DIFF
+            string "Maximum computed differential thrust assist"
+            default "0.06"
+            help
+                Hard cap for dry-run differential thrust in normalized ESC
+                units. This is only logged while dry-run mode is enabled.
+
+    endmenu
+
     menu "Winch / Servo Configuration"
 
         config WINCH_PWM_PIN
@@ -176,6 +244,18 @@ menu "Board Configuration"
             default 2000
             range 1500 2500
 
+        config WINCH_DEADBAND_US
+            int "Winch dead-band (us) — servo neutral zone to skip past"
+            default 45
+            range 0 300
+            help
+                Continuous-rotation servos ignore pulses within this many us of
+                neutral (the winch didn't move until ~9% slider = ~45us). Any
+                non-zero speed command jumps straight past this, so the winch
+                responds at the very bottom of the slider. Trim so the smallest
+                slider motion just barely starts the servo (raise if the bottom
+                of the slider still does nothing; lower if it creeps at zero).
+
         config SERVO_ENABLE_PIN
             int "Servo Power Enable Pin"
             default 36
@@ -200,13 +280,18 @@ menu "Board Configuration"
                 Enable if the LED lights when the pin is driven LOW (cathode to
                 the pin, anode to 3V3).
 
-        config STEER_LEFT_PIN
-            int "Left Steering Servo PWM Pin (rudder)"
+        config STEER_PIN
+            int "Rudder Servo PWM Pin (both rudders share this one signal)"
             default 32
-
-        config STEER_RIGHT_PIN
-            int "Right Steering Servo PWM Pin (rudder)"
-            default 34
+            help
+                Single unified rudder output. A boat has ONE steering axis, so
+                both rudder servos take this same signal and always deflect
+                together — independent (split) rudders cost complexity with no
+                steering benefit, and a planner only ever wants one steering
+                value. Wire both servo signal leads to this pin (each keeps its
+                own + and GND). Both rudder servos are wired to GPIO32 on this
+                board (moved off GPIO34 — 2026-08-04, confirmed via live PWM
+                math checking out on 34 while nothing physically moved).
 
         config STEER_PWM_FREQ_HZ
             int "Steering PWM Frequency (Hz)"
@@ -214,30 +299,46 @@ menu "Board Configuration"
 
         config STEER_PULSE_MIN_US
             int "Steering Pulse Min (us) — full left"
-            default 1000
+            default 1195
             range 500 1500
+            help
+                Full-left mechanical stop, found 2026-08-04 by direct probe via
+                the dashboard's raw-pulse calibration box (bypasses this value
+                entirely, so a wrong number here can't hide the true stop) —
+                walked down from 1000 until the servo hit its real limit. The
+                old 1000 default predates the GPIO34->32 rewiring and was never
+                actually verified against this wiring. Slider -100 maps here.
 
         config STEER_PULSE_NEUTRAL_US
             int "Steering Pulse Neutral (us) — centered"
-            default 1500
-            range 1000 2000
+            default 1516
+            range 1195 1805
+            help
+                Calibrated: the rudder points dead-ahead at 1516us on this hull,
+                found the same way as STEER_PULSE_MIN_US 2026-08-04. Close to but
+                not exactly the arithmetic midpoint of MIN/MAX (1500) — hobby
+                servos aren't perfectly symmetric between their end-stops, and/or
+                the horn isn't mounted at true mid-travel. Slider 0 maps here —
+                nudge a few us if straight-ahead drifts.
 
         config STEER_PULSE_MAX_US
             int "Steering Pulse Max (us) — full right"
-            default 2000
+            default 1805
             range 1500 2500
+            help
+                Calibrated hard limit: at 1805us the servo reaches its mechanical
+                rotation stop (it physically hits something). Do NOT raise past
+                this — anything higher just stalls the servo against the stop.
+                Slider +100 maps here.
 
-        config STEER_LEFT_REVERSE
-            bool "Reverse Left Steering Servo"
+        config STEER_REVERSE
+            bool "Reverse Rudder Direction"
             default n
             help
-                Flip if the left rudder servo is mounted mirrored (deflects the wrong way).
-
-        config STEER_RIGHT_REVERSE
-            bool "Reverse Right Steering Servo"
-            default n
-            help
-                Flip if the right rudder servo is mounted mirrored (deflects the wrong way).
+                Flip if the rudders deflect the wrong way for a given command.
+                Both servos share one signal, so they must be mounted to deflect
+                the same way — if only ONE is backwards, mirror it mechanically
+                (flip its horn/linkage); this flag inverts both together.
 
     endmenu
 
@@ -250,11 +351,18 @@ menu "Board Configuration"
 
         config GPS_RX_PIN
             int "GPS UART RX Pin (MCU receive, = GPS TX)"
-            default 37
+            default 38
+            help
+                Swapped from 37 2026-08-05: traced uart_set_pin(uart, tx_pin,
+                rx_pin, ...) against the real ESP-IDF signature (tx_io_num is
+                the 2nd param, rx_io_num the 3rd) and confirmed the old 37/38
+                assignment had MCU RX and TX backwards relative to the actual
+                wiring (GPS module's RX wire lands on GPIO37 on this board, so
+                GPIO37 must be the MCU's TX, not its RX).
 
         config GPS_TX_PIN
             int "GPS UART TX Pin (MCU transmit, = GPS RX)"
-            default 38
+            default 37
 
         config GPS_BAUD
             int "GPS UART Power-on Baud Rate"

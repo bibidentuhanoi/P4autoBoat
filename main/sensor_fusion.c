@@ -16,6 +16,25 @@ static const char *FUSION_TAG = "FUSION";
 #define MAG_LPF_ALPHA       0.2f
 #define ACCEL_EPSILON       0.0001f // Prevents Div-by-Zero at 0G
 
+/* ---- DIAGNOSTIC: magnetometer locus capture -----------------------------
+ * Set to 1 to stream the RAW magnetometer + computed heading as compact CSV
+ * ("MLOC,idx,mx,my,mz,hdg") at ~10Hz. Rotate the boat LEVEL through a full
+ * turn and paste the MLOC block; fitting the (mx,my) locus offline shows
+ * whether the field traces a clean CENTRED CIRCLE (calibration good, sticking
+ * is elsewhere) or an OFF-CENTRE / ROTATED ELLIPSE (per-axis scale can't fix
+ * it → ellipsoid fit needed). Set back to 0 for normal operation. */
+#define MAG_LOCUS_CAPTURE   0
+
+/* ---- Gyro + mag complementary YAW fusion --------------------------------
+ * Heading was pure instantaneous magnetometer — jittery, and on water the
+ * tilt-comp turns wave rock into heading swings. Fuse the gyro Z rate (smooth,
+ * tilt-immune, short-term) with the mag bearing (absolute, anchors north over
+ * ~seconds), same idea as the pitch/roll complementary filter. Gyro carries the
+ * heading through mag disturbances (motors/tilt); mag kills gyro drift. */
+#define YAW_GYRO_SIGN        (+1.0f)   /* flip to -1.0f if heading runs BACKWARDS vs the turn */
+#define YAW_MAG_TILT_LIMIT   45.0f     /* deg: above this, tilt-comp unreliable -> gyro-only */
+#define YAW_MAG_NORM_MIN     800.0f    /* LSB: reject a near-zero horizontal field (bad/disturbed) */
+
 // Globals
 static CalibrationData* calib;
 static SemaphoreHandle_t fusion_mutex;
@@ -26,6 +45,10 @@ static float mag_filt[3] = {0};
 static float pitch = 0.0f;
 static float roll = 0.0f;
 static float alpha;
+static float yaw_alpha;            /* gyro/mag complementary weight for heading */
+static float declination_deg;      /* magnetic -> true north correction (deg) */
+static float heading_yaw = 0.0f;   /* fused absolute yaw state (deg) */
+static bool  yaw_init = false;     /* snap heading_yaw to mag on first valid fix */
 
 void fusion_init(CalibrationData* calib_data) {
     calib = calib_data;
@@ -36,6 +59,14 @@ void fusion_init(CalibrationData* calib_data) {
     if (alpha <= 0.0f || alpha >= 1.0f) {
         alpha = 0.96f;
     }
+
+    // Yaw complementary weight (higher = trust gyro more short-term) + declination.
+    yaw_alpha = strtof(CONFIG_FUSION_YAW_ALPHA, NULL);
+    if (yaw_alpha <= 0.0f || yaw_alpha >= 1.0f) {
+        yaw_alpha = 0.98f;
+    }
+    declination_deg = strtof(CONFIG_HEADING_DECLINATION_DEG, NULL);
+    yaw_init = false;
 
     // Initialize state with tares
     pitch = calib->pitch_tare;
@@ -60,6 +91,7 @@ void task_imu_fusion(void *pvParameters) {
         while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
         int64_t now = esp_timer_get_time();
         float dt = (float)(now - last_time) / 1000000.0f;
+        if (dt > 0.1f) dt = 0.1f;   /* clamp: after an inference stall, don't let the integrators jump */
         last_time = now;
 
         // --- I2C reads under shared bus mutex ---
@@ -85,7 +117,11 @@ void task_imu_fusion(void *pvParameters) {
         // MAG READ
         bool    mag_diag_now = false;   /* emit a raw/cal/ctrl diagnostic line this tick */
         uint8_t mag_ctrl     = 0xFF;    /* QMC control reg 0x09 read-back (0x05 = continuous) */
-        static float diag_heading = 0.0f;  /* last heading stored — mirrors the UI value for the diag line */
+        static float diag_heading = 0.0f;  /* last FUSED heading — mirrors the UI value for the diag line */
+#if MAG_LOCUS_CAPTURE
+        static float diag_mag_only = 0.0f; /* mag-only bearing (pre-fusion) for the diag comparison */
+        static float diag_gz = 0.0f;       /* gyro Z rate (deg/s) — lets us verify YAW_GYRO_SIGN */
+#endif
         mag_err = imu_read_mag(&raw_mx, &raw_my, &raw_mz);
         mag_ok  = (mag_err == ESP_OK);
         if (mag_ok) {
@@ -125,14 +161,14 @@ void task_imu_fusion(void *pvParameters) {
                 l_mx = raw_mx; l_my = raw_my; l_mz = raw_mz;
             }
 
-            /* Periodic health readout (~every 5s): re-assert continuous as a
+            /* Periodic health readout (~every 30s): re-assert continuous as a
              * belt-and-suspenders and grab the control register. The post-mutex
              * log then prints raw mag + ctrl so the bench test is unambiguous —
              * rotate the boat: raw moving = sensor + wiring good; raw stuck with
              * ctrl09=0x05 = chip stopped measuring; ctrl09!=0x05 = config not
              * landing (wiring/solder). */
             static uint32_t mag_diag = 0;
-            if (++mag_diag >= 250) {
+            if (++mag_diag >= 1500) {
                 mag_diag = 0;
                 imu_mag_ensure_continuous();
                 imu_mag_read_ctrl(&mag_ctrl);
@@ -260,23 +296,54 @@ void task_imu_fusion(void *pvParameters) {
             roll  = alpha * (roll  + gx_rate * dt) + (1.0f - alpha) * acc_roll;
             pitch = alpha * (pitch + gy_rate * dt) + (1.0f - alpha) * acc_pitch;
 
-            // --- COMPASS ---
+            // --- COMPASS: gyro + mag complementary yaw fusion ---
             float p_rad = pitch * DEG_TO_RAD;
             float r_rad = roll * DEG_TO_RAD;
 
+            // Tilt-compensated horizontal mag components (NXP AN4248).
             float Xh = mag_filt[0] * cosf(p_rad) + mag_filt[2] * sinf(p_rad);
             float Yh = mag_filt[0] * sinf(r_rad) * sinf(p_rad) + mag_filt[1] * cosf(r_rad) - mag_filt[2] * sinf(r_rad) * cosf(p_rad);
+            float mag_hdg = atan2f(Yh, Xh) * RAD_TO_DEG;   // absolute magnetic bearing [-180,180]
 
-            float heading = atan2f(Yh, Xh) * RAD_TO_DEG;
+            // Gyro Z yaw-rate (deg/s): smooth, tilt-immune short-term heading.
+            float gz_rate = YAW_GYRO_SIGN * ((float)raw_gz - calib->g_bias[2]) / GYRO_SCALE_250DPS;
+#if MAG_LOCUS_CAPTURE
+            diag_gz = gz_rate;
+#endif
 
-            heading -= calib->heading_tare;
-
-            if (heading < 0.0f) {
-                heading += 360.0f;
+            if (!yaw_init) {
+                heading_yaw = mag_hdg;               // snap to mag on first fix (no startup ramp)
+                yaw_init = true;
+            } else {
+                heading_yaw += gz_rate * dt;         // (1) gyro predicts every tick
+                if (mag_ok) {
+                    float err = mag_hdg - heading_yaw;   // wrap-safe innovation
+                    while (err >  180.0f) err -= 360.0f;
+                    while (err < -180.0f) err += 360.0f;
+                    // (2) mag corrects slowly — gated so a tilted/disturbed mag can't yank it.
+                    float mag_norm = sqrtf(Xh * Xh + Yh * Yh);
+                    if (mag_norm > YAW_MAG_NORM_MIN &&
+                        fabsf(pitch) < YAW_MAG_TILT_LIMIT &&
+                        fabsf(roll)  < YAW_MAG_TILT_LIMIT) {
+                        heading_yaw += (1.0f - yaw_alpha) * err;
+                    }
+                }
             }
-            if (heading >= 360.0f) {
-                heading -= 360.0f;
-            }
+            while (heading_yaw >= 360.0f) heading_yaw -= 360.0f;
+            while (heading_yaw <    0.0f) heading_yaw += 360.0f;
+
+            // Zero reference (point-zero / mounting offset) + declination -> true bow heading.
+            float heading = heading_yaw - calib->heading_tare + declination_deg;
+            while (heading >= 360.0f) heading -= 360.0f;
+            while (heading <    0.0f) heading += 360.0f;
+
+            // Mag-only bearing (diagnostic: compare fused-vs-raw-mag to verify the fusion + gyro sign).
+            float mag_only = mag_hdg - calib->heading_tare + declination_deg;
+            while (mag_only >= 360.0f) mag_only -= 360.0f;
+            while (mag_only <    0.0f) mag_only += 360.0f;
+#if MAG_LOCUS_CAPTURE
+            diag_mag_only = mag_only;
+#endif
 
             // --- THREAD SAFE WRITE ---
             if (xSemaphoreTake(fusion_mutex, portMAX_DELAY) == pdTRUE) {
@@ -303,6 +370,19 @@ void task_imu_fusion(void *pvParameters) {
                      mag_filt[0], mag_filt[1], mag_filt[2],
                      diag_heading, mag_ctrl);
         }
+
+#if MAG_LOCUS_CAPTURE
+        /* Dense raw-locus stream for offline circle-vs-ellipse fitting (see the
+         * MAG_LOCUS_CAPTURE note near the top). ~10Hz, only when this tick's mag
+         * read is fresh so mx/my/mz are real. */
+        static uint32_t mloc_ctr = 0, mloc_idx = 0;
+        if (mag_ok && ++mloc_ctr >= 5) {
+            mloc_ctr = 0;
+            ESP_LOGI(FUSION_TAG, "MLOC,%lu,%d,%d,%d,%.1f,%.1f,%.2f",
+                     (unsigned long)mloc_idx++, raw_mx, raw_my, raw_mz,
+                     diag_heading, diag_mag_only, diag_gz);
+        }
+#endif
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }

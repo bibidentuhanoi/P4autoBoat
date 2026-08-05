@@ -36,6 +36,9 @@ PB_BIND(boat_WinchCommand, boat_WinchCommand, AUTO)
 PB_BIND(boat_SteerCommand, boat_SteerCommand, AUTO)
 
 
+PB_BIND(boat_SteerRawCommand, boat_SteerRawCommand, AUTO)
+
+
 PB_BIND(boat_MotorStatus, boat_MotorStatus, AUTO)
 
 

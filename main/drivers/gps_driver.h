@@ -51,6 +51,22 @@ esp_err_t gps_driver_get_fix(gps_fix_t *out);
  */
 bool gps_driver_has_lock(void);
 
+/**
+ * True when the module has sent at least one checksum-valid NMEA sentence or
+ * UBX frame within GPS_STALE_US — i.e. "the module is talking to the UART",
+ * independent of whether any sentence carried a usable position. Distinct
+ * from gps_driver_has_lock(): a module can be alive with zero satellites.
+ */
+bool gps_driver_is_alive(void);
+
+/**
+ * Returns the baud in effect. If confirmed is non-NULL, *confirmed is set
+ * true only when the scan got an actual checksum-valid NMEA hit at that rate
+ * — false means this is just the configured fallback, not a verified fact.
+ * See gps_driver_init() for the scan itself.
+ */
+uint32_t gps_driver_get_detected_baud(bool *confirmed);
+
 #ifdef __cplusplus
 }
 #endif

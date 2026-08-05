@@ -184,7 +184,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing winch servo + servo power...");
     ESP_ERROR_CHECK(winch_driver_init());
 
-    // 8c. Steering rudder servos (GPIO32/34, MCPWM group 1) — center on boot.
+    // 8c. Steering rudder servos (GPIO32, MCPWM group 1) — homes to full-left on boot.
     ESP_LOGI(TAG, "Initializing steering servos...");
     ESP_ERROR_CHECK(steer_driver_init());
 
@@ -251,8 +251,7 @@ void app_main(void) {
     esp_sleep_enable_gpio_switch(false);
     gpio_hold_dis(CONFIG_ESC_PWM_LEFT_PIN);
     gpio_hold_dis(CONFIG_ESC_PWM_RIGHT_PIN);
-    gpio_hold_dis(CONFIG_STEER_LEFT_PIN);
-    gpio_hold_dis(CONFIG_STEER_RIGHT_PIN);
+    gpio_hold_dis(CONFIG_STEER_PIN);
     gpio_hold_dis(CONFIG_WINCH_PWM_PIN);
 
     // 12. Start RTOS Tasks — loud failure: a silent Snap_Task death means no
