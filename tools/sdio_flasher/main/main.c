@@ -27,6 +27,14 @@ extern const uint8_t partition_table_bin_md5[];
 extern const uint8_t app_bin[];
 extern const uint32_t app_bin_size;
 extern const uint8_t app_bin_md5[];
+/* Initial OTA-select data. REQUIRED: the C6 slave uses a TWO_OTA partition
+ * table (otadata / ota_0 / ota_1) with NO factory partition. We flash the app
+ * into ota_0, so if stale otadata still selects ota_1 the bootloader would
+ * silently boot the OLD firmware and the flash would appear to have done
+ * nothing. Writing ota_data_initial.bin pins the boot slot to ota_0. */
+extern const uint8_t ota_data_initial_bin[];
+extern const uint32_t ota_data_initial_bin_size;
+extern const uint8_t ota_data_initial_bin_md5[];
 
 static const char *TAG = "sdio_ram_loader";
 
@@ -98,6 +106,9 @@ void app_main(void)
         flash_binary(&loader, partition_table_bin, partition_table_bin_size, PARTITION_TABLE_ADDRESS);
         ESP_LOGI(TAG, "Loading app...");
         flash_binary(&loader, app_bin, app_bin_size, APPLICATION_ADDRESS);
+        ESP_LOGI(TAG, "Loading otadata (pin boot slot to ota_0)...");
+        flash_binary(&loader, ota_data_initial_bin, ota_data_initial_bin_size,
+                     OTA_DATA_ADDRESS);
         ESP_LOGI(TAG, "Done!");
         esp_loader_reset_target(&loader);
 

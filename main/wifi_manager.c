@@ -16,6 +16,7 @@ static const char *TAG = "WIFI";
 
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_count;
+static volatile bool s_stop_reconnect = false;
 #define MAX_RETRIES 5
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -24,6 +25,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* Field mode owns the radio channel — never reconnect (and never scan)
+         * behind ESP-NOW's back. See wifi_manager_stop_reconnect(). */
+        if (s_stop_reconnect) {
+            return;
+        }
         s_retry_count++;
         /* Fast retries first, then back off to 10s — never give up */
         int delay_ms = (s_retry_count <= MAX_RETRIES) ? 1000 : 10000;
@@ -119,4 +125,18 @@ esp_err_t wifi_init(void)
         ESP_LOGE(TAG, "WiFi connection timed out");
         return ESP_ERR_TIMEOUT;
     }
+}
+
+void wifi_manager_stop_reconnect(void)
+{
+    s_stop_reconnect = true;
+
+    /* Abort any connect/scan already in flight, otherwise it keeps hopping
+     * channels for a few more seconds after we hand the radio to ESP-NOW. */
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "stop_reconnect: disconnect returned %s", esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "WiFi auto-reconnect disabled — radio channel released for ESP-NOW");
 }

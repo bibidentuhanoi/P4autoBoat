@@ -19,6 +19,9 @@
 
 // Standard flash addresses that are the same for all chips
 #define PARTITION_TABLE_ADDRESS  0x8000
+/* otadata offset from the slave's partition table (TWO_OTA layout).
+ * Must match the `otadata` row emitted by the C6 build. */
+#define OTA_DATA_ADDRESS         0xd000
 #define APPLICATION_ADDRESS      0x10000
 
 esp_loader_error_t connect_to_target(esp_loader_t *loader, uint32_t higher_transmission_rate);

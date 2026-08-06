@@ -223,6 +223,10 @@ void app_main(void) {
 #if CONFIG_ESPNOW_ENABLED
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi unavailable — switching to ESP-NOW field mode");
+        /* MUST precede espnow_transport_init(): the reconnect loop scans all
+         * channels looking for the AP, which pulls the radio off the ESP-NOW
+         * channel set by MSG_ESPNOW_INIT and never puts it back. */
+        wifi_manager_stop_reconnect();
         esp_err_t en_ret = espnow_transport_init();
         if (en_ret != ESP_OK) {
             ESP_LOGE(TAG, "ESP-NOW init failed (%s) — no connectivity", esp_err_to_name(en_ret));
