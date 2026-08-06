@@ -195,6 +195,7 @@ _jpeg_seq = 0
 MSG_JPEG_CHUNK    = 0x01
 MSG_SENSOR        = 0x02
 MSG_BRIDGE_STATUS = 0x13   # S3 self-diagnostics, USB only
+_bridge_prev = {}          # last cumulative bridge counters, for rate deltas
 JPEG_MAX_CHUNK = 8162
 
 
@@ -294,15 +295,26 @@ def handle_serial_packet(data):
         # the USB pins, so this is how we tell WHERE a silent link is broken.
         if len(payload) >= 24:
             up, pkts, byts, frames, hello, drops = struct.unpack('<6I', payload[:24])
-            if pkts == 0:
-                verdict = "S3 hears NOTHING off-air -> boat not in field mode / wrong channel / out of range"
-            elif frames == 0:
-                verdict = "S3 hears fragments but completes no frame -> reassembly fault"
+            # The bridge sends cumulative totals; rates are what actually
+            # diagnose the link, so difference successive reports here rather
+            # than making the reader do arithmetic against an unknown epoch.
+            prev = _bridge_prev.get('v')
+            _bridge_prev['v'] = (up, pkts, byts, frames, drops)
+            if prev and up > prev[0]:
+                dt = up - prev[0]
+                d_pkts = (pkts - prev[1]) / dt
+                d_byts = (byts - prev[2]) / dt
+                d_frames = (frames - prev[3]) / dt
+                d_drops = (drops - prev[4]) / dt
+                per_frame = (d_pkts / d_frames) if d_frames else 0.0
+                bytes_frame = (d_byts / d_frames) if d_frames else 0.0
+                print(f"[bridge] {d_frames:5.1f} frames/s  {d_pkts:5.1f} pkts/s  "
+                      f"{per_frame:4.1f} pkts/frame  {bytes_frame:6.0f} B/frame  "
+                      f"{d_byts:6.0f} B/s  drops+{d_drops:.1f}/s",
+                      flush=True)
             else:
-                verdict = "S3 forwarding frames -> link OK"
-            print(f"[bridge] up={up}s espnow_pkts={pkts} bytes={byts} "
-                  f"frames_out={frames} hello_sent={hello} drops={drops}\n"
-                  f"[bridge] {verdict}", flush=True)
+                print(f"[bridge] up={up}s (totals) pkts={pkts} frames={frames} "
+                      f"drops={drops} hello={hello}", flush=True)
 
 
 def serial_reader(port, baud=921600):
