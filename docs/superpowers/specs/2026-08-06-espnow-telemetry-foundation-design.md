@@ -71,6 +71,10 @@ it.
   stream; a dropped snapshot costs 50 ms, not safety.
 - **Simultaneous WiFi + ESP-NOW / runtime switching.** Excluded by the
   boot-time-only decision.
+- **Regenerating the committed nanopb C** (`boat.pb.c` / `.h`). Those files are
+  already correct and are compiled into the *working WiFi/WS path* as well as
+  ESP-NOW. This project does not touch them (see §4); regenerating them is
+  deliberately out of scope to protect the working transport.
 
 ---
 
@@ -99,37 +103,58 @@ Schema representations after this change:
 | 1 | `main/proto/boat.proto` | source of truth | yes |
 | 2 | `main/proto/boat.pb.c` / `.h` | nanopb 0.4.9.1 + `boat.options` | yes |
 | 3 | `main/dashboard.html` `protoSchema` | hand-mirrored protobuf.js | yes |
-| 4 | `proto/boat_pb2.py` (new) | `grpc_tools.protoc` | yes |
+| 4 | `proto/boat_pb2.py` (new) | `grpc_tools.protoc` **in `.venv`** | yes |
 
-### Build: `tools/gen_proto.sh`
+### Toolchain environment (verified 2026-08-06)
 
-A single script that regenerates the machine-generated copies (#2 and #4) from
-the one source (#1):
+Ground truth, checked on this machine (an earlier draft asserted these wrong —
+corrected after design review):
 
-- **nanopb C** (`boat.pb.c` / `.h`): via `nanopb_generator`
-  (`/opt/esp/python_env/idf5.4_py3.12_env/bin/nanopb_generator`, in the ESP-IDF
-  Python env), which auto-consumes `main/proto/boat.options` for field-size caps.
-- **Python** (`proto/boat_pb2.py` + `proto/__init__.py`): via
-  `python3 -m grpc_tools.protoc` from the repo venv (`grpc_tools` present,
-  `protobuf 6.33.6`).
-- The two generators live in **different Python environments** — the script
-  invokes each with its correct interpreter/binary and fails loudly if either is
-  missing.
-- On completion, prints a reminder that `dashboard.html`'s `protoSchema` (#3, the
-  one copy that cannot be auto-generated) must be hand-mirrored if `boat.proto`
-  changed.
+| Interpreter | protobuf | `grpc_tools` | Role |
+|-------------|----------|--------------|------|
+| repo `.venv` | **7.34.1** | **absent** (must be installed) | runs `visualize.py` (has pyserial / PIL / numpy) |
+| ESP-IDF env | 6.33.6 | present | builds firmware; **not** the telemetry runtime |
+| system `python3` | — | absent | irrelevant |
 
-### Behavior & safety
+`nanopb_generator` is 0.4.9.1 in the IDF env, matching the committed C banner,
+with no timestamp line in its output.
 
-- Idempotent: re-running with an unchanged `.proto` must reproduce byte-identical
-  output.
-- The script verifies its output files exist after generation; no half-generated
-  state.
-- **Implementation commits only `proto/boat_pb2.py` + `proto/__init__.py`.**
-  The regenerated `boat.pb.c` / `.h` are expected to be byte-identical to the
-  committed versions (same generator version, same options); the implementation
-  verifies `git diff` is clean on those two files. If they differ, that is a
-  drift signal to investigate, not to auto-commit.
+**The invariant that governs Change 1:** the interpreter that *generates*
+`boat_pb2.py` and the interpreter that *runs* `visualize.py` must share the same
+protobuf **major** version. protobuf 4+ gencode embeds a runtime-version guard;
+generating under 6.x and importing under 7.x can fail to load. The repo `.venv`
+(protobuf 7.34.1) is the runtime, so generation must happen there too — not in
+the IDF env, despite that being where `grpc_tools` currently lives.
+
+### Build: `tools/gen_proto.sh` (Python-only)
+
+The script regenerates **only** the Python binding (#4). It does **not** touch
+the nanopb C (#2): those files are already correct, committed, and compiled into
+the working WiFi path, so regenerating them is an unnecessary risk to a working
+transport (see §2 non-goals).
+
+- **Prereq:** `grpcio-tools` installed into `.venv` and pinned in
+  `requirements.txt`. The script invokes `.venv/bin/python -m grpc_tools.protoc`,
+  so generation and the `visualize.py` runtime are the *same* interpreter —
+  protobuf gencode/runtime compatibility is satisfied by construction, not hope.
+- **Generates:** `proto/boat_pb2.py` + `proto/__init__.py` from
+  `main/proto/boat.proto` (output rooted at repo top so `from proto import
+  boat_pb2` resolves).
+- **Fails loudly** if `grpcio-tools` is missing from `.venv`, printing the exact
+  `pip install` line to fix it; verifies the output file exists before exiting 0;
+  never leaves a half-written binding.
+- **Guards the committed C:** asserts `git diff` is clean on
+  `main/proto/boat.pb.c` / `.h` after running — proving the script did not
+  perturb the shared firmware protobuf layer.
+- **Drift detection, not a reminder:** if `main/proto/boat.proto` is newer
+  (mtime) than `main/dashboard.html`, the script warns loudly that the
+  hand-mirrored `protoSchema` (#3) may be stale — the exact 2026-07 UI-lockout
+  failure mode. A printed reminder alone is the control that already failed once;
+  making staleness *detectable* is the point.
+- **Fallback:** if no `grpcio-tools` compatible with protobuf 7.x is installable,
+  align the other way — pin `.venv` to the protobuf major that an available
+  `grpcio-tools` bundles, keeping generate-env == run-env. Either way the §8
+  import round-trip under `.venv` is the gate that proves compatibility.
 
 ---
 
@@ -146,6 +171,22 @@ the one source (#1):
   populating the three diagnostic repeated fields on **both** ToF grids:
   `sigma`, `target_status`, `nb_target_detected`. It still populates `valid` and
   `distances` (the actual obstacle data), plus `imu`, `gps`, and `detections`.
+
+### Two implementation guards (from design review)
+
+- **Gate the proto-copy, not the sensor read.** The flag must gate where these
+  values are *copied into the snapshot* in `sensor_task.c`, never where they are
+  *read from the ToF driver*. Gating the read would starve any other consumer of
+  the live arrays and would manifest only in field mode — the hardest mode to
+  debug (no dashboard, no WiFi). Confirm during implementation that nothing else
+  consumes the live `sigma` / `target_status` / `nb_target_detected`.
+- **Fail safe toward the full payload.** `g_field_mode` is defined `false` at
+  file scope and set `true` *only* inside the ESP-NOW branch next to
+  `espnow_transport_init()`; it can never become `true` when
+  `CONFIG_ESPNOW_ENABLED` is off. Setting it true on a successful WiFi boot would
+  trim WiFi telemetry and break the dashboard's ToF overlay (which needs full
+  grids), so the flag defaults to the WiFi-safe value and the boot log records
+  the chosen mode once.
 
 ### Why this shrinks the wire with no schema change
 
@@ -189,9 +230,10 @@ of it already runs today.
 
 ## 7. Error Handling
 
-- **`gen_proto.sh`**: exits non-zero with a clear message if `nanopb_generator`
-  or `grpc_tools` is unavailable; verifies each expected output file exists
-  before exiting 0; never leaves a partially-written binding.
+- **`gen_proto.sh`**: exits non-zero with the exact `pip install` fix line if
+  `grpcio-tools` is missing from `.venv`; verifies `proto/boat_pb2.py` exists
+  before exiting 0; asserts it left `boat.pb.c` / `.h` untouched; never leaves a
+  partially-written binding.
 - **`g_field_mode`**: defaults to `false` (full, safe payload). Only set `true`
   on confirmed WiFi failure. Set before the consuming task starts (no race).
 - **`visualize.py`**: retains its existing `try/except` around
@@ -205,14 +247,18 @@ of it already runs today.
 ### Host-only (automatable, but PROXY only — not proof of field function)
 
 1. Run `tools/gen_proto.sh`; assert `proto/boat_pb2.py` and `proto/__init__.py`
-   exist and `import`s cleanly under the repo venv.
+   exist and **`from proto import boat_pb2` imports cleanly under `.venv`**
+   (`.venv/bin/python` — the same interpreter `visualize.py` uses). This import,
+   not mere file generation, is the gate for Change 1: it is what proves
+   gencode/runtime protobuf compatibility.
 2. Round-trip: build a `BoatMessage` with a `SensorSnapshot` in Python, serialize,
-   deserialize, assert field equality.
+   deserialize, assert field equality — under `.venv`.
 3. Trim assertion: decode a trimmed-style message; assert `sigma`,
    `target_status`, `nb_target_detected` are empty while `distances`, `imu`,
    `gps` are populated.
-4. Assert `git diff` is clean on `main/proto/boat.pb.c` and `boat.pb.h` after
-   running the script (drift check).
+4. Assert the script left `main/proto/boat.pb.c` and `boat.pb.h` **untouched**
+   (`git diff` clean) — proving Python-only scoping held and the shared firmware
+   protobuf layer was not perturbed.
 
 ### Hardware acceptance (the ONLY proof that counts)
 
@@ -233,19 +279,26 @@ This gate is the user's to run and sign off.
 
 | File | Change |
 |------|--------|
-| `tools/gen_proto.sh` | **new** — single regeneration entry point |
+| `tools/gen_proto.sh` | **new** — Python-binding regeneration only (does not touch the nanopb C) |
+| `requirements.txt` | pin `grpcio-tools` (dev dep for regeneration, installed into `.venv`) |
 | `proto/boat_pb2.py` | **new (generated, committed)** |
 | `proto/__init__.py` | **new (empty, committed)** — makes `from proto import boat_pb2` work |
 | `include/common.h` | add `extern bool g_field_mode;` |
 | `main/main.c` | define `g_field_mode`; set it in the ESP-NOW branch before tasks start |
-| `main/sensor_task.c` | gate the three ToF diagnostic arrays on `g_field_mode` |
+| `main/sensor_task.c` | gate the three ToF diagnostic arrays on `g_field_mode` (at snapshot-copy, not sensor-read) |
 
 No changes to: the failover logic, `pipeline.c`, `espnow_transport.c`, the C6/S3
-bridges, or `boat.proto` (hence no schema regeneration required by Change 2).
+bridges, `main/proto/boat.pb.c` / `.h`, or `boat.proto` (hence no schema
+regeneration and no perturbation of the protobuf layer the working WiFi path
+depends on).
 
 ---
 
 ## 10. Open Questions
 
-None. Payload-trim scope, failover trigger (boot-time only), and coexistence
-mode (idle standby) are all decided.
+None blocking. Payload-trim scope, failover trigger (boot-time only), and
+coexistence mode (idle standby) are all decided. One implementation detail is
+pinned by test rather than by guesswork: the exact `grpcio-tools` version for
+`.venv` is whatever `pip` resolves against protobuf 7.34.1 — the `import
+boat_pb2` round-trip under `.venv` (§8) is the gate that confirms the resolved
+versions are compatible, regardless of the specific numbers.
