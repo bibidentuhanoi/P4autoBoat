@@ -188,9 +188,9 @@ def cobs_decode(data: bytes) -> bytes:
     return bytes(out)
 
 
-# JPEG reassembly state
-_jpeg_buf = bytearray()
-_jpeg_seq = 0
+# JPEG reassembly state: chunks keyed by index, reset when frame_id changes
+_jpeg_chunks = {}
+_jpeg_frame_id = -1
 
 MSG_JPEG_CHUNK    = 0x01
 MSG_SENSOR        = 0x02
@@ -260,7 +260,7 @@ def parse_sensor_snapshot(data):
 
 def handle_serial_packet(data):
     """Parse espnow_pkt_hdr_t and dispatch by msg_type."""
-    global _jpeg_buf, _jpeg_seq, latest_frame
+    global _jpeg_chunks, _jpeg_frame_id, latest_frame
 
     if len(data) < 4:
         return
@@ -269,20 +269,35 @@ def handle_serial_packet(data):
     payload = data[4:4 + payload_len]
 
     if msg_type == MSG_JPEG_CHUNK:
-        if seq != _jpeg_seq:
-            _jpeg_buf = bytearray()
-            _jpeg_seq = seq
-        _jpeg_buf.extend(payload)
-        # Last chunk indicated by payload shorter than max chunk size
-        if payload_len < JPEG_MAX_CHUNK:
+        # Payload: [frame_id][chunk_idx][n_chunks] + JPEG bytes.
+        # Previously the boat put a per-CHUNK counter in the header seq and this
+        # side reset the buffer whenever seq changed — so every chunk wiped the
+        # previous one and a multi-chunk image could never reassemble. Now the
+        # chunks are self-describing, so out-of-order or missing chunks are
+        # detected instead of silently producing a corrupt image.
+        if len(payload) < 3:
+            return
+        frame_id, chunk_idx, n_chunks = payload[0], payload[1], payload[2]
+        body = payload[3:]
+
+        if frame_id != _jpeg_frame_id:
+            _jpeg_frame_id = frame_id
+            _jpeg_chunks.clear()
+        _jpeg_chunks[chunk_idx] = body
+
+        if len(_jpeg_chunks) == n_chunks:
+            blob = b''.join(_jpeg_chunks[i] for i in range(n_chunks))
+            _jpeg_chunks.clear()
             try:
-                img = Image.open(io.BytesIO(bytes(_jpeg_buf)))
-                arr = np.array(img)
+                arr = np.array(Image.open(io.BytesIO(blob)))
                 with frame_lock:
                     latest_frame = arr
-            except Exception:
-                pass
-            _jpeg_buf = bytearray()
+                print(f"[jpeg] frame {frame_id}: {len(blob)} B, "
+                      f"{n_chunks} chunk(s) -> {arr.shape[1]}x{arr.shape[0]}",
+                      flush=True)
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[jpeg] frame {frame_id}: decode failed "
+                      f"({len(blob)} B): {exc}", flush=True)
 
     elif msg_type == MSG_SENSOR:
         try:

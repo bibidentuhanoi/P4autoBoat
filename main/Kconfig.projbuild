@@ -441,7 +441,7 @@ menu "ESP-NOW Field Mode"
 
     config ESPNOW_JPEG_INTERVAL_MS
         int "Field-mode JPEG interval (ms, 0 = video off)"
-        default 0
+        default 10000
         range 0 60000
         depends on ESPNOW_ENABLED
         help

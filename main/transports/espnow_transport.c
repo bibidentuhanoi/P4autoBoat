@@ -7,6 +7,7 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <pb_encode.h>
 #include <pb_decode.h>
@@ -25,6 +26,15 @@ static const char *TAG = "ESPNOW_TRANSPORT";
 
 /* Maximum JPEG payload that fits in one peer_data frame after the header */
 #define JPEG_CHUNK_MAX  (PEER_DATA_MAX - ESPNOW_HDR_SIZE)
+
+/* Per-chunk sub-header inside a MSG_JPEG_CHUNK payload:
+ *   [0] frame_id   same for every chunk of one image
+ *   [1] chunk_idx  0-based order
+ *   [2] n_chunks   total for this image
+ */
+#define JPEG_SUBHDR_SIZE      3
+/* Gap between chunks so telemetry can interleave (see send_jpeg). */
+#define JPEG_INTER_CHUNK_MS   40
 
 /* Static send buffer shared by espnow_send_fn (sensor path, single-task) */
 static uint8_t s_send_buf[PEER_DATA_MAX];
@@ -133,36 +143,67 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
         return ESP_ERR_INVALID_ARG;
     }
 
-    static uint8_t seq = 0;
+    /* Payload of every MSG_JPEG_CHUNK is:
+     *     [frame_id][chunk_idx][n_chunks] then JPEG bytes
+     *
+     * The old scheme put a rolling counter in espnow_pkt_hdr_t.seq and
+     * incremented it PER CHUNK, while the receiver treated a changed seq as
+     * "new frame — reset buffer". Every chunk therefore wiped the previous one
+     * and a multi-chunk JPEG could never reassemble. frame_id now stays
+     * constant across one image, chunk_idx orders them, and n_chunks lets the
+     * receiver know when it is complete (and detect a missing chunk instead of
+     * decoding garbage). */
+    static uint8_t frame_id = 0;
+    frame_id++;
+
+    const size_t payload_max = JPEG_CHUNK_MAX - JPEG_SUBHDR_SIZE;
+    const size_t n_chunks    = (len + payload_max - 1) / payload_max;
+
+    if (n_chunks > 255) {
+        ESP_LOGW(TAG, "send_jpeg: %u bytes needs %u chunks (max 255)",
+                 (unsigned)len, (unsigned)n_chunks);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    static uint8_t chunk_buf[PEER_DATA_MAX];
     size_t offset = 0;
 
-    while (offset < len) {
+    for (size_t i = 0; i < n_chunks; i++) {
         size_t chunk = len - offset;
-        if (chunk > JPEG_CHUNK_MAX) {
-            chunk = JPEG_CHUNK_MAX;
+        if (chunk > payload_max) {
+            chunk = payload_max;
         }
 
-        espnow_pkt_hdr_t hdr = {
-            .msg_type    = MSG_JPEG_CHUNK,
-            .payload_len = (uint16_t)chunk,
-            .seq         = seq++,
-        };
+        espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)chunk_buf;
+        hdr->msg_type    = MSG_JPEG_CHUNK;
+        hdr->payload_len = (uint16_t)(JPEG_SUBHDR_SIZE + chunk);
+        hdr->seq         = frame_id;      /* same for every chunk of this image */
 
-        /* Use stack-local buf for header + this chunk (fits because chunk ≤ JPEG_CHUNK_MAX) */
-        static uint8_t chunk_buf[PEER_DATA_MAX];
-        memcpy(chunk_buf, &hdr, ESPNOW_HDR_SIZE);
-        memcpy(chunk_buf + ESPNOW_HDR_SIZE, jpg + offset, chunk);
+        uint8_t *sub = chunk_buf + ESPNOW_HDR_SIZE;
+        sub[0] = frame_id;
+        sub[1] = (uint8_t)i;
+        sub[2] = (uint8_t)n_chunks;
+        memcpy(sub + JPEG_SUBHDR_SIZE, jpg + offset, chunk);
 
-        esp_err_t ret = esp_hosted_send_custom_data(PEER_MSG_VIDEO,
-                                                    chunk_buf,
-                                                    ESPNOW_HDR_SIZE + chunk);
+        esp_err_t ret = esp_hosted_send_custom_data(
+            PEER_MSG_VIDEO, chunk_buf,
+            ESPNOW_HDR_SIZE + JPEG_SUBHDR_SIZE + chunk);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "send_jpeg: chunk send failed at offset %u (%s)",
-                     (unsigned)offset, esp_err_to_name(ret));
+            ESP_LOGW(TAG, "send_jpeg: chunk %u/%u failed (%s)",
+                     (unsigned)(i + 1), (unsigned)n_chunks, esp_err_to_name(ret));
             return ret;
         }
 
         offset += chunk;
+
+        /* Breathe between chunks. Each ~8 KB chunk becomes ~34 ESP-NOW
+         * fragments on the co-processor; firing several back-to-back is what
+         * previously buried telemetry in the C6's 8-deep TX queue. Yielding
+         * here lets 20 Hz snapshots interleave instead of queueing behind the
+         * whole image. */
+        if (i + 1 < n_chunks) {
+            vTaskDelay(pdMS_TO_TICKS(JPEG_INTER_CHUNK_MS));
+        }
     }
 
     return ESP_OK;
