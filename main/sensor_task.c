@@ -57,9 +57,22 @@ void task_sensor_snapshot(void *pvParameters)
              1000 / SNAPSHOT_INTERVAL_MS,
              1000 / SNAPSHOT_INTERVAL_MS / TOF_EVERY_N);
 
+    /* Fixed PERIOD, not fixed delay. vTaskDelay() after the work made the loop
+     * run at (work + 50 ms): the ToF ticks take ~25 ms of I2C (two grid reads,
+     * contending with the 50 Hz IMU task for g_i2c_mutex), so the real rate was
+     * ~13 Hz rather than the advertised 20 Hz. That was the whole "missing ToF
+     * frames" mystery — the radio was delivering everything it was given. */
+    TickType_t last_wake = xTaskGetTickCount();
+    uint32_t overruns = 0;
+
     while (true) {
         /* Yield while inference is running — avoid DMA/PSRAM contention */
-        while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+        if (g_inference_active) {
+            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+            /* Re-baseline after the pause, or xTaskDelayUntil would fire with
+             * no delay repeatedly trying to "catch up" the inference stall. */
+            last_wake = xTaskGetTickCount();
+        }
 
         snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
         snap.timestamp_us = (uint64_t)esp_timer_get_time();
@@ -191,6 +204,16 @@ void task_sensor_snapshot(void *pvParameters)
             pipeline_publish_status(&sys);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS));
+        /* Sleep until the NEXT period boundary, so loop time is 50 ms total
+         * rather than 50 ms on top of the work. Returns pdFALSE when the
+         * deadline had already passed, i.e. the work itself overran — surfaced
+         * here so a slow loop is visible instead of silently halving the rate
+         * the way the old vTaskDelay() did. */
+        if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS)) == pdFALSE) {
+            if ((++overruns % 50) == 1) {
+                ESP_LOGW(TAG, "snapshot loop overrun (#%u): work exceeded %d ms",
+                         (unsigned)overruns, SNAPSHOT_INTERVAL_MS);
+            }
+        }
     }
 }
