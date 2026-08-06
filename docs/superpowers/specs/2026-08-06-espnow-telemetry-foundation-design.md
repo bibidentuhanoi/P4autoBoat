@@ -85,6 +85,17 @@ fixed for the entire session.** This eliminates dual-encoding, per-transport
 payload negotiation, and mode-flapping. Every simplification below depends on
 it.
 
+Two consequences follow directly and are worth stating explicitly:
+
+- **WiFi telemetry is never trimmed.** WiFi and ESP-NOW are never registered
+  simultaneously, so the single snapshot built each 50 ms tick is consumed by
+  exactly one transport and `g_field_mode` always matches it. No code path trims
+  the WiFi payload.
+- **Only payload shrinks, never rate.** Both modes publish at 20 Hz; field mode
+  drops three ToF diagnostic arrays per snapshot and nothing else. Trimmed
+  ≈500 B × 20 Hz ≈ 80 kbps sits well inside ESP-NOW's ~214–555 kbps budget
+  (~3 air fragments per snapshot), so 20 Hz is sustainable, not merely nominal.
+
 ---
 
 ## 4. Change 1 — Python binding + anti-drift regeneration script
@@ -302,3 +313,29 @@ pinned by test rather than by guesswork: the exact `grpcio-tools` version for
 `.venv` is whatever `pip` resolves against protobuf 7.34.1 — the `import
 boat_pb2` round-trip under `.venv` (§8) is the gate that confirms the resolved
 versions are compatible, regardless of the specific numbers.
+
+---
+
+## 11. Known Behavior & Limitations (accepted, not fixed here)
+
+The boot-time-only failover model is a deliberate "keep it simple" choice. Its
+consequences are accepted for this project and recorded here so they are not
+later mistaken for defects:
+
+- **~30 s field-boot delay before ESP-NOW starts.** `wifi_init()` blocks up to
+  `WIFI_CONNECT_TIMEOUT_MS = 30000` (`main/wifi_manager.c:15`) searching for an
+  AP before the boot branch falls through to `espnow_transport_init()`. In the
+  field (no AP), telemetry therefore begins ~30 s after power-on. The 30 s is
+  conservative on purpose — shortening it risks a slow dock AP falsely tripping
+  field mode and costing the dashboard/video when WiFi was actually available.
+- **`CONFIG_ESPNOW_WIFI_TIMEOUT_S` is a dead knob.** Defined at
+  `main/Kconfig.projbuild:418` (default 10 s) but consumed nowhere; the real
+  timeout is the hardcoded 30 s above. Left as-is, noted so nobody tunes it
+  expecting an effect.
+- **Mid-mission WiFi loss = go dark, no ESP-NOW rescue.**
+  `espnow_transport_init()` is called only from the boot branch
+  (`main/main.c:226`); nothing re-inits it at runtime. If WiFi is up at boot and
+  drops later, `wifi_manager` retries WiFi forever (fast, then every 10 s) and no
+  telemetry flows until it returns. This is **pre-existing** behavior, unchanged
+  by this project. Runtime WiFi→ESP-NOW failover is explicitly a separate, larger
+  sub-project (see §2 non-goals).
