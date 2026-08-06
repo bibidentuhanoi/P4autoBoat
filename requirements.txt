@@ -2,3 +2,17 @@ numpy
 matplotlib
 requests
 Pillow
+
+# ESP-NOW / field-mode serial path
+#   visualize.py --serial ...  and  tools/usb_selftest_verify.py
+pyserial
+protobuf
+
+# Headless plotting: dev container / SSH with no X or Wayland display, where
+# visualize.py falls back to the WebAgg backend (served over HTTP).
+tornado
+
+# Regenerating proto/boat_pb2.py via tools/gen_proto.sh.
+# Must be installed in the SAME venv that runs visualize.py, so the generated
+# code and the protobuf runtime stay on the same major version.
+grpcio-tools

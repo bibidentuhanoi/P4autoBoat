@@ -1,10 +1,28 @@
+import os
 import sys
 import argparse
 import struct
 import threading
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
+
+# Backend selection.
+#   - An explicit MPLBACKEND wins (previously impossible: the unconditional
+#     matplotlib.use('TkAgg') below overrode it).
+#   - Headless Linux (dev container / SSH with no X or Wayland display) gets
+#     WebAgg, which serves the interactive plot over HTTP — forward the port and
+#     open it in a browser.  Requires tornado:  pip install tornado
+#   - Otherwise TkAgg as before.
+if os.environ.get('MPLBACKEND'):
+    pass                                    # respect the user's choice
+elif sys.platform.startswith('linux') and not (
+        os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+    matplotlib.use('WebAgg')
+    print('[viz] No X/Wayland display detected — using WebAgg. '
+          'Open the printed URL (forward the port if in a container).',
+          flush=True)
+else:
+    matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.gridspec as gridspec
