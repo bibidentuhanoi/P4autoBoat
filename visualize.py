@@ -228,24 +228,55 @@ def handle_serial_packet(data):
 
 
 def serial_reader(port, baud=921600):
-    """Read COBS-framed packets from USB CDC serial, dispatch to handlers."""
+    """Read COBS-framed packets from USB CDC serial, dispatch to handlers.
+
+    Prints a once-per-second RX summary so the link is observable: without it,
+    'connected but receiving nothing' and 'not connected at all' look identical
+    on screen.  Counts are of what actually arrives, nothing synthetic.
+    """
     import serial as pyserial
     ser = pyserial.Serial(port, baud, timeout=0.1)
     buf = bytearray()
 
+    n_bytes = n_frames = n_sensor = n_jpeg = n_other = n_baddecode = 0
+    last_report = time.time()
+
     while True:
         chunk = ser.read(4096)
-        if not chunk:
-            continue
-        buf.extend(chunk)
+        if chunk:
+            n_bytes += len(chunk)
+            buf.extend(chunk)
 
-        while b'\x00' in buf:
-            delim = buf.index(b'\x00')
-            if delim > 0:
-                decoded = cobs_decode(bytes(buf[:delim]))
-                if len(decoded) >= 4:
-                    handle_serial_packet(decoded)
-            buf = buf[delim + 1:]
+            while b'\x00' in buf:
+                delim = buf.index(b'\x00')
+                if delim > 0:
+                    decoded = cobs_decode(bytes(buf[:delim]))
+                    if len(decoded) >= 4:
+                        n_frames += 1
+                        mt = decoded[0]
+                        if mt == MSG_SENSOR:
+                            n_sensor += 1
+                        elif mt == MSG_JPEG_CHUNK:
+                            n_jpeg += 1
+                        else:
+                            n_other += 1
+                        handle_serial_packet(decoded)
+                    elif decoded == b'' :
+                        n_baddecode += 1
+                buf = buf[delim + 1:]
+
+        now = time.time()
+        if now - last_report >= 1.0:
+            if n_bytes:
+                print(f"[serial] RX {n_bytes:6d} B/s  frames:{n_frames:3d}  "
+                      f"sensor:{n_sensor:3d} jpeg:{n_jpeg:3d} "
+                      f"other:{n_other:3d} cobs_fail:{n_baddecode:3d}",
+                      flush=True)
+            else:
+                print("[serial] RX 0 B/s — nothing arriving on the port",
+                      flush=True)
+            n_bytes = n_frames = n_sensor = n_jpeg = n_other = n_baddecode = 0
+            last_report = now
 
 
 # ==========================================
