@@ -83,9 +83,15 @@ void task_sensor_snapshot(void *pvParameters)
                 if (snap.has_tof_a) {
                     snap.tof_a.valid = true;
                     snap.tof_a.distances_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_a.sigma_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_a.target_status_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_a.nb_target_detected_count = 64;
+                    /* Field mode: omit the three diagnostic arrays. proto3
+                     * encodes an empty repeated field as ZERO bytes, so this
+                     * halves the snapshot (~2288 -> ~1120 B) with no schema
+                     * change and no decoder change. distances/IMU/GPS are
+                     * untouched, and `status` above still comes from tof_res,
+                     * so distance gating is unaffected. */
+                    snap.tof_a.sigma_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
+                    snap.tof_a.target_status_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
+                    snap.tof_a.nb_target_detected_count = g_field_mode ? 0 : 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t nb = tof_res.nb_target_detected[i];
                         for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
@@ -113,9 +119,15 @@ void task_sensor_snapshot(void *pvParameters)
                 if (snap.has_tof_b) {
                     snap.tof_b.valid = true;
                     snap.tof_b.distances_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_b.sigma_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_b.target_status_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_b.nb_target_detected_count = 64;
+                    /* Field mode: omit the three diagnostic arrays. proto3
+                     * encodes an empty repeated field as ZERO bytes, so this
+                     * halves the snapshot (~2288 -> ~1120 B) with no schema
+                     * change and no decoder change. distances/IMU/GPS are
+                     * untouched, and `status` above still comes from tof_res,
+                     * so distance gating is unaffected. */
+                    snap.tof_b.sigma_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
+                    snap.tof_b.target_status_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
+                    snap.tof_b.nb_target_detected_count = g_field_mode ? 0 : 64;
                     for (int i = 0; i < 64; i++) {
                         uint8_t nb = tof_res.nb_target_detected[i];
                         for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {

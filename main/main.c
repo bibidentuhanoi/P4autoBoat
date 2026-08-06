@@ -54,6 +54,7 @@ static CalibrationData calib_data = {
 static tof_devices_t tof_devs;
 SemaphoreHandle_t g_i2c_mutex = NULL;
 volatile bool g_camera_ok = false;
+volatile bool g_field_mode = false;
 
 // ==========================================
 // APP MAIN
@@ -237,6 +238,10 @@ void app_main(void) {
             wifi_manager_stop_reconnect();
             if (espnow_transport_activate() == ESP_OK) {
                 field_mode = true;
+                /* Trim the ToF diagnostic arrays out of every snapshot; set
+                 * BEFORE the sensor task starts, so no full-size frame can
+                 * escape first. */
+                g_field_mode = true;
             }
         } else if (probe == ESP_ERR_NOT_FOUND) {
             ESP_LOGI(TAG, "No ground station — falling back to WiFi");

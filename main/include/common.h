@@ -14,6 +14,16 @@ extern SemaphoreHandle_t g_i2c_mutex;
 // Read by sensor_task to report status; dashboard shows a warning when false.
 extern volatile bool g_camera_ok;
 
+/**
+ * @brief True when running in ESP-NOW field mode (set once at boot, never
+ *        changes afterwards).
+ *
+ * Consumers trim what they put on the wire: ESP-NOW has ~1/10th the usable
+ * bandwidth of the WiFi link. Defaults to false so the full payload — what the
+ * dashboard's ToF overlay needs — is the safe fallback.
+ */
+extern volatile bool g_field_mode;
+
 // Define constants
 #ifndef PI
 #define PI                  3.14159265358979323846f
