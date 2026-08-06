@@ -33,13 +33,22 @@ static const char *TAG = "ESPNOW_TRANSPORT";
  *   [2] n_chunks   total for this image
  */
 #define JPEG_SUBHDR_SIZE      3
-/* Deliberately well under PEER_DATA_MAX (8166). The first attempt sized chunks
- * at exactly 8166 total — sitting precisely on a documented limit — and nothing
- * ever reached the air. 4 KB keeps a wide margin at the cost of a few more
- * chunks. */
-#define JPEG_CHUNK_BYTES      4096u
+/* Sized by RADIO drain rate, not by the peer_data limit.
+ *
+ * The co-processor splits each chunk into 244-byte ESP-NOW packets spaced only
+ * INTER_CHUNK_DELAY_MS=1 apart, but ESP-NOW moves ~214-555 kbps, so one packet
+ * needs ~4-9 ms of airtime. Queuing every 1 ms fills the radio's internal queue
+ * about 5x faster than it drains; esp_now_send() then returns NO_MEM and the
+ * fragments are discarded. Telemetry never trips this (1-2 fragments), but a
+ * JPEG is ~72 and died after roughly the first 8 — the boat logged "JPEG sent"
+ * while nothing reached the air.
+ *
+ * 1024 B => ~5 fragments/chunk, which fits the radio queue, and the 50 ms gap
+ * below is long enough to drain them (~5 x 9 ms). A 13 KB image becomes ~13
+ * chunks over ~650 ms — fine at one frame per 10 s. */
+#define JPEG_CHUNK_BYTES      1024u
 /* Gap between chunks so telemetry can interleave (see send_jpeg). */
-#define JPEG_INTER_CHUNK_MS   40
+#define JPEG_INTER_CHUNK_MS   50
 
 /* Static send buffer shared by espnow_send_fn (sensor path, single-task) */
 static uint8_t s_send_buf[PEER_DATA_MAX];
