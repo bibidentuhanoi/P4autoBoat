@@ -20,7 +20,22 @@ typedef enum {
      * USB bridge. The boat listens for it at boot to decide whether to run in
      * ESP-NOW field mode or fall back to WiFi. Header only, no payload. */
     MSG_GROUND_HELLO  = 0x12,
+    /* S3 bridge -> laptop (USB only, never over the air): self-diagnostics so
+     * the bridge is observable. Its console is unavailable once TinyUSB claims
+     * the USB pins, so without this a silent bridge is indistinguishable from
+     * a crashed one, or from a boat that never transmitted. */
+    MSG_BRIDGE_STATUS = 0x13,
 } espnow_msg_type_t;
+
+/* Payload of MSG_BRIDGE_STATUS (packed, little-endian). */
+typedef struct __attribute__((packed)) {
+    uint32_t uptime_s;      /* bridge uptime */
+    uint32_t espnow_pkts;   /* ESP-NOW packets received off-air */
+    uint32_t espnow_bytes;  /* ...and their total payload bytes */
+    uint32_t frames_out;    /* complete frames reassembled and sent to USB */
+    uint32_t hello_sent;    /* MSG_GROUND_HELLO beacons broadcast */
+    uint32_t reasm_drops;   /* frames dropped: overflow or length mismatch */
+} espnow_bridge_status_t;
 
 /* How often the S3 bridge broadcasts MSG_GROUND_HELLO. The boat's probe window
  * must comfortably exceed this so it cannot miss the gap between two beacons. */

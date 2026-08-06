@@ -192,8 +192,9 @@ def cobs_decode(data: bytes) -> bytes:
 _jpeg_buf = bytearray()
 _jpeg_seq = 0
 
-MSG_JPEG_CHUNK = 0x01
-MSG_SENSOR     = 0x02
+MSG_JPEG_CHUNK    = 0x01
+MSG_SENSOR        = 0x02
+MSG_BRIDGE_STATUS = 0x13   # S3 self-diagnostics, USB only
 JPEG_MAX_CHUNK = 8162
 
 
@@ -287,6 +288,21 @@ def handle_serial_packet(data):
             parse_sensor_snapshot(payload)
         except Exception:
             pass
+
+    elif msg_type == MSG_BRIDGE_STATUS:
+        # S3 bridge self-report. Its console is unavailable once TinyUSB owns
+        # the USB pins, so this is how we tell WHERE a silent link is broken.
+        if len(payload) >= 24:
+            up, pkts, byts, frames, hello, drops = struct.unpack('<6I', payload[:24])
+            if pkts == 0:
+                verdict = "S3 hears NOTHING off-air -> boat not in field mode / wrong channel / out of range"
+            elif frames == 0:
+                verdict = "S3 hears fragments but completes no frame -> reassembly fault"
+            else:
+                verdict = "S3 forwarding frames -> link OK"
+            print(f"[bridge] up={up}s espnow_pkts={pkts} bytes={byts} "
+                  f"frames_out={frames} hello_sent={hello} drops={drops}\n"
+                  f"[bridge] {verdict}", flush=True)
 
 
 def serial_reader(port, baud=921600):

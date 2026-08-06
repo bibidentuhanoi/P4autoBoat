@@ -12,6 +12,7 @@
 #include "esp_now.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 
 #include "tinyusb.h"                /* -> tusb.h -> class/cdc/cdc_device.h
                                        (declares tud_cdc_n_connected) */
@@ -47,6 +48,18 @@ static const char *TAG = "bridge";
  * main/transports/espnow_protocol.h (separate build, so duplicated here). */
 #define MSG_GROUND_HELLO         0x12
 #define HELLO_INTERVAL_MS        500
+
+/* Bridge self-diagnostics -> laptop over USB (never transmitted over the air).
+ * The console is gone once TinyUSB owns the USB pins, so this is the only way
+ * to tell "bridge idle" from "bridge crashed" from "boat never transmitted". */
+#define MSG_BRIDGE_STATUS        0x13
+#define STATUS_INTERVAL_MS       1000
+
+static volatile uint32_t s_espnow_pkts   = 0;
+static volatile uint32_t s_espnow_bytes  = 0;
+static volatile uint32_t s_frames_out    = 0;
+static volatile uint32_t s_hello_sent    = 0;
+static volatile uint32_t s_reasm_drops   = 0;
 
 /* ---- USB self-test ------------------------------------------------------- *
  * TEMPORARY BENCH AID.  Set to 0 for normal operation.
@@ -235,10 +248,57 @@ static void hello_beacon_task(void *arg)
             seq++,
         };
         esp_err_t err = esp_now_send(BROADCAST_MAC, hello, sizeof(hello));
-        if (err != ESP_OK) {
+        if (err == ESP_OK) {
+            s_hello_sent++;
+        } else {
             ESP_LOGW(TAG, "hello beacon send failed: %s", esp_err_to_name(err));
         }
         vTaskDelay(pdMS_TO_TICKS(HELLO_INTERVAL_MS));
+    }
+}
+
+/* ========================================================================== */
+/*  Bridge status -> laptop                                                    */
+/* ========================================================================== */
+
+/*
+ * Emit a COBS-framed MSG_BRIDGE_STATUS once a second so the laptop can see the
+ * bridge's internal state. Goes through the normal usb_tx_enqueue() path, so a
+ * status line arriving also proves the USB write path itself is healthy.
+ *
+ * Reading the counters:
+ *   espnow_pkts == 0  -> nothing heard off-air: boat not in field mode, wrong
+ *                        channel, or out of range. NOT a USB problem.
+ *   espnow_pkts >  0 but frames_out == 0 -> hearing fragments but never
+ *                        completing a frame: reassembly/fragmentation fault.
+ *   frames_out >  0 but the UI shows nothing -> decode problem on the laptop.
+ */
+static void status_task(void *arg)
+{
+    uint8_t seq = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
+
+        uint8_t payload[4 + 24];
+        payload[0] = MSG_BRIDGE_STATUS;
+        uint16_t plen = 24;
+        memcpy(payload + 1, &plen, 2);
+        payload[3] = seq++;
+
+        uint32_t vals[6] = {
+            (uint32_t)(esp_timer_get_time() / 1000000),
+            s_espnow_pkts, s_espnow_bytes,
+            s_frames_out,  s_hello_sent, s_reasm_drops,
+        };
+        memcpy(payload + 4, vals, sizeof(vals));
+
+        uint8_t *cobs = malloc(sizeof(payload) + COBS_MAX_OVERHEAD(sizeof(payload)));
+        if (!cobs) {
+            continue;
+        }
+        size_t clen = cobs_encode(payload, sizeof(payload), cobs);
+        cobs[clen++] = 0x00;
+        usb_tx_enqueue(cobs, clen);   /* takes ownership */
     }
 }
 
@@ -268,10 +328,16 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info,
     const uint8_t *payload     = data + FRAG_HDR_SIZE;
     size_t         payload_len = (size_t)(data_len - FRAG_HDR_SIZE);
 
+    /* Counted here, before any drop path: proves whether we hear the boat at
+     * all, which separates an air/channel fault from a USB/reassembly one. */
+    s_espnow_pkts++;
+    s_espnow_bytes += payload_len;
+
     /* Append payload to reassembly buffer */
     if (s_reassembly_len + payload_len > REASSEMBLY_BUF_SIZE) {
         ESP_LOGE(TAG, "Reassembly buffer overflow — discarding %u bytes",
                  (unsigned)(s_reassembly_len + payload_len));
+        s_reasm_drops++;
         s_reassembly_len = 0;
         return;
     }
@@ -287,6 +353,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info,
     if (s_reassembly_len != total_len) {
         ESP_LOGW(TAG, "Reassembly length mismatch: got %u, expected %u",
                  (unsigned)s_reassembly_len, (unsigned)total_len);
+        s_reasm_drops++;
         s_reassembly_len = 0;
         return;
     }
@@ -304,6 +371,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info,
     cobs_buf[cobs_len] = 0x00;   /* COBS frame delimiter */
     cobs_len++;
 
+    s_frames_out++;
     usb_tx_enqueue(cobs_buf, cobs_len);   /* takes ownership */
 
     /* Reset for next reassembly */
@@ -457,6 +525,7 @@ void app_main(void)
 
     /* Announce our presence so the boat prefers ESP-NOW over WiFi at boot. */
     xTaskCreate(hello_beacon_task, "hello_beacon", 2560, NULL, 4, NULL);
+    xTaskCreate(status_task, "bridge_status", 3072, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Bridge ready — channel %d, beaconing every %d ms",
              ESPNOW_CHANNEL, HELLO_INTERVAL_MS);
