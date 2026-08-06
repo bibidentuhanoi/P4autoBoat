@@ -3,6 +3,7 @@
 #include "pipeline.h"
 #include "esp_hosted_misc.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -242,6 +243,37 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
             ESP_LOGE(TAG, "Failed to send ESPNOW_CONFIG (%s)", esp_err_to_name(ret));
             return ret;
         }
+    }
+
+    /* --- Own the channel from THIS side, and verify it -----------------------
+     * The C6's init_cb is a void callback: it calls esp_wifi_set_channel() and
+     * esp_now_init(), logs any failure to its own console (invisible to us),
+     * and returns nothing. The RPC reports success merely because the handler
+     * ran, so "MSG_ESPNOW_INIT sent OK" proves nothing about ESP-NOW actually
+     * being up on the right channel.
+     *
+     * esp_wifi_set/get_channel() are proxied to the co-processor by
+     * esp_wifi_remote and DO return a status, so drive the channel here and
+     * read it back. Requires the station to be started but NOT associated —
+     * which is exactly the state wifi_start_radio() leaves it in. */
+    esp_err_t ch_err = esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    if (ch_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_channel(%d) failed: %s",
+                 CONFIG_ESPNOW_CHANNEL, esp_err_to_name(ch_err));
+    }
+
+    uint8_t primary = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&primary, &second) == ESP_OK) {
+        if (primary != CONFIG_ESPNOW_CHANNEL) {
+            ESP_LOGE(TAG, "CHANNEL MISMATCH: co-processor is on %d, ESP-NOW needs %d "
+                          "— the ground station will not be heard",
+                     primary, CONFIG_ESPNOW_CHANNEL);
+        } else {
+            ESP_LOGI(TAG, "Co-processor confirmed on channel %d", primary);
+        }
+    } else {
+        ESP_LOGW(TAG, "Could not read back the co-processor channel");
     }
 
     /* --- Listen for the ground station -------------------------------------
