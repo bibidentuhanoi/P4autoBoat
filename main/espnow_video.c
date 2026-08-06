@@ -17,6 +17,7 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdbool.h>
 
 static const char *TAG = "ESPNOW_VIDEO";
 
@@ -33,12 +34,20 @@ static void espnow_video_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(3000));
 
     uint32_t sent = 0, skipped = 0;
+    bool warned_nocam = false;
+    uint32_t cap_fail = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(CONFIG_ESPNOW_JPEG_INTERVAL_MS));
 
         if (!g_camera_ok) {
-            continue;                     /* camera failed at boot */
+            /* Say so ONCE. Silently spinning here is how a dead feature looks
+             * identical to a disabled one. */
+            if (!warned_nocam) {
+                warned_nocam = true;
+                ESP_LOGE(TAG, "camera not available (init failed at boot) — no video");
+            }
+            continue;
         }
 
         /* detect_task holds a frame while inferring; camera_capture_frame()
@@ -56,7 +65,14 @@ static void espnow_video_task(void *arg)
         esp_err_t ret = camera_capture_frame(&buf, &len, &w, &h, &fmt);
         if (ret != ESP_OK) {
             skipped++;
-            ESP_LOGD(TAG, "capture failed: %s", esp_err_to_name(ret));
+            /* Was ESP_LOGD, i.e. invisible at default log level — a capture
+             * that always fails looked exactly like video never running.
+             * Shout for the first few, then throttle. */
+            if (++cap_fail <= 3 || (cap_fail % 20) == 0) {
+                ESP_LOGW(TAG, "capture failed (#%u): %s — nothing drains the "
+                              "camera in field mode, so buffers may be starved",
+                         (unsigned)cap_fail, esp_err_to_name(ret));
+            }
             continue;
         }
 
