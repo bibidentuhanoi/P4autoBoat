@@ -15,6 +15,7 @@
 
 #include "tinyusb.h"                /* -> tusb.h -> class/cdc/cdc_device.h
                                        (declares tud_cdc_n_connected) */
+#include "tinyusb_default_config.h" /* TINYUSB_DEFAULT_CONFIG() */
 #include "tinyusb_cdc_acm.h"
 
 #include "cobs.h"
@@ -370,7 +371,11 @@ static void espnow_init(void)
 
 static void usb_cdc_init(void)
 {
-    const tinyusb_config_t tusb_cfg = { 0 };
+    /* Must be TINYUSB_DEFAULT_CONFIG(), not `{ 0 }`.  esp_tinyusb 2.x validates
+     * the driver task config and rejects a zeroed one with
+     * "Task size can't be 0" -> ESP_ERR_INVALID_ARG.  The macro fills in
+     * .port / .phy / .task (TINYUSB_DEFAULT_TASK_SIZE) / .descriptor. */
+    const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     tinyusb_config_cdcacm_t acm_cfg = {
