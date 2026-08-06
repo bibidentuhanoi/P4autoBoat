@@ -216,23 +216,50 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initializing detection task...");
     detect_init();
 
-    // 10. Connect to WiFi (blocks until connected or timeout)
-    ESP_LOGI(TAG, "Connecting to WiFi...");
-    esp_err_t wifi_ret = wifi_init();
+    // 10. Bring up the radio WITHOUT associating. The co-processor needs
+    //     esp_wifi_start() before esp_now_init(), and not connecting yet keeps
+    //     the radio parked on one channel so the ESP-NOW probe below is valid.
+    ESP_LOGI(TAG, "Starting WiFi radio...");
+    esp_err_t radio_ret = wifi_start_radio();
+    esp_err_t wifi_ret  = ESP_FAIL;
 
 #if CONFIG_ESPNOW_ENABLED
-    if (wifi_ret != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi unavailable — switching to ESP-NOW field mode");
-        /* MUST precede espnow_transport_init(): the reconnect loop scans all
-         * channels looking for the AP, which pulls the radio off the ESP-NOW
-         * channel set by MSG_ESPNOW_INIT and never puts it back. */
-        wifi_manager_stop_reconnect();
-        esp_err_t en_ret = espnow_transport_init();
-        if (en_ret != ESP_OK) {
-            ESP_LOGE(TAG, "ESP-NOW init failed (%s) — no connectivity", esp_err_to_name(en_ret));
+    // 10a. ESP-NOW FIRST: listen for the S3 ground station's beacon. Hearing it
+    //      proves the field link is actually live, which is a far better signal
+    //      than "WiFi failed" — and it skips the 30 s AP timeout entirely.
+    bool field_mode = false;
+    if (radio_ret == ESP_OK) {
+        esp_err_t probe = espnow_transport_probe(CONFIG_ESPNOW_PROBE_MS);
+        if (probe == ESP_OK) {
+            ESP_LOGI(TAG, "Ground station present — ESP-NOW field mode");
+            /* Latch WiFi off: its reconnect/scan would drag the radio away
+             * from the ESP-NOW channel and never restore it. */
+            wifi_manager_stop_reconnect();
+            if (espnow_transport_activate() == ESP_OK) {
+                field_mode = true;
+            }
+        } else if (probe == ESP_ERR_NOT_FOUND) {
+            ESP_LOGI(TAG, "No ground station — falling back to WiFi");
+        } else {
+            ESP_LOGW(TAG, "ESP-NOW probe failed (%s) — falling back to WiFi",
+                     esp_err_to_name(probe));
         }
+    }
+
+    if (!field_mode && radio_ret == ESP_OK) {
+        wifi_ret = wifi_connect();
+    }
+
+    if (field_mode) {
+        /* nothing more to start: no HTTP/WS servers in field mode */
+    } else if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi unavailable (%s) — no connectivity", esp_err_to_name(wifi_ret));
     } else {
 #else
+    if (radio_ret == ESP_OK) {
+        wifi_ret = wifi_connect();
+    }
+
     if (wifi_ret != ESP_OK) {
         ESP_LOGW(TAG, "WiFi unavailable (%s) — camera stream disabled", esp_err_to_name(wifi_ret));
     } else {

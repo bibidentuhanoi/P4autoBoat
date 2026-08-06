@@ -17,13 +17,20 @@ static const char *TAG = "WIFI";
 static EventGroupHandle_t s_wifi_events;
 static int s_retry_count;
 static volatile bool s_stop_reconnect = false;
+static volatile bool s_connect_enabled = false;
 #define MAX_RETRIES 5
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        /* Only chase an AP once wifi_connect() has asked us to. Starting the
+         * radio must NOT trigger a scan: ESP-NOW probing runs on the started-
+         * but-unconnected radio, and a scan would hop it off the ESP-NOW
+         * channel. */
+        if (s_connect_enabled) {
+            esp_wifi_connect();
+        }
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         /* Field mode owns the radio channel — never reconnect (and never scan)
          * behind ESP-NOW's back. See wifi_manager_stop_reconnect(). */
@@ -44,7 +51,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-esp_err_t wifi_init(void)
+esp_err_t wifi_start_radio(void)
 {
     s_wifi_events = xEventGroupCreate();
     if (!s_wifi_events) {
@@ -108,7 +115,27 @@ esp_err_t wifi_init(void)
         ESP_LOGI(TAG, "WiFi power save disabled (PS_NONE)");
     }
 
+    ESP_LOGI(TAG, "WiFi radio started (not connected)");
+    return ESP_OK;
+}
+
+esp_err_t wifi_connect(void)
+{
+    if (!s_wifi_events) {
+        ESP_LOGE(TAG, "wifi_connect() before wifi_start_radio()");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     ESP_LOGI(TAG, "Connecting to SSID: %s", CONFIG_WIFI_SSID);
+
+    /* Arm the handler and kick off the first attempt; the radio is already
+     * started, so WIFI_EVENT_STA_START has long since fired. */
+    s_connect_enabled = true;
+    esp_err_t conn_err = esp_wifi_connect();
+    if (conn_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(conn_err));
+        return conn_err;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
                                             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,

@@ -16,7 +16,15 @@ typedef enum {
     MSG_MOTOR_STATUS  = 0x06,
     MSG_ESPNOW_INIT   = 0x10,
     MSG_ESPNOW_CONFIG = 0x11,
+    /* S3 ground station -> boat: "I am here". Broadcast periodically by the
+     * USB bridge. The boat listens for it at boot to decide whether to run in
+     * ESP-NOW field mode or fall back to WiFi. Header only, no payload. */
+    MSG_GROUND_HELLO  = 0x12,
 } espnow_msg_type_t;
+
+/* How often the S3 bridge broadcasts MSG_GROUND_HELLO. The boat's probe window
+ * must comfortably exceed this so it cannot miss the gap between two beacons. */
+#define ESPNOW_HELLO_INTERVAL_MS  500u
 
 /* ---------------------------------------------------------------------------
  * Base packet header (4 bytes, packed)

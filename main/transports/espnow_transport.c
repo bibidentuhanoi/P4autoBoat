@@ -4,6 +4,8 @@
 #include "esp_hosted_misc.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include <string.h>
 #include <pb_encode.h>
 #include <pb_decode.h>
@@ -25,6 +27,11 @@ static const char *TAG = "ESPNOW_TRANSPORT";
 
 /* Static send buffer shared by espnow_send_fn (sensor path, single-task) */
 static uint8_t s_send_buf[PEER_DATA_MAX];
+
+/* Ground-station presence, set from upstream_cb (RPC RX thread) */
+#define GROUND_SEEN_BIT  BIT0
+static EventGroupHandle_t s_ground_evt = NULL;
+static volatile bool      s_ground_seen = false;
 
 /* ---------------------------------------------------------------------------
  * parse_mac_string — "AA:BB:CC:DD:EE:FF" → 6 bytes; falls back to broadcast
@@ -63,6 +70,18 @@ static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 
     const espnow_pkt_hdr_t *hdr = (const espnow_pkt_hdr_t *)data;
     uint16_t payload_len = hdr->payload_len;
+
+    /* Ground-station beacon: presence signal only, never application data. */
+    if (hdr->msg_type == MSG_GROUND_HELLO) {
+        if (!s_ground_seen) {
+            ESP_LOGI(TAG, "Ground station detected (MSG_GROUND_HELLO)");
+        }
+        s_ground_seen = true;
+        if (s_ground_evt) {
+            xEventGroupSetBits(s_ground_evt, GROUND_SEEN_BIT);
+        }
+        return;
+    }
 
     if ((size_t)(ESPNOW_HDR_SIZE + payload_len) > data_len) {
         ESP_LOGW(TAG, "upstream_cb: payload_len %u overflows frame %u",
@@ -149,11 +168,18 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
 }
 
 /* ---------------------------------------------------------------------------
- * espnow_transport_init
+ * espnow_transport_probe — bring ESP-NOW up, then listen for the S3 beacon
  * -------------------------------------------------------------------------*/
-esp_err_t espnow_transport_init(void)
+esp_err_t espnow_transport_probe(uint32_t timeout_ms)
 {
     esp_err_t ret;
+
+    if (!s_ground_evt) {
+        s_ground_evt = xEventGroupCreate();
+        if (!s_ground_evt) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     /* --- Register upstream callback for C6→P4 commands --- */
     ret = esp_hosted_register_custom_callback(PEER_MSG_UPSTREAM, upstream_cb);
@@ -218,8 +244,31 @@ esp_err_t espnow_transport_init(void)
         }
     }
 
-    /* --- Register pipeline transport --- */
-    ret = pipeline_register_transport(espnow_send_fn, NULL);
+    /* --- Listen for the ground station -------------------------------------
+     * The S3 bridge broadcasts MSG_GROUND_HELLO every ESPNOW_HELLO_INTERVAL_MS.
+     * Hearing one proves the whole chain is live: C6 radio on the right
+     * channel, S3 powered and in range. If nothing arrives the caller falls
+     * back to WiFi, so no pipeline transport is registered here. */
+    ESP_LOGI(TAG, "Listening %ums for a ground station (ch=%d)...",
+             (unsigned)timeout_ms, CONFIG_ESPNOW_CHANNEL);
+
+    EventBits_t bits = xEventGroupWaitBits(s_ground_evt, GROUND_SEEN_BIT,
+                                            pdFALSE, pdFALSE,
+                                            pdMS_TO_TICKS(timeout_ms));
+    if (!(bits & GROUND_SEEN_BIT)) {
+        ESP_LOGW(TAG, "No ground station beacon within %ums", (unsigned)timeout_ms);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * espnow_transport_activate — attach ESP-NOW to the pipeline
+ * -------------------------------------------------------------------------*/
+esp_err_t espnow_transport_activate(void)
+{
+    esp_err_t ret = pipeline_register_transport(espnow_send_fn, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register pipeline transport (%s)", esp_err_to_name(ret));
         return ret;

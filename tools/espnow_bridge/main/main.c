@@ -41,6 +41,13 @@ static const char *TAG = "bridge";
 /* USB → ESP-NOW accumulator */
 #define USB_RX_ACCUM_SIZE   512
 
+/* Ground-station beacon. Broadcast so the boat can detect that a ground
+ * station is present and choose ESP-NOW field mode over WiFi at boot.
+ * Must match espnow_msg_type_t / ESPNOW_HELLO_INTERVAL_MS in
+ * main/transports/espnow_protocol.h (separate build, so duplicated here). */
+#define MSG_GROUND_HELLO         0x12
+#define HELLO_INTERVAL_MS        500
+
 /* ---- USB self-test ------------------------------------------------------- *
  * TEMPORARY BENCH AID.  Set to 0 for normal operation.
  *
@@ -203,6 +210,37 @@ static void usb_selftest_task(void *arg)
     }
 }
 #endif /* USB_SELFTEST */
+
+/* ========================================================================== */
+/*  Ground-station beacon                                                      */
+/* ========================================================================== */
+
+/*
+ * Periodically broadcast a bare espnow_pkt_hdr_t{MSG_GROUND_HELLO, 0, seq}.
+ *
+ * The boat listens for this at boot: heard -> run ESP-NOW field mode, silence
+ * -> fall back to connecting to WiFi. Sent raw (no fragment header), which is
+ * what the C6 bridge forwards verbatim to the P4 as PEER_MSG_UPSTREAM.
+ *
+ * Beacons unconditionally, whether or not a laptop has the USB port open —
+ * the S3 being powered IS the ground station being present.
+ */
+static void hello_beacon_task(void *arg)
+{
+    uint8_t seq = 0;
+    while (1) {
+        const uint8_t hello[4] = {
+            MSG_GROUND_HELLO,
+            0x00, 0x00,          /* payload_len = 0 (little-endian uint16) */
+            seq++,
+        };
+        esp_err_t err = esp_now_send(BROADCAST_MAC, hello, sizeof(hello));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "hello beacon send failed: %s", esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(HELLO_INTERVAL_MS));
+    }
+}
 
 /* ========================================================================== */
 /*  ESP-NOW → USB path                                                         */
@@ -417,7 +455,11 @@ void app_main(void)
     /* USB CDC */
     usb_cdc_init();
 
-    ESP_LOGI(TAG, "Bridge ready — channel %d", ESPNOW_CHANNEL);
+    /* Announce our presence so the boat prefers ESP-NOW over WiFi at boot. */
+    xTaskCreate(hello_beacon_task, "hello_beacon", 2560, NULL, 4, NULL);
+
+    ESP_LOGI(TAG, "Bridge ready — channel %d, beaconing every %d ms",
+             ESPNOW_CHANNEL, HELLO_INTERVAL_MS);
 
 #if USB_SELFTEST
     ESP_LOGW(TAG, "***********************************************************");

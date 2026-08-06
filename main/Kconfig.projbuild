@@ -415,10 +415,29 @@ menu "ESP-NOW Field Mode"
         bool "Enable ESP-NOW field mode"
         default y
 
+    config ESPNOW_PROBE_MS
+        int "Ground-station probe window at boot (ms)"
+        default 2500
+        range 600 30000
+        depends on ESPNOW_ENABLED
+        help
+            At boot the boat listens this long for a MSG_GROUND_HELLO beacon
+            from the ESP32-S3 USB bridge. Heard -> ESP-NOW field mode; silence
+            -> connect to WiFi instead.
+
+            The S3 beacons every 500 ms, so this must be comfortably larger
+            than 500 to avoid landing in the gap between two beacons. 2500 ms
+            gives ~5 chances while adding only ~2.5 s to a WiFi boot.
+
     config ESPNOW_WIFI_TIMEOUT_S
         int "WiFi connect timeout before ESP-NOW fallback (seconds)"
         default 10
         depends on ESPNOW_ENABLED
+        help
+            DEPRECATED / UNUSED. Kept only so existing sdkconfigs do not break.
+            Mode is now chosen by the ESP-NOW probe above, not by a WiFi
+            timeout. The WiFi connect timeout itself is
+            WIFI_CONNECT_TIMEOUT_MS in wifi_manager.c.
 
     config ESPNOW_JPEG_QUALITY
         int "JPEG quality for ESP-NOW (1-63, lower=smaller)"
