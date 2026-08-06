@@ -24,6 +24,10 @@ esp_err_t camera_capture_raw(void **buf, size_t *len, uint32_t *width, uint32_t 
 /** @brief Return the held frame buffer back to the driver. */
 void camera_release_frame(void);
 
+/** @brief Set JPEG encode quality (1-100, higher = better/larger). Applies to
+ *  the next captured frame. Used to shrink images for the ESP-NOW field link. */
+void camera_set_jpeg_quality(int quality);
+
 /** @brief Start V4L2 streaming (VIDIOC_STREAMON). Call before capturing frames. Idempotent. */
 esp_err_t camera_start_streaming(void);
 

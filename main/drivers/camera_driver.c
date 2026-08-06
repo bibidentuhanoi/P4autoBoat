@@ -20,6 +20,20 @@
 
 static const char *TAG = "CAM_DRV";
 
+/* Encode quality, applied per frame. Runtime-settable because ESP-NOW field
+ * mode needs far smaller images than the WiFi MJPEG stream: one lost chunk
+ * loses a whole image (there is no retransmission), so fewer chunks means a
+ * far higher chance of a complete frame. */
+static int s_jpeg_quality = CONFIG_CAM_JPEG_QUALITY;
+
+void camera_set_jpeg_quality(int quality)
+{
+    if (quality < 1)   quality = 1;
+    if (quality > 100) quality = 100;
+    s_jpeg_quality = quality;
+    ESP_LOGI(TAG, "JPEG encode quality set to %d", quality);
+}
+
 #define CAM_BUF_COUNT  2
 
 static int                    s_cam_fd = -1;
@@ -237,7 +251,7 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
     jpeg_encode_cfg_t enc_cfg = {
         .src_type      = JPEG_ENCODE_IN_FORMAT_RGB565,
         .sub_sample    = JPEG_DOWN_SAMPLING_YUV422,
-        .image_quality = CONFIG_CAM_JPEG_QUALITY,
+        .image_quality = s_jpeg_quality,
         .width         = s_cam_width,
         .height        = s_cam_height,
     };

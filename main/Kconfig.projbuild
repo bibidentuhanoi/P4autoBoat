@@ -456,13 +456,20 @@ menu "ESP-NOW Field Mode"
             confirming telemetry holds its rate.
 
     config ESPNOW_JPEG_QUALITY
-        int "JPEG quality for ESP-NOW (1-63, lower=smaller)"
-        default 12
+        int "JPEG quality in field mode (1-100, higher = better/larger)"
+        default 25
+        range 1 100
         depends on ESPNOW_ENABLED
         help
-            Controls JPEG compression for ESP-NOW streaming.
-            Lower value = smaller frames = higher FPS but worse quality.
-            At quality 12, native 800x640 frames are ~15-25KB giving 3-5 fps.
+            Encode quality used INSTEAD of CAM_JPEG_QUALITY while in ESP-NOW
+            field mode. Same 1-100 scale as the camera option.
+
+            Size matters more than it looks: a JPEG is split into 1 KB chunks
+            and there is NO retransmission, so a single lost chunk loses the
+            entire image. At quality 60 an image is ~14 KB = 14 chunks, and
+            5%% per-chunk loss completes only ~49%% of frames; at ~5 chunks the
+            same loss completes ~77%%. Lower quality therefore buys reliability,
+            not just bandwidth.
 
     config ESPNOW_CHANNEL
         int "ESP-NOW WiFi channel"

@@ -191,6 +191,7 @@ def cobs_decode(data: bytes) -> bytes:
 # JPEG reassembly state: chunks keyed by index, reset when frame_id changes
 _jpeg_chunks = {}
 _jpeg_frame_id = -1
+_jpeg_expect = 0
 
 MSG_JPEG_CHUNK    = 0x01
 MSG_SENSOR        = 0x02
@@ -261,7 +262,7 @@ def parse_sensor_snapshot(data):
 
 def handle_serial_packet(data):
     """Parse espnow_pkt_hdr_t and dispatch by msg_type."""
-    global _jpeg_chunks, _jpeg_frame_id, latest_frame
+    global _jpeg_chunks, _jpeg_frame_id, _jpeg_expect, latest_frame
 
     if len(data) < 4:
         return
@@ -282,8 +283,18 @@ def handle_serial_packet(data):
         body = payload[3:]
 
         if frame_id != _jpeg_frame_id:
+            # Starting a new image. If the previous one never completed, say so
+            # loudly with the exact shortfall — one lost chunk loses the WHOLE
+            # image (there is no retransmission), and that reads on screen as
+            # "it showed one frame then stopped".
+            if _jpeg_chunks and _jpeg_expect:
+                missing = sorted(set(range(_jpeg_expect)) - set(_jpeg_chunks))
+                print(f"[jpeg] frame {_jpeg_frame_id} INCOMPLETE: "
+                      f"{len(_jpeg_chunks)}/{_jpeg_expect} chunks, missing {missing}",
+                      flush=True)
             _jpeg_frame_id = frame_id
             _jpeg_chunks.clear()
+        _jpeg_expect = n_chunks
         _jpeg_chunks[chunk_idx] = body
 
         if len(_jpeg_chunks) == n_chunks:

@@ -109,8 +109,11 @@ esp_err_t espnow_video_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Field-mode video enabled: 1 JPEG every %d ms",
-             CONFIG_ESPNOW_JPEG_INTERVAL_MS);
+    /* Shrink frames for the field link — see CONFIG_ESPNOW_JPEG_QUALITY. */
+    camera_set_jpeg_quality(CONFIG_ESPNOW_JPEG_QUALITY);
+
+    ESP_LOGI(TAG, "Field-mode video enabled: 1 JPEG every %d ms (quality %d)",
+             CONFIG_ESPNOW_JPEG_INTERVAL_MS, CONFIG_ESPNOW_JPEG_QUALITY);
     return ESP_OK;
 }
 
