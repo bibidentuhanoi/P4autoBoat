@@ -40,6 +40,17 @@ static const char *TAG = "bridge";
 /* USB → ESP-NOW accumulator */
 #define USB_RX_ACCUM_SIZE   512
 
+/* ---- USB self-test ------------------------------------------------------- *
+ * TEMPORARY BENCH AID.  Set to 0 for normal operation.
+ *
+ * When 1, a task emits synthetic COBS-framed frames at real telemetry sizes
+ * through the SAME usb_tx_enqueue() -> usb_write_all() path production uses, so
+ * it genuinely exercises the TX-FIFO truncation fix without needing the P4, the
+ * C6, or the radio.  Verify on the laptop with:
+ *     .venv/bin/python tools/usb_selftest_verify.py /dev/ttyACM0
+ * ------------------------------------------------------------------------- */
+#define USB_SELFTEST 1
+
 /* ---- Types --------------------------------------------------------------- */
 typedef struct {
     uint8_t *data;   /* heap-allocated; freed by usb_tx_task after write */
@@ -141,6 +152,56 @@ static void usb_tx_enqueue(uint8_t *buf, size_t len)
         free(buf);
     }
 }
+
+#if USB_SELFTEST
+/* ========================================================================== */
+/*  USB self-test emitter (temporary — see USB_SELFTEST above)                 */
+/* ========================================================================== */
+
+/* Frame layout before COBS encoding:
+ *   [0..3]   magic "TST1"
+ *   [4..7]   seq        (uint32 LE)
+ *   [8..11]  total_len  (uint32 LE)  <- receiver checks this vs bytes received
+ *   [12..]   body, body[i] = (uint8_t)(i * 7 + seq)
+ *
+ * Sizes sweep the range that used to break: 300 B fit the old 512 B FIFO,
+ * 1126 B is a trimmed snapshot, 2299 B a full one, 4000 B stresses the new
+ * 4096 B FIFO.  Anything above 512 would have been truncated before the fix.
+ */
+static void usb_selftest_task(void *arg)
+{
+    static const size_t sizes[] = {300, 1126, 2299, 4000};
+    const size_t nsizes = sizeof(sizes) / sizeof(sizes[0]);
+    uint32_t seq = 0;
+
+    while (1) {
+        const size_t n = sizes[seq % nsizes];
+
+        uint8_t *payload = malloc(n);
+        if (payload) {
+            memcpy(payload, "TST1", 4);
+            uint32_t seq_le = seq, len_le = (uint32_t)n;
+            memcpy(payload + 4, &seq_le, 4);
+            memcpy(payload + 8, &len_le, 4);
+            for (size_t i = 12; i < n; i++) {
+                payload[i] = (uint8_t)(i * 7 + seq);
+            }
+
+            /* COBS worst case: +1 byte per 254, +1 code byte, +1 delimiter */
+            uint8_t *cobs = malloc(n + n / 254 + 2);
+            if (cobs) {
+                size_t clen = cobs_encode(payload, n, cobs);
+                cobs[clen++] = 0x00;
+                usb_tx_enqueue(cobs, clen);   /* takes ownership of cobs */
+            }
+            free(payload);
+        }
+
+        seq++;
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+#endif /* USB_SELFTEST */
 
 /* ========================================================================== */
 /*  ESP-NOW → USB path                                                         */
@@ -352,4 +413,12 @@ void app_main(void)
     usb_cdc_init();
 
     ESP_LOGI(TAG, "Bridge ready — channel %d", ESPNOW_CHANNEL);
+
+#if USB_SELFTEST
+    ESP_LOGW(TAG, "***********************************************************");
+    ESP_LOGW(TAG, "*** USB SELF-TEST ACTIVE — emitting synthetic frames    ***");
+    ESP_LOGW(TAG, "*** Set USB_SELFTEST to 0 before real telemetry testing ***");
+    ESP_LOGW(TAG, "***********************************************************");
+    xTaskCreate(usb_selftest_task, "usb_selftest", 4096, NULL, 4, NULL);
+#endif
 }
