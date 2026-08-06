@@ -13,7 +13,8 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 
-#include "tinyusb.h"
+#include "tinyusb.h"                /* -> tusb.h -> class/cdc/cdc_device.h
+                                       (declares tud_cdc_n_connected) */
 #include "tinyusb_cdc_acm.h"
 
 #include "cobs.h"
@@ -30,6 +31,11 @@ static const char *TAG = "bridge";
 
 /* USB TX queue depth */
 #define USB_TX_QUEUE_DEPTH  8
+
+/* Per-flush timeout while draining the CDC TX FIFO.  FreeRTOS tick is 100 Hz
+ * here, so the flush helper's internal vTaskDelay(1) costs 10 ms per stall;
+ * this bounds a stalled frame instead of blocking the task indefinitely. */
+#define USB_TX_FLUSH_TIMEOUT_MS 100
 
 /* USB → ESP-NOW accumulator */
 #define USB_RX_ACCUM_SIZE   512
@@ -59,13 +65,67 @@ static const uint8_t BROADCAST_MAC[ESP_NOW_ETH_ALEN] =
 /*  USB TX task                                                                */
 /* ========================================================================== */
 
+/*
+ * usb_write_all — write the WHOLE buffer to USB CDC, or give up cleanly.
+ *
+ * Why this is not a single write_queue() call:
+ *   tinyusb_cdcacm_write_queue() queues only MIN(len, tud_cdc_n_write_available())
+ *   and RETURNS how much it took.  The TX FIFO is CONFIG_TINYUSB_CDC_TX_BUFSIZE
+ *   bytes, so any frame larger than the free FIFO space is silently truncated if
+ *   the return value is ignored.  A COBS frame that loses its tail also loses its
+ *   0x00 delimiter, so the host would glue the next frame onto the partial one and
+ *   corrupt BOTH.  We therefore loop on the return value, and on failure emit a
+ *   lone delimiter so the host resynchronises on the next frame.
+ *
+ * Returns true if every byte was queued and flushed.
+ */
+static bool usb_write_all(const uint8_t *data, size_t len)
+{
+    /* No host has the port open: flush can never drain (TinyUSB drops data when
+     * the terminal is not connected), so writing would just burn the timeout on
+     * every frame.  Drop instead — telemetry is best-effort. */
+    if (!tud_cdc_n_connected(TINYUSB_CDC_ACM_0)) {
+        return false;
+    }
+
+    size_t sent = 0;
+    while (sent < len) {
+        size_t n = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0,
+                                              data + sent, len - sent);
+        sent += n;
+
+        if (sent < len) {
+            /* FIFO full — block until it drains before queuing the rest.
+             * A timeout here means the host stopped reading; abandon the frame. */
+            if (tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
+                                            pdMS_TO_TICKS(USB_TX_FLUSH_TIMEOUT_MS)) != ESP_OK) {
+                return false;
+            }
+        }
+    }
+
+    /* Push the tail out of the FIFO. */
+    return tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
+                                       pdMS_TO_TICKS(USB_TX_FLUSH_TIMEOUT_MS)) == ESP_OK;
+}
+
 static void usb_tx_task(void *arg)
 {
     usb_tx_item_t item;
     while (1) {
         if (xQueueReceive(s_usb_tx_queue, &item, portMAX_DELAY) == pdTRUE) {
-            tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, item.data, item.len);
-            tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(100));
+            if (!usb_write_all(item.data, item.len)) {
+                /* Partial or skipped frame: the COBS delimiter may not have gone
+                 * out.  Emit a bare 0x00 (best effort) so the host flushes its
+                 * accumulator and the NEXT frame decodes cleanly. */
+                if (tud_cdc_n_connected(TINYUSB_CDC_ACM_0)) {
+                    const uint8_t delim = 0x00;
+                    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, &delim, 1);
+                    tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 0);
+                    ESP_LOGW(TAG, "USB TX incomplete — dropped frame (%u bytes)",
+                             (unsigned)item.len);
+                }
+            }
             free(item.data);
         }
     }

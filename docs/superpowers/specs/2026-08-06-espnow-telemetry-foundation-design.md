@@ -35,6 +35,31 @@ payload."
   COBS delimiter, `cobs_decode()`s, `handle_serial_packet()` parses the 4-byte
   `espnow_pkt_hdr_t` and dispatches by `msg_type`. JPEG display path works.
 
+### Blocking gap #2 — the S3 USB write silently truncates every frame
+*(found 2026-08-06 by measurement, after the original draft)*
+
+The original draft claimed telemetry needed **zero** firmware changes. That was
+wrong. `tinyusb_cdcacm_write_queue()` queues only
+`MIN(len, tud_cdc_n_write_available())` and **returns** how much it took
+(verified in the vendored
+`managed_components/espressif__esp_tinyusb/tinyusb_cdc_acm.c:242-249`).
+`usb_tx_task` discarded that return value, so anything larger than the free TX
+FIFO was silently dropped.
+
+Measured with the generated `boat_pb2.py`, at the firmware's real setting
+`CONFIG_VL53L5CX_NB_TARGET_PER_ZONE=4` (256 values per ToF array, i.e. the
+`boat.options` cap is the *actual* case), against the then-512 B TX FIFO:
+
+| Snapshot | protobuf | +COBS | vs 512 B FIFO |
+|----------|---------:|------:|---------------|
+| Full     | 2288 B | 2299 B | truncated — 78 % lost |
+| Trimmed  | 1120 B | 1126 B | truncated — 55 % lost |
+
+So telemetry could not have worked even with the Python binding in place, and
+**the trim alone would not have fixed it** (1126 B still overflows 512 B).
+A truncated COBS frame also loses its `0x00` delimiter, so the host would glue
+the next frame onto the partial one and corrupt *both*.
+
 ### The single blocking gap
 
 `visualize.py:171` does `from proto import boat_pb2`. The `proto/` directory
@@ -199,6 +224,14 @@ transport (see §2 non-goals).
   grids), so the flag defaults to the WiFi-safe value and the boot log records
   the chosen mode once.
 
+### Priority note (revised 2026-08-06)
+
+With Change 3 in place, full snapshots also survive the USB leg, so the trim is
+**no longer required for telemetry to work**. Its remaining value is airtime:
+at 4 targets/zone it cuts the radio load from ~366 kbps to ~179 kbps at 20 Hz,
+moving from the edge of ESP-NOW's practical 214-555 kbps ceiling to comfortably
+inside it (10 → 5 air fragments per snapshot).
+
 ### Why this shrinks the wire with no schema change
 
 In proto3, a `repeated` field with zero elements occupies **zero bytes** on the
@@ -218,6 +251,36 @@ In field mode there is no HTTP server running, so the JSON `/api/snapshot`
 endpoint being trimmed is irrelevant (it does not run in that mode).
 
 ---
+
+## 5b. Change 3 — S3 USB CDC write must not truncate (BLOCKING)
+
+Fixes the gap in §1. Three parts; all three are required.
+
+**(a) Loop honouring the return value.** `usb_write_all()` in
+`tools/espnow_bridge/main/main.c` writes → advances by the returned count →
+flushes → repeats until the whole buffer is out. Correct for any frame size,
+including JPEG later.
+
+**(b) Raise `CONFIG_TINYUSB_CDC_TX_BUFSIZE` 512 → 4096.** This is a
+*performance* requirement, not cosmetic. `CONFIG_FREERTOS_HZ=100` on the S3, so
+the flush helper's internal `vTaskDelay(1)` costs **10 ms per stall**; a 1126 B
+frame through a 512 B FIFO stalls 2-3 times ≈ 20-30 ms against a 50 ms budget at
+20 Hz. At 4096 B a full (2299 B) or trimmed (1126 B) frame is queued in one call
+and never stalls. Costs ~3.5 KB of S3 RAM. `TINYUSB_CDC_TX_BUFSIZE` has no upper
+bound in the component's Kconfig.
+**Note:** `sdkconfig.defaults` is not re-applied over an existing `sdkconfig`,
+so the live `tools/espnow_bridge/sdkconfig` is updated too (it is generated and
+git-ignored); a fresh checkout picks it up from the defaults file.
+
+**(c) Two robustness guards.**
+- *Gate on `tud_cdc_n_connected()`* and drop the frame when no host has the port
+  open. TinyUSB drops data when the terminal is not connected and the FIFO then
+  never drains, so without this every frame would burn its full flush timeout at
+  20 Hz and peg the task.
+- *Emit a lone `0x00` on abort.* The COBS delimiter is appended inside the
+  enqueued buffer, so a partial write loses it; a bare delimiter lets the host
+  flush its accumulator and decode the next frame cleanly instead of corrupting
+  it too.
 
 ## 6. Data Flow (unchanged except payload size)
 
@@ -294,6 +357,8 @@ This gate is the user's to run and sign off.
 | `requirements.txt` | pin `grpcio-tools` (dev dep for regeneration, installed into `.venv`) |
 | `proto/boat_pb2.py` | **new (generated, committed)** |
 | `proto/__init__.py` | **new (empty, committed)** — makes `from proto import boat_pb2` work |
+| `tools/espnow_bridge/main/main.c` | **Change 3a/3c** — `usb_write_all()` loop + connected-gate + abort delimiter |
+| `tools/espnow_bridge/sdkconfig.defaults` | **Change 3b** — `TINYUSB_CDC_TX_BUFSIZE` 512 → 4096 (live `sdkconfig` updated too) |
 | `include/common.h` | add `extern bool g_field_mode;` |
 | `main/main.c` | define `g_field_mode`; set it in the ESP-NOW branch before tasks start |
 | `main/sensor_task.c` | gate the three ToF diagnostic arrays on `g_field_mode` (at snapshot-copy, not sensor-read) |
