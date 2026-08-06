@@ -50,7 +50,7 @@ static const char *TAG = "bridge";
  * C6, or the radio.  Verify on the laptop with:
  *     .venv/bin/python tools/usb_selftest_verify.py /dev/ttyACM0
  * ------------------------------------------------------------------------- */
-#define USB_SELFTEST 1
+#define USB_SELFTEST 0
 
 /* ---- Types --------------------------------------------------------------- */
 typedef struct {
