@@ -189,33 +189,34 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
         return ret;
     }
 
-    /* --- Build and send MSG_ESPNOW_INIT --- */
-    /*
-     * Payload layout:
-     *   [0..3]  espnow_pkt_hdr_t  (4 bytes)
-     *   [4]     channel            (1 byte)
-     *   [5..10] peer MAC           (6 bytes)
+    /* --- Build and send the ESP-NOW init payload ----------------------------
+     * RAW payload, NO espnow_pkt_hdr_t. The C6's init_cb reads:
+     *     channel  = data[0]
+     *     peer_mac = data[1..6]
+     * so it must receive exactly {channel, mac[6]} = 7 bytes.
+     *
+     * This previously sent a 4-byte header first, so the C6 read
+     * channel = MSG_ESPNOW_INIT = 0x10 = 16 (invalid; the valid range is
+     * 0-14) and peer_mac = the rest of the header (07:00:00:06:FF:FF).
+     * esp_now_add_peer() then rejected .channel = 16 with ESP_ERR_ESPNOW_ARG,
+     * and the C6's error path calls esp_now_deinit() — leaving the
+     * co-processor with ESP-NOW torn down and completely deaf. The P4 never
+     * saw it because init_cb is a void callback: the RPC reports success as
+     * long as the handler ran.
      */
     {
-        uint8_t init_buf[ESPNOW_HDR_SIZE + 1 + 6];
+        uint8_t init_buf[1 + 6];
 
-        espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)init_buf;
-        hdr->msg_type    = MSG_ESPNOW_INIT;
-        hdr->payload_len = 1 + 6;
-        hdr->seq         = 0;
-
-        uint8_t channel = (uint8_t)CONFIG_ESPNOW_CHANNEL;
-        init_buf[ESPNOW_HDR_SIZE] = channel;
-
-        uint8_t peer_mac[6];
-        parse_mac_string(CONFIG_ESPNOW_PEER_MAC, peer_mac);
-        memcpy(init_buf + ESPNOW_HDR_SIZE + 1, peer_mac, 6);
+        init_buf[0] = (uint8_t)CONFIG_ESPNOW_CHANNEL;
+        parse_mac_string(CONFIG_ESPNOW_PEER_MAC, &init_buf[1]);
 
         ret = esp_hosted_send_custom_data(PEER_MSG_INIT, init_buf, sizeof(init_buf));
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to send ESPNOW_INIT (%s)", esp_err_to_name(ret));
             return ret;
         }
+        ESP_LOGI(TAG, "Sent ESPNOW_INIT (ch=%d peer=" CONFIG_ESPNOW_PEER_MAC ")",
+                 CONFIG_ESPNOW_CHANNEL);
     }
 
     /* --- Build and send MSG_ESPNOW_CONFIG --- */
