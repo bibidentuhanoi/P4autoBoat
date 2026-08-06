@@ -33,6 +33,11 @@ static const char *TAG = "ESPNOW_TRANSPORT";
  *   [2] n_chunks   total for this image
  */
 #define JPEG_SUBHDR_SIZE      3
+/* Deliberately well under PEER_DATA_MAX (8166). The first attempt sized chunks
+ * at exactly 8166 total — sitting precisely on a documented limit — and nothing
+ * ever reached the air. 4 KB keeps a wide margin at the cost of a few more
+ * chunks. */
+#define JPEG_CHUNK_BYTES      4096u
 /* Gap between chunks so telemetry can interleave (see send_jpeg). */
 #define JPEG_INTER_CHUNK_MS   40
 
@@ -137,6 +142,20 @@ static esp_err_t espnow_send_fn(const uint8_t *buf, size_t len, void *ctx)
 /* ---------------------------------------------------------------------------
  * espnow_transport_send_jpeg — fragments JPEG into ≤JPEG_CHUNK_MAX chunks
  * -------------------------------------------------------------------------*/
+/* Tell the ground station what a JPEG attempt did: rc 0 = sent. */
+static void espnow_report_jpeg(uint8_t rc, uint16_t size, uint8_t n_chunks)
+{
+    uint8_t buf[ESPNOW_HDR_SIZE + 4];
+    espnow_pkt_hdr_t *h = (espnow_pkt_hdr_t *)buf;
+    h->msg_type = MSG_JPEG_STATUS;
+    h->payload_len = 4;
+    h->seq = 0;
+    buf[ESPNOW_HDR_SIZE + 0] = rc;
+    buf[ESPNOW_HDR_SIZE + 1] = n_chunks;
+    memcpy(&buf[ESPNOW_HDR_SIZE + 2], &size, 2);
+    esp_hosted_send_custom_data(PEER_MSG_VIDEO, buf, sizeof(buf));
+}
+
 esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
 {
     if (!jpg || len == 0) {
@@ -156,7 +175,7 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
     static uint8_t frame_id = 0;
     frame_id++;
 
-    const size_t payload_max = JPEG_CHUNK_MAX - JPEG_SUBHDR_SIZE;
+    const size_t payload_max = JPEG_CHUNK_BYTES;
     const size_t n_chunks    = (len + payload_max - 1) / payload_max;
 
     if (n_chunks > 255) {
@@ -191,6 +210,7 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "send_jpeg: chunk %u/%u failed (%s)",
                      (unsigned)(i + 1), (unsigned)n_chunks, esp_err_to_name(ret));
+            espnow_report_jpeg((uint8_t)(i + 1), (uint16_t)len, (uint8_t)n_chunks);
             return ret;
         }
 
@@ -206,6 +226,7 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
         }
     }
 
+    espnow_report_jpeg(0, (uint16_t)len, (uint8_t)n_chunks);
     return ESP_OK;
 }
 

@@ -195,6 +195,7 @@ _jpeg_frame_id = -1
 MSG_JPEG_CHUNK    = 0x01
 MSG_SENSOR        = 0x02
 MSG_BRIDGE_STATUS = 0x13   # S3 self-diagnostics, USB only
+MSG_JPEG_STATUS   = 0x14   # boat's own report of each JPEG send attempt
 _bridge_prev = {}          # last cumulative bridge counters, for rate deltas
 JPEG_MAX_CHUNK = 8162
 
@@ -304,6 +305,22 @@ def handle_serial_packet(data):
             parse_sensor_snapshot(payload)
         except Exception:
             pass
+
+    elif msg_type == MSG_JPEG_STATUS:
+        # The boat telling us what its JPEG attempt did. Without this, a video
+        # path that fails on the BOAT is indistinguishable from one that fails
+        # in the air — and the P4 console is not always reachable.
+        if len(payload) >= 4:
+            rc, n_chunks = payload[0], payload[1]
+            size = struct.unpack('<H', payload[2:4])[0]
+            if rc == 0:
+                print(f"[jpeg] boat SENT ok: {size} B in {n_chunks} chunk(s) "
+                      f"-- if no [jpeg] frame line follows, it was lost in the air",
+                      flush=True)
+            else:
+                print(f"[jpeg] boat FAILED at chunk {rc}/{n_chunks} "
+                      f"({size} B) -- send rejected on the boat, never reached air",
+                      flush=True)
 
     elif msg_type == MSG_BRIDGE_STATUS:
         # S3 bridge self-report. Its console is unavailable once TinyUSB owns

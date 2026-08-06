@@ -25,6 +25,11 @@ typedef enum {
      * the USB pins, so without this a silent bridge is indistinguishable from
      * a crashed one, or from a boat that never transmitted. */
     MSG_BRIDGE_STATUS = 0x13,
+    /* Boat -> laptop: outcome of each JPEG send attempt. Exists because the
+     * P4's serial console is often unavailable in the field, so a failing
+     * video path was indistinguishable from one that never ran. Raw framing,
+     * no protobuf, so it needs no schema change. */
+    MSG_JPEG_STATUS   = 0x14,
 } espnow_msg_type_t;
 
 /* Payload of MSG_BRIDGE_STATUS (packed, little-endian). */
