@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
                        "espnow_video.c"
+                       "sd_card.c"
         "file_system.c"
         "sensor_fusion.c"
         "calibration.c"
@@ -30,5 +31,6 @@ idf_component_register(
         livekit__nanopb
         espressif__cat_detect espressif__esp-dl
         espressif__esp_hosted
+        fatfs sdmmc esp_driver_sdmmc
     INCLUDE_DIRS "include" "drivers" "." "proto"
     EMBED_TXTFILES "dashboard.html")

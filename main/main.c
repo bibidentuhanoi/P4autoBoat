@@ -34,6 +34,7 @@
 #include "motor_control.h"
 #include "transports/espnow_transport.h"
 #include "espnow_video.h"
+#include "sd_card.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -300,6 +301,14 @@ void app_main(void) {
     if (xTaskCreate(task_imu_fusion, "IMU_Task", 4096, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
     }
+    /* 12b. microSD — LAST, and soft-optional. It shares the SDMMC peripheral
+     *      with the C6 (card on slot 0, co-processor on slot 1), so it is
+     *      brought up only after the radio is established and a failure here
+     *      must never take connectivity down with it. */
+    if (sd_card_init() != ESP_OK) {
+        ESP_LOGW(TAG, "No SD card — data logging unavailable, flight continues");
+    }
+
     ESP_ERROR_CHECK(sensor_task_init());
     /* ToF reader FIRST: it fills the cache the snapshot task reads. */
     if (xTaskCreate(task_tof_reader, "ToF_Task", 8192, &tof_devs, 4, NULL) != pdPASS) {
