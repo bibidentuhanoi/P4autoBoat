@@ -127,6 +127,10 @@ void task_tof_reader(void *pvParameters)
     static uint8_t med_idx_a = 0, med_idx_b = 0;
 
     TickType_t last_wake = xTaskGetTickCount();
+    uint32_t ok_a = 0, notready_a = 0, mutexfail_a = 0;
+    uint32_t ok_b = 0, notready_b = 0, mutexfail_b = 0;
+    uint32_t report_div = 0;
+
     ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
 
     while (true) {
@@ -136,20 +140,39 @@ void task_tof_reader(void *pvParameters)
         }
 
         /* One sensor per mutex acquisition, so the IMU keeps a read window. */
-        if (devs->a_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            esp_err_t r = tof_read_grid(&devs->dev_a, &res);
-            xSemaphoreGive(g_i2c_mutex);
-            if (r == ESP_OK) {
-                tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a);
+        if (devs->a_ok) {
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                esp_err_t r = tof_read_grid(&devs->dev_a, &res);
+                xSemaphoreGive(g_i2c_mutex);
+                if (r == ESP_OK) { ok_a++;   tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a); }
+                else             { notready_a++; }
+            } else {
+                mutexfail_a++;
             }
         }
 
-        if (devs->b_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            esp_err_t r = tof_read_grid(&devs->dev_b, &res);
-            xSemaphoreGive(g_i2c_mutex);
-            if (r == ESP_OK) {
-                tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b);
+        if (devs->b_ok) {
+            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                esp_err_t r = tof_read_grid(&devs->dev_b, &res);
+                xSemaphoreGive(g_i2c_mutex);
+                if (r == ESP_OK) { ok_b++;   tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b); }
+                else             { notready_b++; }
+            } else {
+                mutexfail_b++;
             }
+        }
+
+        /* Report every ~5 s. Separates the two failure modes: "sensor had no
+         * frame ready" (notready) vs "could not get the I2C bus" (mutexfail).
+         * ok/s should land near the sensor's ranging rate (~10 Hz). */
+        if (++report_div >= (5000 / TOF_POLL_INTERVAL_MS)) {
+            ESP_LOGI(TAG,
+                     "ToF 5s: A ok=%u notready=%u mutexfail=%u | B ok=%u notready=%u mutexfail=%u",
+                     (unsigned)ok_a, (unsigned)notready_a, (unsigned)mutexfail_a,
+                     (unsigned)ok_b, (unsigned)notready_b, (unsigned)mutexfail_b);
+            ok_a = notready_a = mutexfail_a = 0;
+            ok_b = notready_b = mutexfail_b = 0;
+            report_div = 0;
         }
 
         xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_POLL_INTERVAL_MS));
