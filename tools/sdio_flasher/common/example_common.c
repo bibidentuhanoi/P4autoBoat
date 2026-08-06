@@ -39,7 +39,8 @@ static const uint32_t bootloader_addresses[] = {
     [ESP32C5_CHIP] = 0x2000,
     [ESP32H2_CHIP] = 0x0,
     [ESP32C6_CHIP] = 0x0,
-    [ESP32P4_CHIP] = 0x2000
+    [ESP32P4_CHIP] = 0x2000,
+    [ESP32C61_CHIP] = 0x0    /* added in esp-serial-flasher 2.0.0 */
 };
 
 // If someone adds a new chip but forgets to update the array, compilation FAILS
@@ -120,12 +121,15 @@ esp_loader_error_t connect_to_target_with_stub(esp_loader_t *loader,
     printf("Connected to target\n");
 
     if (higher_transmission_rate != current_transmission_rate) {
-        err = esp_loader_change_transmission_rate_stub(loader,
-                current_transmission_rate,
-                higher_transmission_rate);
+        /* esp-serial-flasher 2.0.0 dropped the _stub variant (which took both
+         * the current and target rate) in favour of a single-rate call.
+         * For SDIO this is a no-op anyway: the port's change_transmission_rate
+         * hook is NULL because the host SDMMC driver owns the clock, so this
+         * returns ESP_LOADER_ERROR_UNSUPPORTED_FUNC and is handled below. */
+        err = esp_loader_change_transmission_rate(loader, higher_transmission_rate);
 
         if (err == ESP_LOADER_ERROR_UNSUPPORTED_FUNC) {
-            printf("Interface does not support changing transmission rate via stub.\n");
+            printf("Interface does not support changing transmission rate.\n");
         } else if (err != ESP_LOADER_SUCCESS) {
             printf("Unable to change transmission rate. Error: %s\n", get_error_string(err));
             return err;

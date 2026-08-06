@@ -11,8 +11,11 @@ function(create_resources dir output)
 
     # Create empty output file
     file(WRITE ${output} "#include <stdint.h>\n\n")
-    # Collect input files
-    file(GLOB bin_paths ${dir}/*)
+    # Collect input files.
+    # Only *.bin — globbing everything also picks up git placeholders
+    # (.gitignore/.gitkeep), and an EMPTY file such as .gitkeep makes the
+    # unquoted REGEX REPLACE below collapse to 5 arguments and fail the build.
+    file(GLOB bin_paths ${dir}/*.bin)
 
     # Iterate through input files
     foreach(bin ${bin_paths})
@@ -32,8 +35,14 @@ function(create_resources dir output)
 
         # Read hex data from file
         file(READ ${bin} filedata HEX)
-        # Convert hex data for C compatibility
-        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," filedata ${filedata})
+        # Skip empty files: an empty ${filedata} would collapse the argument
+        # list of the REGEX REPLACE below and abort configuration.
+        if(filedata STREQUAL "")
+            message(WARNING "[bin2array]   Skipping empty file: ${bin}")
+            continue()
+        endif()
+        # Convert hex data for C compatibility (quote filedata — see above)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," filedata "${filedata}")
         # Compute MD5 hash of the file
         file(MD5 "${bin}" md5_hash)
         message(STATUS "[bin2array]   MD5: ${md5_hash}")

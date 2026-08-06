@@ -1,3 +1,6 @@
 dependencies:
+  # PIN THIS. It was "*", which is why the build broke: the tool is written
+  # against the 2.x handle-based API (esp_loader_t), so 1.x does not compile
+  # at all, while an unpinned "*" will keep drifting onto future majors.
   espressif/esp-serial-flasher:
-    version: "*"
+    version: "^2.0"
