@@ -1,6 +1,7 @@
 #pragma once
 #include "esp_err.h"
 #include <stdint.h>
+#include <stddef.h>
 
 /**
  * @brief Bring ESP-NOW up on the co-processor and listen for a ground station.
@@ -25,3 +26,12 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms);
  *        successful espnow_transport_probe().
  */
 esp_err_t espnow_transport_activate(void);
+
+/**
+ * @brief Fragment and send a JPEG over the field link.
+ *
+ * Was defined in espnow_transport.c but never declared here, so nothing could
+ * call it — the reason field mode had no video despite the code existing.
+ * Chunks into <=JPEG_CHUNK_MAX pieces tagged MSG_JPEG_CHUNK.
+ */
+esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len);

@@ -33,6 +33,7 @@
 #include "detect_task.h"
 #include "motor_control.h"
 #include "transports/espnow_transport.h"
+#include "espnow_video.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -242,6 +243,9 @@ void app_main(void) {
                  * BEFORE the sensor task starts, so no full-size frame can
                  * escape first. */
                 g_field_mode = true;
+                /* Periodic JPEG stills. Deliberately after the transport is
+                 * live, and rate-limited — see espnow_video.h. */
+                espnow_video_start();
             }
         } else if (probe == ESP_ERR_NOT_FOUND) {
             ESP_LOGI(TAG, "No ground station — falling back to WiFi");

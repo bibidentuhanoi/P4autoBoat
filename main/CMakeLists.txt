@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+                       "espnow_video.c"
         "file_system.c"
         "sensor_fusion.c"
         "calibration.c"
