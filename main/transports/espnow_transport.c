@@ -32,7 +32,9 @@ static const char *TAG = "ESPNOW_TRANSPORT";
  *   [1] chunk_idx  0-based order
  *   [2] n_chunks   total for this image
  */
-#define JPEG_SUBHDR_SIZE      3
+/* [frame_id][chunk_idx][n_data][total_len:2]
+ * chunk_idx == n_data marks the XOR PARITY chunk (see send_jpeg). */
+#define JPEG_SUBHDR_SIZE      5
 /* Sized by RADIO drain rate, not by the peer_data limit.
  *
  * The co-processor splits each chunk into 244-byte ESP-NOW packets spaced only
@@ -187,50 +189,60 @@ esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
     const size_t payload_max = JPEG_CHUNK_BYTES;
     const size_t n_chunks    = (len + payload_max - 1) / payload_max;
 
-    if (n_chunks > 255) {
-        ESP_LOGW(TAG, "send_jpeg: %u bytes needs %u chunks (max 255)",
+    if (n_chunks > 254) {          /* 255 reserved: parity uses index n_chunks */
+        ESP_LOGW(TAG, "send_jpeg: %u bytes needs %u chunks (max 254)",
                  (unsigned)len, (unsigned)n_chunks);
         return ESP_ERR_INVALID_SIZE;
     }
 
-    static uint8_t chunk_buf[PEER_DATA_MAX];
-    size_t offset = 0;
-
+    /* XOR parity over zero-padded data chunks. There is no retransmission and
+     * no feedback channel, so losing ONE chunk previously lost the whole image
+     * — which on screen looked like "it showed one frame then froze". One
+     * parity chunk lets the receiver rebuild any single missing chunk for
+     * 1/N overhead, instead of the 100% cost of sending everything twice. */
+    static uint8_t parity[JPEG_CHUNK_BYTES];
+    memset(parity, 0, sizeof(parity));
     for (size_t i = 0; i < n_chunks; i++) {
-        size_t chunk = len - offset;
-        if (chunk > payload_max) {
-            chunk = payload_max;
+        size_t off = i * payload_max;
+        size_t c   = (len - off > payload_max) ? payload_max : (len - off);
+        for (size_t k = 0; k < c; k++) {
+            parity[k] ^= jpg[off + k];      /* short tail is implicitly zero-padded */
         }
+    }
+
+    static uint8_t chunk_buf[PEER_DATA_MAX];
+    uint16_t total_len = (uint16_t)len;
+
+    for (size_t i = 0; i <= n_chunks; i++) {     /* <= : last pass sends parity */
+        const bool is_parity = (i == n_chunks);
+        size_t off   = i * payload_max;
+        size_t chunk = is_parity ? payload_max
+                                 : ((len - off > payload_max) ? payload_max : (len - off));
 
         espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)chunk_buf;
         hdr->msg_type    = MSG_JPEG_CHUNK;
         hdr->payload_len = (uint16_t)(JPEG_SUBHDR_SIZE + chunk);
-        hdr->seq         = frame_id;      /* same for every chunk of this image */
+        hdr->seq         = frame_id;
 
         uint8_t *sub = chunk_buf + ESPNOW_HDR_SIZE;
         sub[0] = frame_id;
         sub[1] = (uint8_t)i;
         sub[2] = (uint8_t)n_chunks;
-        memcpy(sub + JPEG_SUBHDR_SIZE, jpg + offset, chunk);
+        memcpy(sub + 3, &total_len, 2);
+        memcpy(sub + JPEG_SUBHDR_SIZE,
+               is_parity ? parity : (jpg + off), chunk);
 
         esp_err_t ret = esp_hosted_send_custom_data(
             PEER_MSG_VIDEO, chunk_buf,
             ESPNOW_HDR_SIZE + JPEG_SUBHDR_SIZE + chunk);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "send_jpeg: chunk %u/%u failed (%s)",
-                     (unsigned)(i + 1), (unsigned)n_chunks, esp_err_to_name(ret));
+                     (unsigned)(i + 1), (unsigned)(n_chunks + 1), esp_err_to_name(ret));
             espnow_report_jpeg((uint8_t)(i + 1), (uint16_t)len, (uint8_t)n_chunks);
             return ret;
         }
 
-        offset += chunk;
-
-        /* Breathe between chunks. Each ~8 KB chunk becomes ~34 ESP-NOW
-         * fragments on the co-processor; firing several back-to-back is what
-         * previously buried telemetry in the C6's 8-deep TX queue. Yielding
-         * here lets 20 Hz snapshots interleave instead of queueing behind the
-         * whole image. */
-        if (i + 1 < n_chunks) {
+        if (i < n_chunks) {
             vTaskDelay(pdMS_TO_TICKS(JPEG_INTER_CHUNK_MS));
         }
     }

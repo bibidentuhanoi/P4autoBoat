@@ -439,37 +439,7 @@ menu "ESP-NOW Field Mode"
             timeout. The WiFi connect timeout itself is
             WIFI_CONNECT_TIMEOUT_MS in wifi_manager.c.
 
-    config ESPNOW_JPEG_INTERVAL_MS
-        int "Field-mode JPEG interval (ms, 0 = video off)"
-        default 10000
-        range 0 60000
-        depends on ESPNOW_ENABLED
-        help
-            How often to capture and send one JPEG over ESP-NOW in field mode.
-            0 disables video entirely.
 
-            This is a periodic STILL, not a stream. A native 800x640 JPEG is
-            ~15-25 KB versus ~1.1 KB for a trimmed telemetry snapshot, and both
-            share the co-processor TX queue. Hardware measurement showed ToF
-            snapshots already being dropped upstream BEFORE video existed, so
-            lowering this value will cost sensor frames. Raise it only after
-            confirming telemetry holds its rate.
-
-    config ESPNOW_JPEG_QUALITY
-        int "JPEG quality in field mode (1-100, higher = better/larger)"
-        default 25
-        range 1 100
-        depends on ESPNOW_ENABLED
-        help
-            Encode quality used INSTEAD of CAM_JPEG_QUALITY while in ESP-NOW
-            field mode. Same 1-100 scale as the camera option.
-
-            Size matters more than it looks: a JPEG is split into 1 KB chunks
-            and there is NO retransmission, so a single lost chunk loses the
-            entire image. At quality 60 an image is ~14 KB = 14 chunks, and
-            5%% per-chunk loss completes only ~49%% of frames; at ~5 chunks the
-            same loss completes ~77%%. Lower quality therefore buys reliability,
-            not just bandwidth.
 
     config ESPNOW_CHANNEL
         int "ESP-NOW WiFi channel"

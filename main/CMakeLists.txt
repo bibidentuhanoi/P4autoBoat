@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "main.c"
-                       "espnow_video.c"
                        "sd_card.c"
         "file_system.c"
         "sensor_fusion.c"
