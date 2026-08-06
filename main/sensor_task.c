@@ -38,18 +38,156 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
 #define TOF_EVERY_N           4    /* ToF at every 4th tick = 5 Hz (keeps WS traffic low) */
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
 
+/* ─── ToF reader task ────────────────────────────────────────────────────────
+ * ToF used to be read inline by the snapshot loop, but tof_read_grid() is a
+ * single non-blocking poll: if the sensor has no fresh frame at that instant it
+ * returns ESP_FAIL and the snapshot ships with NO ToF at all. The sensor ranges
+ * on its own ~10 Hz clock while the snapshot loop free-runs, so the two rates
+ * beat against each other and most polls missed — measured ~2 of 5.5 expected
+ * ToF frames/s reaching the ground station.
+ *
+ * Now a dedicated task polls at the sensor's own rate and caches the PROCESSED
+ * grid; the snapshot just copies the cache. Benefits:
+ *   - reads happen when data actually is ready, so they succeed
+ *   - the median filter runs per SENSOR frame, not per publish (feeding it the
+ *     same cached frame repeatedly would make median3 a no-op)
+ *   - the snapshot loop does no I2C at all, so it stops overrunning its 50 ms
+ *     period and no longer contends with the IMU task for g_i2c_mutex
+ * ───────────────────────────────────────────────────────────────────────────*/
+#define TOF_POLL_INTERVAL_MS  25   /* 40 Hz poll of a ~10 Hz sensor: always catches
+                                    * a fresh frame without busy-waiting */
+#define TOF_STALE_US   (1000 * 1000)  /* cached grid older than this = not valid */
+
+#define TOF_NVALS  (64 * VL53L5CX_NB_TARGET_PER_ZONE)
+
+typedef struct {
+    int16_t  distances[TOF_NVALS];
+    uint16_t sigma[TOF_NVALS];
+    uint8_t  status[TOF_NVALS];
+    uint8_t  nb_target[64];
+    int64_t  ts_us;          /* 0 = never populated */
+} tof_grid_cache_t;
+
+static tof_grid_cache_t  s_cache_a, s_cache_b;
+static SemaphoreHandle_t s_cache_mutex = NULL;
+
+/* Apply per-slot gating + 3-frame median, then publish into the cache. */
+static void tof_cache_store(tof_grid_cache_t *cache,
+                            const VL53L5CX_ResultsData *res,
+                            int16_t med[][3], uint8_t *med_idx)
+{
+    int16_t  dist[TOF_NVALS];
+    uint16_t sig[TOF_NVALS];
+    uint8_t  st[TOF_NVALS];
+    uint8_t  nbt[64];
+
+    for (int i = 0; i < 64; i++) {
+        uint8_t nb = res->nb_target_detected[i];
+        for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
+            int idx = i * VL53L5CX_NB_TARGET_PER_ZONE + j;
+            uint8_t status = res->target_status[idx];
+            /* Slots beyond nb_target_detected hold stale driver buffer data. */
+            bool slot_valid = (j < nb) && (status == 5 || status == 9);
+            med[idx][*med_idx] = slot_valid ? res->distance_mm[idx] : 0;
+            dist[idx] = median3(med[idx][0], med[idx][1], med[idx][2]);
+            sig[idx]  = slot_valid ? res->range_sigma_mm[idx] : 0;
+            st[idx]   = slot_valid ? status : 0;
+        }
+        nbt[i] = nb;
+    }
+    *med_idx = (*med_idx + 1) % 3;
+
+    xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+    memcpy(cache->distances, dist, sizeof(dist));
+    memcpy(cache->sigma,     sig,  sizeof(sig));
+    memcpy(cache->status,    st,   sizeof(st));
+    memcpy(cache->nb_target, nbt,  sizeof(nbt));
+    cache->ts_us = esp_timer_get_time();
+    xSemaphoreGive(s_cache_mutex);
+}
+
+esp_err_t sensor_task_init(void)
+{
+    if (!s_cache_mutex) {
+        s_cache_mutex = xSemaphoreCreateMutex();
+        if (!s_cache_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+void task_tof_reader(void *pvParameters)
+{
+    tof_devices_t *devs = (tof_devices_t *)pvParameters;
+
+    static VL53L5CX_ResultsData res;
+    static int16_t med_a[TOF_NVALS][3];
+    static int16_t med_b[TOF_NVALS][3];
+    static uint8_t med_idx_a = 0, med_idx_b = 0;
+
+    TickType_t last_wake = xTaskGetTickCount();
+    ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
+
+    while (true) {
+        if (g_inference_active) {
+            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+            last_wake = xTaskGetTickCount();
+        }
+
+        /* One sensor per mutex acquisition, so the IMU keeps a read window. */
+        if (devs->a_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            esp_err_t r = tof_read_grid(&devs->dev_a, &res);
+            xSemaphoreGive(g_i2c_mutex);
+            if (r == ESP_OK) {
+                tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a);
+            }
+        }
+
+        if (devs->b_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            esp_err_t r = tof_read_grid(&devs->dev_b, &res);
+            xSemaphoreGive(g_i2c_mutex);
+            if (r == ESP_OK) {
+                tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b);
+            }
+        }
+
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_POLL_INTERVAL_MS));
+    }
+}
+
+/* Copy a cached grid into the snapshot. Returns false when nothing fresh. */
+static bool tof_cache_load(const tof_grid_cache_t *cache, boat_ToFGrid *out)
+{
+    bool ok = false;
+    xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
+    if (cache->ts_us != 0 && (esp_timer_get_time() - cache->ts_us) < TOF_STALE_US) {
+        out->valid = true;
+        out->distances_count = TOF_NVALS;
+        memcpy(out->distances, cache->distances, sizeof(cache->distances));
+        /* Field mode omits the diagnostics: proto3 encodes an empty repeated
+         * field as zero bytes, halving the snapshot for the ESP-NOW link. */
+        if (!g_field_mode) {
+            out->sigma_count = TOF_NVALS;
+            out->target_status_count = TOF_NVALS;
+            out->nb_target_detected_count = 64;
+            memcpy(out->sigma, cache->sigma, sizeof(cache->sigma));
+            memcpy(out->target_status, cache->status, sizeof(cache->status));
+            memcpy(out->nb_target_detected, cache->nb_target, sizeof(cache->nb_target));
+        }
+        ok = true;
+    }
+    xSemaphoreGive(s_cache_mutex);
+    return ok;
+}
+
 void task_sensor_snapshot(void *pvParameters)
 {
     tof_devices_t *devs = (tof_devices_t *)pvParameters;
 
-    /* Static allocation — avoids stack overflow risk */
+    /* Static allocation — avoids stack overflow risk.
+     * ToF buffers and the median filter now live in task_tof_reader. */
     static boat_SensorSnapshot snap;
-    static VL53L5CX_ResultsData tof_res;
-
-    /* 3-frame median filter per zone×target — kills single-frame spikes */
-    static int16_t med_a[64 * VL53L5CX_NB_TARGET_PER_ZONE][3];
-    static int16_t med_b[64 * VL53L5CX_NB_TARGET_PER_ZONE][3];
-    static uint8_t med_idx_a = 0, med_idx_b = 0;
 
     uint32_t iteration = 0;
 
@@ -85,78 +223,18 @@ void task_sensor_snapshot(void *pvParameters)
         snap.imu.roll    = imu.roll;
         snap.imu.heading = imu.heading;
 
-        /* ToF — 5 Hz to keep WS payload small (~1.4KB per full frame) */
+        /* ToF — copied from the reader task's cache (5 Hz publish).
+         * No I2C here any more: the cache is filled by task_tof_reader at the
+         * sensor's own rate, so a snapshot no longer misses ToF just because
+         * the sensor had nothing ready at this exact instant. */
         bool tof_tick = (iteration % TOF_EVERY_N == 0);
 
         if (tof_tick) {
-            /* ToF A — take/release mutex per sensor to give IMU a read window */
-            if (devs->a_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                snap.has_tof_a = (tof_read_grid(&devs->dev_a, &tof_res) == ESP_OK);
-                xSemaphoreGive(g_i2c_mutex);
-                if (snap.has_tof_a) {
-                    snap.tof_a.valid = true;
-                    snap.tof_a.distances_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    /* Field mode: omit the three diagnostic arrays. proto3
-                     * encodes an empty repeated field as ZERO bytes, so this
-                     * halves the snapshot (~2288 -> ~1120 B) with no schema
-                     * change and no decoder change. distances/IMU/GPS are
-                     * untouched, and `status` above still comes from tof_res,
-                     * so distance gating is unaffected. */
-                    snap.tof_a.sigma_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_a.target_status_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_a.nb_target_detected_count = g_field_mode ? 0 : 64;
-                    for (int i = 0; i < 64; i++) {
-                        uint8_t nb = tof_res.nb_target_detected[i];
-                        for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
-                            int idx = i * VL53L5CX_NB_TARGET_PER_ZONE + j;
-                            uint8_t status = tof_res.target_status[idx];
-                            /* Gate on nb_target_detected AND status: slots beyond
-                             * nb_target_detected contain stale driver buffer data. */
-                            bool slot_valid = (j < nb) && (status == 5 || status == 9);
-                            int16_t raw = slot_valid ? tof_res.distance_mm[idx] : 0;
-                            med_a[idx][med_idx_a] = raw;
-                            snap.tof_a.distances[idx] = median3(med_a[idx][0], med_a[idx][1], med_a[idx][2]);
-                            snap.tof_a.sigma[idx] = slot_valid ? tof_res.range_sigma_mm[idx] : 0;
-                            snap.tof_a.target_status[idx] = slot_valid ? status : 0;
-                        }
-                        snap.tof_a.nb_target_detected[i] = nb;
-                    }
-                    med_idx_a = (med_idx_a + 1) % 3;
-                }
+            if (devs->a_ok) {
+                snap.has_tof_a = tof_cache_load(&s_cache_a, &snap.tof_a);
             }
-
-            /* ToF B — separate mutex acquisition */
-            if (devs->b_ok && xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                snap.has_tof_b = (tof_read_grid(&devs->dev_b, &tof_res) == ESP_OK);
-                xSemaphoreGive(g_i2c_mutex);
-                if (snap.has_tof_b) {
-                    snap.tof_b.valid = true;
-                    snap.tof_b.distances_count = 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    /* Field mode: omit the three diagnostic arrays. proto3
-                     * encodes an empty repeated field as ZERO bytes, so this
-                     * halves the snapshot (~2288 -> ~1120 B) with no schema
-                     * change and no decoder change. distances/IMU/GPS are
-                     * untouched, and `status` above still comes from tof_res,
-                     * so distance gating is unaffected. */
-                    snap.tof_b.sigma_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_b.target_status_count = g_field_mode ? 0 : 64 * VL53L5CX_NB_TARGET_PER_ZONE;
-                    snap.tof_b.nb_target_detected_count = g_field_mode ? 0 : 64;
-                    for (int i = 0; i < 64; i++) {
-                        uint8_t nb = tof_res.nb_target_detected[i];
-                        for (int j = 0; j < VL53L5CX_NB_TARGET_PER_ZONE; j++) {
-                            int idx = i * VL53L5CX_NB_TARGET_PER_ZONE + j;
-                            uint8_t status = tof_res.target_status[idx];
-                            bool slot_valid = (j < nb) && (status == 5 || status == 9);
-                            int16_t raw = slot_valid ? tof_res.distance_mm[idx] : 0;
-                            med_b[idx][med_idx_b] = raw;
-                            snap.tof_b.distances[idx] = median3(med_b[idx][0], med_b[idx][1], med_b[idx][2]);
-                            snap.tof_b.sigma[idx] = slot_valid ? tof_res.range_sigma_mm[idx] : 0;
-                            snap.tof_b.target_status[idx] = slot_valid ? status : 0;
-                        }
-                        snap.tof_b.nb_target_detected[i] = nb;
-                    }
-                    med_idx_b = (med_idx_b + 1) % 3;
-                }
+            if (devs->b_ok) {
+                snap.has_tof_b = tof_cache_load(&s_cache_b, &snap.tof_b);
             }
         }
 

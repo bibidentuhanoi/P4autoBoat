@@ -300,6 +300,11 @@ void app_main(void) {
     if (xTaskCreate(task_imu_fusion, "IMU_Task", 4096, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
     }
+    ESP_ERROR_CHECK(sensor_task_init());
+    /* ToF reader FIRST: it fills the cache the snapshot task reads. */
+    if (xTaskCreate(task_tof_reader, "ToF_Task", 8192, &tof_devs, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "FATAL: ToF_Task create failed — snapshots will carry no ToF");
+    }
     if (xTaskCreate(task_sensor_snapshot, "Snap_Task", 16384, &tof_devs, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "FATAL: Snap_Task create failed (out of internal RAM) — no telemetry");
     }
