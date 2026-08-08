@@ -365,6 +365,30 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
         ESP_LOGW(TAG, "Could not read back the co-processor channel");
     }
 
+    /* --- Verify Long Range mode took, if the C6 build has it enabled --------
+     * esp_wifi_set_protocol()/esp_now_set_peer_rate_config() run ON THE C6
+     * (tools/slave_firmware/espnow_bridge.c's init_cb), not here -- the P4
+     * can't set them, only verify. esp_wifi_get_protocol() IS proxied
+     * through esp_wifi_remote like the channel check above, so it genuinely
+     * reflects the co-processor's state. Log-only: a mismatch doesn't fail
+     * the probe (the link still works at normal range), it just means the
+     * range test won't show a gain -- confirm that here, at boot, rather
+     * than discovering it 300m into a field test. */
+    uint8_t protocol_bitmap = 0;
+    if (esp_wifi_get_protocol(WIFI_IF_STA, &protocol_bitmap) == ESP_OK) {
+        if (protocol_bitmap & WIFI_PROTOCOL_LR) {
+            ESP_LOGI(TAG, "Co-processor LR protocol bit is SET (bitmap=0x%02x)",
+                     protocol_bitmap);
+        } else {
+            ESP_LOGW(TAG, "Co-processor LR protocol bit NOT set (bitmap=0x%02x) "
+                          "-- ESPNOW_LR_ENABLED may be 0 on the C6 build, or "
+                          "esp_wifi_set_protocol failed there (check its own log)",
+                     protocol_bitmap);
+        }
+    } else {
+        ESP_LOGW(TAG, "Could not read back the co-processor's WiFi protocol bitmap");
+    }
+
     /* --- Listen for the ground station -------------------------------------
      * The S3 bridge broadcasts MSG_GROUND_HELLO every ESPNOW_HELLO_INTERVAL_MS.
      * Hearing one proves the whole chain is live: C6 radio on the right
