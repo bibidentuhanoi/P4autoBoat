@@ -46,6 +46,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.patheffects as pe
 import time
 import requests
+import websocket
 import io
 from PIL import Image
 
@@ -61,9 +62,12 @@ args = parser.parse_args()
 
 ESP32_IP     = args.ip
 SERIAL_MODE  = args.serial is not None
-STREAM_URL   = f'http://{ESP32_IP}/stream'
-IMU_URL      = f'http://{ESP32_IP}/api/imu'
-SNAPSHOT_URL = f'http://{ESP32_IP}/api/snapshot'
+# Ports and paths match dashboard.html exactly (//${host}:80/ws,
+# //${host}:81/stream) — Kconfig defaults CONFIG_HTTP_API_PORT=80 /
+# CONFIG_HTTP_STREAM_PORT=81. There is no REST API for sensor data: pitch/
+# roll/heading/ToF all arrive as protobuf BoatMessage frames over the WS.
+STREAM_URL = f'http://{ESP32_IP}:81/stream'
+WS_URL     = f'ws://{ESP32_IP}:80/ws'
 MAX_DISTANCE = 2000  # mm
 # ==========================================
 
@@ -127,43 +131,29 @@ def mjpeg_reader():
             time.sleep(backoff)
             backoff = min(backoff * 2, 5)
 
-def imu_poller():
-    """Poll /api/imu at ~20Hz for fast heading updates."""
-    backoff = 1
-    while True:
-        try:
-            r = requests.get(IMU_URL, timeout=2)
-            if r.status_code == 200:
-                d = r.json()
-                with imu_lock:
-                    imu_data['pitch']   = d.get('pitch', 0.0)
-                    imu_data['roll']    = d.get('roll', 0.0)
-                    imu_data['heading'] = d.get('heading', 0.0)
-                backoff = 1
-            time.sleep(0.05)
-        except Exception as e:
-            print(f"IMU poll error: {e}")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 5)
+def ws_reader():
+    """Open the same ws://host:80/ws BoatMessage stream dashboard.html uses.
 
-def snapshot_poller():
-    """Poll /api/snapshot at ~5Hz for synced ToF grids."""
-    global grid_A, grid_B
+    There is no REST API for sensor data (no /api/imu, no /api/snapshot) —
+    pitch/roll/heading/ToF all arrive as protobuf BoatMessage binary WS
+    frames, decoded by parse_sensor_snapshot() below: the SAME function the
+    ESP-NOW/serial path uses, so both transports render identically.
+    """
     backoff = 1
     while True:
         try:
-            r = requests.get(SNAPSHOT_URL, timeout=2)
-            if r.status_code == 200:
-                d = r.json()
-                with snapshot_lock:
-                    if d.get('tof_a') is not None:
-                        grid_A = np.array(d['tof_a'])
-                    if d.get('tof_b') is not None:
-                        grid_B = np.array(d['tof_b'])
-                backoff = 1
-            time.sleep(0.2)
+            ws = websocket.create_connection(WS_URL, timeout=5)
+            print(f"[ws] connected to {WS_URL}", flush=True)
+            backoff = 1
+            while True:
+                opcode, data = ws.recv_data()
+                if opcode == websocket.ABNF.OPCODE_BINARY:
+                    try:
+                        parse_sensor_snapshot(data)
+                    except Exception:
+                        pass
         except Exception as e:
-            print(f"Snapshot poll error: {e}")
+            print(f"[ws] error: {e}", flush=True)
             time.sleep(backoff)
             backoff = min(backoff * 2, 5)
 
@@ -188,17 +178,17 @@ def cobs_decode(data: bytes) -> bytes:
     return bytes(out)
 
 
-# JPEG reassembly state: chunks keyed by index, reset when frame_id changes
-_jpeg_chunks = {}
-_jpeg_frame_id = -1
-_jpeg_expect = 0
-
-MSG_JPEG_CHUNK    = 0x01
-MSG_SENSOR        = 0x02
+MSG_SENSOR        = 0x02   # legacy full SensorSnapshot protobuf
 MSG_BRIDGE_STATUS = 0x13   # S3 self-diagnostics, USB only
-MSG_JPEG_STATUS   = 0x14   # boat's own report of each JPEG send attempt
+# Field-mode telemetry, IMU+GPS only -- a hand-packed struct (main/transports/
+# espnow_protocol.h: espnow_telemetry_t), NOT a boat.proto message. Current
+# firmware sends this instead of MSG_SENSOR over the ESP-NOW link (fits one
+# packet, no fragmentation -- a full SensorSnapshot with ToF needed ~55).
+# This viewer has no GPS display, so only pitch/roll/heading are used here;
+# see tools/espnow_drive.py for the full field set if that's ever needed.
+MSG_FIELD_TELEMETRY = 0x08
+FIELD_TELEMETRY_FMT = '<fffBddffBf'
 _bridge_prev = {}          # last cumulative bridge counters, for rate deltas
-JPEG_MAX_CHUNK = 8162
 
 
 def _load_boat_pb2():
@@ -223,15 +213,54 @@ def _load_boat_pb2():
         print(f'[viz]   interpreter: {sys.executable}', file=sys.stderr)
         print('[viz]   Fix: run with the repo venv, which is where the binding '
               'was generated:', file=sys.stderr)
-        print('[viz]     .venv/bin/python visualize.py --serial /dev/ttyACM0',
+        print('[viz]     .venv/bin/python visualize.py [ip | --serial /dev/ttyACM0]',
               file=sys.stderr)
         print('[viz]   If the file is missing:  tools/gen_proto.sh\n',
               file=sys.stderr)
         sys.exit(1)
 
 
-# Resolved once, at startup, only when serial mode will actually use it.
-_boat_pb2 = _load_boat_pb2() if SERIAL_MODE else None
+# Resolved once at startup. Needed by both modes: WiFi decodes BoatMessage
+# frames off the WS, serial decodes them off COBS-framed ESP-NOW packets.
+_boat_pb2 = _load_boat_pb2()
+
+# Per-sensor mounting orientation (flip_h, flip_v, transpose). Values copied
+# from dashboard.html's FLIP object, which is the single source of truth for
+# overlay/grid constants (both renderers must use identical values or the two
+# UIs disagree on which physical zone a cell represents) — see FLIP in
+# dashboard.html. Sensor B is mounted mirrored relative to A.
+TOF_FLIP = {
+    'A': (False, False, False),
+    'B': (True,  True,  False),
+}
+
+
+def read_depth(distances, row, col, flip_h, flip_v, trans):
+    """Mirror dashboard.html's readDepth(): resolve one zone's distance from a
+    possibly multi-target-per-zone array, applying the sensor's mount-orientation
+    flip/transpose first.
+
+    ToFGrid.distances is NOT always a flat 64-entry grid — VL53L5CX_NB_TARGET_PER_ZONE
+    (Kconfig; currently 4) makes it 64*ntpp entries laid out [zone*ntpp + target].
+    Indexing it as distances[row*8+col] (ntpp=1 only) silently reads the wrong
+    zone/target once ntpp>1 and produces a scrambled-looking heatmap — it decodes
+    without error, so nothing flags it as wrong.
+    """
+    n = len(distances)
+    if n < 64:
+        return 0
+    ntpp = max(1, n // 64)
+    r = (7 - row) if flip_v else row
+    c = (7 - col) if flip_h else col
+    zone = (c * 8 + r) if trans else (r * 8 + c)
+    if ntpp == 1:
+        return distances[zone] or 0
+    best = 0
+    for t in range(ntpp):
+        v = distances[zone * ntpp + t]
+        if v > 0 and (best == 0 or v < best):
+            best = v
+    return best
 
 
 def parse_sensor_snapshot(data):
@@ -251,87 +280,40 @@ def parse_sensor_snapshot(data):
 
     with snapshot_lock:
         if s.tof_a.valid and len(s.tof_a.distances) >= 64:
+            fh, fv, tr = TOF_FLIP['A']
             for r in range(8):
                 for c in range(8):
-                    grid_A[r][c] = s.tof_a.distances[r * 8 + c]
+                    grid_A[r][c] = read_depth(s.tof_a.distances, r, c, fh, fv, tr)
         if s.tof_b.valid and len(s.tof_b.distances) >= 64:
+            fh, fv, tr = TOF_FLIP['B']
             for r in range(8):
                 for c in range(8):
-                    grid_B[r][c] = s.tof_b.distances[r * 8 + c]
+                    grid_B[r][c] = read_depth(s.tof_b.distances, r, c, fh, fv, tr)
 
 
 def handle_serial_packet(data):
     """Parse espnow_pkt_hdr_t and dispatch by msg_type."""
-    global _jpeg_chunks, _jpeg_frame_id, _jpeg_expect, latest_frame
-
     if len(data) < 4:
         return
 
     msg_type, payload_len, seq = struct.unpack('<BHB', data[:4])
     payload = data[4:4 + payload_len]
 
-    if msg_type == MSG_JPEG_CHUNK:
-        # Payload: [frame_id][chunk_idx][n_chunks] + JPEG bytes.
-        # Previously the boat put a per-CHUNK counter in the header seq and this
-        # side reset the buffer whenever seq changed — so every chunk wiped the
-        # previous one and a multi-chunk image could never reassemble. Now the
-        # chunks are self-describing, so out-of-order or missing chunks are
-        # detected instead of silently producing a corrupt image.
-        if len(payload) < 3:
-            return
-        frame_id, chunk_idx, n_chunks = payload[0], payload[1], payload[2]
-        body = payload[3:]
-
-        if frame_id != _jpeg_frame_id:
-            # Starting a new image. If the previous one never completed, say so
-            # loudly with the exact shortfall — one lost chunk loses the WHOLE
-            # image (there is no retransmission), and that reads on screen as
-            # "it showed one frame then stopped".
-            if _jpeg_chunks and _jpeg_expect:
-                missing = sorted(set(range(_jpeg_expect)) - set(_jpeg_chunks))
-                print(f"[jpeg] frame {_jpeg_frame_id} INCOMPLETE: "
-                      f"{len(_jpeg_chunks)}/{_jpeg_expect} chunks, missing {missing}",
-                      flush=True)
-            _jpeg_frame_id = frame_id
-            _jpeg_chunks.clear()
-        _jpeg_expect = n_chunks
-        _jpeg_chunks[chunk_idx] = body
-
-        if len(_jpeg_chunks) == n_chunks:
-            blob = b''.join(_jpeg_chunks[i] for i in range(n_chunks))
-            _jpeg_chunks.clear()
-            try:
-                arr = np.array(Image.open(io.BytesIO(blob)))
-                with frame_lock:
-                    latest_frame = arr
-                print(f"[jpeg] frame {frame_id}: {len(blob)} B, "
-                      f"{n_chunks} chunk(s) -> {arr.shape[1]}x{arr.shape[0]}",
-                      flush=True)
-            except Exception as exc:                    # noqa: BLE001
-                print(f"[jpeg] frame {frame_id}: decode failed "
-                      f"({len(blob)} B): {exc}", flush=True)
-
-    elif msg_type == MSG_SENSOR:
+    if msg_type == MSG_SENSOR:
         try:
             parse_sensor_snapshot(payload)
         except Exception:
             pass
 
-    elif msg_type == MSG_JPEG_STATUS:
-        # The boat telling us what its JPEG attempt did. Without this, a video
-        # path that fails on the BOAT is indistinguishable from one that fails
-        # in the air — and the P4 console is not always reachable.
-        if len(payload) >= 4:
-            rc, n_chunks = payload[0], payload[1]
-            size = struct.unpack('<H', payload[2:4])[0]
-            if rc == 0:
-                print(f"[jpeg] boat SENT ok: {size} B in {n_chunks} chunk(s) "
-                      f"-- if no [jpeg] frame line follows, it was lost in the air",
-                      flush=True)
-            else:
-                print(f"[jpeg] boat FAILED at chunk {rc}/{n_chunks} "
-                      f"({size} B) -- send rejected on the boat, never reached air",
-                      flush=True)
+    elif msg_type == MSG_FIELD_TELEMETRY:
+        expect_len = struct.calcsize(FIELD_TELEMETRY_FMT)
+        if len(payload) == payload_len == expect_len:
+            pitch, roll, heading, _valid, _lat, _lon, _spd, _crs, _sats, _hdop = \
+                struct.unpack(FIELD_TELEMETRY_FMT, payload)
+            with imu_lock:
+                imu_data['pitch']   = pitch
+                imu_data['roll']    = roll
+                imu_data['heading'] = heading
 
     elif msg_type == MSG_BRIDGE_STATUS:
         # S3 bridge self-report. Its console is unavailable once TinyUSB owns
@@ -371,7 +353,7 @@ def serial_reader(port, baud=921600):
     ser = pyserial.Serial(port, baud, timeout=0.1)
     buf = bytearray()
 
-    n_bytes = n_frames = n_sensor = n_jpeg = n_other = n_baddecode = 0
+    n_bytes = n_frames = n_sensor = n_other = n_baddecode = 0
     last_report = time.time()
 
     while True:
@@ -389,8 +371,6 @@ def serial_reader(port, baud=921600):
                         mt = decoded[0]
                         if mt == MSG_SENSOR:
                             n_sensor += 1
-                        elif mt == MSG_JPEG_CHUNK:
-                            n_jpeg += 1
                         else:
                             n_other += 1
                         handle_serial_packet(decoded)
@@ -402,13 +382,13 @@ def serial_reader(port, baud=921600):
         if now - last_report >= 1.0:
             if n_bytes:
                 print(f"[serial] RX {n_bytes:6d} B/s  frames:{n_frames:3d}  "
-                      f"sensor:{n_sensor:3d} jpeg:{n_jpeg:3d} "
+                      f"sensor:{n_sensor:3d} "
                       f"other:{n_other:3d} cobs_fail:{n_baddecode:3d}",
                       flush=True)
             else:
                 print("[serial] RX 0 B/s — nothing arriving on the port",
                       flush=True)
-            n_bytes = n_frames = n_sensor = n_jpeg = n_other = n_baddecode = 0
+            n_bytes = n_frames = n_sensor = n_other = n_baddecode = 0
             last_report = now
 
 
@@ -893,10 +873,9 @@ if __name__ == '__main__':
                          daemon=True).start()
     else:
         print(f'Connecting to ESP32 at {ESP32_IP}...')
-        print(f'  MJPEG:    {STREAM_URL}')
-        print(f'  IMU:      {IMU_URL}')
-        print(f'  Snapshot: {SNAPSHOT_URL}')
-        for target in [mjpeg_reader, imu_poller, snapshot_poller]:
+        print(f'  MJPEG: {STREAM_URL}')
+        print(f'  WS:    {WS_URL}')
+        for target in [mjpeg_reader, ws_reader]:
             threading.Thread(target=target, daemon=True).start()
 
     print('AutoBoat visualizer running... (close window to stop)')

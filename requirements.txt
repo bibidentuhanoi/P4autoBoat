@@ -3,6 +3,10 @@ matplotlib
 requests
 Pillow
 
+# WiFi mode: visualize.py's sensor/ToF data arrives over the same ws://host:80/ws
+# protobuf stream dashboard.html uses (there is no REST API for it).
+websocket-client
+
 # ESP-NOW / field-mode serial path
 #   visualize.py --serial ...  and  tools/usb_selftest_verify.py
 pyserial
