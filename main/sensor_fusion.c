@@ -87,12 +87,28 @@ void task_imu_fusion(void *pvParameters) {
 
     int64_t last_time = esp_timer_get_time();
 
+    /* Diagnostic: how often a tick gets SKIPPED because the I2C bus mutex
+     * couldn't be acquired within 200ms (the `continue` below), and the
+     * longest gap between two successful fusion writes. Nothing previously
+     * counted this -- that skip path was a silent `continue`, so a fusion
+     * task starved by ToF bus contention would show frozen heading/pitch/
+     * roll with nothing in the log to explain why. Reported every ~5s,
+     * same cadence as task_tof_reader's own mutexfail counters
+     * (sensor_task.c) -- if THIS number is high while ToF's mutexfail stays
+     * 0 (as it consistently has been), that localises the contention
+     * precisely: ToF wins the race for the bus, fusion loses it. */
+    uint32_t mutex_fails = 0, ticks = 0;
+    int64_t last_report_us  = esp_timer_get_time();
+    int64_t last_success_us = esp_timer_get_time();
+    int64_t max_gap_us = 0;
+
     while(1) {
         while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
         int64_t now = esp_timer_get_time();
         float dt = (float)(now - last_time) / 1000000.0f;
         if (dt > 0.1f) dt = 0.1f;   /* clamp: after an inference stall, don't let the integrators jump */
         last_time = now;
+        ticks++;
 
         // --- I2C reads under shared bus mutex ---
         // Failure visibility: a dead IMU used to freeze the outputs at zero
@@ -111,6 +127,13 @@ void task_imu_fusion(void *pvParameters) {
          * a ToF read; if we still can't get the bus, SKIP the tick (hold last
          * values) — bus contention is not a sensor problem, don't false-alarm. */
         if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+            mutex_fails++;
+            if (now - last_report_us >= 5000000) {
+                ESP_LOGW(FUSION_TAG, "fusion 5s: ticks=%u mutex_fails=%u max_gap=%lldms since last write",
+                         (unsigned)ticks, (unsigned)mutex_fails, (long long)(max_gap_us / 1000));
+                ticks = 0; mutex_fails = 0; max_gap_us = 0;
+                last_report_us = now;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -353,6 +376,10 @@ void task_imu_fusion(void *pvParameters) {
                 xSemaphoreGive(fusion_mutex);
             }
             diag_heading = heading;   /* what the UI will show this tick */
+
+            int64_t gap_us = now - last_success_us;
+            if (gap_us > max_gap_us) max_gap_us = gap_us;
+            last_success_us = now;
         }
 
         /* Wiring-vs-firmware oracle (~5s), logged with the bus released. Rotate the
@@ -383,6 +410,13 @@ void task_imu_fusion(void *pvParameters) {
                      diag_heading, diag_mag_only, diag_gz);
         }
 #endif
+
+        if (now - last_report_us >= 5000000) {
+            ESP_LOGI(FUSION_TAG, "fusion 5s: ticks=%u mutex_fails=%u max_gap=%lldms since last write",
+                     (unsigned)ticks, (unsigned)mutex_fails, (long long)(max_gap_us / 1000));
+            ticks = 0; mutex_fails = 0; max_gap_us = 0;
+            last_report_us = now;
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }

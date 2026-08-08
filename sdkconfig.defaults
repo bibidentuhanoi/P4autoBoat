@@ -1,5 +1,41 @@
 CONFIG_IDF_TARGET="esp32p4"
 CONFIG_VL53L5CX_NB_TARGET_PER_ZONE=4
+# --- ToF: transfer only the fields this architecture actually uses ---
+# ARCHITECTURE DECISION (Kiet, 2026-08-08): ML trains on CAMERA IMAGES ONLY
+# (PicoDet). ToF is NOT a training input -- it is a RUNTIME distance
+# reference: detect an obstacle in the image, read the ToF distance to that
+# obstacle to decide avoid-or-not, and measure zone distances to plan the
+# route. So ToF only needs distance + enough confidence/validity to trust it.
+#
+# Disabling a field means the host never pulls it off the sensor at all
+# (host-side read-length ONLY -- the sensor's ranging is computed identically
+# regardless; verified in vl53l5cx_get_ranging_data()). Every enabled field
+# is I2C bus-time task_tof_reader holds away from task_imu_fusion on the
+# SHARED bus -- the whole reason heading/pitch/roll froze (fusion starved
+# ~92-96% of ticks at the old all-fields ~3370B/read; ~1420B now, confirmed
+# snappy). See sensor_fusion.c "fusion 5s: mutex_fails=".
+#
+# KEPT (what avoid/route decisions need): distance_mm, range_sigma_mm,
+#   target_status, nb_target_detected -- all read by sensor_task/dashboard.
+# DISABLED -- not used by the image-only-ML + ToF-as-distance-ref design.
+#   The two marked "DATASET?" MIGHT be worth capturing IF a future plan ever
+#   trains ML on ToF features -- but that is explicitly NOT the current
+#   architecture. They are unrecoverable after collection, so flip the
+#   relevant one back BEFORE any ToF-logging field campaign if that changes:
+#   signal_per_spad     1028B  raw unnormalized signal (biggest single cost)
+#   reflectance_percent  260B  DATASET? per-zone material/surface estimate --
+#                              would matter only for ToF-feature ML, not this
+#                              image-only design
+#   ambient_per_spad     260B  DATASET? background-IR; could let a future set
+#                              tell "clear" from "sun-blinded". sigma+status
+#                              already carry runtime confidence, so not now
+#   nb_spads_enabled     260B  internal photodiode bookkeeping, no use
+#   motion_indicator     144B  motion detection -- confirmed not needed
+CONFIG_VL53L5CX_DISABLE_AMBIENT_PER_SPAD=y
+CONFIG_VL53L5CX_DISABLE_NB_SPADS_ENABLED=y
+CONFIG_VL53L5CX_DISABLE_SIGNAL_PER_SPAD=y
+CONFIG_VL53L5CX_DISABLE_REFLECTANCE_PERCENT=y
+CONFIG_VL53L5CX_DISABLE_MOTION_INDICATOR=y
 CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=y
 CONFIG_ESP_INT_WDT=y
 CONFIG_ESP_INT_WDT_TIMEOUT_MS=2000
