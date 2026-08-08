@@ -36,3 +36,11 @@ esp_err_t espnow_transport_activate(void);
  *        in espnow_protocol.h for why.
  */
 esp_err_t espnow_transport_send_telemetry(const espnow_telemetry_t *t);
+
+/**
+ * @brief LR rate-config result reported by the C6 (see init_cb in
+ *        tools/slave_firmware/espnow_bridge.c): 1 = esp_now_set_peer_rate_config
+ *        succeeded, 0 = it failed, -1 = not yet reported (LR disabled on the
+ *        C6 build, or the report hasn't arrived yet).
+ */
+int8_t espnow_transport_lr_status(void);

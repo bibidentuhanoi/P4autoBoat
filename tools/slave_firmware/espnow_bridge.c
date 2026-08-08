@@ -40,6 +40,11 @@
 #define PEER_MSG_COMMAND  2u
 #define PEER_MSG_INIT     3u
 #define PEER_MSG_UPSTREAM 4u
+/* C6->P4, one-shot: reports whether esp_now_set_peer_rate_config(LR) in
+ * init_cb succeeded. A dedicated channel, not folded into PEER_MSG_UPSTREAM
+ * -- this never has to share that channel's espnow_pkt_hdr_t/ground-command
+ * parsing contract. */
+#define PEER_MSG_INIT_STATUS 5u
 
 /* Long Range PHY toggle for the A/B range test -- flip to 0, rebuild via
  * build.sh, and reflash to get a same-hardware LR-off baseline. Both this
@@ -342,6 +347,18 @@ static void init_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
                  esp_err_to_name(err));
     } else {
         ESP_LOGI(TAG, "init_cb: peer rate config set to LR/250K");
+    }
+
+    /* One-shot, not per-command: reports the RESULT of the call above, once,
+     * at init time -- costs one small extra RPC at boot, never touches the
+     * 30Hz control path. This is the only way for the P4 (and from there,
+     * the ground station UI) to learn whether this specific call actually
+     * succeeded -- see the Task 3c header comment for why. */
+    uint8_t lr_status = (err == ESP_OK) ? 1u : 0u;
+    esp_err_t status_err = esp_hosted_send_custom_data(PEER_MSG_INIT_STATUS, &lr_status, 1);
+    if (status_err != ESP_OK) {
+        ESP_LOGW(TAG, "init_cb: failed to report LR status to P4: %s",
+                 esp_err_to_name(status_err));
     }
 #endif /* ESPNOW_LR_ENABLED */
 

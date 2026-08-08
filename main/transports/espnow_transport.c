@@ -23,6 +23,7 @@ static const char *TAG = "ESPNOW_TRANSPORT";
 #define PEER_MSG_COMMAND  2u   /* P4→C6: commands (fast path on C6) */
 #define PEER_MSG_INIT     3u   /* P4→C6: ESP-NOW init */
 #define PEER_MSG_UPSTREAM 4u   /* C6→P4: commands from laptop */
+#define PEER_MSG_INIT_STATUS 5u /* C6→P4: one-shot LR rate-config result */
 /* Sized from the nanopb worst case, not a hardcoded number -- PEER_DATA_MAX
  * used to be 8166 (leftover from when PEER_MSG_VIDEO carried JPEG frames,
  * before that feature was reverted). boat_BoatMessage_size grew to 13270
@@ -119,6 +120,7 @@ static esp_err_t send_espnow_init(void)
 static volatile int64_t   s_last_upstream_us = 0;
 static volatile int       s_reinit_attempts  = 0;
 static esp_timer_handle_t s_reinit_watchdog  = NULL;
+static volatile int8_t    s_lr_status        = -1;  /* -1 = not yet reported */
 
 static void reinit_watchdog_cb(void *arg)
 {
@@ -187,6 +189,29 @@ static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 
     const uint8_t *payload = data + ESPNOW_HDR_SIZE;
     pipeline_handle_incoming(payload, payload_len);
+}
+
+/* ---------------------------------------------------------------------------
+ * init_status_cb — registered for PEER_MSG_INIT_STATUS (C6→P4, one-shot LR
+ * rate-config result; see tools/slave_firmware/espnow_bridge.c's init_cb).
+ * -------------------------------------------------------------------------*/
+static void init_status_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+{
+    (void)msg_id;
+    if (!data || data_len < 1) {
+        return;
+    }
+    s_lr_status = (int8_t)data[0];
+    ESP_LOGI(TAG, "Co-processor reports LR rate config: %s",
+             s_lr_status ? "OK" : "FAILED");
+}
+
+/* ---------------------------------------------------------------------------
+ * espnow_transport_lr_status — LR rate-config result reported by the C6.
+ * -------------------------------------------------------------------------*/
+int8_t espnow_transport_lr_status(void)
+{
+    return s_lr_status;
 }
 
 /* ---------------------------------------------------------------------------
@@ -311,6 +336,13 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
     ret = esp_hosted_register_custom_callback(PEER_MSG_UPSTREAM, upstream_cb);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register upstream callback (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* --- Register the one-shot LR-status callback --- */
+    ret = esp_hosted_register_custom_callback(PEER_MSG_INIT_STATUS, init_status_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register init-status callback (%s)", esp_err_to_name(ret));
         return ret;
     }
 
