@@ -75,6 +75,7 @@ Desktop.ini
 # Claude Code
 CLAUDE.md
 .claude/
+.worktrees/
 
 # Documentation / example projects (not part of firmware)
 docs/
