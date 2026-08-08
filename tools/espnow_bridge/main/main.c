@@ -65,6 +65,8 @@ static volatile uint32_t s_espnow_bytes  = 0;
 static volatile uint32_t s_frames_out    = 0;
 static volatile uint32_t s_hello_sent    = 0;
 static volatile uint32_t s_reasm_drops   = 0;
+static volatile int8_t   s_last_rx_rssi  = 0;
+static volatile int8_t   s_lr_rate_config_ok = -1;  /* -1 = LR disabled on this build */
 
 /* ---- USB self-test ------------------------------------------------------- *
  * TEMPORARY BENCH AID.  Set to 0 for normal operation.
@@ -284,9 +286,9 @@ static void status_task(void *arg)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
 
-        uint8_t payload[4 + 24];
+        uint8_t payload[4 + 26];
         payload[0] = MSG_BRIDGE_STATUS;
-        uint16_t plen = 24;
+        uint16_t plen = 26;
         memcpy(payload + 1, &plen, 2);
         payload[3] = seq++;
 
@@ -296,6 +298,10 @@ static void status_task(void *arg)
             s_frames_out,  s_hello_sent, s_reasm_drops,
         };
         memcpy(payload + 4, vals, sizeof(vals));
+        int8_t rssi = s_last_rx_rssi;
+        memcpy(payload + 4 + sizeof(vals), &rssi, sizeof(rssi));
+        int8_t lr_ok = s_lr_rate_config_ok;
+        memcpy(payload + 4 + sizeof(vals) + sizeof(rssi), &lr_ok, sizeof(lr_ok));
 
         uint8_t *cobs = malloc(sizeof(payload) + COBS_MAX_OVERHEAD(sizeof(payload)));
         if (!cobs) {
@@ -326,6 +332,12 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info,
         ESP_LOGW(TAG, "Short ESP-NOW packet (%d bytes) — ignored", data_len);
         return;
     }
+
+    /* Uplink signal margin, the ground station's-eye view -- every frame
+     * the S3 hears from the boat updates this, regardless of what kind of
+     * frame it turns out to be. Reported to the laptop via MSG_BRIDGE_STATUS
+     * below. */
+    s_last_rx_rssi = (int8_t)info->rx_ctrl->rssi;
 
     uint32_t total_len;
     memcpy(&total_len, data, sizeof(total_len));   /* little-endian uint32_t */
@@ -498,6 +510,7 @@ static void espnow_init(void)
      * range test proves which outcome we got; aborting the whole bridge over
      * a still-open question would be the wrong failure mode. */
     esp_err_t rc_err = esp_now_set_peer_rate_config(BROADCAST_MAC, &rate_cfg);
+    s_lr_rate_config_ok = (rc_err == ESP_OK) ? 1 : 0;
     if (rc_err != ESP_OK) {
         ESP_LOGW(TAG, "espnow_init: esp_now_set_peer_rate_config(broadcast, LR) "
                       "failed: %s -- LR bitmap is still set; broadcast frames "
