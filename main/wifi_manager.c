@@ -126,6 +126,22 @@ esp_err_t wifi_connect(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Undo any LR protocol bitmap the ESP-NOW probe may have set on the C6
+     * (tools/slave_firmware/espnow_bridge.c's init_cb runs unconditionally
+     * at the START of every probe attempt, before we know whether a ground
+     * station will answer -- see main.c's boot sequence). Espressif
+     * documents BGNLR as negotiating down cleanly with a normal router, but
+     * this path has nothing to do with ESP-NOW/LR at all -- don't rely on
+     * that claim holding on this exact hardware. Restore the chip's own
+     * documented default (BGNAX -- the C6 supports 802.11ax) before this
+     * interface is ever used for a real AP connection. */
+    esp_err_t proto_err = esp_wifi_set_protocol(WIFI_IF_STA,
+            WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+    if (proto_err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_connect: esp_wifi_set_protocol(reset) failed: %s",
+                 esp_err_to_name(proto_err));
+    }
+
     ESP_LOGI(TAG, "Connecting to SSID: %s", CONFIG_WIFI_SSID);
 
     /* Arm the handler and kick off the first attempt; the radio is already
