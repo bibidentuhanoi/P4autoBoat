@@ -17,6 +17,7 @@
 #include "sensor_fusion.h"
 #include "drivers/gps_driver.h"
 #include "drivers/imu_driver.h"
+#include "transports/espnow_transport.h"
 #include "common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -131,6 +132,23 @@ void task_tof_reader(void *pvParameters)
     uint32_t ok_b = 0, notready_b = 0, mutexfail_b = 0;
     uint32_t report_div = 0;
 
+    /* Diagnostic: how long tof_read_grid() actually holds g_i2c_mutex, split
+     * by outcome. task_imu_fusion is failing to get this same mutex ~96% of
+     * the time (its own "fusion 5s: mutex_fails=" log) despite ToF never
+     * reporting a mutexfail itself -- this measures the side of that
+     * asymmetry that was never actually timed, just described as "slow" in
+     * a comment. The ok/notready split matters for deciding whether an
+     * interrupt-driven redesign (INT pins are wired -- ToF-A GPIO50,
+     * ToF-B GPIO1) is worth building: if notready time dominates, it would
+     * remove most of this task's I2C usage (no more blind polling of a
+     * sensor with nothing ready, most polls). If ok time dominates, the real
+     * grid reads are the cost and still have to happen regardless of what
+     * triggers them -- interrupts would only help by cutting the poll count,
+     * not the per-read cost. */
+    int64_t held_us_a_ok = 0, held_us_a_notready = 0;
+    int64_t held_us_b_ok = 0, held_us_b_notready = 0;
+    uint32_t max_read_us_a = 0, max_read_us_b = 0;
+
     ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
 
     while (true) {
@@ -142,10 +160,13 @@ void task_tof_reader(void *pvParameters)
         /* One sensor per mutex acquisition, so the IMU keeps a read window. */
         if (devs->a_ok) {
             if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int64_t t0 = esp_timer_get_time();
                 esp_err_t r = tof_read_grid(&devs->dev_a, &res);
+                uint32_t held = (uint32_t)(esp_timer_get_time() - t0);
                 xSemaphoreGive(g_i2c_mutex);
-                if (r == ESP_OK) { ok_a++;   tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a); }
-                else             { notready_a++; }
+                if (held > max_read_us_a) max_read_us_a = held;
+                if (r == ESP_OK) { ok_a++;   held_us_a_ok += held; tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a); }
+                else             { notready_a++; held_us_a_notready += held; }
             } else {
                 mutexfail_a++;
             }
@@ -153,10 +174,13 @@ void task_tof_reader(void *pvParameters)
 
         if (devs->b_ok) {
             if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                int64_t t0 = esp_timer_get_time();
                 esp_err_t r = tof_read_grid(&devs->dev_b, &res);
+                uint32_t held = (uint32_t)(esp_timer_get_time() - t0);
                 xSemaphoreGive(g_i2c_mutex);
-                if (r == ESP_OK) { ok_b++;   tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b); }
-                else             { notready_b++; }
+                if (held > max_read_us_b) max_read_us_b = held;
+                if (r == ESP_OK) { ok_b++;   held_us_b_ok += held; tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b); }
+                else             { notready_b++; held_us_b_notready += held; }
             } else {
                 mutexfail_b++;
             }
@@ -167,11 +191,19 @@ void task_tof_reader(void *pvParameters)
          * ok/s should land near the sensor's ranging rate (~10 Hz). */
         if (++report_div >= (5000 / TOF_POLL_INTERVAL_MS)) {
             ESP_LOGI(TAG,
-                     "ToF 5s: A ok=%u notready=%u mutexfail=%u | B ok=%u notready=%u mutexfail=%u",
-                     (unsigned)ok_a, (unsigned)notready_a, (unsigned)mutexfail_a,
-                     (unsigned)ok_b, (unsigned)notready_b, (unsigned)mutexfail_b);
+                     "ToF 5s: A ok=%u(%lldms) notready=%u(%lldms) mutexfail=%u max=%ums | "
+                     "B ok=%u(%lldms) notready=%u(%lldms) mutexfail=%u max=%ums",
+                     (unsigned)ok_a, (long long)(held_us_a_ok / 1000),
+                     (unsigned)notready_a, (long long)(held_us_a_notready / 1000),
+                     (unsigned)mutexfail_a, (unsigned)(max_read_us_a / 1000),
+                     (unsigned)ok_b, (long long)(held_us_b_ok / 1000),
+                     (unsigned)notready_b, (long long)(held_us_b_notready / 1000),
+                     (unsigned)mutexfail_b, (unsigned)(max_read_us_b / 1000));
             ok_a = notready_a = mutexfail_a = 0;
             ok_b = notready_b = mutexfail_b = 0;
+            held_us_a_ok = held_us_a_notready = 0;
+            held_us_b_ok = held_us_b_notready = 0;
+            max_read_us_a = max_read_us_b = 0;
             report_div = 0;
         }
 
@@ -179,7 +211,10 @@ void task_tof_reader(void *pvParameters)
     }
 }
 
-/* Copy a cached grid into the snapshot. Returns false when nothing fresh. */
+/* Copy a cached grid into the snapshot. Returns false when nothing fresh.
+ * Only ever called from the non-field-mode branch of task_sensor_snapshot
+ * below -- field mode sends espnow_telemetry_t instead and never reaches
+ * this function at all, so there is no g_field_mode check needed here. */
 static bool tof_cache_load(const tof_grid_cache_t *cache, boat_ToFGrid *out)
 {
     bool ok = false;
@@ -187,17 +222,13 @@ static bool tof_cache_load(const tof_grid_cache_t *cache, boat_ToFGrid *out)
     if (cache->ts_us != 0 && (esp_timer_get_time() - cache->ts_us) < TOF_STALE_US) {
         out->valid = true;
         out->distances_count = TOF_NVALS;
+        out->sigma_count = TOF_NVALS;
+        out->target_status_count = TOF_NVALS;
+        out->nb_target_detected_count = 64;
         memcpy(out->distances, cache->distances, sizeof(cache->distances));
-        /* Field mode omits the diagnostics: proto3 encodes an empty repeated
-         * field as zero bytes, halving the snapshot for the ESP-NOW link. */
-        if (!g_field_mode) {
-            out->sigma_count = TOF_NVALS;
-            out->target_status_count = TOF_NVALS;
-            out->nb_target_detected_count = 64;
-            memcpy(out->sigma, cache->sigma, sizeof(cache->sigma));
-            memcpy(out->target_status, cache->status, sizeof(cache->status));
-            memcpy(out->nb_target_detected, cache->nb_target, sizeof(cache->nb_target));
-        }
+        memcpy(out->sigma, cache->sigma, sizeof(cache->sigma));
+        memcpy(out->target_status, cache->status, sizeof(cache->status));
+        memcpy(out->nb_target_detected, cache->nb_target, sizeof(cache->nb_target));
         ok = true;
     }
     xSemaphoreGive(s_cache_mutex);
@@ -235,53 +266,80 @@ void task_sensor_snapshot(void *pvParameters)
             last_wake = xTaskGetTickCount();
         }
 
-        snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
-        snap.timestamp_us = (uint64_t)esp_timer_get_time();
-
-        /* IMU — always available, 20 Hz */
+        /* IMU — always available, 20 Hz. GPS — whatever the driver currently
+         * has cached. Both modes need these; ToF/detections/full-snapshot
+         * assembly below is bench-mode only. */
         FusionResult imu;
         fusion_get_result(&imu);
-        snap.has_imu     = true;
-        snap.imu.pitch   = imu.pitch;
-        snap.imu.roll    = imu.roll;
-        snap.imu.heading = imu.heading;
-
-        /* ToF — copied from the reader task's cache (5 Hz publish).
-         * No I2C here any more: the cache is filled by task_tof_reader at the
-         * sensor's own rate, so a snapshot no longer misses ToF just because
-         * the sensor had nothing ready at this exact instant. */
-        bool tof_tick = (iteration % TOF_EVERY_N == 0);
-
-        if (tof_tick) {
-            if (devs->a_ok) {
-                snap.has_tof_a = tof_cache_load(&s_cache_a, &snap.tof_a);
-            }
-            if (devs->b_ok) {
-                snap.has_tof_b = tof_cache_load(&s_cache_b, &snap.tof_b);
-            }
-        }
-
-        /* Re-emit cached detections for up to 30s so the browser gets them
-         * after WS reconnect — was 15s but post-detect WS reconnect can drag
-         * 15-20s on slow TCP timeouts, dropping the cached result on the floor. */
-        detect_get_cached_results(snap.detections, &snap.detections_count, 30000);
 
         gps_fix_t gps;
-        if (gps_driver_get_fix(&gps) == ESP_OK && gps.last_update_us != 0) {
-            snap.has_gps         = true;
-            snap.gps.valid       = gps.valid;
-            snap.gps.latitude    = gps.latitude;
-            snap.gps.longitude   = gps.longitude;
-            snap.gps.altitude_m  = gps.altitude_m;
-            snap.gps.speed_mps   = gps.speed_mps;
-            snap.gps.course_deg  = gps.course_deg;
-            snap.gps.fix_quality = gps.fix_quality;
-            snap.gps.satellites  = gps.satellites;
-            snap.gps.hdop        = gps.hdop;
-            snap.gps.utc_ms      = gps.utc_ms;
-        }
+        bool have_gps = (gps_driver_get_fix(&gps) == ESP_OK && gps.last_update_us != 0);
 
-        pipeline_publish_sensors(&snap);
+        if (g_field_mode) {
+            /* ESP-NOW: compact struct, IMU+GPS only -- see espnow_telemetry_t
+             * in espnow_protocol.h for why (no ToF, no detections, no
+             * boat.proto at all on this path). WiFi/WS mode never reaches
+             * this branch, so its full-fidelity snapshot is untouched. */
+            espnow_telemetry_t tel = {
+                .pitch   = imu.pitch,
+                .roll    = imu.roll,
+                .heading = imu.heading,
+            };
+            if (have_gps) {
+                tel.gps_valid  = gps.valid;
+                tel.latitude   = gps.latitude;
+                tel.longitude  = gps.longitude;
+                tel.speed_mps  = gps.speed_mps;
+                tel.course_deg = gps.course_deg;
+                tel.satellites = (uint8_t)gps.satellites;
+                tel.hdop       = gps.hdop;
+            }
+            espnow_transport_send_telemetry(&tel);
+        } else {
+            /* WiFi/WS bench mode: full snapshot, exactly as always. */
+            snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
+            snap.timestamp_us = (uint64_t)esp_timer_get_time();
+            snap.has_imu     = true;
+            snap.imu.pitch   = imu.pitch;
+            snap.imu.roll    = imu.roll;
+            snap.imu.heading = imu.heading;
+
+            /* ToF — copied from the reader task's cache (5 Hz publish).
+             * No I2C here any more: the cache is filled by task_tof_reader at
+             * the sensor's own rate, so a snapshot no longer misses ToF just
+             * because the sensor had nothing ready at this exact instant. */
+            bool tof_tick = (iteration % TOF_EVERY_N == 0);
+            if (tof_tick) {
+                if (devs->a_ok) {
+                    snap.has_tof_a = tof_cache_load(&s_cache_a, &snap.tof_a);
+                }
+                if (devs->b_ok) {
+                    snap.has_tof_b = tof_cache_load(&s_cache_b, &snap.tof_b);
+                }
+            }
+
+            /* Re-emit cached detections for up to 30s so the browser gets
+             * them after WS reconnect — was 15s but post-detect WS reconnect
+             * can drag 15-20s on slow TCP timeouts, dropping the cached
+             * result on the floor. */
+            detect_get_cached_results(snap.detections, &snap.detections_count, 30000);
+
+            if (have_gps) {
+                snap.has_gps         = true;
+                snap.gps.valid       = gps.valid;
+                snap.gps.latitude    = gps.latitude;
+                snap.gps.longitude   = gps.longitude;
+                snap.gps.altitude_m  = gps.altitude_m;
+                snap.gps.speed_mps   = gps.speed_mps;
+                snap.gps.course_deg  = gps.course_deg;
+                snap.gps.fix_quality = gps.fix_quality;
+                snap.gps.satellites  = gps.satellites;
+                snap.gps.hdop        = gps.hdop;
+                snap.gps.utc_ms      = gps.utc_ms;
+            }
+
+            pipeline_publish_sensors(&snap);
+        }
 
         /* SystemStatus at ~1Hz */
         if (++iteration % STATUS_EVERY_N == 0) {
@@ -289,9 +347,20 @@ void task_sensor_snapshot(void *pvParameters)
             sys.heap_free = (uint32_t)esp_get_free_heap_size();
             sys.uptime_us = (uint64_t)esp_timer_get_time();
 
-            wifi_ap_record_t ap;
-            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-                sys.wifi_rssi = ap.rssi;
+            /* Field mode never joins a WiFi AP (ESP-NOW only) -- querying AP
+             * info while connected to none goes through esp_wifi_remote's own
+             * RPC path to the C6 (separate from PEER_MSG_VIDEO, uninstrumented
+             * here) for a value that's always "not connected" anyway, once a
+             * second, forever. Correlates with an rpc_rsp "resp code 12303"
+             * log at the exact same 1Hz cadence and lines up with the one
+             * "snapshot loop overrun" seen after the ToF/struct fixes landed.
+             * espnow_drive.py doesn't even decode MSG_STATUS right now, so
+             * this was costing RPC time for a field nothing reads. */
+            if (!g_field_mode) {
+                wifi_ap_record_t ap;
+                if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                    sys.wifi_rssi = ap.rssi;
+                }
             }
 
             sys.camera_ok = g_camera_ok;

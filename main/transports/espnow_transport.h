@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include "espnow_protocol.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -28,10 +29,10 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms);
 esp_err_t espnow_transport_activate(void);
 
 /**
- * @brief Fragment and send a JPEG over the field link.
- *
- * Was defined in espnow_transport.c but never declared here, so nothing could
- * call it — the reason field mode had no video despite the code existing.
- * Chunks into <=JPEG_CHUNK_MAX pieces tagged MSG_JPEG_CHUNK.
+ * @brief Send field-mode telemetry (IMU + GPS only) as a compact,
+ *        non-protobuf struct — bypasses the pipeline/boat.proto path
+ *        entirely. Called directly by sensor_task.c when g_field_mode is
+ *        true, instead of pipeline_publish_sensors(). See espnow_telemetry_t
+ *        in espnow_protocol.h for why.
  */
-esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len);
+esp_err_t espnow_transport_send_telemetry(const espnow_telemetry_t *t);

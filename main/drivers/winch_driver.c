@@ -85,6 +85,15 @@ esp_err_t winch_driver_init(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "servo-enable gpio_config");
+    /* Max drive strength (40mA vs 20mA default) -- same reasoning as the ESC
+     * pin (GPIO31, see esc_driver.c): this board has repeatedly turned out to
+     * electrically load pins that looked plain on schematic alone. This pin
+     * switches real downstream current (winch + both rudder servos) through
+     * whatever gate/switch sits on CONFIG_SERVO_ENABLE_PIN's net -- a weak
+     * drive means a slow, not-quite-clean transition into that load exactly
+     * at power-on, which is the single moment most likely to glitch anything
+     * sharing the same rail. Harmless if the net turns out to be unloaded. */
+    gpio_set_drive_capability(CONFIG_SERVO_ENABLE_PIN, GPIO_DRIVE_CAP_3);
     servo_power_write(false);
 
     /* MCPWM timer. */

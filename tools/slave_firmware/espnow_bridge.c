@@ -158,6 +158,15 @@ static void espnow_tx_task(void *arg)
  * is full the frame is dropped and the buffer freed immediately.
  *
  * Must return quickly — no blocking operations here.
+ *
+ * Uses xQueueSend() with a zero timeout, not xQueueSendFromISR(): the RPC RX
+ * thread is a normal FreeRTOS task, not an ISR (the doc comment above always
+ * said so — the ISR-safe API was simply the wrong call for that context).
+ * The ISR variant skips the scheduler bookkeeping xQueueSend() does on this
+ * queue's OTHER (correct, task-context) callers, so calling it here-only,
+ * repeatedly, under sustained traffic, risked corrupting whatever internal
+ * queue state those callers rely on being consistent. A zero timeout keeps
+ * the exact same non-blocking, drop-if-full behaviour as before.
  * ---------------------------------------------------------------------- */
 static void video_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 {
@@ -173,7 +182,7 @@ static void video_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 
     tx_item_t item = { .data = buf, .len = data_len };
 
-    if (xQueueSendFromISR(s_tx_queue, &item, NULL) != pdTRUE) {
+    if (xQueueSend(s_tx_queue, &item, 0) != pdTRUE) {
         /* Queue full — drop this frame */
         ESP_LOGW(TAG, "video_cb: tx_queue full, dropping frame (len=%zu)",
                  data_len);

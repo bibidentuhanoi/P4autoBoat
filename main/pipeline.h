@@ -1,4 +1,6 @@
 #pragma once
+#include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "transport.h"
 #include "proto/boat.pb.h"
@@ -35,6 +37,14 @@ void pipeline_publish_status(const boat_SystemStatus *status);
  *        Called from transport receive context (e.g., WS httpd task).
  */
 void pipeline_handle_incoming(const uint8_t *buf, size_t len);
+
+/**
+ * @brief True if any transport (WS or ESP-NOW) delivered a decodable
+ *        BoatMessage within the last max_age_us microseconds. Transport-
+ *        agnostic liveness signal for failsafes — ESP-NOW has no persistent
+ *        "connected" concept, so recency of traffic is its only substitute.
+ */
+bool pipeline_recent_command(int64_t max_age_us);
 
 /**
  * @brief Motor command handler callback type.

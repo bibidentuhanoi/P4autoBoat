@@ -1,6 +1,7 @@
 #include "pipeline.h"
 #include "detect_task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <pb_encode.h>
 #include <pb_decode.h>
@@ -28,15 +29,45 @@ static steer_command_handler_fn s_steer_handler = NULL;
 static servo_power_handler_fn s_servo_power_handler = NULL;
 static steer_raw_command_handler_fn s_steer_raw_handler = NULL;
 
-/* ---- Shared protobuf envelope ----
+/* ---- Shared protobuf envelopes ----
  * boat_BoatMessage is a ~7KB union (SensorSnapshot member holds the 256-entry
  * ToF arrays): too big for small task stacks (esp_timer is 3.5KB, httpd 4KB),
  * and per-call-site statics cost 7KB of internal RAM EACH — that starved
  * xTaskCreate of contiguous internal heap (detect task failed to spawn).
- * So: ONE shared static envelope, serialized by a mutex. All uses are short
- * (encode/decode + dispatch), and publishers run at <= 20 Hz. */
+ * So: static envelopes serialized by mutexes, instead of per-call-site
+ * stack copies.
+ *
+ * TWO envelopes, not one. This used to be a single s_msg/s_msg_mutex shared
+ * between publish (encode+send) and pipeline_handle_incoming (decode+
+ * dispatch). fanout_locked() calls each transport's send_fn *inside* that
+ * mutex, and the ESP-NOW transport's send_fn blocks on esp_hosted_send_
+ * custom_data() waiting for an RPC response. esp_hosted delivers that
+ * response and dispatches inbound custom-RPC events from the SAME single
+ * task (rpc_rx_thread) — so an inbound event arriving while a publish's
+ * send was in flight would make rpc_rx_thread block taking s_msg_mutex for
+ * the decode, stalling the very task needed to deliver the response the
+ * publish call was waiting on. Deadlock, broken only by the RPC call's own
+ * timeout: observed on the P4 console as "Timeout waiting for Resp"
+ * alternating with esp_hosted's "H_SDIO_DRV task still writing Rx data to
+ * queue" (its RX pipeline backing up behind the wedged rpc_rx_thread), and
+ * on the ESP-NOW ground station as telemetry going completely silent even
+ * though the C6 itself was never actually crashing.
+ * Fix: RX gets its own envelope/mutex so a stuck TX send can never again
+ * block RX decode+dispatch. Costs one extra ~7KB static buffer. */
 static boat_BoatMessage  s_msg;
 static SemaphoreHandle_t s_msg_mutex = NULL;
+
+static boat_BoatMessage  s_rx_msg;
+static SemaphoreHandle_t s_rx_msg_mutex = NULL;
+
+/* ---- Transport-agnostic command liveness ----
+ * Stamped on every decodable inbound message regardless of which transport
+ * delivered it. WS has a "connected" concept the motor-control watchdog can
+ * use directly; ESP-NOW is connectionless (broadcast, no session), so this
+ * timestamp is field mode's only liveness signal. portMUX (not s_msg_mutex)
+ * so the watchdog's 100ms poll never blocks behind a decode+dispatch. */
+static portMUX_TYPE s_rx_time_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile int64_t s_last_rx_us = 0;
 
 /* Encode s_msg (caller set which_payload/payload under the mutex) and fan out. */
 static void fanout_locked(uint8_t *buf, size_t bufsize, const char *what)
@@ -69,7 +100,14 @@ esp_err_t pipeline_init(void)
     if (!s_msg_mutex) {
         s_msg_mutex = xSemaphoreCreateMutex();
         if (!s_msg_mutex) {
-            ESP_LOGE(TAG, "Failed to create envelope mutex");
+            ESP_LOGE(TAG, "Failed to create TX envelope mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_rx_msg_mutex) {
+        s_rx_msg_mutex = xSemaphoreCreateMutex();
+        if (!s_rx_msg_mutex) {
+            ESP_LOGE(TAG, "Failed to create RX envelope mutex");
             return ESP_ERR_NO_MEM;
         }
     }
@@ -174,27 +212,31 @@ void pipeline_publish_motor_status(const boat_MotorStatus *mstatus)
 
 void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 {
-    if (!s_msg_mutex) return;
+    if (!s_rx_msg_mutex) return;
 
-    xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_rx_msg_mutex, portMAX_DELAY);
 
     /* Decode needs a zeroed struct (repeated-field counts etc.). */
-    memset(&s_msg, 0, sizeof(s_msg));
+    memset(&s_rx_msg, 0, sizeof(s_rx_msg));
     pb_istream_t stream = pb_istream_from_buffer(buf, len);
 
-    if (!pb_decode(&stream, boat_BoatMessage_fields, &s_msg)) {
+    if (!pb_decode(&stream, boat_BoatMessage_fields, &s_rx_msg)) {
         ESP_LOGW(TAG, "Decode failed: %s", PB_GET_ERROR(&stream));
-        xSemaphoreGive(s_msg_mutex);
+        xSemaphoreGive(s_rx_msg_mutex);
         return;
     }
 
-    switch (s_msg.which_payload) {
+    portENTER_CRITICAL(&s_rx_time_lock);
+    s_last_rx_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_rx_time_lock);
+
+    switch (s_rx_msg.which_payload) {
     case boat_BoatMessage_motor_tag:
-        ESP_LOGI(TAG, "RX motor: L=%.2f R=%.2f thr=%.2f rud=%.2f",
-                 s_msg.payload.motor.left, s_msg.payload.motor.right,
-                 s_msg.payload.motor.throttle, s_msg.payload.motor.rudder);   /* DIAG */
+        ESP_LOGD(TAG, "RX motor: L=%.2f R=%.2f thr=%.2f rud=%.2f",
+                 s_rx_msg.payload.motor.left, s_rx_msg.payload.motor.right,
+                 s_rx_msg.payload.motor.throttle, s_rx_msg.payload.motor.rudder);   /* DIAG */
         if (s_motor_handler) {
-            s_motor_handler(&s_msg.payload.motor);
+            s_motor_handler(&s_rx_msg.payload.motor);
         } else {
             ESP_LOGW(TAG, "Motor command received but no handler registered");
         }
@@ -205,49 +247,59 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
         break;
     case boat_BoatMessage_arm_cmd_tag:
         ESP_LOGI(TAG, "Arm command received: %s%s",
-                 s_msg.payload.arm_cmd.arm ? "ARM" : "DISARM",
-                 s_msg.payload.arm_cmd.force ? " (force)" : "");
+                 s_rx_msg.payload.arm_cmd.arm ? "ARM" : "DISARM",
+                 s_rx_msg.payload.arm_cmd.force ? " (force)" : "");
         if (s_arm_handler) {
-            s_arm_handler(s_msg.payload.arm_cmd.arm, s_msg.payload.arm_cmd.force);
+            s_arm_handler(s_rx_msg.payload.arm_cmd.arm, s_rx_msg.payload.arm_cmd.force);
         }
         break;
     case boat_BoatMessage_winch_tag:
-        ESP_LOGI(TAG, "RX winch: speed=%.2f", s_msg.payload.winch.speed);   /* DIAG */
+        ESP_LOGD(TAG, "RX winch: speed=%.2f", s_rx_msg.payload.winch.speed);   /* DIAG */
         if (s_winch_handler) {
-            s_winch_handler(&s_msg.payload.winch);
+            s_winch_handler(&s_rx_msg.payload.winch);
         } else {
             ESP_LOGW(TAG, "Winch command received but no handler registered");
         }
         break;
     case boat_BoatMessage_steer_tag:
-        ESP_LOGI(TAG, "RX steer: L=%.2f R=%.2f",
-                 s_msg.payload.steer.left, s_msg.payload.steer.right);   /* DIAG */
+        ESP_LOGD(TAG, "RX steer: L=%.2f R=%.2f",
+                 s_rx_msg.payload.steer.left, s_rx_msg.payload.steer.right);   /* DIAG */
         if (s_steer_handler) {
-            s_steer_handler(&s_msg.payload.steer);
+            s_steer_handler(&s_rx_msg.payload.steer);
         } else {
             ESP_LOGW(TAG, "Steer command received but no handler registered");
         }
         break;
     case boat_BoatMessage_servo_power_tag:
-        ESP_LOGI(TAG, "Servo power command: %s", s_msg.payload.servo_power.on ? "ON" : "OFF");
+        ESP_LOGI(TAG, "Servo power command: %s", s_rx_msg.payload.servo_power.on ? "ON" : "OFF");
         if (s_servo_power_handler) {
-            s_servo_power_handler(s_msg.payload.servo_power.on);
+            s_servo_power_handler(s_rx_msg.payload.servo_power.on);
         } else {
             ESP_LOGW(TAG, "Servo power command received but no handler registered");
         }
         break;
     case boat_BoatMessage_steer_raw_tag:
-        ESP_LOGI(TAG, "RX steer_raw: pulse_us=%u", (unsigned)s_msg.payload.steer_raw.pulse_us);
+        ESP_LOGI(TAG, "RX steer_raw: pulse_us=%u", (unsigned)s_rx_msg.payload.steer_raw.pulse_us);
         if (s_steer_raw_handler) {
-            s_steer_raw_handler(&s_msg.payload.steer_raw);
+            s_steer_raw_handler(&s_rx_msg.payload.steer_raw);
         } else {
             ESP_LOGW(TAG, "SteerRaw command received but no handler registered");
         }
         break;
     default:
-        ESP_LOGW(TAG, "Unhandled message type: %d", (int)s_msg.which_payload);
+        ESP_LOGW(TAG, "Unhandled message type: %d", (int)s_rx_msg.which_payload);
         break;
     }
 
-    xSemaphoreGive(s_msg_mutex);
+    xSemaphoreGive(s_rx_msg_mutex);
+}
+
+bool pipeline_recent_command(int64_t max_age_us)
+{
+    portENTER_CRITICAL(&s_rx_time_lock);
+    int64_t last = s_last_rx_us;
+    portEXIT_CRITICAL(&s_rx_time_lock);
+
+    if (last == 0) return false;   /* nothing ever received */
+    return (esp_timer_get_time() - last) <= max_age_us;
 }

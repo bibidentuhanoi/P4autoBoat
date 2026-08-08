@@ -3,6 +3,7 @@
 #include "pipeline.h"
 #include "esp_hosted_misc.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -18,39 +19,22 @@ static const char *TAG = "ESPNOW_TRANSPORT";
 /* ---------------------------------------------------------------------------
  * peer_data msg_id constants
  * -------------------------------------------------------------------------*/
-#define PEER_MSG_VIDEO    1u   /* P4→C6: JPEG + sensor data (queued on C6) */
+#define PEER_MSG_VIDEO    1u   /* P4→C6: sensor telemetry (queued on C6) */
 #define PEER_MSG_COMMAND  2u   /* P4→C6: commands (fast path on C6) */
 #define PEER_MSG_INIT     3u   /* P4→C6: ESP-NOW init */
 #define PEER_MSG_UPSTREAM 4u   /* C6→P4: commands from laptop */
-#define PEER_DATA_MAX  8166u   /* max bytes per esp_hosted_send_custom_data call */
-
-/* Maximum JPEG payload that fits in one peer_data frame after the header */
-#define JPEG_CHUNK_MAX  (PEER_DATA_MAX - ESPNOW_HDR_SIZE)
-
-/* Per-chunk sub-header inside a MSG_JPEG_CHUNK payload:
- *   [0] frame_id   same for every chunk of one image
- *   [1] chunk_idx  0-based order
- *   [2] n_chunks   total for this image
- */
-/* [frame_id][chunk_idx][n_data][total_len:2]
- * chunk_idx == n_data marks the XOR PARITY chunk (see send_jpeg). */
-#define JPEG_SUBHDR_SIZE      5
-/* Sized by RADIO drain rate, not by the peer_data limit.
- *
- * The co-processor splits each chunk into 244-byte ESP-NOW packets spaced only
- * INTER_CHUNK_DELAY_MS=1 apart, but ESP-NOW moves ~214-555 kbps, so one packet
- * needs ~4-9 ms of airtime. Queuing every 1 ms fills the radio's internal queue
- * about 5x faster than it drains; esp_now_send() then returns NO_MEM and the
- * fragments are discarded. Telemetry never trips this (1-2 fragments), but a
- * JPEG is ~72 and died after roughly the first 8 — the boat logged "JPEG sent"
- * while nothing reached the air.
- *
- * 1024 B => ~5 fragments/chunk, which fits the radio queue, and the 50 ms gap
- * below is long enough to drain them (~5 x 9 ms). A 13 KB image becomes ~13
- * chunks over ~650 ms — fine at one frame per 10 s. */
-#define JPEG_CHUNK_BYTES      1024u
-/* Gap between chunks so telemetry can interleave (see send_jpeg). */
-#define JPEG_INTER_CHUNK_MS   50
+/* Sized from the nanopb worst case, not a hardcoded number -- PEER_DATA_MAX
+ * used to be 8166 (leftover from when PEER_MSG_VIDEO carried JPEG frames,
+ * before that feature was reverted). boat_BoatMessage_size grew to 13270
+ * once PEER_MSG_VIDEO was repurposed for pure SensorSnapshot telemetry (dual
+ * 8x8 ToF grids + IMU + GPS + detections), but this ceiling was never
+ * revisited -- so any real snapshot big enough to exceed the old 8166 got
+ * silently rejected by the size check in espnow_send_fn() below, worse
+ * exactly when there was more real data to report (active driving, ToF
+ * detections, GPS lock), which is the opposite of when you want telemetry
+ * to drop. Same class of bug as the two encode-buffer sizes fixed elsewhere
+ * in this file's history -- see pipeline.c's buffer comments. */
+#define PEER_DATA_MAX  (boat_BoatMessage_size + ESPNOW_HDR_SIZE)
 
 /* Static send buffer shared by espnow_send_fn (sensor path, single-task) */
 static uint8_t s_send_buf[PEER_DATA_MAX];
@@ -84,11 +68,96 @@ broadcast:
 }
 
 /* ---------------------------------------------------------------------------
+ * send_espnow_init — the {channel, peer_mac} handshake that brings the C6's
+ * ESP-NOW stack up. Extracted so both the initial probe() and the
+ * self-healing watchdog below can call it identically.
+ * -------------------------------------------------------------------------*/
+static esp_err_t send_espnow_init(void)
+{
+    uint8_t init_buf[1 + 6];
+    init_buf[0] = (uint8_t)CONFIG_ESPNOW_CHANNEL;
+    parse_mac_string(CONFIG_ESPNOW_PEER_MAC, &init_buf[1]);
+
+    esp_err_t ret = esp_hosted_send_custom_data(PEER_MSG_INIT, init_buf, sizeof(init_buf));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send ESPNOW_INIT (%s)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Sent ESPNOW_INIT (ch=%d peer=" CONFIG_ESPNOW_PEER_MAC ")",
+                 CONFIG_ESPNOW_CHANNEL);
+    }
+    return ret;
+}
+
+/* ---------------------------------------------------------------------------
+ * Self-healing re-init: if the C6 crashes/reboots under sustained ESP-NOW
+ * load, its stack comes back up completely uninitialised -- init_cb only
+ * ever runs once, triggered by the MSG_ESPNOW_INIT this side sends during
+ * probe(). Nothing on the C6 asks for it again on its own, so a transient
+ * C6-side fault otherwise becomes PERMANENT: the boat stops responding and
+ * stays that way until the P4 itself is manually reset (which happens to
+ * re-run probe() from scratch). Detect prolonged silence from upstream and
+ * re-send the same handshake automatically instead.
+ *
+ * MSG_GROUND_HELLO is the signal to watch, not application data: the S3
+ * broadcasts it every ESPNOW_HELLO_INTERVAL_MS regardless of whether anyone
+ * is actively driving, so its absence is a clean heartbeat that doesn't
+ * depend on traffic volume or operator activity.
+ * -------------------------------------------------------------------------*/
+#define UPSTREAM_SILENCE_TIMEOUT_US ((int64_t)3 * ESPNOW_HELLO_INTERVAL_MS * 1000LL)
+#define REINIT_WATCHDOG_PERIOD_US   (1000LL * 1000LL)
+
+/* A reinit tears the C6's ESP-NOW down and rebuilds it -- disruptive, and it
+ * can't complete faster than the next hello cycle proves it worked. If the
+ * underlying fault is PERSISTENT rather than a one-time crash, an uncapped
+ * watchdog fires roughly every UPSTREAM_SILENCE_TIMEOUT_US forever, which
+ * never gives the link more than one timeout window to prove itself before
+ * being torn down again -- indistinguishable from a permanent stall, and
+ * potentially worse than doing nothing. Bound the damage: try a few times,
+ * then go quiet and wait for a human, same fallback as before this existed. */
+#define MAX_CONSECUTIVE_REINIT_ATTEMPTS 3
+
+static volatile int64_t   s_last_upstream_us = 0;
+static volatile int       s_reinit_attempts  = 0;
+static esp_timer_handle_t s_reinit_watchdog  = NULL;
+
+static void reinit_watchdog_cb(void *arg)
+{
+    (void)arg;
+    int64_t last = s_last_upstream_us;
+    if (last == 0) {
+        return;   /* never heard anything yet -- probe()'s own timeout owns that case */
+    }
+    if (esp_timer_get_time() - last > UPSTREAM_SILENCE_TIMEOUT_US) {
+        if (s_reinit_attempts >= MAX_CONSECUTIVE_REINIT_ATTEMPTS) {
+            return;   /* already gave up this round -- see the ESP_LOGE below */
+        }
+        s_reinit_attempts++;
+        ESP_LOGW(TAG, "No upstream traffic (hello or data) for over %lldms -- "
+                      "re-sending ESPNOW_INIT, attempt %d/%d (the C6 may have reset)",
+                 (long long)(UPSTREAM_SILENCE_TIMEOUT_US / 1000),
+                 s_reinit_attempts, MAX_CONSECUTIVE_REINIT_ATTEMPTS);
+        if (s_reinit_attempts >= MAX_CONSECUTIVE_REINIT_ATTEMPTS) {
+            ESP_LOGE(TAG, "Giving up after %d attempts -- this fault is persistent, "
+                          "not transient. Auto-recovery can't fix that class of problem; "
+                          "the link needs a manual reset (and the real cause needs "
+                          "investigating, not more retries).",
+                     MAX_CONSECUTIVE_REINIT_ATTEMPTS);
+        }
+        send_espnow_init();
+        /* Stamp now so a still-dead C6 gets re-poked once per timeout window,
+         * not once per REINIT_WATCHDOG_PERIOD_US tick while silent. */
+        s_last_upstream_us = esp_timer_get_time();
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * upstream_cb — registered for PEER_MSG_UPSTREAM (C6→P4 commands)
  * -------------------------------------------------------------------------*/
 static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 {
     (void)msg_id;
+    s_last_upstream_us = esp_timer_get_time();
+    s_reinit_attempts  = 0;   /* real traffic heard -- link is genuinely alive again */
 
     if (!data || data_len < ESPNOW_HDR_SIZE) {
         ESP_LOGW(TAG, "upstream_cb: short frame (%u bytes)", (unsigned)data_len);
@@ -122,8 +191,12 @@ static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 
 /* ---------------------------------------------------------------------------
  * espnow_send_fn — transport_send_fn registered with the pipeline
- * Wraps nanopb-encoded BoatMessage bytes with espnow_pkt_hdr_t (MSG_SENSOR)
- * and sends via PEER_MSG_VIDEO.
+ * Wraps nanopb-encoded BoatMessage bytes with espnow_pkt_hdr_t and sends via
+ * PEER_MSG_VIDEO. Used identically for pipeline_publish_sensors(),
+ * pipeline_publish_status(), and pipeline_publish_motor_status() -- the
+ * pipeline's transport_send_fn interface is generic (buf, len, ctx) and
+ * carries no "what kind of message is this" hint, so espnow_pkt_hdr_t.msg_type
+ * has to be derived from the encoded bytes themselves.
  * -------------------------------------------------------------------------*/
 static esp_err_t espnow_send_fn(const uint8_t *buf, size_t len, void *ctx)
 {
@@ -134,16 +207,52 @@ static esp_err_t espnow_send_fn(const uint8_t *buf, size_t len, void *ctx)
         return ESP_ERR_INVALID_SIZE;
     }
 
+    /* buf[0] is the wire tag of BoatMessage's oneof member -- reliable
+     * because `oneof payload` is the ENTIRE message (no other top-level
+     * field ever accompanies it), so nanopb always encodes exactly one
+     * length-delimited field, at the very start. tag = (field_num << 3) | 2:
+     *   sensors=1 -> 0x0A, status=3 -> 0x1A, motor_status=6 -> 0x32
+     * This was hardcoded to MSG_SENSOR unconditionally before, so every
+     * MotorStatus/SystemStatus publish over ESP-NOW was mislabeled as sensor
+     * telemetry on the wire -- silently dropped by any receiver that (correctly)
+     * checked HasField('sensors') before trusting msg_type, which is exactly
+     * why this went unnoticed: it fails at the same "nothing happens" level
+     * as every other silent fault in this transport. */
+    espnow_msg_type_t msg_type = MSG_SENSOR;
+    if (len > 0) {
+        switch (buf[0]) {
+        case 0x1A: msg_type = MSG_STATUS;       break;  /* SystemStatus */
+        case 0x32: msg_type = MSG_MOTOR_STATUS; break;  /* MotorStatus */
+        default:   msg_type = MSG_SENSOR;       break;  /* SensorSnapshot (0x0A), or unknown -> safe default */
+        }
+    }
+
     espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)s_send_buf;
-    hdr->msg_type    = MSG_SENSOR;
+    hdr->msg_type    = msg_type;
     hdr->payload_len = (uint16_t)len;
     hdr->seq         = 0;  /* sensor frames are standalone; seq unused */
 
     memcpy(s_send_buf + ESPNOW_HDR_SIZE, buf, len);
 
+    /* Timed, not just pass/fail: esp_hosted_send_custom_data() is a
+     * synchronous RPC that blocks the caller (the sensor task, for
+     * PEER_MSG_VIDEO) until the C6's response arrives or the RPC layer's own
+     * timeout fires. A slow-but-eventually-OK call and a full timeout both
+     * return -- the sensor task's overrun warning can't tell them apart, it
+     * only knows the 50ms budget was blown. Logging only when this actually
+     * exceeds 20ms keeps this silent in the normal case (matches the fast
+     * command path) while giving an exact number the moment it isn't. */
+    int64_t t0 = esp_timer_get_time();
     esp_err_t ret = esp_hosted_send_custom_data(PEER_MSG_VIDEO,
                                                 s_send_buf,
                                                 ESPNOW_HDR_SIZE + len);
+    int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+    if (elapsed_ms > 20) {
+        ESP_LOGW(TAG, "espnow_send_fn: esp_hosted_send_custom_data took %lldms "
+                      "for %u-byte payload (msg_type=%d, ret=%s)",
+                 (long long)elapsed_ms, (unsigned)(ESPNOW_HDR_SIZE + len),
+                 (int)msg_type, esp_err_to_name(ret));
+    }
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "espnow_send_fn: send failed (%s)", esp_err_to_name(ret));
     }
@@ -151,104 +260,37 @@ static esp_err_t espnow_send_fn(const uint8_t *buf, size_t len, void *ctx)
 }
 
 /* ---------------------------------------------------------------------------
- * espnow_transport_send_jpeg — fragments JPEG into ≤JPEG_CHUNK_MAX chunks
+ * espnow_transport_send_telemetry — field-mode-only compact IMU+GPS send.
+ * Bypasses pipeline.c/boat.proto entirely; see espnow_telemetry_t for why.
+ * Called directly from sensor_task.c, not registered as a pipeline
+ * transport_send_fn -- this is not a boat_BoatMessage, there is nothing for
+ * fanout_locked()'s pb_encode() to do with it.
  * -------------------------------------------------------------------------*/
-/* Tell the ground station what a JPEG attempt did: rc 0 = sent. */
-static void espnow_report_jpeg(uint8_t rc, uint16_t size, uint8_t n_chunks)
+esp_err_t espnow_transport_send_telemetry(const espnow_telemetry_t *t)
 {
-    uint8_t buf[ESPNOW_HDR_SIZE + 4];
-    espnow_pkt_hdr_t *h = (espnow_pkt_hdr_t *)buf;
-    h->msg_type = MSG_JPEG_STATUS;
-    h->payload_len = 4;
-    h->seq = 0;
-    buf[ESPNOW_HDR_SIZE + 0] = rc;
-    buf[ESPNOW_HDR_SIZE + 1] = n_chunks;
-    memcpy(&buf[ESPNOW_HDR_SIZE + 2], &size, 2);
-    esp_hosted_send_custom_data(PEER_MSG_VIDEO, buf, sizeof(buf));
-}
+    uint8_t buf[ESPNOW_HDR_SIZE + sizeof(espnow_telemetry_t)];
+    espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)buf;
+    hdr->msg_type    = MSG_FIELD_TELEMETRY;
+    hdr->payload_len = (uint16_t)sizeof(espnow_telemetry_t);
+    hdr->seq         = 0;
+    memcpy(buf + ESPNOW_HDR_SIZE, t, sizeof(espnow_telemetry_t));
 
-esp_err_t espnow_transport_send_jpeg(const uint8_t *jpg, size_t len)
-{
-    if (!jpg || len == 0) {
-        return ESP_ERR_INVALID_ARG;
+    /* Same timing instrumentation as espnow_send_fn, for the same reason:
+     * this path is EXPECTED to always be fast now (one packet, no
+     * fragmentation) -- if it ever isn't, that's worth knowing exactly,
+     * not guessing at. */
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t ret = esp_hosted_send_custom_data(PEER_MSG_VIDEO, buf, sizeof(buf));
+    int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+    if (elapsed_ms > 20) {
+        ESP_LOGW(TAG, "espnow_transport_send_telemetry: esp_hosted_send_custom_data "
+                      "took %lldms for %u-byte payload (ret=%s)",
+                 (long long)elapsed_ms, (unsigned)sizeof(buf), esp_err_to_name(ret));
     }
-
-    /* Payload of every MSG_JPEG_CHUNK is:
-     *     [frame_id][chunk_idx][n_chunks] then JPEG bytes
-     *
-     * The old scheme put a rolling counter in espnow_pkt_hdr_t.seq and
-     * incremented it PER CHUNK, while the receiver treated a changed seq as
-     * "new frame — reset buffer". Every chunk therefore wiped the previous one
-     * and a multi-chunk JPEG could never reassemble. frame_id now stays
-     * constant across one image, chunk_idx orders them, and n_chunks lets the
-     * receiver know when it is complete (and detect a missing chunk instead of
-     * decoding garbage). */
-    static uint8_t frame_id = 0;
-    frame_id++;
-
-    const size_t payload_max = JPEG_CHUNK_BYTES;
-    const size_t n_chunks    = (len + payload_max - 1) / payload_max;
-
-    if (n_chunks > 254) {          /* 255 reserved: parity uses index n_chunks */
-        ESP_LOGW(TAG, "send_jpeg: %u bytes needs %u chunks (max 254)",
-                 (unsigned)len, (unsigned)n_chunks);
-        return ESP_ERR_INVALID_SIZE;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "espnow_transport_send_telemetry: send failed (%s)", esp_err_to_name(ret));
     }
-
-    /* XOR parity over zero-padded data chunks. There is no retransmission and
-     * no feedback channel, so losing ONE chunk previously lost the whole image
-     * — which on screen looked like "it showed one frame then froze". One
-     * parity chunk lets the receiver rebuild any single missing chunk for
-     * 1/N overhead, instead of the 100% cost of sending everything twice. */
-    static uint8_t parity[JPEG_CHUNK_BYTES];
-    memset(parity, 0, sizeof(parity));
-    for (size_t i = 0; i < n_chunks; i++) {
-        size_t off = i * payload_max;
-        size_t c   = (len - off > payload_max) ? payload_max : (len - off);
-        for (size_t k = 0; k < c; k++) {
-            parity[k] ^= jpg[off + k];      /* short tail is implicitly zero-padded */
-        }
-    }
-
-    static uint8_t chunk_buf[PEER_DATA_MAX];
-    uint16_t total_len = (uint16_t)len;
-
-    for (size_t i = 0; i <= n_chunks; i++) {     /* <= : last pass sends parity */
-        const bool is_parity = (i == n_chunks);
-        size_t off   = i * payload_max;
-        size_t chunk = is_parity ? payload_max
-                                 : ((len - off > payload_max) ? payload_max : (len - off));
-
-        espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)chunk_buf;
-        hdr->msg_type    = MSG_JPEG_CHUNK;
-        hdr->payload_len = (uint16_t)(JPEG_SUBHDR_SIZE + chunk);
-        hdr->seq         = frame_id;
-
-        uint8_t *sub = chunk_buf + ESPNOW_HDR_SIZE;
-        sub[0] = frame_id;
-        sub[1] = (uint8_t)i;
-        sub[2] = (uint8_t)n_chunks;
-        memcpy(sub + 3, &total_len, 2);
-        memcpy(sub + JPEG_SUBHDR_SIZE,
-               is_parity ? parity : (jpg + off), chunk);
-
-        esp_err_t ret = esp_hosted_send_custom_data(
-            PEER_MSG_VIDEO, chunk_buf,
-            ESPNOW_HDR_SIZE + JPEG_SUBHDR_SIZE + chunk);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "send_jpeg: chunk %u/%u failed (%s)",
-                     (unsigned)(i + 1), (unsigned)(n_chunks + 1), esp_err_to_name(ret));
-            espnow_report_jpeg((uint8_t)(i + 1), (uint16_t)len, (uint8_t)n_chunks);
-            return ret;
-        }
-
-        if (i < n_chunks) {
-            vTaskDelay(pdMS_TO_TICKS(JPEG_INTER_CHUNK_MS));
-        }
-    }
-
-    espnow_report_jpeg(0, (uint16_t)len, (uint8_t)n_chunks);
-    return ESP_OK;
+    return ret;
 }
 
 /* ---------------------------------------------------------------------------
@@ -287,46 +329,9 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
      * saw it because init_cb is a void callback: the RPC reports success as
      * long as the handler ran.
      */
-    {
-        uint8_t init_buf[1 + 6];
-
-        init_buf[0] = (uint8_t)CONFIG_ESPNOW_CHANNEL;
-        parse_mac_string(CONFIG_ESPNOW_PEER_MAC, &init_buf[1]);
-
-        ret = esp_hosted_send_custom_data(PEER_MSG_INIT, init_buf, sizeof(init_buf));
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send ESPNOW_INIT (%s)", esp_err_to_name(ret));
-            return ret;
-        }
-        ESP_LOGI(TAG, "Sent ESPNOW_INIT (ch=%d peer=" CONFIG_ESPNOW_PEER_MAC ")",
-                 CONFIG_ESPNOW_CHANNEL);
-    }
-
-    /* --- Build and send MSG_ESPNOW_CONFIG --- */
-    /*
-     * Payload layout:
-     *   [0..3]  espnow_pkt_hdr_t  (4 bytes)
-     *   [4..5]  width  uint16_t   (little-endian)
-     *   [6..7]  height uint16_t   (little-endian)
-     */
-    {
-        uint8_t cfg_buf[ESPNOW_HDR_SIZE + 2 + 2];
-
-        espnow_pkt_hdr_t *hdr = (espnow_pkt_hdr_t *)cfg_buf;
-        hdr->msg_type    = MSG_ESPNOW_CONFIG;
-        hdr->payload_len = 2 + 2;
-        hdr->seq         = 0;
-
-        uint16_t width  = 800;
-        uint16_t height = 640;
-        memcpy(cfg_buf + ESPNOW_HDR_SIZE,     &width,  2);
-        memcpy(cfg_buf + ESPNOW_HDR_SIZE + 2, &height, 2);
-
-        ret = esp_hosted_send_custom_data(PEER_MSG_VIDEO, cfg_buf, sizeof(cfg_buf));
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send ESPNOW_CONFIG (%s)", esp_err_to_name(ret));
-            return ret;
-        }
+    ret = send_espnow_init();
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     /* --- Own the channel from THIS side, and verify it -----------------------
@@ -388,6 +393,23 @@ esp_err_t espnow_transport_activate(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register pipeline transport (%s)", esp_err_to_name(ret));
         return ret;
+    }
+
+    /* probe() already heard at least one MSG_GROUND_HELLO (that's what makes
+     * activate() get called at all), so s_last_upstream_us is already fresh
+     * via upstream_cb -- just start the periodic check from here on. */
+    const esp_timer_create_args_t reinit_args = {
+        .callback = reinit_watchdog_cb,
+        .name     = "espnow_reinit",
+    };
+    ret = esp_timer_create(&reinit_args, &s_reinit_watchdog);
+    if (ret == ESP_OK) {
+        ret = esp_timer_start_periodic(s_reinit_watchdog, REINIT_WATCHDOG_PERIOD_US);
+    }
+    if (ret != ESP_OK) {
+        /* Non-fatal: the link still works, it just won't self-heal from a
+         * C6 crash without a manual P4 reset -- same as before this existed. */
+        ESP_LOGW(TAG, "Could not start ESP-NOW self-heal watchdog (%s)", esp_err_to_name(ret));
     }
 
     ESP_LOGI(TAG, "ESP-NOW transport ready (ch=%d peer=" CONFIG_ESPNOW_PEER_MAC ")",

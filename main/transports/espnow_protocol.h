@@ -8,14 +8,17 @@
  * Message type identifiers
  * -------------------------------------------------------------------------*/
 typedef enum {
-    MSG_JPEG_CHUNK    = 0x01,
     MSG_SENSOR        = 0x02,
     MSG_MOTOR_CMD     = 0x03,
     MSG_ARM_CMD       = 0x04,
     MSG_DETECT_CMD    = 0x05,
     MSG_MOTOR_STATUS  = 0x06,
+    MSG_STATUS        = 0x07,  /* SystemStatus -- see espnow_send_fn() */
+    /* Field-mode-only compact telemetry -- see espnow_telemetry_t below.
+     * Replaces MSG_SENSOR for the ESP-NOW link specifically; WS/bench mode
+     * keeps sending full SensorSnapshot via MSG_SENSOR, unaffected. */
+    MSG_FIELD_TELEMETRY = 0x08,
     MSG_ESPNOW_INIT   = 0x10,
-    MSG_ESPNOW_CONFIG = 0x11,
     /* S3 ground station -> boat: "I am here". Broadcast periodically by the
      * USB bridge. The boat listens for it at boot to decide whether to run in
      * ESP-NOW field mode or fall back to WiFi. Header only, no payload. */
@@ -25,11 +28,6 @@ typedef enum {
      * the USB pins, so without this a silent bridge is indistinguishable from
      * a crashed one, or from a boat that never transmitted. */
     MSG_BRIDGE_STATUS = 0x13,
-    /* Boat -> laptop: outcome of each JPEG send attempt. Exists because the
-     * P4's serial console is often unavailable in the field, so a failing
-     * video path was indistinguishable from one that never ran. Raw framing,
-     * no protobuf, so it needs no schema change. */
-    MSG_JPEG_STATUS   = 0x14,
 } espnow_msg_type_t;
 
 /* Payload of MSG_BRIDGE_STATUS (packed, little-endian). */
@@ -56,6 +54,48 @@ typedef struct __attribute__((packed)) {
 } espnow_pkt_hdr_t;
 
 #define ESPNOW_HDR_SIZE  (sizeof(espnow_pkt_hdr_t))  /* 4 */
+
+/* ---------------------------------------------------------------------------
+ * MSG_FIELD_TELEMETRY payload (packed, little-endian)
+ *
+ * Field-mode-only replacement for the full protobuf SensorSnapshot: IMU +
+ * GPS, nothing else -- no ToF, no detections. ~42 bytes vs. up to 13270 for
+ * the full boat_BoatMessage worst case: fits in ONE ESP-NOW packet (244B
+ * limit, see ESPNOW_MAX_PAYLOAD below), so it never needs fragmentation.
+ *
+ * That matters concretely: a full snapshot needs ~55 fragments, each with a
+ * mandatory 1ms inter-chunk delay on the C6 (espnow_bridge.c's
+ * espnow_frag_send()) -- on the C6's single core, a backlog of those can
+ * starve the esp_hosted RPC response the P4's sensor task is blocked
+ * waiting on, which is what turned into esp_hosted_send_custom_data timing
+ * out and the sensor task blowing its 50ms loop budget (see sensor_task.c's
+ * "snapshot loop overrun" history). Zero fragmentation removes that failure
+ * mode structurally, not just by making it less likely.
+ *
+ * Deliberately a hand-packed struct, not a new boat.proto message: adding a
+ * message to boat.proto means regenerating main/proto/boat.pb.c/.h, which
+ * tools/gen_proto.sh explicitly refuses to do ("would put a WORKING
+ * transport at risk for no benefit"). This type never touches boat.proto or
+ * its generated code, so it carries none of that risk to the WiFi/WS path
+ * -- which keeps sending the full boat_SensorSnapshot exactly as before,
+ * completely unaffected by anything here.
+ *
+ * Field names mirror boat.proto's IMUData/GpsFix 1:1 (values, not full
+ * field sets -- altitude_m/fix_quality/utc_ms are omitted, matching what
+ * the ESP-NOW-side tools actually consume) so nothing has to be re-derived
+ * by a reader comparing the two. */
+typedef struct __attribute__((packed)) {
+    float    pitch;
+    float    roll;
+    float    heading;
+    uint8_t  gps_valid;
+    double   latitude;
+    double   longitude;
+    float    speed_mps;
+    float    course_deg;
+    uint8_t  satellites;
+    float    hdop;
+} espnow_telemetry_t;
 
 /* ---------------------------------------------------------------------------
  * Fragmentation header — prepended to each fragment payload

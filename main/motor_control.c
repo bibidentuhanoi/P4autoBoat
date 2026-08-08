@@ -21,6 +21,13 @@ static const char *TAG = "MOTOR_CTL";
 #define WATCHDOG_INTERVAL_US (100 * 1000)
 #define STATUS_DIVIDER       10
 
+/* How long a control link may go silent before it's treated as lost. Only
+ * matters when no WS client is connected (see control_link_alive()) — field
+ * mode streams at 10-20Hz, so this survives a couple of dropped ESP-NOW
+ * packets without false-tripping, while still stopping the boat well inside
+ * a second of a genuine link loss. */
+#define CONTROL_LINK_TIMEOUT_US (400 * 1000)
+
 /* New Kconfig symbols are absent until sdkconfig is regenerated. Keep safe
  * fallback defaults so this branch builds and dry-run works immediately. */
 #ifndef CONFIG_HEADING_ASSIST_DRY_RUN
@@ -63,13 +70,25 @@ static const char *TAG = "MOTOR_CTL";
  *    • A zero/stop command never powers the rail (spring-back-to-0 must not
  *      re-energise it).
  *    • ARM powers the rail and clears the cut; DISARM cuts rail power.
- *    • WS-loss failsafe (100 ms) zeroes throttle + winch, centres rudders, and
- *      DE-ENERGISES the rail — loss of the control link returns to a safe,
- *      unpowered state, not a hot rail holding torque forever.
+ *    • Control-link-loss failsafe (100 ms poll) zeroes throttle + winch,
+ *      centres rudders, and DE-ENERGISES the rail — loss of the control link
+ *      returns to a safe, unpowered state, not a hot rail holding torque
+ *      forever. "Link alive" means EITHER an open WS client (dashboard sends
+ *      only on slider drag/change, then goes silent holding a steady value —
+ *      so a connected client is alive on its own, independent of command
+ *      recency) OR a BoatMessage received within CONTROL_LINK_TIMEOUT_US
+ *      (ESP-NOW/field mode: connectionless, so recent traffic is the only
+ *      substitute for "connected").
  * ───────────────────────────────────────────────────────────────────────────── */
 
 static bool s_was_nonzero = false;
 static esp_timer_handle_t s_watchdog = NULL;
+
+static inline bool control_link_alive(void)
+{
+    return ws_transport_client_count() > 0 ||
+           pipeline_recent_command(CONTROL_LINK_TIMEOUT_US);
+}
 
 /* Set when motor/servo state changes so the next 100ms watchdog tick publishes
  * status immediately (vs the ~1s cadence). Only the timer publishes it: doing so
@@ -157,8 +176,7 @@ static void heading_assist_dry_run_tick(void)
     const int64_t now = esp_timer_get_time();
     const bool log_now = (++log_div % STATUS_DIVIDER) == 0;
 
-    int ws_clients = ws_transport_client_count();
-    if (ws_clients == 0) {
+    if (!control_link_alive()) {
         heading_assist_reset();
         return;
     }
@@ -383,10 +401,10 @@ static void watchdog_cb(void *arg)
     (void)arg;
     static int tick = 0;
 
-    /* Failsafe on WS loss: covers ARMED, and the bench case where the servo rail
-     * is powered while disarmed. Return to a safe, DE-ENERGISED state. */
+    /* Failsafe on control-link loss: covers ARMED, and the bench case where the
+     * servo rail is powered while disarmed. Return to a safe, DE-ENERGISED state. */
     if ((esc_driver_get_state() == ESC_STATE_ARMED || winch_driver_get_power()) &&
-        ws_transport_client_count() == 0) {
+        !control_link_alive()) {
         bool acted = false;
         if (s_was_nonzero) {
             esc_driver_set_throttle(0.0f, 0.0f);
@@ -400,7 +418,7 @@ static void watchdog_cb(void *arg)
             acted = true;
         }
         if (steer_driver_get() != 0.0f) {
-            steer_driver_set(0.0f);   /* WS-loss: center, not STEER_HOME — safer than a hard-over rudder */
+            steer_driver_set(0.0f);   /* link-loss: center, not STEER_HOME — safer than a hard-over rudder */
             s_manual_rudder = 0.0f;
             acted = true;
         }
@@ -410,7 +428,7 @@ static void watchdog_cb(void *arg)
             acted = true;
         }
         if (acted) {
-            ESP_LOGW(TAG, "WS lost — throttle 0, winch 0, rudders centred, servo rail cut");
+            ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
             s_status_dirty = true;
         }
     }

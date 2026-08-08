@@ -141,7 +141,7 @@ esp_err_t steer_driver_set(float steer)
     uint32_t us = steer_to_us(s);
     esp_err_t err = mcpwm_comparator_set_compare_value(s_cmp, us);
     xSemaphoreGive(s_mutex);
-    ESP_LOGI(TAG, "set: steer=%.2f -> %uus, mcpwm_ret=%s",   /* DIAG */
+    ESP_LOGD(TAG, "set: steer=%.2f -> %uus, mcpwm_ret=%s",   /* DIAG */
              s_steer, (unsigned)us, esp_err_to_name(err));
     return err;
 }
