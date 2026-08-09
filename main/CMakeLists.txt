@@ -4,6 +4,7 @@ idf_component_register(
         "runtime_schedule.c"
         "runtime_task.c"
         "runtime_metrics.c"
+        "sensor_schedule.c"
         "control_arbiter.c"
         "arm_sequence.c"
                        "sd_card.c"
