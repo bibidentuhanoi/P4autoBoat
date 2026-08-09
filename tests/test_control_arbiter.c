@@ -21,6 +21,42 @@ static void assert_disabled_sources_are_rejected(control_arbiter_t *arbiter)
            CONTROL_REJECT_SOURCE_DISABLED);
 }
 
+static void assert_mutable_selection_cannot_authorize_nonmanual_drive(void)
+{
+    control_arbiter_t arbiter;
+    control_decision_t decision;
+
+    control_arbiter_init(&arbiter);
+    assert(control_arbiter_submit_drive(&arbiter, CONTROL_SOURCE_MANUAL,
+                                        0.2f, 0.0f, 1000) == CONTROL_ACCEPTED);
+
+    arbiter.drive[CONTROL_SOURCE_ML] = (control_drive_proposal_t){
+        .throttle = 0.9f,
+        .rudder = 0.0f,
+        .rx_us = 2000,
+        .valid = true,
+        .changed = true,
+    };
+    arbiter.drive[CONTROL_SOURCE_WAYPOINT] = (control_drive_proposal_t){
+        .throttle = -0.9f,
+        .rudder = 0.0f,
+        .rx_us = 2000,
+        .valid = true,
+        .changed = true,
+    };
+    assert(control_arbiter_submit_drive(&arbiter, CONTROL_SOURCE_WAYPOINT,
+                                        -0.9f, 0.0f, 2000) ==
+           CONTROL_REJECT_SOURCE_DISABLED);
+    assert(control_arbiter_submit_drive(&arbiter, CONTROL_SOURCE_ML,
+                                        0.9f, 0.0f, 2000) ==
+           CONTROL_REJECT_SOURCE_DISABLED);
+
+    control_arbiter_decide(&arbiter, 2001, &decision);
+    assert(!decision.failsafe);
+    assert(decision.left == 0.2f);
+    assert(decision.right == 0.2f);
+}
+
 static void assert_invalid_continuous_commands_are_rejected(control_arbiter_t *arbiter)
 {
     assert(control_arbiter_submit_drive(arbiter, CONTROL_SOURCE_MANUAL,
@@ -135,6 +171,7 @@ int main(void)
     control_arbiter_init(&arbiter);
 
     assert_disabled_sources_are_rejected(&arbiter);
+    assert_mutable_selection_cannot_authorize_nonmanual_drive();
     assert_invalid_continuous_commands_are_rejected(&arbiter);
     assert_latest_drive_is_selected_and_expires(&arbiter);
 

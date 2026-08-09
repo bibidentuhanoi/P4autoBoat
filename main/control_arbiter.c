@@ -2,18 +2,10 @@
 
 #include <math.h>
 
-#define CONTROL_SOURCE_MASK(source) (1u << (unsigned)(source))
 #define CONTROL_URGENT_SERVO_POWER_OFF (1u << 0)
 #define CONTROL_URGENT_DISARM (1u << 1)
 #define CONTROL_STEER_RAW_MIN_US 400u
 #define CONTROL_STEER_RAW_MAX_US 2600u
-
-static bool source_is_enabled(const control_arbiter_t *arbiter,
-                              control_source_t source)
-{
-    return source >= CONTROL_SOURCE_MANUAL && source < CONTROL_SOURCE_COUNT &&
-           (arbiter->enabled_sources & CONTROL_SOURCE_MASK(source)) != 0;
-}
 
 static bool value_is_normalized(float value)
 {
@@ -29,10 +21,9 @@ static float clamp_normalized(float value)
     return value;
 }
 
-static control_submit_result_t validate_drive_source(
-    const control_arbiter_t *arbiter, control_source_t source)
+static control_submit_result_t validate_drive_source(control_source_t source)
 {
-    if (!source_is_enabled(arbiter, source))
+    if (source != CONTROL_SOURCE_MANUAL)
         return CONTROL_REJECT_SOURCE_DISABLED;
     return CONTROL_ACCEPTED;
 }
@@ -63,8 +54,6 @@ static bool update_continuous(control_continuous_proposal_t *proposal,
 void control_arbiter_init(control_arbiter_t *arbiter)
 {
     *arbiter = (control_arbiter_t){0};
-    arbiter->active_source = CONTROL_SOURCE_MANUAL;
-    arbiter->enabled_sources = CONTROL_SOURCE_MASK(CONTROL_SOURCE_MANUAL);
     arbiter->was_failsafe = true;
 }
 
@@ -73,7 +62,7 @@ control_submit_result_t control_arbiter_submit_drive(control_arbiter_t *arbiter,
                                                      float throttle, float rudder,
                                                      int64_t rx_us)
 {
-    control_submit_result_t source_result = validate_drive_source(arbiter, source);
+    control_submit_result_t source_result = validate_drive_source(source);
     control_drive_proposal_t *proposal;
 
     if (source_result != CONTROL_ACCEPTED)
@@ -185,7 +174,7 @@ static void apply_event(control_decision_t *out, control_event_kind_t event)
 void control_arbiter_decide(control_arbiter_t *arbiter, int64_t now_us,
                             control_decision_t *out)
 {
-    control_drive_proposal_t *drive = &arbiter->drive[arbiter->active_source];
+    control_drive_proposal_t *drive = &arbiter->drive[CONTROL_SOURCE_MANUAL];
 
     *out = (control_decision_t){0};
     if (!drive->valid || now_us - drive->rx_us >= CONTROL_DRIVE_TIMEOUT_US) {

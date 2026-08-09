@@ -73,8 +73,6 @@ typedef struct {
     uint8_t event_head;
     uint8_t event_count;
     uint8_t urgent_events;
-    uint8_t enabled_sources;
-    control_source_t active_source;
     bool was_failsafe;
 } control_arbiter_t;
 
