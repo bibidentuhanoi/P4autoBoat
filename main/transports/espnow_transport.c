@@ -23,6 +23,7 @@ static const char *TAG = "ESPNOW_TRANSPORT";
 #define PEER_MSG_COMMAND  2u   /* P4→C6: commands (fast path on C6) */
 #define PEER_MSG_INIT     3u   /* P4→C6: ESP-NOW init */
 #define PEER_MSG_UPSTREAM 4u   /* C6→P4: commands from laptop */
+#define PEER_MSG_INIT_STATUS 5u /* C6→P4: one-shot LR rate-config result */
 /* Sized from the nanopb worst case, not a hardcoded number -- PEER_DATA_MAX
  * used to be 8166 (leftover from when PEER_MSG_VIDEO carried JPEG frames,
  * before that feature was reverted). boat_BoatMessage_size grew to 13270
@@ -119,6 +120,7 @@ static esp_err_t send_espnow_init(void)
 static volatile int64_t   s_last_upstream_us = 0;
 static volatile int       s_reinit_attempts  = 0;
 static esp_timer_handle_t s_reinit_watchdog  = NULL;
+static volatile int8_t    s_lr_status        = -1;  /* -1 = not yet reported */
 
 static void reinit_watchdog_cb(void *arg)
 {
@@ -187,6 +189,29 @@ static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
 
     const uint8_t *payload = data + ESPNOW_HDR_SIZE;
     pipeline_handle_incoming(payload, payload_len);
+}
+
+/* ---------------------------------------------------------------------------
+ * init_status_cb — registered for PEER_MSG_INIT_STATUS (C6→P4, one-shot LR
+ * rate-config result; see tools/slave_firmware/espnow_bridge.c's init_cb).
+ * -------------------------------------------------------------------------*/
+static void init_status_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+{
+    (void)msg_id;
+    if (!data || data_len < 1) {
+        return;
+    }
+    s_lr_status = (int8_t)data[0];
+    ESP_LOGI(TAG, "Co-processor reports LR rate config: %s",
+             s_lr_status ? "OK" : "FAILED");
+}
+
+/* ---------------------------------------------------------------------------
+ * espnow_transport_lr_status — LR rate-config result reported by the C6.
+ * -------------------------------------------------------------------------*/
+int8_t espnow_transport_lr_status(void)
+{
+    return s_lr_status;
 }
 
 /* ---------------------------------------------------------------------------
@@ -314,6 +339,13 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
         return ret;
     }
 
+    /* --- Register the one-shot LR-status callback --- */
+    ret = esp_hosted_register_custom_callback(PEER_MSG_INIT_STATUS, init_status_cb);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to register init-status callback (%s)", esp_err_to_name(ret));
+        return ret;
+    }
+
     /* --- Build and send the ESP-NOW init payload ----------------------------
      * RAW payload, NO espnow_pkt_hdr_t. The C6's init_cb reads:
      *     channel  = data[0]
@@ -363,6 +395,30 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
         }
     } else {
         ESP_LOGW(TAG, "Could not read back the co-processor channel");
+    }
+
+    /* --- Verify Long Range mode took, if the C6 build has it enabled --------
+     * esp_wifi_set_protocol()/esp_now_set_peer_rate_config() run ON THE C6
+     * (tools/slave_firmware/espnow_bridge.c's init_cb), not here -- the P4
+     * can't set them, only verify. esp_wifi_get_protocol() IS proxied
+     * through esp_wifi_remote like the channel check above, so it genuinely
+     * reflects the co-processor's state. Log-only: a mismatch doesn't fail
+     * the probe (the link still works at normal range), it just means the
+     * range test won't show a gain -- confirm that here, at boot, rather
+     * than discovering it 300m into a field test. */
+    uint8_t protocol_bitmap = 0;
+    if (esp_wifi_get_protocol(WIFI_IF_STA, &protocol_bitmap) == ESP_OK) {
+        if (protocol_bitmap & WIFI_PROTOCOL_LR) {
+            ESP_LOGI(TAG, "Co-processor LR protocol bit is SET (bitmap=0x%02x)",
+                     protocol_bitmap);
+        } else {
+            ESP_LOGW(TAG, "Co-processor LR protocol bit NOT set (bitmap=0x%02x) "
+                          "-- ESPNOW_LR_ENABLED may be 0 on the C6 build, or "
+                          "esp_wifi_set_protocol failed there (check its own log)",
+                     protocol_bitmap);
+        }
+    } else {
+        ESP_LOGW(TAG, "Could not read back the co-processor's WiFi protocol bitmap");
     }
 
     /* --- Listen for the ground station -------------------------------------

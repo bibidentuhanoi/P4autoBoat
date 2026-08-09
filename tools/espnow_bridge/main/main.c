@@ -24,6 +24,11 @@
 static const char *TAG = "bridge";
 
 /* ---- Constants ---------------------------------------------------------- */
+/* Long Range PHY toggle for the A/B range test -- see the matching define
+ * in tools/slave_firmware/espnow_bridge.c (boat side) for the full
+ * rationale. Both ends must be flashed with the SAME value. */
+#define ESPNOW_LR_ENABLED 1
+
 #define ESPNOW_CHANNEL      6
 #define FRAG_HDR_SIZE       4
 #define REASSEMBLY_BUF_SIZE (64 * 1024)   /* 64 KB — enough for a JPEG frame */
@@ -60,6 +65,8 @@ static volatile uint32_t s_espnow_bytes  = 0;
 static volatile uint32_t s_frames_out    = 0;
 static volatile uint32_t s_hello_sent    = 0;
 static volatile uint32_t s_reasm_drops   = 0;
+static volatile int8_t   s_last_rx_rssi  = 0;
+static volatile int8_t   s_lr_rate_config_ok = -1;  /* -1 = LR disabled on this build */
 
 /* ---- USB self-test ------------------------------------------------------- *
  * TEMPORARY BENCH AID.  Set to 0 for normal operation.
@@ -279,9 +286,9 @@ static void status_task(void *arg)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(STATUS_INTERVAL_MS));
 
-        uint8_t payload[4 + 24];
+        uint8_t payload[4 + 26];
         payload[0] = MSG_BRIDGE_STATUS;
-        uint16_t plen = 24;
+        uint16_t plen = 26;
         memcpy(payload + 1, &plen, 2);
         payload[3] = seq++;
 
@@ -291,6 +298,10 @@ static void status_task(void *arg)
             s_frames_out,  s_hello_sent, s_reasm_drops,
         };
         memcpy(payload + 4, vals, sizeof(vals));
+        int8_t rssi = s_last_rx_rssi;
+        memcpy(payload + 4 + sizeof(vals), &rssi, sizeof(rssi));
+        int8_t lr_ok = s_lr_rate_config_ok;
+        memcpy(payload + 4 + sizeof(vals) + sizeof(rssi), &lr_ok, sizeof(lr_ok));
 
         uint8_t *cobs = malloc(sizeof(payload) + COBS_MAX_OVERHEAD(sizeof(payload)));
         if (!cobs) {
@@ -321,6 +332,12 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info,
         ESP_LOGW(TAG, "Short ESP-NOW packet (%d bytes) — ignored", data_len);
         return;
     }
+
+    /* Uplink signal margin, the ground station's-eye view -- every frame
+     * the S3 hears from the boat updates this, regardless of what kind of
+     * frame it turns out to be. Reported to the laptop via MSG_BRIDGE_STATUS
+     * below. */
+    s_last_rx_rssi = (int8_t)info->rx_ctrl->rssi;
 
     uint32_t total_len;
     memcpy(&total_len, data, sizeof(total_len));   /* little-endian uint32_t */
@@ -452,6 +469,16 @@ static void wifi_init(void)
     /* Fix the channel — must match CONFIG_ESPNOW_CHANNEL on P4 side */
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
+#if ESPNOW_LR_ENABLED
+    /* Must match the C6's bitmap exactly (tools/slave_firmware/espnow_bridge.c) --
+     * see that file for the esp-now issue #144 caveat and why BGNLR, not
+     * LR-only. ESP_ERROR_CHECK is correct here (matches this function's own
+     * style): this call is local to this chip, not RPC-proxied, so a real
+     * esp_err_t is trustworthy. */
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+#endif
+
     /* Disable power-save for lowest latency */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 }
@@ -469,6 +496,29 @@ static void espnow_init(void)
     };
     memcpy(peer.peer_addr, BROADCAST_MAC, ESP_NOW_ETH_ALEN);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+
+#if ESPNOW_LR_ENABLED
+    esp_now_rate_config_t rate_cfg = {
+        .phymode = WIFI_PHY_MODE_LR,
+        .rate    = WIFI_PHY_RATE_LORA_250K,
+        .ersu    = false,
+        .dcm     = false,
+    };
+    /* Not ESP_ERROR_CHECK, unlike every other call in this function: whether
+     * a BROADCAST peer even accepts a per-peer rate config is genuinely
+     * unverified (design doc open item). Log and continue either way -- the
+     * range test proves which outcome we got; aborting the whole bridge over
+     * a still-open question would be the wrong failure mode. */
+    esp_err_t rc_err = esp_now_set_peer_rate_config(BROADCAST_MAC, &rate_cfg);
+    s_lr_rate_config_ok = (rc_err == ESP_OK) ? 1 : 0;
+    if (rc_err != ESP_OK) {
+        ESP_LOGW(TAG, "espnow_init: esp_now_set_peer_rate_config(broadcast, LR) "
+                      "failed: %s -- LR bitmap is still set; broadcast frames "
+                      "may fall back to normal rate", esp_err_to_name(rc_err));
+    } else {
+        ESP_LOGI(TAG, "espnow_init: broadcast peer rate config set to LR/250K");
+    }
+#endif
 }
 
 /* ========================================================================== */

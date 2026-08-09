@@ -45,14 +45,13 @@ talks plain JSON to this script's own HTTP API, and THIS PROCESS (already
 holding the tested COBS/protobuf encoder) is what writes framed bytes to the
 serial port. Nothing in the browser needs to stay in sync with boat.proto.
 
-Commands stream continuously at ~15 Hz for as long as a serial port is
-connected, regardless of whether anything changed -- driven by a background
-thread here, not by the browser (so a backgrounded/throttled browser tab
-can't stall it). This is the point, not an inefficiency: a lost packet just
-holds the previous value for one tick (RC-style loss tolerance), and it is
-what feeds the firmware's control-link-loss failsafe (motor_control.c) --
-that failsafe stops the boat if this stream goes silent for 400ms, so closing
-this tool (or losing the link) is the SAFE direction.
+Throttle and rudder stream continuously at ~15 Hz for as long as a serial port
+is connected, regardless of whether anything changed. Nonzero winch commands
+have a separate 300ms laptop-side lease which the browser renews while a button
+is physically held; losing/backgrounding the page therefore stops the winch
+even though the serial process remains connected. The continuous base stream
+feeds the firmware's control-link-loss failsafe (motor_control.c), which stops
+the boat if the whole stream goes silent for 400ms.
 
 NOTE: the armed/force state shown in the page is still just the last command
 WE SENT, never confirmed by the boat -- MotorStatus (which would confirm it)
@@ -75,6 +74,7 @@ browser is available).
 import base64
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -107,6 +107,7 @@ ESP_NOW_MAX_DATA_LEN = 250     # ESP-NOW v1 single-packet limit
 SEND_HZ = 15
 HTTP_HOST = '127.0.0.1'        # LAN-reachable would let anyone drive the boat
 TELEMETRY_STALE_S = 2.0        # snapshot task runs ~20Hz normally -- 2s is a generous margin
+WINCH_LEASE_S = 0.30           # nonzero command must be renewed before firmware's 400ms failsafe
 
 WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'   # RFC 6455 handshake constant
 WS_PUSH_HZ = 20                 # status push rate over /ws -- at least matches the
@@ -212,6 +213,12 @@ class BoatLink:
         self.connected = False
         self.throttle = 0.0
         self.rudder = 0.0
+        self.winch_speed = 0.0
+        self.winch_lease_until = 0.0
+        self.winch_command_seq = 0
+        # None means this laptop session has not commanded the rail yet. This
+        # is deliberately not presented as boat-confirmed telemetry.
+        self.servo_rail_cut = None
         self.armed_cmd = False
         self.force = False
         self.seq = 0
@@ -239,6 +246,9 @@ class BoatLink:
             'have': False, 'last_rx_monotonic': None,
             'uptime_s': 0, 'espnow_pkts': 0, 'espnow_bytes': 0,
             'frames_out': 0, 'hello_sent': 0, 'reasm_drops': 0,
+            # Task 13 decodes these signed bytes. None keeps older S3
+            # firmware's 24-byte status payload distinguishable from a real 0.
+            'uplink_rssi_dbm': None, 'lr_rate_config_ok': None,
         }
 
     # ---- internal, must hold self._lock ----
@@ -249,20 +259,32 @@ class BoatLink:
         try:
             self.ser.write(frame)
             self.last_error = None
+            return True
         except Exception as exc:                        # noqa: BLE001
             self.last_error = str(exc)
+            return False
 
     def _send_motor_locked(self, throttle: float):
         msg = self.pb2.BoatMessage()
         msg.motor.left = throttle
         msg.motor.right = throttle
-        self._write_locked(msg.SerializeToString())
+        return self._write_locked(msg.SerializeToString())
 
     def _send_steer_locked(self, rudder: float):
         msg = self.pb2.BoatMessage()
         msg.steer.left = rudder
         msg.steer.right = rudder
-        self._write_locked(msg.SerializeToString())
+        return self._write_locked(msg.SerializeToString())
+
+    def _send_winch_locked(self, speed: float):
+        msg = self.pb2.BoatMessage()
+        msg.winch.speed = speed
+        return self._write_locked(msg.SerializeToString())
+
+    def _send_servo_power_locked(self, on: bool):
+        msg = self.pb2.BoatMessage()
+        msg.servo_power.on = on
+        return self._write_locked(msg.SerializeToString())
 
     def _send_arm_locked(self, arm: bool, force: bool):
         msg = self.pb2.BoatMessage()
@@ -286,7 +308,7 @@ class BoatLink:
         import serial as pyserial
         with self._lock:
             if self.connected:
-                self._close_locked()
+                return False, 'already connected; disconnect first'
             try:
                 self.ser = pyserial.Serial(port, 921600, timeout=0.1)
             except Exception as exc:                     # noqa: BLE001
@@ -298,6 +320,9 @@ class BoatLink:
             # state -- never carry over values from a previous session.
             self.throttle = 0.0
             self.rudder = 0.0
+            self.winch_speed = 0.0
+            self.winch_lease_until = 0.0
+            self.servo_rail_cut = None
             self.armed_cmd = False
             self.force = False
             self.last_error = None
@@ -309,10 +334,14 @@ class BoatLink:
         with self._lock:
             if not self.connected:
                 return
+            self.winch_command_seq += 1
             self.throttle = 0.0
             self.rudder = 0.0
+            self.winch_speed = 0.0
+            self.winch_lease_until = 0.0
             self._send_motor_locked(0.0)
             self._send_steer_locked(0.0)
+            self._send_winch_locked(0.0)
             if self.armed_cmd:
                 self._send_arm_locked(False, self.force)
                 self.armed_cmd = False
@@ -325,17 +354,76 @@ class BoatLink:
             if rudder is not None:
                 self.rudder = clamp(float(rudder), -1.0, 1.0)
 
-    def stop(self):
+    def set_winch(self, speed: float, command_seq: int):
+        """Set winch speed and transmit immediately; the stream loop repeats
+        the same value while it is held, and a release gets a zero out now."""
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
+            if not self.connected:
+                self.winch_speed = 0.0
+                self.winch_lease_until = 0.0
+                return False, 'serial link is disconnected'
+            self.winch_speed = clamp(float(speed), -1.0, 1.0)
+            if self.winch_speed != 0.0 and self.servo_rail_cut is not False:
+                self.winch_speed = 0.0
+                self.winch_lease_until = 0.0
+                return False, 'servo rail must be powered on before moving winch'
+            self.winch_lease_until = (
+                time.monotonic() + WINCH_LEASE_S
+                if self.winch_speed != 0.0 else 0.0)
+            if not self._send_winch_locked(self.winch_speed):
+                self.winch_speed = 0.0
+                self.winch_lease_until = 0.0
+                return False, 'serial write failed'
+            return True, None
+
+    def set_servo_power(self, on: bool, command_seq: int):
+        """Center rail actuators, then command the shared servo power rail."""
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
+            if not self.connected:
+                self.winch_speed = 0.0
+                self.winch_lease_until = 0.0
+                return False, 'serial link is disconnected'
+            self.rudder = 0.0
+            self.winch_speed = 0.0
+            self.winch_lease_until = 0.0
+            steer_zero_sent = self._send_steer_locked(0.0)
+            zero_sent = self._send_winch_locked(0.0)
+            if on and not (steer_zero_sent and zero_sent):
+                return False, 'serial write failed'
+            if not self._send_servo_power_locked(on):
+                return False, 'serial write failed'
+            self.servo_rail_cut = not on
+            return True, None
+
+    def stop(self, command_seq: int):
         """Panic stop: zero throttle/rudder and send immediately rather than
         waiting for the next background tick. Does not touch armed_cmd --
         matches the firmware's own link-loss failsafe, which centres/zeroes
         but leaves the ARM decision to an explicit command."""
         with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
             self.throttle = 0.0
             self.rudder = 0.0
-            if self.connected:
-                self._send_motor_locked(0.0)
-                self._send_steer_locked(0.0)
+            self.winch_speed = 0.0
+            self.winch_lease_until = 0.0
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            writes_ok = (
+                self._send_motor_locked(0.0),
+                self._send_steer_locked(0.0),
+                self._send_winch_locked(0.0),
+            )
+            if not all(writes_ok):
+                return False, 'serial write failed'
+            return True, None
 
     def arm(self, do_arm: bool, force: bool):
         with self._lock:
@@ -363,6 +451,11 @@ class BoatLink:
                 'port': self.port,
                 'throttle': self.throttle,
                 'rudder': self.rudder,
+                'winch_speed': self.winch_speed,
+                'winch_command_seq': self.winch_command_seq,
+                # This is only the last command this local UI sent, never a
+                # claim that the P4 has reported its actual rail state.
+                'servo_rail_cut': self.servo_rail_cut,
                 'armed_cmd': self.armed_cmd,
                 'force': self.force,
                 'seq': self.seq,
@@ -379,8 +472,12 @@ class BoatLink:
         while not self._stop.is_set():
             with self._lock:
                 if self.connected:
+                    if (self.winch_speed != 0.0 and
+                            time.monotonic() >= self.winch_lease_until):
+                        self.winch_speed = 0.0
                     self._send_motor_locked(self.throttle)
                     self._send_steer_locked(self.rudder)
+                    self._send_winch_locked(self.winch_speed)
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -423,14 +520,23 @@ class BoatLink:
         payload = raw[4:4 + plen]
 
         if msg_type == MSG_BRIDGE_STATUS:
-            if len(payload) != plen or len(payload) < 24:
+            if len(payload) != plen or len(payload) < 24 or len(payload) == 25:
                 return
             uptime_s, pkts, byts, frames, hello, drops = struct.unpack('<6I', payload[:24])
+            # Optional Task 13 decode: S3's last received boat RSSI (dBm),
+            # then its broadcast-peer LR/250K rate-config result (-1, 0, or 1).
+            # Keeping the suffix optional accepts 24-byte reports from older
+            # S3 firmware and leaves room for later trailing fields.
+            uplink_rssi_dbm = lr_rate_config_ok = None
+            if len(payload) >= 26:
+                uplink_rssi_dbm, lr_rate_config_ok = struct.unpack('<bb', payload[24:26])
             with self._lock:
                 self.bridge_status = {
                     'have': True, 'last_rx_monotonic': time.monotonic(),
                     'uptime_s': uptime_s, 'espnow_pkts': pkts, 'espnow_bytes': byts,
                     'frames_out': frames, 'hello_sent': hello, 'reasm_drops': drops,
+                    'uplink_rssi_dbm': uplink_rssi_dbm,
+                    'lr_rate_config_ok': lr_rate_config_ok,
                 }
             return
 
@@ -638,6 +744,22 @@ PAGE = """<!DOCTYPE html>
     <input type="range" id="rudder" min="-100" max="100" value="0" step="5">
     <span class="val" id="rudder-val">0%</span>
   </div>
+  <div class="row">
+    <label>Servo rail</label>
+    <button id="servo-on-btn">PWR ON</button>
+    <button id="servo-off-btn">PWR OFF</button>
+    <span class="val" id="servo-state">UNKNOWN</span>
+  </div>
+  <div class="row slider-row">
+    <label>Winch speed</label>
+    <input type="range" id="winch-speed" min="0" max="100" value="50" step="5">
+    <span class="val" id="winch-speed-val">50%</span>
+  </div>
+  <div class="row">
+    <label>Winch jog</label>
+    <button id="winch-up-btn">UP / REEL IN</button>
+    <button id="winch-down-btn">DOWN / PAY OUT</button>
+  </div>
   <button id="stop-btn">STOP</button>
 </div>
 
@@ -654,6 +776,8 @@ PAGE = """<!DOCTYPE html>
 <div class="card" id="bridge-card">
   <div class="card-title">Bridge (S3) <span class="pill" id="bridge-pill" style="margin-left:6px;">NO DATA YET</span></div>
   <div class="telem-row"><label>ESP-NOW pkts</label><span class="val" id="b-pkts">--</span></div>
+  <div class="telem-row"><label>Uplink RSSI</label><span class="val" id="b-rssi">--</span></div>
+  <div class="telem-row"><label>LR peer rate</label><span class="val" id="b-lr-rate">--</span></div>
   <div class="telem-row"><label>Frames fwd'd</label><span class="val" id="b-frames">--</span></div>
   <div class="telem-row"><label>Hello sent</label><span class="val" id="b-hello">--</span></div>
   <div class="telem-row"><label>Reasm drops</label><span class="val" id="b-drops">--</span></div>
@@ -676,6 +800,10 @@ PAGE = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let connected = false;
 let armedCmd = false;
+let servoRailOn = false;
+let winchCommandSeq = 0;
+let winchRenewTimer = null;
+const WINCH_RENEW_MS = 100;
 
 async function api(path, method, body) {
   const opts = { method };
@@ -708,12 +836,17 @@ async function refreshPorts() {
 
 function setConnectedUI(isConn, port) {
   connected = isConn;
+  if (!isConn) {
+    clearWinchRenewal();
+    winchDir = 0;
+  }
   $('conn-pill').textContent = isConn ? `CONNECTED ${port}` : 'DISCONNECTED';
   $('conn-pill').classList.toggle('up', isConn);
   $('connect-btn').textContent = isConn ? 'DISCONNECT' : 'CONNECT';
   $('connect-btn').classList.toggle('disconnect', isConn);
   $('port-select').disabled = isConn;
   $('drive-card').classList.toggle('disabled-overlay', !isConn);
+  updateWinchControls();
 }
 
 $('refresh-btn').addEventListener('click', refreshPorts);
@@ -728,6 +861,7 @@ $('connect-btn').addEventListener('click', async () => {
   if (!port) return;
   const res = await api('/api/connect', 'POST', { port });
   if (res.ok) {
+    winchDir = 0;
     setConnectedUI(true, port);
     $('throttle').value = 0; $('throttle-val').textContent = '0%';
     $('rudder').value = 0; $('rudder-val').textContent = '0%';
@@ -748,10 +882,98 @@ $('rudder').addEventListener('input', (e) => {
   api('/api/state', 'POST', { rudder: v / 100 });
 });
 
+function winchMagnitude() {
+  return Math.abs(parseInt($('winch-speed').value) || 0) / 100;
+}
+
+function sendWinch(speed) {
+  return api('/api/winch', 'POST', { speed, seq: ++winchCommandSeq });
+}
+
+let winchDir = 0;
+function clearWinchRenewal() {
+  if (winchRenewTimer !== null) {
+    clearInterval(winchRenewTimer);
+    winchRenewTimer = null;
+  }
+}
+
+function updateWinchControls() {
+  const enabled = connected && servoRailOn;
+  ['winch-speed', 'winch-up-btn', 'winch-down-btn'].forEach(id => {
+    $(id).disabled = !enabled;
+  });
+  if (!enabled) {
+    clearWinchRenewal();
+    winchDir = 0;
+  }
+}
+
+function stopWinch() {
+  clearWinchRenewal();
+  if (winchDir === 0) return;
+  winchDir = 0;
+  if (connected) sendWinch(0);
+}
+
+function startWinchRenewal() {
+  clearWinchRenewal();
+  winchRenewTimer = setInterval(() => {
+    if (!connected || !servoRailOn || winchDir === 0) {
+      stopWinch();
+      return;
+    }
+    sendWinch(winchDir * winchMagnitude());
+  }, WINCH_RENEW_MS);
+}
+
+$('winch-speed').addEventListener('input', (e) => {
+  const v = Math.abs(parseInt(e.target.value) || 0);
+  $('winch-speed-val').textContent = v + '%';
+  if (winchDir !== 0) sendWinch(winchDir * (v / 100));
+});
+
+[['winch-up-btn', -1], ['winch-down-btn', +1]].forEach(([id, dir]) => {
+  const el = $(id);
+  const start = (e) => {
+    e.preventDefault();
+    if (!connected || !servoRailOn) return;
+    winchDir = dir;
+    sendWinch(dir * winchMagnitude());
+    startWinchRenewal();
+  };
+  const stop = () => { if (winchDir === dir) stopWinch(); };
+  el.addEventListener('pointerdown', start);
+  el.addEventListener('pointerup', stop);
+  el.addEventListener('pointercancel', stop);
+  el.addEventListener('pointerleave', stop);
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
+});
+window.addEventListener('blur', stopWinch);
+window.addEventListener('pagehide', () => {
+  if (!connected || winchDir === 0) return;
+  clearWinchRenewal();
+  winchDir = 0;
+  const body = new Blob(
+    [JSON.stringify({ speed: 0, seq: ++winchCommandSeq })],
+    { type: 'application/json' });
+  navigator.sendBeacon('/api/winch', body);
+});
+
+function setServoPower(on) {
+  stopWinch();
+  return api('/api/servo-power', 'POST', { on, seq: ++winchCommandSeq });
+}
+
+$('servo-on-btn').addEventListener('click', () => setServoPower(true));
+$('servo-off-btn').addEventListener('click', () => setServoPower(false));
+
 $('stop-btn').addEventListener('click', async () => {
+  clearWinchRenewal();
+  winchDir = 0;
   $('throttle').value = 0; $('throttle-val').textContent = '0%';
   $('rudder').value = 0; $('rudder-val').textContent = '0%';
-  await api('/api/stop', 'POST');
+  await api('/api/stop', 'POST', { seq: ++winchCommandSeq });
 });
 
 $('arm-btn').addEventListener('click', async () => {
@@ -765,6 +987,9 @@ $('arm-btn').addEventListener('click', async () => {
 });
 
 function applyStatus(s) {
+    if (Number.isInteger(s.winch_command_seq)) {
+      winchCommandSeq = Math.max(winchCommandSeq, s.winch_command_seq);
+    }
     if (s.connected !== connected) setConnectedUI(s.connected, s.port);
     armedCmd = s.armed_cmd;
     $('state-dot').classList.toggle('armed', s.armed_cmd);
@@ -772,6 +997,10 @@ function applyStatus(s) {
     $('arm-btn').textContent = s.armed_cmd ? 'DISARM' : 'ARM';
     $('arm-btn').classList.toggle('arm', !s.armed_cmd);
     $('arm-btn').classList.toggle('disarm', s.armed_cmd);
+    $('servo-state').textContent = s.servo_rail_cut === null ? 'UNKNOWN'
+      : s.servo_rail_cut ? 'PWR OFF sent' : 'PWR ON sent';
+    servoRailOn = s.servo_rail_cut === false;
+    updateWinchControls();
     $('seq').textContent = s.seq;
     $('err').textContent = s.last_error ? `tx error: ${s.last_error}` : '';
 
@@ -813,6 +1042,14 @@ function applyStatus(s) {
       bpill.classList.remove('stale'); bpill.classList.add('up');
     }
     $('b-pkts').textContent = b.have ? `${b.espnow_pkts} (${b.espnow_bytes} B)` : '--';
+    $('b-rssi').textContent = !b.have ? '--'
+      : (b.espnow_pkts > 0 && Number.isFinite(b.uplink_rssi_dbm) && b.uplink_rssi_dbm < 0)
+      ? `${b.uplink_rssi_dbm} dBm` : 'UNKNOWN';
+    $('b-lr-rate').textContent = !b.have ? '--'
+      : b.lr_rate_config_ok === null ? 'UNKNOWN'
+      : b.lr_rate_config_ok === 1 ? 'LR/250K SET'
+      : b.lr_rate_config_ok === 0 ? 'LR/250K FAILED'
+      : b.lr_rate_config_ok === -1 ? 'LR DISABLED' : 'UNKNOWN';
     $('b-frames').textContent = b.have ? `${b.frames_out}` : '--';
     $('b-hello').textContent = b.have ? `${b.hello_sent}` : '--';
     $('b-drops').textContent = b.have ? `${b.reasm_drops}` : '--';
@@ -878,7 +1115,8 @@ class Handler(BaseHTTPRequestHandler):
         if length == 0:
             return {}
         try:
-            return json.loads(self.rfile.read(length))
+            body = json.loads(self.rfile.read(length))
+            return body if isinstance(body, dict) else {}
         except Exception:                                # noqa: BLE001
             return {}
 
@@ -952,9 +1190,45 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/state':
             self.link.set_state(throttle=body.get('throttle'), rudder=body.get('rudder'))
             self._json({'ok': True})
+        elif self.path == '/api/winch':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            speed = body.get('speed')
+            if (not isinstance(speed, (int, float)) or isinstance(speed, bool) or
+                    not math.isfinite(speed)):
+                self._json({'ok': False, 'error': 'speed must be a finite number'}, 400)
+                return
+            ok, err = self.link.set_winch(speed, command_seq)
+            code = 200 if ok else (503 if err in (
+                'serial link is disconnected', 'serial write failed') else 409)
+            self._json({'ok': ok, 'error': err}, code)
+        elif self.path == '/api/servo-power':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            on = body.get('on')
+            if not isinstance(on, bool):
+                self._json({'ok': False, 'error': 'on must be a boolean'}, 400)
+                return
+            ok, err = self.link.set_servo_power(on, command_seq)
+            code = 200 if ok else (503 if err in (
+                'serial link is disconnected', 'serial write failed') else 409)
+            self._json({'ok': ok, 'error': err}, code)
         elif self.path == '/api/stop':
-            self.link.stop()
-            self._json({'ok': True})
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            ok, err = self.link.stop(command_seq)
+            code = 200 if ok else (503 if err in (
+                'serial link is disconnected', 'serial write failed') else 409)
+            self._json({'ok': ok, 'error': err}, code)
         elif self.path == '/api/arm':
             self.link.arm(bool(body.get('arm')), bool(body.get('force')))
             self._json({'ok': True})

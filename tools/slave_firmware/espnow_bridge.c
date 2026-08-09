@@ -40,6 +40,20 @@
 #define PEER_MSG_COMMAND  2u
 #define PEER_MSG_INIT     3u
 #define PEER_MSG_UPSTREAM 4u
+/* C6->P4, one-shot: reports whether esp_now_set_peer_rate_config(LR) in
+ * init_cb succeeded. A dedicated channel, not folded into PEER_MSG_UPSTREAM
+ * -- this never has to share that channel's espnow_pkt_hdr_t/ground-command
+ * parsing contract. */
+#define PEER_MSG_INIT_STATUS 5u
+
+/* Long Range PHY toggle for the A/B range test -- flip to 0, rebuild via
+ * build.sh, and reflash to get a same-hardware LR-off baseline. Both this
+ * file and tools/espnow_bridge/main/main.c (ground station) must be flashed
+ * with the SAME value, or LR-rate frames from one end simply go unheard by
+ * the other (LR is only demodulable by an LR-enabled receiver). Not a
+ * Kconfig entry: this build is regenerated from scratch each run (see
+ * build.sh), so there's no persistent sdkconfig to hang a menu option off. */
+#define ESPNOW_LR_ENABLED 1
 
 /* ESP-NOW packet layout (ESPNowCam-style fragmentation):
  *   [uint32_t total_len][up to FRAG_DATA_SIZE bytes of payload]
@@ -259,6 +273,31 @@ static void init_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
         /* Non-fatal — proceed anyway; the channel the AP set may be fine */
     }
 
+#if ESPNOW_LR_ENABLED
+    /* Long Range PHY: ~4dB better RX sensitivity, ~2-2.5x the 802.11b
+     * distance (Espressif C6 wifi-driver docs). BGNLR, not LR-only -- matches
+     * Espressif's own espnow example and keeps the STA able to fall back to
+     * normal rates. esp-now issue #144 showed a bare WIFI_PROTOCOL_LR
+     * producing ZERO range gain on two C6s -- the actual per-frame rate is
+     * forced separately below via esp_now_set_peer_rate_config(), which
+     * #144's reporter never did; that is almost certainly why they saw
+     * nothing. This codebase's whole history is silent RPC/config failures
+     * -- log every outcome here, never trust a bare success. */
+    err = esp_wifi_set_protocol(WIFI_IF_STA,
+            WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "init_cb: esp_wifi_set_protocol(LR) failed: %s",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "init_cb: LR protocol bitmap set");
+    }
+
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "init_cb: esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(err));
+    }
+#endif /* ESPNOW_LR_ENABLED */
+
     err = esp_now_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "init_cb: esp_now_init failed: %s",
@@ -290,6 +329,38 @@ static void init_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
         esp_now_deinit();
         return;
     }
+
+#if ESPNOW_LR_ENABLED
+    /* This is what ACTUALLY selects the LR PHY for frames to this peer --
+     * the protocol bitmap above only makes LR available, it doesn't select
+     * it. esp_now_rate_config_t is a typedef of wifi_tx_rate_config_t; must
+     * be called after esp_now_add_peer() per the IDF ESP-NOW docs. */
+    esp_now_rate_config_t rate_cfg = {
+        .phymode = WIFI_PHY_MODE_LR,
+        .rate    = WIFI_PHY_RATE_LORA_250K,
+        .ersu    = false,
+        .dcm     = false,
+    };
+    err = esp_now_set_peer_rate_config(s_peer_mac, &rate_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "init_cb: esp_now_set_peer_rate_config(LR) failed: %s",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "init_cb: peer rate config set to LR/250K");
+    }
+
+    /* One-shot, not per-command: reports the RESULT of the call above, once,
+     * at init time -- costs one small extra RPC at boot, never touches the
+     * 30Hz control path. This is the only way for the P4 (and from there,
+     * the ground station UI) to learn whether this specific call actually
+     * succeeded -- see the Task 3c header comment for why. */
+    uint8_t lr_status = (err == ESP_OK) ? 1u : 0u;
+    esp_err_t status_err = esp_hosted_send_custom_data(PEER_MSG_INIT_STATUS, &lr_status, 1);
+    if (status_err != ESP_OK) {
+        ESP_LOGW(TAG, "init_cb: failed to report LR status to P4: %s",
+                 esp_err_to_name(status_err));
+    }
+#endif /* ESPNOW_LR_ENABLED */
 
     s_espnow_ready = true;
     ESP_LOGI(TAG, "ESP-NOW bridge ready");
