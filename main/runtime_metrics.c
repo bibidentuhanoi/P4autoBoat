@@ -186,6 +186,16 @@ void runtime_metrics_snapshot(runtime_task_id_t id, runtime_metric_snapshot_t *o
     } while (before != after || (after & 1U));
 }
 
+bool runtime_metrics_core_attribution_complete(const uint8_t *affinity_masks,
+                                               uint32_t task_count)
+{
+    if (!affinity_masks || task_count == 0) return false;
+    for (uint32_t i = 0; i < task_count; ++i) {
+        if (affinity_masks[i] != 1U && affinity_masks[i] != 2U) return false;
+    }
+    return true;
+}
+
 #ifdef ESP_PLATFORM
 #define RUNTIME_METRICS_SYSTEM_TASK_CAPACITY 32
 
@@ -203,6 +213,7 @@ void task_runtime_diagnostics(void *arg)
     static const char *tag = "RTM";
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1)
     static TaskStatus_t task_status[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
+    static uint8_t affinity_masks[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
 #endif
     while (true) {
         for (runtime_task_id_t id = RUNTIME_TASK_CONTROL; id < RUNTIME_TASK_COUNT; ++id) {
@@ -229,17 +240,18 @@ void task_runtime_diagnostics(void *arg)
         UBaseType_t task_count = uxTaskGetSystemState(task_status,
                                                       RUNTIME_METRICS_SYSTEM_TASK_CAPACITY,
                                                       &total_runtime);
-        if (task_count > 0 && total_runtime > 0) {
+        for (UBaseType_t i = 0; i < task_count; ++i) {
+            affinity_masks[i] = (uint8_t)task_status[i].uxCoreAffinityMask;
+        }
+        if (total_runtime > 0 &&
+            runtime_metrics_core_attribution_complete(affinity_masks, task_count)) {
             configRUN_TIME_COUNTER_TYPE core_runtime[2] = {0, 0};
             configRUN_TIME_COUNTER_TYPE idle_runtime[2] = {0, 0};
             for (UBaseType_t i = 0; i < task_count; ++i) {
-                UBaseType_t affinity = task_status[i].uxCoreAffinityMask;
-                if (affinity == 1U || affinity == 2U) {
-                    unsigned core = affinity == 1U ? 0U : 1U;
-                    core_runtime[core] += task_status[i].ulRunTimeCounter;
-                    if (strncmp(task_status[i].pcTaskName, "IDLE", 4) == 0) {
-                        idle_runtime[core] += task_status[i].ulRunTimeCounter;
-                    }
+                unsigned core = affinity_masks[i] == 1U ? 0U : 1U;
+                core_runtime[core] += task_status[i].ulRunTimeCounter;
+                if (strncmp(task_status[i].pcTaskName, "IDLE", 4) == 0) {
+                    idle_runtime[core] += task_status[i].ulRunTimeCounter;
                 }
             }
             unsigned core0_load = core_runtime[0] == 0 ? 0 :

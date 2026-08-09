@@ -23,6 +23,7 @@ static const char *TAG = "CAM_STREAM";
 #define BOUNDARY      "frame"
 #define PART_BOUNDARY "\r\n--" BOUNDARY "\r\n"
 #define PART_HEADER   "Content-Type: image/jpeg\r\nContent-Length: %"PRIu32"\r\n\r\n"
+#define CAMERA_DRAIN_PERIOD_MS 30
 
 /* ---- Frame drain ----
  * The ISP pipeline runs continuously after VIDIOC_STREAMON.
@@ -34,20 +35,22 @@ static volatile bool s_client_streaming = false;
 
 static void camera_drain_task(void *pvParameters)
 {
+    uint64_t metric_scheduled = esp_timer_get_time();
     while (true) {
-        uint64_t metric_started = esp_timer_get_time();
-        runtime_metrics_cycle_begin(RUNTIME_TASK_CAMERA_DRAIN, metric_started, metric_started);
         if (g_inference_active) {
             runtime_metrics_count(RUNTIME_TASK_CAMERA_DRAIN, RUNTIME_EVENT_FEATURE_DISABLED);
-            runtime_metrics_cycle_end(RUNTIME_TASK_CAMERA_DRAIN, esp_timer_get_time());
-            vTaskDelay(pdMS_TO_TICKS(10));
+            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+            metric_scheduled = esp_timer_get_time();
             continue;
         }
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_CAMERA_DRAIN, metric_scheduled, metric_started);
         if (!s_client_streaming) {
             camera_drain_frame();
         }
         runtime_metrics_cycle_end(RUNTIME_TASK_CAMERA_DRAIN, esp_timer_get_time());
-        vTaskDelay(pdMS_TO_TICKS(30));
+        metric_scheduled += (uint64_t)CAMERA_DRAIN_PERIOD_MS * 1000U;
+        vTaskDelay(pdMS_TO_TICKS(CAMERA_DRAIN_PERIOD_MS));
     }
 }
 

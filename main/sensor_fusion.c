@@ -35,6 +35,7 @@ static const char *FUSION_TAG = "FUSION";
 #define YAW_GYRO_SIGN        (+1.0f)   /* flip to -1.0f if heading runs BACKWARDS vs the turn */
 #define YAW_MAG_TILT_LIMIT   45.0f     /* deg: above this, tilt-comp unreliable -> gyro-only */
 #define YAW_MAG_NORM_MIN     800.0f    /* LSB: reject a near-zero horizontal field (bad/disturbed) */
+#define FUSION_PERIOD_MS      20
 
 // Globals
 static CalibrationData* calib;
@@ -102,11 +103,15 @@ void task_imu_fusion(void *pvParameters) {
     int64_t last_report_us  = esp_timer_get_time();
     int64_t last_success_us = esp_timer_get_time();
     int64_t max_gap_us = 0;
+    uint64_t metric_scheduled = esp_timer_get_time();
 
     while(1) {
+        if (g_inference_active) {
+            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+            metric_scheduled = esp_timer_get_time();
+        }
         uint64_t metric_started = esp_timer_get_time();
-        runtime_metrics_cycle_begin(RUNTIME_TASK_FUSION, metric_started, metric_started);
-        while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+        runtime_metrics_cycle_begin(RUNTIME_TASK_FUSION, metric_scheduled, metric_started);
         int64_t now = esp_timer_get_time();
         float dt = (float)(now - last_time) / 1000000.0f;
         if (dt > 0.1f) dt = 0.1f;   /* clamp: after an inference stall, don't let the integrators jump */
@@ -137,9 +142,10 @@ void task_imu_fusion(void *pvParameters) {
                 ticks = 0; mutex_fails = 0; max_gap_us = 0;
                 last_report_us = now;
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
             runtime_metrics_count(RUNTIME_TASK_FUSION, RUNTIME_EVENT_SENSOR_SKIP);
             runtime_metrics_cycle_end(RUNTIME_TASK_FUSION, esp_timer_get_time());
+            metric_scheduled += (uint64_t)FUSION_PERIOD_MS * 1000U;
+            vTaskDelay(pdMS_TO_TICKS(FUSION_PERIOD_MS));
             continue;
         }
         // MAG READ
@@ -424,6 +430,7 @@ void task_imu_fusion(void *pvParameters) {
         }
 
         runtime_metrics_cycle_end(RUNTIME_TASK_FUSION, esp_timer_get_time());
-        vTaskDelay(pdMS_TO_TICKS(20));
+        metric_scheduled += (uint64_t)FUSION_PERIOD_MS * 1000U;
+        vTaskDelay(pdMS_TO_TICKS(FUSION_PERIOD_MS));
     }
 }

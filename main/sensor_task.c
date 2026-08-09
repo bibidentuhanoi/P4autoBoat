@@ -149,16 +149,18 @@ void task_tof_reader(void *pvParameters)
     int64_t held_us_a_ok = 0, held_us_a_notready = 0;
     int64_t held_us_b_ok = 0, held_us_b_notready = 0;
     uint32_t max_read_us_a = 0, max_read_us_b = 0;
+    uint64_t metric_scheduled = esp_timer_get_time();
 
     ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
 
     while (true) {
-        uint64_t metric_started = esp_timer_get_time();
-        runtime_metrics_cycle_begin(RUNTIME_TASK_SENSOR_BUS, metric_started, metric_started);
         if (g_inference_active) {
             while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
             last_wake = xTaskGetTickCount();
+            metric_scheduled = esp_timer_get_time();
         }
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_SENSOR_BUS, metric_scheduled, metric_started);
 
         /* One sensor per mutex acquisition, so the IMU keeps a read window. */
         if (devs->a_ok) {
@@ -213,6 +215,7 @@ void task_tof_reader(void *pvParameters)
         }
 
         runtime_metrics_cycle_end(RUNTIME_TASK_SENSOR_BUS, esp_timer_get_time());
+        metric_scheduled += (uint64_t)TOF_POLL_INTERVAL_MS * 1000U;
         xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_POLL_INTERVAL_MS));
     }
 }
@@ -262,17 +265,19 @@ void task_sensor_snapshot(void *pvParameters)
      * frames" mystery — the radio was delivering everything it was given. */
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t overruns = 0;
+    uint64_t metric_scheduled = esp_timer_get_time();
 
     while (true) {
-        uint64_t metric_started = esp_timer_get_time();
-        runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_started, metric_started);
         /* Yield while inference is running — avoid DMA/PSRAM contention */
         if (g_inference_active) {
             while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
             /* Re-baseline after the pause, or xTaskDelayUntil would fire with
              * no delay repeatedly trying to "catch up" the inference stall. */
             last_wake = xTaskGetTickCount();
+            metric_scheduled = esp_timer_get_time();
         }
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_scheduled, metric_started);
 
         /* IMU — always available, 20 Hz. GPS — whatever the driver currently
          * has cached. Both modes need these; ToF/detections/full-snapshot
@@ -388,6 +393,7 @@ void task_sensor_snapshot(void *pvParameters)
          * here so a slow loop is visible instead of silently halving the rate
          * the way the old vTaskDelay() did. */
         runtime_metrics_cycle_end(RUNTIME_TASK_SNAPSHOT, esp_timer_get_time());
+        metric_scheduled += (uint64_t)SNAPSHOT_INTERVAL_MS * 1000U;
         if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS)) == pdFALSE) {
             if ((++overruns % 50) == 1) {
                 ESP_LOGW(TAG, "snapshot loop overrun (#%u): work exceeded %d ms",

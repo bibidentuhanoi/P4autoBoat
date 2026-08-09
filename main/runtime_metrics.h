@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "runtime_schedule.h"
@@ -34,6 +35,8 @@ void runtime_metrics_cycle_end(runtime_task_id_t id, uint64_t finished_us);
 void runtime_metrics_count(runtime_task_id_t id, runtime_metric_event_t event);
 void runtime_metrics_set_stack(runtime_task_id_t id, uint32_t words);
 void runtime_metrics_snapshot(runtime_task_id_t id, runtime_metric_snapshot_t *out);
+bool runtime_metrics_core_attribution_complete(const uint8_t *affinity_masks,
+                                               uint32_t task_count);
 
 /* Host-test support; production calls runtime_metrics_init() once at startup. */
 void runtime_metrics_reset_for_test(void);
