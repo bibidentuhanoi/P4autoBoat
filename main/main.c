@@ -55,7 +55,6 @@ static CalibrationData calib_data = {
 };
 
 static tof_devices_t tof_devs;
-SemaphoreHandle_t g_i2c_mutex = NULL;
 volatile bool g_camera_ok = false;
 volatile bool g_field_mode = false;
 
@@ -120,8 +119,6 @@ void app_main(void) {
 
     // 4. Create sensor I2C bus on same GPIO7/GPIO8 (GPIO matrix re-routes from I2C_NUM_0)
     ESP_LOGI(TAG, "Initializing sensor I2C bus...");
-    g_i2c_mutex = xSemaphoreCreateMutex();
-    assert(g_i2c_mutex);
     i2c_master_bus_config_t bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_1,
@@ -297,8 +294,11 @@ void app_main(void) {
     // 12. Start RTOS Tasks — loud failure: a silent Snap_Task death means no
     //     telemetry at all (dashboard shows no IMU/ToF/GPS and arming stays locked).
     ESP_LOGI(TAG, "Starting tasks...");
-    if (runtime_task_create(RUNTIME_TASK_FUSION, task_imu_fusion, NULL, NULL) != ESP_OK) {
+    TaskHandle_t fusion_task = NULL;
+    if (runtime_task_create(RUNTIME_TASK_FUSION, task_imu_fusion, NULL, &fusion_task) != ESP_OK) {
         ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
+    } else {
+        sensor_task_register_fusion_task(fusion_task);
     }
     /* 12b. microSD — LAST, and soft-optional. It shares the SDMMC peripheral
      *      with the C6 (card on slot 0, co-processor on slot 1), so it is
@@ -309,9 +309,11 @@ void app_main(void) {
     }
 
     ESP_ERROR_CHECK(sensor_task_init());
-    /* ToF reader FIRST: it fills the cache the snapshot task reads. */
-    if (runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_tof_reader, &tof_devs, NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "FATAL: ToF_Task create failed — snapshots will carry no ToF");
+    if (runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_sensor_bus, &tof_devs, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "FATAL: SensorBus create failed — no runtime sensor acquisition");
+    }
+    if (runtime_task_create(RUNTIME_TASK_TOF_PROCESS, task_tof_processor, NULL, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "FATAL: ToFProc create failed — snapshots will carry no ToF");
     }
     if (runtime_task_create(RUNTIME_TASK_SNAPSHOT, task_sensor_snapshot, &tof_devs, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "FATAL: Snap_Task create failed (out of internal RAM) — no telemetry");

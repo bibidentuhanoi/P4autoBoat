@@ -22,6 +22,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "runtime_metrics.h"
+#include "sensor_schedule.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -41,7 +42,7 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
 #define TOF_EVERY_N           4    /* ToF at every 4th tick = 5 Hz (keeps WS traffic low) */
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
 
-/* ─── ToF reader task ────────────────────────────────────────────────────────
+/* ─── ToF acquisition and processing ────────────────────────────────────────
  * ToF used to be read inline by the snapshot loop, but tof_read_grid() is a
  * single non-blocking poll: if the sensor has no fresh frame at that instant it
  * returns ESP_FAIL and the snapshot ships with NO ToF at all. The sensor ranges
@@ -49,16 +50,17 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
  * beat against each other and most polls missed — measured ~2 of 5.5 expected
  * ToF frames/s reaching the ground station.
  *
- * Now a dedicated task polls at the sensor's own rate and caches the PROCESSED
- * grid; the snapshot just copies the cache. Benefits:
+ * SensorBusTask now owns all runtime I2C and publishes raw fixed-buffer
+ * generations to ToFProc on Core 1. The snapshot still only copies the
+ * processed cache. Benefits:
  *   - reads happen when data actually is ready, so they succeed
  *   - the median filter runs per SENSOR frame, not per publish (feeding it the
  *     same cached frame repeatedly would make median3 a no-op)
- *   - the snapshot loop does no I2C at all, so it stops overrunning its 50 ms
- *     period and no longer contends with the IMU task for g_i2c_mutex
+ *   - the snapshot loop does no I2C at all
+ *   - IMU acquisition runs first on an absolute 20 ms schedule
  * ───────────────────────────────────────────────────────────────────────────*/
-#define TOF_POLL_INTERVAL_MS  25   /* 40 Hz poll of a ~10 Hz sensor: always catches
-                                    * a fresh frame without busy-waiting */
+#define SENSOR_BUS_INTERVAL_MS 20
+#define TOF_INITIAL_BUDGET_US 15000U
 #define TOF_STALE_US   (1000 * 1000)  /* cached grid older than this = not valid */
 
 #define TOF_NVALS  (64 * VL53L5CX_NB_TARGET_PER_ZONE)
@@ -71,10 +73,27 @@ typedef struct {
     int64_t  ts_us;          /* 0 = never populated */
 } tof_grid_cache_t;
 
+typedef struct {
+    VL53L5CX_ResultsData buffers[2];
+    atomic_uint slot_state[2];
+    atomic_uint generation;
+} tof_result_channel_t;
+
+enum {
+    TOF_SLOT_FREE,
+    TOF_SLOT_WRITING,
+    TOF_SLOT_READING,
+};
+
+_Static_assert(sizeof(unsigned int) == 4 && ATOMIC_INT_LOCK_FREE == 2,
+               "ToF cross-core slot claims require lock-free 32-bit atomics");
+
 static tof_grid_cache_t  s_cache_a, s_cache_b;
 static SemaphoreHandle_t s_cache_mutex = NULL;
 static sample_snapshot_t s_imu_samples;
+static tof_result_channel_t s_tof_results_a, s_tof_results_b;
 static _Atomic(TaskHandle_t) s_fusion_task;
+static _Atomic(TaskHandle_t) s_tof_processor_task;
 static uint32_t s_imu_sequence = 0;
 
 /* Apply per-slot gating + 3-frame median, then publish into the cache. */
@@ -143,7 +162,7 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
     static uint32_t mag_static, mag_rearm, mag_diag;
     static bool mag_frozen;
 
-    if (!sample || xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+    if (!sample) {
         return false;
     }
 
@@ -246,7 +265,6 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
         ag_fails = 0;
     }
 
-    xSemaphoreGive(g_i2c_mutex);
     if (!sample->accel_gyro_valid && !sample->mag_valid) {
         return false;
     }
@@ -255,104 +273,201 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
     return true;
 }
 
-void task_tof_reader(void *pvParameters)
+static sensor_tof_id_t tof_oldest_due(const sensor_schedule_t *schedule,
+                                      uint64_t now_us,
+                                      bool tof_a_available,
+                                      bool tof_b_available)
+{
+    bool a_due = tof_a_available && schedule->next_due_a_us <= now_us;
+    bool b_due = tof_b_available && schedule->next_due_b_us <= now_us;
+    if (!a_due && !b_due) return SENSOR_TOF_NONE;
+    if (!b_due || (a_due && schedule->next_due_a_us <= schedule->next_due_b_us)) {
+        return SENSOR_TOF_A;
+    }
+    return SENSOR_TOF_B;
+}
+
+static uint32_t tof_next_generation(const tof_result_channel_t *channel)
+{
+    uint32_t next = atomic_load_explicit(&channel->generation, memory_order_relaxed) + 1U;
+    return next == 0 ? 1U : next;
+}
+
+static bool tof_result_copy(tof_result_channel_t *channel,
+                            uint32_t last_generation,
+                            VL53L5CX_ResultsData *result,
+                            uint32_t *generation)
+{
+    for (;;) {
+        uint32_t published = atomic_load_explicit(&channel->generation, memory_order_acquire);
+        if (published == 0 || published == last_generation) return false;
+        uint32_t slot = published & 1U;
+        uint32_t expected = TOF_SLOT_FREE;
+        if (!atomic_compare_exchange_strong_explicit(
+                &channel->slot_state[slot], &expected, TOF_SLOT_READING,
+                memory_order_acq_rel, memory_order_acquire)) {
+            continue;
+        }
+
+        uint32_t stable = atomic_load_explicit(&channel->generation, memory_order_acquire);
+        if (stable != published) {
+            atomic_store_explicit(&channel->slot_state[slot], TOF_SLOT_FREE,
+                                  memory_order_release);
+            continue;
+        }
+
+        memcpy(result, &channel->buffers[slot], sizeof(*result));
+        atomic_store_explicit(&channel->slot_state[slot], TOF_SLOT_FREE,
+                              memory_order_release);
+        *generation = published;
+        return true;
+    }
+}
+
+static void tof_count_overwrites(uint32_t last_generation, uint32_t generation)
+{
+    uint32_t missing = generation - last_generation;
+    while (missing > 1U) {
+        runtime_metrics_count(RUNTIME_TASK_TOF_PROCESS, RUNTIME_EVENT_SENSOR_SKIP);
+        --missing;
+    }
+}
+
+static void tof_process_latest(tof_result_channel_t *channel,
+                               tof_grid_cache_t *cache,
+                               int16_t median[][3],
+                               uint8_t *median_index,
+                               uint32_t *last_generation,
+                               VL53L5CX_ResultsData *result)
+{
+    uint32_t generation;
+    while (tof_result_copy(channel, *last_generation, result, &generation)) {
+        tof_count_overwrites(*last_generation, generation);
+        uint64_t started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_TOF_PROCESS, started, started);
+        tof_cache_store(cache, result, median, median_index);
+        runtime_metrics_cycle_end(RUNTIME_TASK_TOF_PROCESS, esp_timer_get_time());
+        *last_generation = generation;
+    }
+}
+
+void task_sensor_bus(void *pvParameters)
 {
     tof_devices_t *devs = (tof_devices_t *)pvParameters;
-
-    static VL53L5CX_ResultsData res;
-    static int16_t med_a[TOF_NVALS][3];
-    static int16_t med_b[TOF_NVALS][3];
-    static uint8_t med_idx_a = 0, med_idx_b = 0;
+    sensor_schedule_t schedule;
+    uint64_t started_us = (uint64_t)esp_timer_get_time();
+    sensor_schedule_init(&schedule, started_us);
 
     TickType_t last_wake = xTaskGetTickCount();
-    uint32_t ok_a = 0, notready_a = 0, mutexfail_a = 0;
-    uint32_t ok_b = 0, notready_b = 0, mutexfail_b = 0;
-    uint32_t report_div = 0;
+    uint64_t metric_scheduled = started_us;
+    uint32_t max_read_us_a = TOF_INITIAL_BUDGET_US;
+    uint32_t max_read_us_b = TOF_INITIAL_BUDGET_US;
 
-    /* Diagnostic: how long tof_read_grid() actually holds g_i2c_mutex, split
-     * by outcome. task_imu_fusion is failing to get this same mutex ~96% of
-     * the time (its own "fusion 5s: mutex_fails=" log) despite ToF never
-     * reporting a mutexfail itself -- this measures the side of that
-     * asymmetry that was never actually timed, just described as "slow" in
-     * a comment. The ok/notready split matters for deciding whether an
-     * interrupt-driven redesign (INT pins are wired -- ToF-A GPIO50,
-     * ToF-B GPIO1) is worth building: if notready time dominates, it would
-     * remove most of this task's I2C usage (no more blind polling of a
-     * sensor with nothing ready, most polls). If ok time dominates, the real
-     * grid reads are the cost and still have to happen regardless of what
-     * triggers them -- interrupts would only help by cutting the poll count,
-     * not the per-read cost. */
-    int64_t held_us_a_ok = 0, held_us_a_notready = 0;
-    int64_t held_us_b_ok = 0, held_us_b_notready = 0;
-    uint32_t max_read_us_a = 0, max_read_us_b = 0;
-    uint64_t metric_scheduled = esp_timer_get_time();
+    ESP_LOGI(TAG, "SensorBus task started (IMU %d Hz, alternating ToF 5 Hz each)",
+             1000 / SENSOR_BUS_INTERVAL_MS);
 
-    ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
+    for (;;) {
+        uint64_t metric_started = (uint64_t)esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_SENSOR_BUS,
+                                    metric_scheduled, metric_started);
 
-    while (true) {
-        if (g_inference_active) {
-            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
-            last_wake = xTaskGetTickCount();
-            metric_scheduled = esp_timer_get_time();
+        imu_sample_t raw_imu;
+        if (sensor_read_imu_sample(&raw_imu)) {
+            sample_snapshot_publish(&s_imu_samples, &raw_imu);
+            TaskHandle_t fusion_task =
+                atomic_load_explicit(&s_fusion_task, memory_order_acquire);
+            if (fusion_task) xTaskNotifyGive(fusion_task);
+        } else {
+            runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR);
         }
-        uint64_t metric_started = esp_timer_get_time();
-        runtime_metrics_cycle_begin(RUNTIME_TASK_SENSOR_BUS, metric_scheduled, metric_started);
 
-        /* One sensor per mutex acquisition, so the IMU keeps a read window. */
-        if (devs->a_ok) {
-            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                int64_t t0 = esp_timer_get_time();
-                esp_err_t r = tof_read_grid(&devs->dev_a, &res);
-                uint32_t held = (uint32_t)(esp_timer_get_time() - t0);
-                xSemaphoreGive(g_i2c_mutex);
-                if (held > max_read_us_a) max_read_us_a = held;
-                if (r == ESP_OK) { ok_a++;   held_us_a_ok += held; tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a); }
-                else             { notready_a++; held_us_a_notready += held; runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR); }
-            } else {
-                mutexfail_a++;
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
+        sensor_tof_id_t due = tof_oldest_due(&schedule, now_us,
+                                             devs->a_ok, devs->b_ok);
+        uint32_t budget_us = due == SENSOR_TOF_B ? max_read_us_b : max_read_us_a;
+        sensor_tof_id_t selected = sensor_schedule_choose_tof(
+            &schedule, now_us, sensor_schedule_next_imu_deadline(&schedule),
+            budget_us, devs->a_ok, devs->b_ok);
+
+        if (selected == SENSOR_TOF_NONE) {
+            if (due != SENSOR_TOF_NONE) {
+                sensor_schedule_note_skip(&schedule, due);
                 runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_SKIP);
             }
-        }
-
-        if (devs->b_ok) {
-            if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                int64_t t0 = esp_timer_get_time();
-                esp_err_t r = tof_read_grid(&devs->dev_b, &res);
-                uint32_t held = (uint32_t)(esp_timer_get_time() - t0);
-                xSemaphoreGive(g_i2c_mutex);
-                if (held > max_read_us_b) max_read_us_b = held;
-                if (r == ESP_OK) { ok_b++;   held_us_b_ok += held; tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b); }
-                else             { notready_b++; held_us_b_notready += held; runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR); }
+        } else {
+            tof_result_channel_t *channel =
+                selected == SENSOR_TOF_A ? &s_tof_results_a : &s_tof_results_b;
+            VL53L5CX_Configuration *device =
+                selected == SENSOR_TOF_A ? &devs->dev_a : &devs->dev_b;
+            uint32_t generation = tof_next_generation(channel);
+            uint32_t slot = generation & 1U;
+            uint32_t expected = TOF_SLOT_FREE;
+            if (!atomic_compare_exchange_strong_explicit(
+                    &channel->slot_state[slot], &expected, TOF_SLOT_WRITING,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                sensor_schedule_note_skip(&schedule, selected);
+                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS,
+                                      RUNTIME_EVENT_SENSOR_SKIP);
             } else {
-                mutexfail_b++;
-                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_SKIP);
-            }
-        }
+                int64_t read_started = esp_timer_get_time();
+                esp_err_t result =
+                    tof_read_grid(device, &channel->buffers[slot]);
+                uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_started);
+                if (selected == SENSOR_TOF_A && read_us > max_read_us_a) {
+                    max_read_us_a = read_us;
+                } else if (selected == SENSOR_TOF_B && read_us > max_read_us_b) {
+                    max_read_us_b = read_us;
+                }
+                if (result == ESP_OK) {
+                    atomic_store_explicit(&channel->generation, generation,
+                                          memory_order_release);
+                }
+                atomic_store_explicit(&channel->slot_state[slot], TOF_SLOT_FREE,
+                                      memory_order_release);
 
-        /* Report every ~5 s. Separates the two failure modes: "sensor had no
-         * frame ready" (notready) vs "could not get the I2C bus" (mutexfail).
-         * ok/s should land near the sensor's ranging rate (~10 Hz). */
-        if (++report_div >= (5000 / TOF_POLL_INTERVAL_MS)) {
-            ESP_LOGI(TAG,
-                     "ToF 5s: A ok=%u(%lldms) notready=%u(%lldms) mutexfail=%u max=%ums | "
-                     "B ok=%u(%lldms) notready=%u(%lldms) mutexfail=%u max=%ums",
-                     (unsigned)ok_a, (long long)(held_us_a_ok / 1000),
-                     (unsigned)notready_a, (long long)(held_us_a_notready / 1000),
-                     (unsigned)mutexfail_a, (unsigned)(max_read_us_a / 1000),
-                     (unsigned)ok_b, (long long)(held_us_b_ok / 1000),
-                     (unsigned)notready_b, (long long)(held_us_b_notready / 1000),
-                     (unsigned)mutexfail_b, (unsigned)(max_read_us_b / 1000));
-            ok_a = notready_a = mutexfail_a = 0;
-            ok_b = notready_b = mutexfail_b = 0;
-            held_us_a_ok = held_us_a_notready = 0;
-            held_us_b_ok = held_us_b_notready = 0;
-            max_read_us_a = max_read_us_b = 0;
-            report_div = 0;
+                sensor_schedule_note_tof_result(&schedule, selected, now_us,
+                                                result == ESP_OK);
+                if (result == ESP_OK) {
+                    TaskHandle_t processor =
+                        atomic_load_explicit(&s_tof_processor_task,
+                                             memory_order_acquire);
+                    if (processor) xTaskNotifyGive(processor);
+                } else {
+                    runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS,
+                                          RUNTIME_EVENT_SENSOR_ERROR);
+                }
+            }
         }
 
         runtime_metrics_cycle_end(RUNTIME_TASK_SENSOR_BUS, esp_timer_get_time());
-        metric_scheduled += (uint64_t)TOF_POLL_INTERVAL_MS * 1000U;
-        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_POLL_INTERVAL_MS));
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_BUS_INTERVAL_MS));
+        metric_scheduled = schedule.next_imu_deadline_us;
+        schedule.next_imu_deadline_us +=
+            (uint64_t)SENSOR_BUS_INTERVAL_MS * 1000U;
+    }
+}
+
+void task_tof_processor(void *pvParameters)
+{
+    (void)pvParameters;
+    static VL53L5CX_ResultsData result;
+    static int16_t med_a[TOF_NVALS][3];
+    static int16_t med_b[TOF_NVALS][3];
+    uint8_t med_idx_a = 0;
+    uint8_t med_idx_b = 0;
+    uint32_t generation_a = 0;
+    uint32_t generation_b = 0;
+
+    atomic_store_explicit(&s_tof_processor_task, xTaskGetCurrentTaskHandle(),
+                          memory_order_release);
+    ESP_LOGI(TAG, "ToF processor task started");
+
+    for (;;) {
+        tof_process_latest(&s_tof_results_a, &s_cache_a, med_a, &med_idx_a,
+                           &generation_a, &result);
+        tof_process_latest(&s_tof_results_b, &s_cache_b, med_b, &med_idx_b,
+                           &generation_b, &result);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
 }
 
@@ -384,8 +499,7 @@ void task_sensor_snapshot(void *pvParameters)
 {
     tof_devices_t *devs = (tof_devices_t *)pvParameters;
 
-    /* Static allocation — avoids stack overflow risk.
-     * ToF buffers and the median filter now live in task_tof_reader. */
+    /* Static allocation avoids stack overflow risk. */
     static boat_SensorSnapshot snap;
 
     uint32_t iteration = 0;
@@ -394,35 +508,14 @@ void task_sensor_snapshot(void *pvParameters)
              1000 / SNAPSHOT_INTERVAL_MS,
              1000 / SNAPSHOT_INTERVAL_MS / TOF_EVERY_N);
 
-    /* Fixed PERIOD, not fixed delay. vTaskDelay() after the work made the loop
-     * run at (work + 50 ms): the ToF ticks take ~25 ms of I2C (two grid reads,
-     * contending with the 50 Hz IMU task for g_i2c_mutex), so the real rate was
-     * ~13 Hz rather than the advertised 20 Hz. That was the whole "missing ToF
-     * frames" mystery — the radio was delivering everything it was given. */
+    /* Fixed period, not fixed delay. This task only assembles cached data. */
     TickType_t last_wake = xTaskGetTickCount();
     uint32_t overruns = 0;
     uint64_t metric_scheduled = esp_timer_get_time();
 
     while (true) {
-        /* Yield while inference is running — avoid DMA/PSRAM contention */
-        if (g_inference_active) {
-            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
-            /* Re-baseline after the pause, or xTaskDelayUntil would fire with
-             * no delay repeatedly trying to "catch up" the inference stall. */
-            last_wake = xTaskGetTickCount();
-            metric_scheduled = esp_timer_get_time();
-        }
         uint64_t metric_started = esp_timer_get_time();
         runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_scheduled, metric_started);
-
-        imu_sample_t raw_imu;
-        if (sensor_read_imu_sample(&raw_imu)) {
-            sample_snapshot_publish(&s_imu_samples, &raw_imu);
-            TaskHandle_t fusion_task = atomic_load_explicit(&s_fusion_task, memory_order_acquire);
-            if (fusion_task) xTaskNotifyGive(fusion_task);
-        } else {
-            runtime_metrics_count(RUNTIME_TASK_SNAPSHOT, RUNTIME_EVENT_SENSOR_SKIP);
-        }
 
         /* IMU — always available, 20 Hz. GPS — whatever the driver currently
          * has cached. Both modes need these; ToF/detections/full-snapshot
@@ -462,10 +555,7 @@ void task_sensor_snapshot(void *pvParameters)
             snap.imu.roll    = imu.roll;
             snap.imu.heading = imu.heading;
 
-            /* ToF — copied from the reader task's cache (5 Hz publish).
-             * No I2C here any more: the cache is filled by task_tof_reader at
-             * the sensor's own rate, so a snapshot no longer misses ToF just
-             * because the sensor had nothing ready at this exact instant. */
+            /* ToF — copied from ToFProc's processed cache (5 Hz publish). */
             bool tof_tick = (iteration % TOF_EVERY_N == 0);
             if (tof_tick) {
                 if (devs->a_ok) {

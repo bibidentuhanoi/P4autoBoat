@@ -1,10 +1,41 @@
 import shutil
 import subprocess
 import tempfile
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def application_sources():
+    return {
+        path.relative_to(ROOT).as_posix(): path.read_text()
+        for path in (ROOT / "main").rglob("*")
+        if path.suffix in {".c", ".h"}
+    }
+
+
+def function_containing(needle):
+    matches = []
+    function_start = re.compile(
+        r"(?m)^[\w\s*]+\b(?P<name>[A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{"
+    )
+    for source in application_sources().values():
+        for match in function_start.finditer(source):
+            depth = 0
+            for index in range(match.end() - 1, len(source)):
+                if source[index] == "{":
+                    depth += 1
+                elif source[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        body = source[match.end():index]
+                        if needle in body:
+                            matches.append(match.group("name"))
+                        break
+    assert len(matches) == 1, f"expected one function containing {needle!r}, got {matches}"
+    return matches[0]
 
 
 STUB_HEADERS = {
@@ -859,3 +890,13 @@ def test_fusion_only_consumes_versioned_raw_samples():
         "g_inference_active",
     ):
         assert forbidden not in fusion_source
+
+
+def test_sensor_bus_is_the_only_runtime_i2c_owner():
+    sources = application_sources()
+    all_application_sources = "\n".join(sources.values())
+
+    assert "g_i2c_mutex" not in all_application_sources
+    assert function_containing("tof_read_grid(") == "task_sensor_bus"
+    assert "g_inference_active" not in sources["main/sensor_task.c"]
+    assert "g_inference_active" not in sources["main/sensor_fusion.c"]

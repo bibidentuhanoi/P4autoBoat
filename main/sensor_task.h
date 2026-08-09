@@ -6,20 +6,17 @@
 #include "imu_sample.h"
 #include "sample_snapshot.h"
 
-/**
- * @brief FreeRTOS task: samples IMU + both ToFs at ~5Hz,
- *        encodes as protobuf, publishes via pipeline.
- *        Pass tof_devices_t* as pvParameters.
- */
+/** @brief Publish the existing 20 Hz cached sensor snapshot. */
 void task_sensor_snapshot(void *pvParameters);
 
 /**
- * @brief Poll the ToF sensors at their own rate and cache processed grids.
- *
- * Must be started BEFORE task_sensor_snapshot, which only reads the cache.
- * Takes the same tof_devices_t* argument.
+ * @brief Sole runtime I2C owner: acquire IMU at 50 Hz and scheduled ToF grids.
+ *        Pass tof_devices_t* as pvParameters.
  */
-void task_tof_reader(void *pvParameters);
+void task_sensor_bus(void *pvParameters);
+
+/** @brief Convert stable raw ToF generations into the existing processed cache. */
+void task_tof_processor(void *pvParameters);
 
 /** @brief Create the ToF cache mutex. Call once before starting either task. */
 esp_err_t sensor_task_init(void);
