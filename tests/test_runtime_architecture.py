@@ -61,21 +61,31 @@ typedef struct { int unused; } portMUX_TYPE;
 #define portENTER_CRITICAL(lock) ((void)(lock))
 #define portEXIT_CRITICAL(lock) ((void)(lock))
 #define pdTRUE 1
+#define pdFALSE 0
 #define pdPASS 1
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
+#define portMAX_DELAY ((TickType_t)-1)
 """,
     "freertos/task.h": r"""
 #pragma once
 #include "freertos/FreeRTOS.h"
 typedef void *TaskHandle_t;
 typedef void (*TaskFunction_t)(void *);
-BaseType_t xTaskCreate(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
-                       UBaseType_t priority, TaskHandle_t *out);
-void vTaskDelete(TaskHandle_t task);
 TickType_t xTaskGetTickCount(void);
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait);
 BaseType_t xTaskNotifyGive(TaskHandle_t task);
 TaskHandle_t xTaskGetCurrentTaskHandle(void);
+""",
+    "freertos/queue.h": r"""
+#pragma once
+#include "freertos/FreeRTOS.h"
+typedef void *QueueHandle_t;
+QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size);
+BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t wait);
+BaseType_t xQueueSendToFront(QueueHandle_t queue, const void *item, TickType_t wait);
+BaseType_t xQueueOverwrite(QueueHandle_t queue, const void *item);
+BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t wait);
+BaseType_t xQueueReset(QueueHandle_t queue);
 """,
     "freertos/semphr.h": "#pragma once\ntypedef void *SemaphoreHandle_t;\n",
     "esp_http_server.h": "#pragma once\ntypedef void *httpd_handle_t;\n",
@@ -84,7 +94,8 @@ TaskHandle_t xTaskGetCurrentTaskHandle(void);
 #include "esp_err.h"
 typedef enum { ESC_STATE_DISARMED, ESC_STATE_ARMING, ESC_STATE_ARMED } esc_state_t;
 esp_err_t esc_driver_init(void);
-esp_err_t esc_driver_arm(void);
+esp_err_t esc_driver_arm_begin(void);
+esp_err_t esc_driver_arm_complete(void);
 esp_err_t esc_driver_set_throttle(float left, float right);
 esp_err_t esc_driver_disarm(void);
 esc_state_t esc_driver_get_state(void);
@@ -162,6 +173,7 @@ HARNESS = r"""
 #include <stddef.h>
 #include <stdint.h>
 #include <setjmp.h>
+#include <string.h>
 #include "motor_control.h"
 #include "pipeline.h"
 #include "runtime_task.h"
@@ -171,6 +183,7 @@ HARNESS = r"""
 #include "drivers/steer_driver.h"
 #include "drivers/winch_driver.h"
 #include "esp_timer.h"
+#include "freertos/queue.h"
 #include "sensor_fusion.h"
 
 static motor_command_handler_fn motor_handler;
@@ -187,21 +200,47 @@ static unsigned steer_writes;
 static unsigned raw_writes;
 static unsigned transport_publishes;
 static unsigned control_notifications;
-static unsigned arm_task_creates;
+static unsigned arm_begin_calls;
+static unsigned arm_complete_calls;
+static unsigned disarm_calls;
 static int64_t now_us = 1000;
 static float esc_left;
 static float esc_right;
 static float winch_speed;
 static float steer_value = 1.0f;
 static bool servo_power;
+static bool gps_lock;
 static esc_state_t esc_state = ESC_STATE_DISARMED;
 static TaskFunction_t control_fn;
+static TaskFunction_t arm_sequence_fn;
 static jmp_buf control_wait;
+static jmp_buf arm_sequence_wait;
 static bool stop_at_wait;
 static bool exercise_urgent_wake;
 static unsigned wait_calls;
 static TickType_t observed_waits[2];
 static TickType_t fake_tick;
+static TickType_t observed_arm_wait;
+static unsigned arm_script_stage;
+static bool run_arm_script;
+static unsigned arm_expected_non_esc_writes;
+
+typedef struct {
+    size_t item_size;
+    unsigned count;
+    unsigned head;
+    unsigned tail;
+    unsigned char items[4][24];
+} test_queue_t;
+
+static test_queue_t test_queues[2];
+static unsigned queue_create_count;
+
+static void run_one_control_cycle(void);
+
+static unsigned non_esc_write_count(void) {
+    return throttle_writes + winch_writes + power_writes + steer_writes + raw_writes;
+}
 
 void pipeline_register_motor_handler(motor_command_handler_fn fn) { motor_handler = fn; }
 void pipeline_register_arm_handler(arm_command_handler_fn fn) { arm_handler = fn; }
@@ -214,8 +253,9 @@ bool pipeline_recent_command(int64_t max_age_us) { (void)max_age_us; return true
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 
 esp_err_t esc_driver_init(void) { return ESP_OK; }
-esp_err_t esc_driver_arm(void) { esc_state = ESC_STATE_ARMED; return ESP_OK; }
-esp_err_t esc_driver_disarm(void) { esc_state = ESC_STATE_DISARMED; esc_left = 0; esc_right = 0; return ESP_OK; }
+esp_err_t esc_driver_arm_begin(void) { assert(esc_state == ESC_STATE_DISARMED); esc_state = ESC_STATE_ARMING; ++arm_begin_calls; return ESP_OK; }
+esp_err_t esc_driver_arm_complete(void) { assert(esc_state == ESC_STATE_ARMING); esc_state = ESC_STATE_ARMED; ++arm_complete_calls; return ESP_OK; }
+esp_err_t esc_driver_disarm(void) { esc_state = ESC_STATE_DISARMED; esc_left = 0; esc_right = 0; ++disarm_calls; return ESP_OK; }
 esp_err_t esc_driver_set_throttle(float left, float right) { esc_left = left; esc_right = right; ++throttle_writes; return ESP_OK; }
 esc_state_t esc_driver_get_state(void) { return esc_state; }
 void esc_driver_get_throttle(float *left, float *right) { *left = esc_left; *right = esc_right; }
@@ -227,7 +267,7 @@ esp_err_t steer_driver_set(float steer) { steer_value = steer; ++steer_writes; r
 float steer_driver_get(void) { return steer_value; }
 void steer_driver_reassert(void) {}
 esp_err_t steer_driver_set_raw_us(uint32_t pulse_us) { (void)pulse_us; ++raw_writes; return ESP_OK; }
-bool gps_driver_has_lock(void) { return true; }
+bool gps_driver_has_lock(void) { return gps_lock; }
 esp_err_t gps_driver_get_fix(gps_fix_t *fix) { (void)fix; return ESP_OK; }
 bool imu_icm_ok(void) { return false; }
 bool imu_mag_ok(void) { return false; }
@@ -236,13 +276,6 @@ int ws_transport_client_count(void) { return 1; }
 int64_t esp_timer_get_time(void) { return now_us; }
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out) { (void)args; *out = (void *)1; return ESP_OK; }
 esp_err_t esp_timer_start_periodic(esp_timer_handle_t timer, uint64_t period) { (void)timer; (void)period; return ESP_OK; }
-BaseType_t xTaskCreate(TaskFunction_t fn, const char *name, uint32_t stack, void *arg,
-                       UBaseType_t priority, TaskHandle_t *out) {
-    (void)fn; (void)name; (void)stack; (void)arg; (void)priority; (void)out;
-    ++arm_task_creates;
-    return pdPASS;
-}
-void vTaskDelete(TaskHandle_t task) { (void)task; }
 TickType_t xTaskGetTickCount(void) { return fake_tick; }
 uint32_t ulTaskNotifyTake(BaseType_t clear, TickType_t wait) {
     (void)clear;
@@ -259,14 +292,136 @@ BaseType_t xTaskNotifyGive(TaskHandle_t task) { (void)task; ++control_notificati
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (TaskHandle_t)1; }
 esp_err_t runtime_task_create(runtime_task_id_t id, TaskFunction_t fn, void *arg, TaskHandle_t *out) {
     (void)arg;
-    assert(id == RUNTIME_TASK_CONTROL);
-    control_fn = fn;
-    if (out) *out = (TaskHandle_t)2;
+    if (id == RUNTIME_TASK_CONTROL) {
+        control_fn = fn;
+        if (out) *out = (TaskHandle_t)2;
+    } else {
+        assert(id == RUNTIME_TASK_ARM_SEQUENCE);
+        arm_sequence_fn = fn;
+        if (out) *out = (TaskHandle_t)3;
+    }
     return ESP_OK;
 }
 void runtime_metrics_count(runtime_task_id_t id, runtime_metric_event_t event) { (void)id; (void)event; }
 void runtime_metrics_cycle_begin(runtime_task_id_t id, uint64_t scheduled, uint64_t started) { (void)id; (void)scheduled; (void)started; }
 void runtime_metrics_cycle_end(runtime_task_id_t id, uint64_t finished) { (void)id; (void)finished; }
+
+QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size) {
+    assert(length <= 4 && item_size <= sizeof(test_queues[0].items[0]));
+    assert(queue_create_count < 2);
+    test_queue_t *queue = &test_queues[queue_create_count++];
+    queue->item_size = item_size;
+    return queue;
+}
+
+static BaseType_t queue_push(test_queue_t *queue, const void *item, bool front) {
+    if (queue->count == 4) return pdFALSE;
+    if (front) {
+        queue->head = (queue->head + 3) % 4;
+        memcpy(queue->items[queue->head], item, queue->item_size);
+    } else {
+        memcpy(queue->items[queue->tail], item, queue->item_size);
+        queue->tail = (queue->tail + 1) % 4;
+    }
+    ++queue->count;
+    return pdTRUE;
+}
+
+BaseType_t xQueueSend(QueueHandle_t handle, const void *item, TickType_t wait) {
+    (void)wait;
+    return queue_push(handle, item, false);
+}
+
+BaseType_t xQueueSendToFront(QueueHandle_t handle, const void *item, TickType_t wait) {
+    (void)wait;
+    return queue_push(handle, item, true);
+}
+
+BaseType_t xQueueOverwrite(QueueHandle_t handle, const void *item) {
+    test_queue_t *queue = handle;
+    queue->count = queue->head = queue->tail = 0;
+    return queue_push(queue, item, false);
+}
+
+BaseType_t xQueueReset(QueueHandle_t handle) {
+    test_queue_t *queue = handle;
+    queue->count = queue->head = queue->tail = 0;
+    return pdPASS;
+}
+
+static BaseType_t queue_pop(test_queue_t *queue, void *item) {
+    if (queue->count == 0) return pdFALSE;
+    memcpy(item, queue->items[queue->head], queue->item_size);
+    queue->head = (queue->head + 1) % 4;
+    --queue->count;
+    return pdTRUE;
+}
+
+BaseType_t xQueueReceive(QueueHandle_t handle, void *item, TickType_t wait) {
+    test_queue_t *queue = handle;
+    if (queue_pop(queue, item) == pdTRUE) return pdTRUE;
+    if (!run_arm_script || queue != &test_queues[0]) return pdFALSE;
+    assert(non_esc_write_count() == arm_expected_non_esc_writes);
+
+    switch (arm_script_stage++) {
+    case 0:
+        assert(wait == portMAX_DELAY);
+        arm_handler(true, true);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        return queue_pop(queue, item);
+    case 1:
+        observed_arm_wait = wait;
+        assert(arm_begin_calls == 0 && arm_complete_calls == 0 && disarm_calls == 0);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(arm_begin_calls == 1 && arm_complete_calls == 0);
+        now_us += 3000000;
+        motor_handler(&(boat_MotorCommand){0});
+        return pdFALSE;
+    case 2:
+        assert(wait == portMAX_DELAY);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(arm_complete_calls == 1 && esc_state == ESC_STATE_ARMED);
+        arm_handler(false, false);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        return queue_pop(queue, item);
+    case 3:
+        assert(wait == portMAX_DELAY);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(disarm_calls == 1 && esc_state == ESC_STATE_DISARMED);
+        arm_handler(true, true);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        return queue_pop(queue, item);
+    case 4:
+        observed_arm_wait = wait;
+        assert(arm_begin_calls == 1);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(arm_begin_calls == 2 && arm_complete_calls == 1);
+        arm_handler(false, false);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        return queue_pop(queue, item);
+    case 5:
+        assert(wait == portMAX_DELAY);
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(disarm_calls == 2 && esc_state == ESC_STATE_DISARMED);
+        now_us += 4000000;
+        run_one_control_cycle();
+        arm_expected_non_esc_writes = non_esc_write_count();
+        assert(arm_complete_calls == 1);
+        longjmp(arm_sequence_wait, 1);
+    default:
+        assert(false);
+        return pdFALSE;
+    }
+}
 
 static bool close_enough(float actual, float expected) {
     return fabsf(actual - expected) < 0.0001f;
@@ -291,7 +446,7 @@ static void run_scheduled_and_urgent_cycle(void) {
 int main(void) {
     assert(motor_control_init() == ESP_OK);
     assert(motor_handler && arm_handler && winch_handler && steer_handler && power_handler && raw_handler);
-    assert(control_fn != NULL);
+    assert(control_fn != NULL && arm_sequence_fn != NULL);
 
     motor_handler(&(boat_MotorCommand){.throttle = 0.4f, .rudder = 0.1f});
     assert(throttle_writes == 0);
@@ -376,20 +531,20 @@ int main(void) {
     assert(status.servo_power && close_enough(status.winch_speed, 0.0f));
     assert(transport_publishes == 0);
 
-    esc_state = ESC_STATE_ARMED;
+    esc_state = ESC_STATE_DISARMED;
+    gps_lock = false;
     now_us += 1;
-    unsigned notifications_before_disarm = control_notifications;
-    arm_handler(false, false);
-    assert(esc_state == ESC_STATE_ARMED);
-    assert(control_notifications == notifications_before_disarm + 1);
+    arm_handler(true, false);
+    assert(arm_begin_calls == 0 && arm_complete_calls == 0 && disarm_calls == 0);
     run_one_control_cycle();
-    assert(esc_state == ESC_STATE_DISARMED && !servo_power);
-
-    now_us += 1;
-    arm_handler(true, true);
-    assert(arm_task_creates == 0);
-    run_one_control_cycle();
-    assert(arm_task_creates == 1);
+    run_arm_script = true;
+    arm_script_stage = 0;
+    arm_expected_non_esc_writes = non_esc_write_count();
+    if (setjmp(arm_sequence_wait) == 0) arm_sequence_fn(NULL);
+    run_arm_script = false;
+    assert(arm_script_stage == 6);
+    assert(observed_arm_wait == pdMS_TO_TICKS(3000));
+    assert(arm_begin_calls == 2 && arm_complete_calls == 1 && disarm_calls == 2);
     return 0;
 }
 """
@@ -410,6 +565,7 @@ def test_pipeline_handlers_do_not_write_actuators():
                 "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                 "-I", str(tmpdir), "-I", str(ROOT / "main"),
                 str(tmpdir / "motor_control.c"), str(ROOT / "main" / "control_arbiter.c"),
+                str(ROOT / "main" / "arm_sequence.c"),
                 str(tmpdir / "harness.c"), "-lm", "-o", str(binary),
             ],
             check=True,

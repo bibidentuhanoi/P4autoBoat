@@ -5,6 +5,7 @@ idf_component_register(
         "runtime_task.c"
         "runtime_metrics.c"
         "control_arbiter.c"
+        "arm_sequence.c"
                        "sd_card.c"
         "file_system.c"
         "sensor_fusion.c"

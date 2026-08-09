@@ -1,4 +1,5 @@
 #include "motor_control.h"
+#include "arm_sequence.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
@@ -13,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include <math.h>
 #include <stdatomic.h>
@@ -24,6 +26,9 @@ static const char *TAG = "MOTOR_CTL";
 #define CONTROL_PERIOD_MS    10
 #define HEADING_DIVIDER      10
 #define STATUS_DIVIDER       10
+#define ARMING_DURATION_US   3000000LL
+#define ARM_REQUEST_QUEUE_LENGTH 4
+#define ARM_ACTION_QUEUE_LENGTH 4
 
 /* How long accepted manual-control traffic may go silent before failsafe.
  * Detect and all other decodable protobuf traffic are deliberately excluded. */
@@ -83,16 +88,22 @@ static portMUX_TYPE s_arbiter_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile int64_t s_last_control_rx_us = 0;
 static bool s_control_failsafe = true;
 static TaskHandle_t s_control_task = NULL;
+static TaskHandle_t s_arm_sequence_task = NULL;
+static QueueHandle_t s_arm_request_queue = NULL;
+static QueueHandle_t s_arm_action_queue = NULL;
 
 static boat_MotorStatus s_status_buffers[2];
 static uint32_t s_status_generation;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uintptr_t s_status_reader_task;
 
-static atomic_bool s_arm_completed;
-static atomic_bool s_arm_succeeded;
-static atomic_bool s_arm_task_running;
-static atomic_bool s_arm_power_allowed;
+static bool s_arm_power_allowed;
+
+typedef struct {
+    arm_request_t request;
+    bool force;
+    int64_t requested_us;
+} arm_request_message_t;
 
 static inline bool control_link_alive(void)
 {
@@ -479,47 +490,150 @@ static void arm_command_handler(bool arm, bool force)
     }
 }
 
-static esp_err_t arm_esc_sequence(bool force)
+static bool submit_arm_request(arm_request_t request, bool force, int64_t requested_us)
 {
-    if (!force && !gps_driver_has_lock()) {
+    arm_request_message_t message = {
+        .request = request,
+        .force = force,
+        .requested_us = requested_us,
+    };
+
+    BaseType_t queued;
+    if (request == ARM_REQUEST_DISARM) {
+        xQueueReset(s_arm_request_queue);
+        queued = xQueueSendToFront(s_arm_request_queue, &message, 0);
+    } else {
+        queued = xQueueSend(s_arm_request_queue, &message, 0);
+    }
+    if (queued != pdTRUE) {
+        runtime_metrics_count(RUNTIME_TASK_ARM_SEQUENCE,
+                              RUNTIME_EVENT_INVALID_COMMAND);
+        ESP_LOGE(TAG, "ArmSeq request queue full");
+        return false;
+    }
+    return true;
+}
+
+static void publish_arm_action(arm_action_t action)
+{
+    if (action == ARM_ACTION_REJECT_NO_GPS) {
         ESP_LOGW(TAG, "Arm refused — waiting for GPS lock (use override to bypass)");
-        return ESP_ERR_INVALID_STATE;
+        return;
     }
-    return esc_driver_arm();
-}
+    if (action == ARM_ACTION_NONE) return;
 
-static void arm_task_fn(void *arg)
-{
-    bool force = (bool)(intptr_t)arg;
-    bool succeeded = arm_esc_sequence(force) == ESP_OK;
-    atomic_store_explicit(&s_arm_succeeded, succeeded, memory_order_relaxed);
-    atomic_store_explicit(&s_arm_task_running, false, memory_order_relaxed);
-    atomic_store_explicit(&s_arm_completed, true, memory_order_release);
+    BaseType_t queued;
+    if (action == ARM_ACTION_DISARM) {
+        xQueueReset(s_arm_action_queue);
+        queued = xQueueSendToFront(s_arm_action_queue, &action, 0);
+    } else {
+        queued = xQueueSend(s_arm_action_queue, &action, 0);
+    }
+    if (queued != pdTRUE) {
+        runtime_metrics_count(RUNTIME_TASK_ARM_SEQUENCE,
+                              RUNTIME_EVENT_INVALID_COMMAND);
+        ESP_LOGE(TAG, "ArmSeq action queue full");
+        return;
+    }
     if (s_control_task) xTaskNotifyGive(s_control_task);
-    vTaskDelete(NULL);
 }
 
-static void start_arm_task(bool force)
+static TickType_t arm_sequence_wait_ticks(const arm_sequence_t *sequence,
+                                          int64_t now_us)
 {
-    if (esc_driver_get_state() != ESC_STATE_DISARMED) return;
-    if (atomic_exchange_explicit(&s_arm_task_running, true, memory_order_acquire)) return;
-    atomic_store_explicit(&s_arm_power_allowed, true, memory_order_release);
-    if (xTaskCreate(arm_task_fn, "esc_arm", 4096, (void *)(intptr_t)force,
-                    5, NULL) != pdPASS) {
-        atomic_store_explicit(&s_arm_task_running, false, memory_order_release);
-        ESP_LOGE(TAG, "ESC arm task create failed");
+    if (sequence->state != ARM_SEQUENCE_ARMING) return portMAX_DELAY;
+    if (sequence->deadline_us <= now_us) return 0;
+
+    uint64_t remaining_ms = (uint64_t)(sequence->deadline_us - now_us + 999) / 1000;
+    TickType_t ticks = pdMS_TO_TICKS(remaining_ms);
+    return ticks == 0 ? 1 : ticks;
+}
+
+static void task_arm_sequence(void *arg)
+{
+    (void)arg;
+    arm_sequence_t sequence;
+    arm_sequence_init(&sequence, ARMING_DURATION_US);
+
+    for (;;) {
+        arm_request_message_t message;
+        int64_t before_wait_us = esp_timer_get_time();
+        TickType_t wait = arm_sequence_wait_ticks(&sequence, before_wait_us);
+        if (xQueueReceive(s_arm_request_queue, &message, wait) == pdTRUE) {
+            arm_sequence_request(&sequence, message.request, message.force,
+                                 message.requested_us);
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        bool gps_locked = false;
+        if (sequence.state == ARM_SEQUENCE_ARM_PENDING) {
+            gps_locked = sequence.force || gps_driver_has_lock();
+        }
+        publish_arm_action(arm_sequence_step(&sequence, now_us, gps_locked));
     }
 }
 
-static void control_apply_decision(const control_decision_t *decision)
+static bool control_apply_arm_action(control_decision_t *decision, bool safe_stop,
+                                     bool *changed)
+{
+    arm_action_t action;
+    if (xQueueReceive(s_arm_action_queue, &action, 0) != pdTRUE) return false;
+
+    switch (action) {
+    case ARM_ACTION_BEGIN:
+        if (safe_stop || !s_arm_power_allowed) {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        } else if (esc_driver_arm_begin() == ESP_OK) {
+            *changed = true;
+        } else {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        }
+        break;
+
+    case ARM_ACTION_COMPLETE:
+        if (safe_stop || !s_arm_power_allowed) {
+            if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+                esc_driver_disarm();
+                *changed = true;
+            }
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        } else if (esc_driver_arm_complete() == ESP_OK) {
+            decision->servo_power_on = true;
+            *changed = true;
+        } else {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        }
+        break;
+
+    case ARM_ACTION_DISARM:
+        if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+            esc_driver_disarm();
+            *changed = true;
+        }
+        decision->arm = false;
+        decision->force_arm = false;
+        decision->disarm = true;
+        return true;
+
+    case ARM_ACTION_NONE:
+    case ARM_ACTION_REJECT_NO_GPS:
+    default:
+        break;
+    }
+    return false;
+}
+
+static void control_apply_decision(control_decision_t *decision)
 {
     bool changed = false;
     bool explicit_off = decision->servo_power_off;
     bool safe_stop = explicit_off || decision->disarm || decision->failsafe;
+    bool internal_disarm = control_apply_arm_action(decision, safe_stop, &changed);
+    safe_stop = explicit_off || decision->disarm || decision->failsafe;
 
     if (explicit_off) {
         s_rail_cut = true;
-        atomic_store_explicit(&s_arm_power_allowed, false, memory_order_release);
+        s_arm_power_allowed = false;
         if (winch_driver_get_power()) {
             winch_driver_set_power(false);
             changed = true;
@@ -535,7 +649,7 @@ static void control_apply_decision(const control_decision_t *decision)
         s_manual_rudder = 1.0f;
         heading_assist_reset();
     } else if (decision->disarm || decision->failsafe) {
-        atomic_store_explicit(&s_arm_power_allowed, false, memory_order_release);
+        s_arm_power_allowed = false;
         float left;
         float right;
         esc_driver_get_throttle(&left, &right);
@@ -564,21 +678,20 @@ static void control_apply_decision(const control_decision_t *decision)
         }
     }
 
-    if (decision->disarm) {
-        if (esc_driver_get_state() != ESC_STATE_DISARMED) {
-            esc_driver_disarm();
-            changed = true;
-        }
+    if (decision->disarm && !internal_disarm) {
+        submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
     }
 
     if (!safe_stop) {
         if (decision->arm || decision->force_arm) {
-            start_arm_task(decision->force_arm);
+            s_arm_power_allowed = true;
+            submit_arm_request(ARM_REQUEST_ARM, decision->force_arm,
+                               esp_timer_get_time());
         }
 
         if (decision->servo_power_on) {
             s_rail_cut = false;
-            atomic_store_explicit(&s_arm_power_allowed, true, memory_order_release);
+            s_arm_power_allowed = true;
             if (!winch_driver_get_power()) {
                 steer_driver_reassert();
                 winch_driver_set_power(true);
@@ -649,16 +762,6 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
     s_control_failsafe = failsafe;
     portEXIT_CRITICAL(&s_arbiter_lock);
 
-    if (atomic_exchange_explicit(&s_arm_completed, false, memory_order_acquire) &&
-        atomic_load_explicit(&s_arm_succeeded, memory_order_relaxed)) {
-        if (atomic_load_explicit(&s_arm_power_allowed, memory_order_acquire) &&
-            !decision.servo_power_off && !decision.disarm && !decision.failsafe) {
-            decision.servo_power_on = true;
-        } else {
-            decision.disarm = true;
-        }
-    }
-
     control_apply_decision(&decision);
     status_commit_current(false);
 
@@ -715,10 +818,12 @@ esp_err_t motor_control_init(void)
     s_rail_cut = false;
     s_status_generation = 0;
     atomic_store(&s_status_reader_task, (uintptr_t)NULL);
-    atomic_store(&s_arm_completed, false);
-    atomic_store(&s_arm_succeeded, false);
-    atomic_store(&s_arm_task_running, false);
-    atomic_store(&s_arm_power_allowed, false);
+    s_arm_power_allowed = false;
+    s_arm_request_queue = xQueueCreate(ARM_REQUEST_QUEUE_LENGTH,
+                                       sizeof(arm_request_message_t));
+    s_arm_action_queue = xQueueCreate(ARM_ACTION_QUEUE_LENGTH,
+                                      sizeof(arm_action_t));
+    if (!s_arm_request_queue || !s_arm_action_queue) return ESP_ERR_NO_MEM;
     status_commit_current(true);
 
     pipeline_register_motor_handler(motor_command_handler);
@@ -728,10 +833,14 @@ esp_err_t motor_control_init(void)
     pipeline_register_servo_power_handler(servo_power_command_handler);
     pipeline_register_steer_raw_handler(steer_raw_command_handler);
 
+    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
+                                            task_arm_sequence, NULL,
+                                            &s_arm_sequence_task),
+                        TAG, "ArmSeq task create");
     ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_CONTROL, task_control,
                                             NULL, &s_control_task),
                         TAG, "Control task create");
 
-    ESP_LOGI(TAG, "Motor control initialized (ControlTask 10 ms)");
+    ESP_LOGI(TAG, "Motor control initialized (ControlTask 10 ms, persistent ArmSeq)");
     return ESP_OK;
 }

@@ -5,7 +5,6 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
 
 #include "sdkconfig.h"
@@ -27,15 +26,13 @@ static const char *TAG = "ESC";
  * for the rest of the 20ms frame (matches the old LEDC MAX-d inversion).
  * Unidirectional, arms at MINIMUM (1000us). Own MCPWM timer+operator in group 0;
  * one operator, two comparators/generators, so left and right are independent.
- * Public API (esc_driver_init/arm/disarm/set_throttle/get_state/get_throttle) is
- * unchanged — motor_control.c is untouched.
+ * Arming is split into nonblocking begin/complete operations; ControlTask owns
+ * the three-second timing through the persistent ArmSeq state machine.
  * ------------------------------------------------------------------------- */
 
 #define ESC_MCPWM_GROUP        0
 #define ESC_TIMER_RESOLUTION   1000000U   /* 1 MHz => 1 us/tick */
 #define ESC_PERIOD_TICKS       (ESC_TIMER_RESOLUTION / CONFIG_ESC_PWM_FREQ_HZ)   /* 20000 @ 50Hz */
-#define ESC_ARMING_DELAY_MS    3000
-
 static mcpwm_timer_handle_t s_timer  = NULL;
 static mcpwm_oper_handle_t  s_oper   = NULL;
 static mcpwm_cmpr_handle_t  s_cmp_l  = NULL;
@@ -150,29 +147,40 @@ esp_err_t esc_driver_init(void)
     return ESP_OK;
 }
 
-esp_err_t esc_driver_arm(void)
+esp_err_t esc_driver_arm_begin(void)
 {
     if (!s_inited) return ESP_ERR_INVALID_STATE;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (s_state != ESC_STATE_DISARMED) {
         xSemaphoreGive(s_mutex);
-        ESP_LOGW(TAG, "arm() ignored — state=%d", (int)s_state);
+        ESP_LOGW(TAG, "arm begin ignored — state=%d", (int)s_state);
         return ESP_ERR_INVALID_STATE;
     }
     /* Arm at MINIMUM throttle on BOTH channels (the HW-517 arm point). */
     uint32_t off_us = CONFIG_ESC_PULSE_MIN_US;
-    set_pulse_us(off_us, off_us);
-    s_thr_left  = 0.0f;
-    s_thr_right = 0.0f;
-    s_state     = ESC_STATE_ARMING;
+    esp_err_t err = set_pulse_us(off_us, off_us);
+    if (err == ESP_OK) {
+        s_thr_left  = 0.0f;
+        s_thr_right = 0.0f;
+        s_state     = ESC_STATE_ARMING;
+    }
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "ESC arming (holding min %d ms)...", ESC_ARMING_DELAY_MS);
+    if (err == ESP_OK) ESP_LOGI(TAG, "ESC arming (holding minimum throttle)");
+    return err;
+}
 
-    vTaskDelay(pdMS_TO_TICKS(ESC_ARMING_DELAY_MS));
+esp_err_t esc_driver_arm_complete(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_state != ESC_STATE_ARMING) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "arm complete ignored — state=%d", (int)s_state);
+        return ESP_ERR_INVALID_STATE;
+    }
     s_state = ESC_STATE_ARMED;
     xSemaphoreGive(s_mutex);
 
