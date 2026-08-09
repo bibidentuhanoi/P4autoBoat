@@ -39,14 +39,6 @@ void pipeline_publish_status(const boat_SystemStatus *status);
 void pipeline_handle_incoming(const uint8_t *buf, size_t len);
 
 /**
- * @brief True if any transport (WS or ESP-NOW) delivered a decodable
- *        BoatMessage within the last max_age_us microseconds. Transport-
- *        agnostic liveness signal for failsafes — ESP-NOW has no persistent
- *        "connected" concept, so recency of traffic is its only substitute.
- */
-bool pipeline_recent_command(int64_t max_age_us);
-
-/**
  * @brief Motor command handler callback type.
  */
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *cmd);

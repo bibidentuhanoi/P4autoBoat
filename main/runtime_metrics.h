@@ -42,6 +42,7 @@ bool runtime_metrics_core_attribution_complete(const uint8_t *affinity_masks,
 void runtime_metrics_reset_for_test(void);
 
 #ifdef ESP_PLATFORM
+#include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 void runtime_metrics_register_handle(runtime_task_id_t id, TaskHandle_t handle);

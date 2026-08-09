@@ -8,6 +8,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "motor_control.h"
+#include "pipeline.h"
 #include <string.h>
 #endif
 
@@ -211,29 +213,41 @@ void task_runtime_diagnostics(void *arg)
 {
     (void)arg;
     static const char *tag = "RTM";
+    TickType_t next_report = xTaskGetTickCount();
+    uint32_t published_motor_generation = UINT32_MAX;
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1)
     static TaskStatus_t task_status[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
     static uint8_t affinity_masks[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
 #endif
     while (true) {
-        for (runtime_task_id_t id = RUNTIME_TASK_CONTROL; id < RUNTIME_TASK_COUNT; ++id) {
-            runtime_metric_record_t *record = &s_records[id];
-            const runtime_task_spec_t *spec = runtime_schedule_get(id);
-            runtime_metric_snapshot_t metrics;
-            TaskHandle_t handle;
-            lock_record(record);
-            handle = record->handle;
-            unlock_record(record);
-            if (handle) {
-                runtime_metrics_set_stack(id, uxTaskGetStackHighWaterMark(handle));
-            }
-            runtime_metrics_snapshot(id, &metrics);
-            ESP_LOGI(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u",
-                     spec->name, spec->core, (unsigned)spec->priority,
-                     (unsigned)metrics.runs, (unsigned)metrics.max_exec_us,
-                     (unsigned)metrics.max_gap_us, (unsigned)metrics.max_jitter_us,
-                     (unsigned)metrics.deadline_misses, (unsigned)metrics.stack_free_words);
+        TickType_t now = xTaskGetTickCount();
+        bool periodic_report = now >= next_report;
+        boat_MotorStatus motor_status;
+        uint32_t motor_generation = motor_control_get_status(&motor_status);
+        if (periodic_report || motor_generation != published_motor_generation) {
+            pipeline_publish_motor_status(&motor_status);
+            published_motor_generation = motor_generation;
         }
+
+        if (periodic_report) {
+            for (runtime_task_id_t id = RUNTIME_TASK_CONTROL; id < RUNTIME_TASK_COUNT; ++id) {
+                runtime_metric_record_t *record = &s_records[id];
+                const runtime_task_spec_t *spec = runtime_schedule_get(id);
+                runtime_metric_snapshot_t metrics;
+                TaskHandle_t handle;
+                lock_record(record);
+                handle = record->handle;
+                unlock_record(record);
+                if (handle) {
+                    runtime_metrics_set_stack(id, uxTaskGetStackHighWaterMark(handle));
+                }
+                runtime_metrics_snapshot(id, &metrics);
+                ESP_LOGI(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u",
+                         spec->name, spec->core, (unsigned)spec->priority,
+                         (unsigned)metrics.runs, (unsigned)metrics.max_exec_us,
+                         (unsigned)metrics.max_gap_us, (unsigned)metrics.max_jitter_us,
+                         (unsigned)metrics.deadline_misses, (unsigned)metrics.stack_free_words);
+            }
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1) && \
     (configUSE_CORE_AFFINITY == 1) && (configNUMBER_OF_CORES > 1)
         configRUN_TIME_COUNTER_TYPE total_runtime = 0;
@@ -264,9 +278,15 @@ void task_runtime_diagnostics(void *arg)
             ESP_LOGI(tag, "core_load_supported=0");
         }
 #else
-        ESP_LOGI(tag, "core_load_supported=0");
+            ESP_LOGI(tag, "core_load_supported=0");
 #endif
-        vTaskDelay(pdMS_TO_TICKS(1000));
+            next_report += pdMS_TO_TICKS(1000);
+            if (next_report <= now) next_report = now + pdMS_TO_TICKS(1000);
+        }
+
+        now = xTaskGetTickCount();
+        TickType_t wait = next_report > now ? next_report - now : 0;
+        ulTaskNotifyTake(pdTRUE, wait);
     }
 }
 #endif

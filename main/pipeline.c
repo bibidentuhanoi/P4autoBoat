@@ -1,7 +1,6 @@
 #include "pipeline.h"
 #include "detect_task.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include <string.h>
 #include <pb_encode.h>
 #include <pb_decode.h>
@@ -59,15 +58,6 @@ static SemaphoreHandle_t s_msg_mutex = NULL;
 
 static boat_BoatMessage  s_rx_msg;
 static SemaphoreHandle_t s_rx_msg_mutex = NULL;
-
-/* ---- Transport-agnostic command liveness ----
- * Stamped on every decodable inbound message regardless of which transport
- * delivered it. WS has a "connected" concept the motor-control watchdog can
- * use directly; ESP-NOW is connectionless (broadcast, no session), so this
- * timestamp is field mode's only liveness signal. portMUX (not s_msg_mutex)
- * so the watchdog's 100ms poll never blocks behind a decode+dispatch. */
-static portMUX_TYPE s_rx_time_lock = portMUX_INITIALIZER_UNLOCKED;
-static volatile int64_t s_last_rx_us = 0;
 
 /* Encode s_msg (caller set which_payload/payload under the mutex) and fan out. */
 static void fanout_locked(uint8_t *buf, size_t bufsize, const char *what)
@@ -226,10 +216,6 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
         return;
     }
 
-    portENTER_CRITICAL(&s_rx_time_lock);
-    s_last_rx_us = esp_timer_get_time();
-    portEXIT_CRITICAL(&s_rx_time_lock);
-
     switch (s_rx_msg.which_payload) {
     case boat_BoatMessage_motor_tag:
         ESP_LOGD(TAG, "RX motor: L=%.2f R=%.2f thr=%.2f rud=%.2f",
@@ -292,14 +278,4 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
     }
 
     xSemaphoreGive(s_rx_msg_mutex);
-}
-
-bool pipeline_recent_command(int64_t max_age_us)
-{
-    portENTER_CRITICAL(&s_rx_time_lock);
-    int64_t last = s_last_rx_us;
-    portEXIT_CRITICAL(&s_rx_time_lock);
-
-    if (last == 0) return false;   /* nothing ever received */
-    return (esp_timer_get_time() - last) <= max_age_us;
 }
