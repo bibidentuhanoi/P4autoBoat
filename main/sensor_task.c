@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "vl53l5cx_api.h"
+#include <stdatomic.h>
 #include <string.h>
 
 static const char *TAG = "SENSOR_TASK";
@@ -72,6 +73,9 @@ typedef struct {
 
 static tof_grid_cache_t  s_cache_a, s_cache_b;
 static SemaphoreHandle_t s_cache_mutex = NULL;
+static sample_snapshot_t s_imu_samples;
+static _Atomic(TaskHandle_t) s_fusion_task;
+static uint32_t s_imu_sequence = 0;
 
 /* Apply per-slot gating + 3-frame median, then publish into the cache. */
 static void tof_cache_store(tof_grid_cache_t *cache,
@@ -116,7 +120,139 @@ esp_err_t sensor_task_init(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    sample_snapshot_init(&s_imu_samples);
     return ESP_OK;
+}
+
+sample_snapshot_t *sensor_imu_sample_snapshot(void)
+{
+    return &s_imu_samples;
+}
+
+void sensor_task_register_fusion_task(TaskHandle_t task)
+{
+    atomic_store_explicit(&s_fusion_task, task, memory_order_release);
+}
+
+bool sensor_read_imu_sample(imu_sample_t *sample)
+{
+    static uint32_t ag_fails;
+    static uint32_t mag_fails;
+    static bool bus_scanned;
+    static int16_t last_mx, last_my, last_mz;
+    static uint32_t mag_static, mag_rearm, mag_diag;
+    static bool mag_frozen;
+
+    if (!sample || xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return false;
+    }
+
+    *sample = (imu_sample_t){0};
+    esp_err_t ag_err = imu_read_accel_gyro(&sample->ax, &sample->ay, &sample->az,
+                                            &sample->gx, &sample->gy, &sample->gz);
+    esp_err_t mag_err = imu_read_mag(&sample->mx, &sample->my, &sample->mz);
+    sample->accel_gyro_valid = (ag_err == ESP_OK);
+    sample->mag_valid = (mag_err == ESP_OK);
+    sample->captured_us = (uint64_t)esp_timer_get_time();
+
+    if (!sample->mag_valid) {
+        ++mag_fails;
+        if (mag_fails == 50) imu_set_mag_ok(false);
+        if (mag_fails == 50 && !bus_scanned) {
+            bus_scanned = true;
+            imu_bus_scan();
+        }
+        if ((mag_fails % 100) == 1) {
+            ESP_LOGW(TAG, "QMC5883L mag read failing (%lu fails, %s) — heading frozen",
+                     (unsigned long)mag_fails, esp_err_to_name(mag_err));
+        }
+        if ((mag_fails % 100) == 0 && imu_recover_mag() == ESP_OK) {
+            ESP_LOGI(TAG, "mag recovered after %lu fails — re-added + reconfigured",
+                     (unsigned long)mag_fails);
+            imu_set_mag_ok(true);
+            mag_fails = 0;
+        }
+    } else {
+        if (sample->mx == last_mx && sample->my == last_my && sample->mz == last_mz) {
+            if (++mag_static >= 50) {
+                mag_static = 0;
+                if (!mag_frozen) {
+                    imu_set_mag_ok(false);
+                    mag_frozen = true;
+                }
+                if (++mag_rearm >= 3) {
+                    imu_reinit_mag();
+                    mag_rearm = 0;
+                    ESP_LOGW(TAG, "mag still frozen after re-arm — full reset");
+                } else {
+                    imu_mag_ensure_continuous();
+                    ESP_LOGW(TAG, "mag data frozen — re-asserted continuous mode");
+                }
+            }
+        } else {
+            if (mag_frozen) {
+                imu_set_mag_ok(true);
+                mag_frozen = false;
+            }
+            mag_static = 0;
+            mag_rearm = 0;
+            last_mx = sample->mx;
+            last_my = sample->my;
+            last_mz = sample->mz;
+        }
+        if (++mag_diag >= 1500) {
+            uint8_t mag_ctrl = 0xFF;
+            mag_diag = 0;
+            imu_mag_ensure_continuous();
+            imu_mag_read_ctrl(&mag_ctrl);
+            ESP_LOGI(TAG, "MAG DIAG raw=(%d,%d,%d) ctrl09=0x%02X",
+                     sample->mx, sample->my, sample->mz, mag_ctrl);
+        }
+        if (mag_fails) {
+            if (mag_fails >= 50) {
+                imu_reinit_mag();
+                ESP_LOGI(TAG, "mag recovered after %lu fails — reconfigured",
+                         (unsigned long)mag_fails);
+                imu_set_mag_ok(true);
+            }
+            mag_fails = 0;
+        }
+    }
+
+    if (!sample->accel_gyro_valid) {
+        ++ag_fails;
+        if (ag_fails == 50) imu_set_icm_ok(false);
+        if (ag_fails == 50 && !bus_scanned) {
+            bus_scanned = true;
+            imu_bus_scan();
+        }
+        if ((ag_fails % 100) == 1) {
+            ESP_LOGW(TAG, "ICM20948 accel/gyro read failing (%lu fails, %s) — pitch/roll frozen",
+                     (unsigned long)ag_fails, esp_err_to_name(ag_err));
+        }
+        if ((ag_fails % 100) == 0 && imu_recover_accel_gyro() == ESP_OK) {
+            ESP_LOGI(TAG, "accel/gyro recovered after %lu fails — reprobed + reconfigured",
+                     (unsigned long)ag_fails);
+            imu_set_icm_ok(true);
+            ag_fails = 0;
+        }
+    } else if (ag_fails) {
+        if (ag_fails >= 50) {
+            imu_reinit_accel_gyro();
+            ESP_LOGI(TAG, "accel/gyro recovered after %lu fails — reconfigured",
+                     (unsigned long)ag_fails);
+            imu_set_icm_ok(true);
+        }
+        ag_fails = 0;
+    }
+
+    xSemaphoreGive(g_i2c_mutex);
+    if (!sample->accel_gyro_valid && !sample->mag_valid) {
+        return false;
+    }
+    if (++s_imu_sequence == 0) ++s_imu_sequence;
+    sample->sequence = s_imu_sequence;
+    return true;
 }
 
 void task_tof_reader(void *pvParameters)
@@ -278,6 +414,15 @@ void task_sensor_snapshot(void *pvParameters)
         }
         uint64_t metric_started = esp_timer_get_time();
         runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_scheduled, metric_started);
+
+        imu_sample_t raw_imu;
+        if (sensor_read_imu_sample(&raw_imu)) {
+            sample_snapshot_publish(&s_imu_samples, &raw_imu);
+            TaskHandle_t fusion_task = atomic_load_explicit(&s_fusion_task, memory_order_acquire);
+            if (fusion_task) xTaskNotifyGive(fusion_task);
+        } else {
+            runtime_metrics_count(RUNTIME_TASK_SNAPSHOT, RUNTIME_EVENT_SENSOR_SKIP);
+        }
 
         /* IMU — always available, 20 Hz. GPS — whatever the driver currently
          * has cached. Both modes need these; ToF/detections/full-snapshot

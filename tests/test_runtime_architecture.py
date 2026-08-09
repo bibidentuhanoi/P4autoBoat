@@ -841,3 +841,18 @@ def test_core1_diagnostics_publishes_motor_status():
             check=True,
         )
         subprocess.run([str(binary)], check=True)
+
+
+def test_fusion_only_consumes_versioned_raw_samples():
+    fusion_source = (ROOT / "main" / "sensor_fusion.c").read_text()
+
+    assert "sample_snapshot_read" in fusion_source
+    assert "fusion_update_sample" in fusion_source
+    for forbidden in (
+        "imu_read_",
+        "imu_recover_",
+        "imu_reinit_",
+        "g_i2c_mutex",
+        "g_inference_active",
+    ):
+        assert forbidden not in fusion_source
