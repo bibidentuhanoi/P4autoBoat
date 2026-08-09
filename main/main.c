@@ -34,6 +34,8 @@
 #include "motor_control.h"
 #include "transports/espnow_transport.h"
 #include "sd_card.h"
+#include "runtime_metrics.h"
+#include "runtime_task.h"
 static const char* TAG = "MAIN";
 
 // Configuration
@@ -62,6 +64,7 @@ volatile bool g_field_mode = false;
 // ==========================================
 void app_main(void) {
     ESP_LOGI(TAG, "=== SYSTEM BOOT ===");
+    runtime_metrics_init();
 
     // 1. Initialize NVS
     ESP_LOGI(TAG, "Initializing NVS...");
@@ -294,7 +297,7 @@ void app_main(void) {
     // 12. Start RTOS Tasks — loud failure: a silent Snap_Task death means no
     //     telemetry at all (dashboard shows no IMU/ToF/GPS and arming stays locked).
     ESP_LOGI(TAG, "Starting tasks...");
-    if (xTaskCreate(task_imu_fusion, "IMU_Task", 4096, NULL, 4, NULL) != pdPASS) {
+    if (runtime_task_create(RUNTIME_TASK_FUSION, task_imu_fusion, NULL, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
     }
     /* 12b. microSD — LAST, and soft-optional. It shares the SDMMC peripheral
@@ -307,11 +310,14 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(sensor_task_init());
     /* ToF reader FIRST: it fills the cache the snapshot task reads. */
-    if (xTaskCreate(task_tof_reader, "ToF_Task", 8192, &tof_devs, 4, NULL) != pdPASS) {
+    if (runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_tof_reader, &tof_devs, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "FATAL: ToF_Task create failed — snapshots will carry no ToF");
     }
-    if (xTaskCreate(task_sensor_snapshot, "Snap_Task", 16384, &tof_devs, 4, NULL) != pdPASS) {
+    if (runtime_task_create(RUNTIME_TASK_SNAPSHOT, task_sensor_snapshot, &tof_devs, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "FATAL: Snap_Task create failed (out of internal RAM) — no telemetry");
+    }
+    if (runtime_task_create(RUNTIME_TASK_DIAGNOSTICS, task_runtime_diagnostics, NULL, NULL) != ESP_OK) {
+        ESP_LOGE(TAG, "Diagnostics task create failed");
     }
 
     ESP_LOGI(TAG, "System running.");

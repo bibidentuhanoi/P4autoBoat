@@ -21,6 +21,7 @@
 #include "common.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "runtime_metrics.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -152,6 +153,8 @@ void task_tof_reader(void *pvParameters)
     ESP_LOGI(TAG, "ToF reader task started (polling every %d ms)", TOF_POLL_INTERVAL_MS);
 
     while (true) {
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_SENSOR_BUS, metric_started, metric_started);
         if (g_inference_active) {
             while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
             last_wake = xTaskGetTickCount();
@@ -166,9 +169,10 @@ void task_tof_reader(void *pvParameters)
                 xSemaphoreGive(g_i2c_mutex);
                 if (held > max_read_us_a) max_read_us_a = held;
                 if (r == ESP_OK) { ok_a++;   held_us_a_ok += held; tof_cache_store(&s_cache_a, &res, med_a, &med_idx_a); }
-                else             { notready_a++; held_us_a_notready += held; }
+                else             { notready_a++; held_us_a_notready += held; runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR); }
             } else {
                 mutexfail_a++;
+                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_SKIP);
             }
         }
 
@@ -180,9 +184,10 @@ void task_tof_reader(void *pvParameters)
                 xSemaphoreGive(g_i2c_mutex);
                 if (held > max_read_us_b) max_read_us_b = held;
                 if (r == ESP_OK) { ok_b++;   held_us_b_ok += held; tof_cache_store(&s_cache_b, &res, med_b, &med_idx_b); }
-                else             { notready_b++; held_us_b_notready += held; }
+                else             { notready_b++; held_us_b_notready += held; runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR); }
             } else {
                 mutexfail_b++;
+                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_SKIP);
             }
         }
 
@@ -207,6 +212,7 @@ void task_tof_reader(void *pvParameters)
             report_div = 0;
         }
 
+        runtime_metrics_cycle_end(RUNTIME_TASK_SENSOR_BUS, esp_timer_get_time());
         xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_POLL_INTERVAL_MS));
     }
 }
@@ -258,6 +264,8 @@ void task_sensor_snapshot(void *pvParameters)
     uint32_t overruns = 0;
 
     while (true) {
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_started, metric_started);
         /* Yield while inference is running — avoid DMA/PSRAM contention */
         if (g_inference_active) {
             while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
@@ -379,6 +387,7 @@ void task_sensor_snapshot(void *pvParameters)
          * deadline had already passed, i.e. the work itself overran — surfaced
          * here so a slow loop is visible instead of silently halving the rate
          * the way the old vTaskDelay() did. */
+        runtime_metrics_cycle_end(RUNTIME_TASK_SNAPSHOT, esp_timer_get_time());
         if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS)) == pdFALSE) {
             if ((++overruns % 50) == 1) {
                 ESP_LOGW(TAG, "snapshot loop overrun (#%u): work exceeded %d ms",

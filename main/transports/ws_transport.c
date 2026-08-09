@@ -5,6 +5,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "runtime_metrics.h"
+#include "runtime_task.h"
 #include <string.h>
 #include <errno.h>
 #include <sys/poll.h>
@@ -173,6 +176,8 @@ static void ws_tx_task(void *arg)
     static ws_queued_send_arg_t send_arg;
 
     while (true) {
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_WS_TX, metric_started, metric_started);
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
         /* ---- Copy slot under mutex ---- */
@@ -211,6 +216,7 @@ static void ws_tx_task(void *arg)
         }
         s_close_count = 0;
         xSemaphoreGive(s_client_mutex);
+        runtime_metrics_cycle_end(RUNTIME_TASK_WS_TX, esp_timer_get_time());
     }
 }
 
@@ -335,9 +341,7 @@ esp_err_t ws_transport_init(httpd_handle_t server)
      * (client crash, network drop), so stale fds are removed when send fails. */
 
     /* Start TX task — owns all WiFi sends, decoupled from sensor task */
-    BaseType_t ret_task = xTaskCreate(ws_tx_task, "WS_TX", WS_TX_STACK,
-                                      NULL, WS_TX_PRIORITY, &s_tx_task);
-    if (ret_task != pdPASS) {
+    if (runtime_task_create(RUNTIME_TASK_WS_TX, ws_tx_task, NULL, &s_tx_task) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create WS TX task");
         return ESP_ERR_NO_MEM;
     }

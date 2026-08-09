@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "runtime_schedule.c"
         "runtime_task.c"
+        "runtime_metrics.c"
                        "sd_card.c"
         "file_system.c"
         "sensor_fusion.c"

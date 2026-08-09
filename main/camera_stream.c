@@ -8,6 +8,9 @@
 #include "linux/videodev2.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "runtime_metrics.h"
+#include "runtime_task.h"
 #include <string.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -32,10 +35,18 @@ static volatile bool s_client_streaming = false;
 static void camera_drain_task(void *pvParameters)
 {
     while (true) {
-        if (g_inference_active) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_CAMERA_DRAIN, metric_started, metric_started);
+        if (g_inference_active) {
+            runtime_metrics_count(RUNTIME_TASK_CAMERA_DRAIN, RUNTIME_EVENT_FEATURE_DISABLED);
+            runtime_metrics_cycle_end(RUNTIME_TASK_CAMERA_DRAIN, esp_timer_get_time());
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         if (!s_client_streaming) {
             camera_drain_frame();
         }
+        runtime_metrics_cycle_end(RUNTIME_TASK_CAMERA_DRAIN, esp_timer_get_time());
         vTaskDelay(pdMS_TO_TICKS(30));
     }
 }
@@ -136,7 +147,8 @@ esp_err_t camera_stream_server_start(void)
                         TAG, "register /stream failed");
 
     /* Lightweight drain — keeps ISP pipeline alive when no MJPEG client */
-    xTaskCreate(camera_drain_task, "CamDrain", 2048, NULL, 2, NULL);
+    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_CAMERA_DRAIN, camera_drain_task, NULL, NULL),
+                        TAG, "camera drain task failed");
 
     return ESP_OK;
 }

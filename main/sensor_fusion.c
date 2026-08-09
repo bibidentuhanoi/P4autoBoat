@@ -1,6 +1,7 @@
 #include "sensor_fusion.h"
 #include "detect_task.h"
 #include "esp_timer.h"
+#include "runtime_metrics.h"
 #include "esp_log.h"
 #include "math.h"
 #include <stdlib.h>
@@ -103,6 +104,8 @@ void task_imu_fusion(void *pvParameters) {
     int64_t max_gap_us = 0;
 
     while(1) {
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_FUSION, metric_started, metric_started);
         while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
         int64_t now = esp_timer_get_time();
         float dt = (float)(now - last_time) / 1000000.0f;
@@ -135,6 +138,8 @@ void task_imu_fusion(void *pvParameters) {
                 last_report_us = now;
             }
             vTaskDelay(pdMS_TO_TICKS(20));
+            runtime_metrics_count(RUNTIME_TASK_FUSION, RUNTIME_EVENT_SENSOR_SKIP);
+            runtime_metrics_cycle_end(RUNTIME_TASK_FUSION, esp_timer_get_time());
             continue;
         }
         // MAG READ
@@ -418,6 +423,7 @@ void task_imu_fusion(void *pvParameters) {
             last_report_us = now;
         }
 
+        runtime_metrics_cycle_end(RUNTIME_TASK_FUSION, esp_timer_get_time());
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
