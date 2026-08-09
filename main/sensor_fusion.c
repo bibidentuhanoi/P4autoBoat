@@ -1,9 +1,11 @@
 #include "sensor_fusion.h"
 
-#include "sensor_task.h"
-#include "esp_log.h"
+#include "sample_snapshot.h"
 #include "esp_timer.h"
 #include "runtime_metrics.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -20,16 +22,22 @@
 #define YAW_MAG_NORM_MIN     800.0f
 
 typedef struct {
-    atomic_uint_fast32_t version;
-    atomic_uint_fast32_t pitch_bits;
-    atomic_uint_fast32_t roll_bits;
-    atomic_uint_fast32_t heading_bits;
+    atomic_uint version;
+    atomic_uint pitch_bits;
+    atomic_uint roll_bits;
+    atomic_uint heading_bits;
 } fusion_result_slot_t;
 
 typedef struct {
     fusion_result_slot_t slots[2];
-    atomic_uint_fast32_t published_sequence;
+    atomic_uint published_sequence;
 } fusion_result_snapshot_t;
+
+_Static_assert(sizeof(unsigned int) == 4, "fusion snapshot requires 32-bit unsigned int");
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "fusion snapshot atomics must be lock-free");
+
+extern sample_snapshot_t *sensor_imu_sample_snapshot(void);
+extern void sensor_task_register_fusion_task(TaskHandle_t task);
 
 static CalibrationData *calib;
 static fusion_result_snapshot_t result_snapshot;
@@ -72,8 +80,8 @@ static void fusion_result_snapshot_init(void)
 static void fusion_publish_result(uint32_t sequence, const FusionResult *result)
 {
     fusion_result_slot_t *slot = &result_snapshot.slots[sequence & 1U];
-    uint_fast32_t stable_version = (uint_fast32_t)sequence << 1U;
-    atomic_store_explicit(&slot->version, stable_version | 1U, memory_order_release);
+    unsigned stable_version = sequence << 1U;
+    atomic_exchange_explicit(&slot->version, stable_version | 1U, memory_order_acq_rel);
     atomic_store_explicit(&slot->pitch_bits, float_bits(result->pitch), memory_order_relaxed);
     atomic_store_explicit(&slot->roll_bits, float_bits(result->roll), memory_order_relaxed);
     atomic_store_explicit(&slot->heading_bits, float_bits(result->heading), memory_order_relaxed);
@@ -92,6 +100,7 @@ void fusion_init(CalibrationData *calib_data)
     declination_deg = strtof(CONFIG_HEADING_DECLINATION_DEG, NULL);
     pitch = calib->pitch_tare;
     roll = calib->roll_tare;
+    memset(mag_filt, 0, sizeof(mag_filt));
     heading_yaw = 0.0f;
     yaw_init = false;
     last_capture_us = 0;
@@ -100,21 +109,21 @@ void fusion_init(CalibrationData *calib_data)
 void fusion_get_result(FusionResult *res)
 {
     for (;;) {
-        uint_fast32_t sequence = atomic_load_explicit(&result_snapshot.published_sequence, memory_order_acquire);
+        unsigned sequence = atomic_load_explicit(&result_snapshot.published_sequence, memory_order_acquire);
         if (sequence == 0) {
             *res = (FusionResult){0};
             return;
         }
         const fusion_result_slot_t *slot = &result_snapshot.slots[sequence & 1U];
-        uint_fast32_t expected_version = sequence << 1U;
-        uint_fast32_t before = atomic_load_explicit(&slot->version, memory_order_acquire);
+        unsigned expected_version = sequence << 1U;
+        unsigned before = atomic_load_explicit(&slot->version, memory_order_acquire);
         if (before != expected_version) continue;
         FusionResult candidate = {
             .pitch = bits_float((uint32_t)atomic_load_explicit(&slot->pitch_bits, memory_order_relaxed)),
             .roll = bits_float((uint32_t)atomic_load_explicit(&slot->roll_bits, memory_order_relaxed)),
             .heading = bits_float((uint32_t)atomic_load_explicit(&slot->heading_bits, memory_order_relaxed)),
         };
-        uint_fast32_t after = atomic_load_explicit(&slot->version, memory_order_acquire);
+        unsigned after = atomic_load_explicit(&slot->version, memory_order_acquire);
         if (before == after) {
             *res = candidate;
             return;

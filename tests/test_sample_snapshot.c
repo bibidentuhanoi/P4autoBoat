@@ -43,6 +43,16 @@ static void test_read_returns_one_complete_latest_generation(void)
     assert(out.captured_us == 2000);
 }
 
+static void test_snapshot_payload_uses_lock_free_word_atomics(void)
+{
+    sample_snapshot_t box;
+    sample_snapshot_init(&box);
+
+    assert(atomic_is_lock_free(&box.slots[0].version));
+    assert(atomic_is_lock_free(&box.slots[0].captured_us_low));
+    assert(atomic_is_lock_free(&box.slots[0].captured_us_high));
+}
+
 typedef struct {
     sample_snapshot_t *box;
     atomic_bool done;
@@ -104,6 +114,7 @@ static void test_reader_never_observes_mixed_generations_under_stress(void)
 int main(void)
 {
     test_read_returns_one_complete_latest_generation();
+    test_snapshot_payload_uses_lock_free_word_atomics();
     test_reader_never_observes_mixed_generations_under_stress();
     return 0;
 }
