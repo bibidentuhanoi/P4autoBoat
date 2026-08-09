@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "main.c"
+        "runtime_schedule.c"
+        "runtime_task.c"
                        "sd_card.c"
         "file_system.c"
         "sensor_fusion.c"
