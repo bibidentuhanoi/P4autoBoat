@@ -21,6 +21,7 @@
 - No task on Core 0 may mount, open, write, flush, or close microSD files. An unavailable card must leave boot, Wi-Fi/ESP-NOW, manual driving, and all safety behavior unchanged.
 - Future ML remains unimplemented; preserve and measure room for the agreed 260 ms path (50 ms capture/preprocess, 100 ms inference hard budget, 20 ms policy, 10 ms handoff, 80 ms contingency) while the currently tested PicoDet inference is approximately 57 ms.
 - Runtime publishing and metrics use fixed-size startup allocations; no control/sensor update allocates memory after startup.
+- Tests must demonstrate externally observable behavior using host fakes, test seams, or hardware acceptance evidence. Earlier task prose that proposes source-text/token scanning is superseded: do not add source-scanning tests merely to enforce an implementation shape.
 - Critical Core 0 task creation failure keeps outputs de-energized and aborts startup visibly; optional Core 1 failure disables only that feature.
 - LP core is an observer only and must not include or call GPIO, MCPWM, ESC, winch, or steering APIs.
 - No C6 or S3 firmware changes are part of this implementation.
