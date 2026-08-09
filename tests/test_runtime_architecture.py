@@ -845,9 +845,12 @@ def test_core1_diagnostics_publishes_motor_status():
 
 def test_fusion_only_consumes_versioned_raw_samples():
     fusion_source = (ROOT / "main" / "sensor_fusion.c").read_text()
+    raw_snapshot_source = (ROOT / "main" / "sample_snapshot.c").read_text()
 
     assert "sample_snapshot_read" in fusion_source
     assert "fusion_update_sample" in fusion_source
+    assert "atomic_thread_fence(memory_order_seq_cst)" in fusion_source
+    assert "atomic_thread_fence(memory_order_seq_cst)" in raw_snapshot_source
     for forbidden in (
         "imu_read_",
         "imu_recover_",

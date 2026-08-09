@@ -93,6 +93,9 @@ bool sample_snapshot_read(const sample_snapshot_t *snapshot, imu_sample_t *sampl
         }
 
         sample_snapshot_load(slot, sample);
+        /* Full reader-side barrier: all payload loads must complete before the
+         * final version validation, even on weakly ordered RISC-V cores. */
+        atomic_thread_fence(memory_order_seq_cst);
         unsigned after = atomic_load_explicit(&slot->version, memory_order_acquire);
         if (before == after && sample->sequence == sequence) {
             return true;

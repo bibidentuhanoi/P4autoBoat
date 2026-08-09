@@ -123,6 +123,9 @@ void fusion_get_result(FusionResult *res)
             .roll = bits_float((uint32_t)atomic_load_explicit(&slot->roll_bits, memory_order_relaxed)),
             .heading = bits_float((uint32_t)atomic_load_explicit(&slot->heading_bits, memory_order_relaxed)),
         };
+        /* Full reader-side barrier: validate only after this entire result
+         * payload was loaded, including on weakly ordered RISC-V cores. */
+        atomic_thread_fence(memory_order_seq_cst);
         unsigned after = atomic_load_explicit(&slot->version, memory_order_acquire);
         if (before == after) {
             *res = candidate;
