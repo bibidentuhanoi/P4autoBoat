@@ -155,9 +155,10 @@ static void reinit_watchdog_cb(void *arg)
 /* ---------------------------------------------------------------------------
  * upstream_cb — registered for PEER_MSG_UPSTREAM (C6→P4 commands)
  * -------------------------------------------------------------------------*/
-static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len, void *local_context)
 {
     (void)msg_id;
+    (void)local_context;
     s_last_upstream_us = esp_timer_get_time();
     s_reinit_attempts  = 0;   /* real traffic heard -- link is genuinely alive again */
 
@@ -195,9 +196,10 @@ static void upstream_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
  * init_status_cb — registered for PEER_MSG_INIT_STATUS (C6→P4, one-shot LR
  * rate-config result; see tools/slave_firmware/espnow_bridge.c's init_cb).
  * -------------------------------------------------------------------------*/
-static void init_status_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+static void init_status_cb(uint32_t msg_id, const uint8_t *data, size_t data_len, void *local_context)
 {
     (void)msg_id;
+    (void)local_context;
     if (!data || data_len < 1) {
         return;
     }
@@ -333,14 +335,14 @@ esp_err_t espnow_transport_probe(uint32_t timeout_ms)
     }
 
     /* --- Register upstream callback for C6→P4 commands --- */
-    ret = esp_hosted_register_custom_callback(PEER_MSG_UPSTREAM, upstream_cb);
+    ret = esp_hosted_register_custom_callback(PEER_MSG_UPSTREAM, upstream_cb, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register upstream callback (%s)", esp_err_to_name(ret));
         return ret;
     }
 
     /* --- Register the one-shot LR-status callback --- */
-    ret = esp_hosted_register_custom_callback(PEER_MSG_INIT_STATUS, init_status_cb);
+    ret = esp_hosted_register_custom_callback(PEER_MSG_INIT_STATUS, init_status_cb, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register init-status callback (%s)", esp_err_to_name(ret));
         return ret;

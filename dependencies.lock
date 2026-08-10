@@ -108,15 +108,15 @@ dependencies:
       type: service
     version: 1.0.4
   espressif/esp_hosted:
-    component_hash: e23eb702781c804a62909e5394da0641a2bff9adccec6673a7bff60ce8c8b756
+    component_hash: 8ca10092db3e8c8122540d907ab705805a269377d31192f087ba1def2f5f4f91
     dependencies:
     - name: idf
       require: private
       version: '>=5.3'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
-    version: 2.12.3
+    version: 2.12.12
   espressif/esp_ipa:
     component_hash: 31003e536f0d26158e10d7fcf2448b6377ce1148518287d0f34ed3b6c942c6d8
     dependencies:
@@ -292,13 +292,12 @@ dependencies:
     version: 4.0.0
 direct_dependencies:
 - espressif/cat_detect
-- espressif/esp_hosted
 - espressif/esp_new_jpeg
 - espressif/esp_video
 - espressif/esp_wifi_remote
 - idf
 - livekit/nanopb
 - rjrp44/vl53l5cx
-manifest_hash: 46a3ac8cf1b2e72559c15641a35bb720ef4a1fb8c2ca3ce5e5630524acaea58d
+manifest_hash: e99149cf487eeb8cccc91070707519b3c9cdb5652e9129c29d916a960df105da
 target: esp32p4
 version: 2.0.0
