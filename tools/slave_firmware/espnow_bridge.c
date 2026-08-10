@@ -29,7 +29,21 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_hosted_coprocessor_fw_ver.h"
 #include "esp_hosted_peer_data.h"
+
+/* ESP-Hosted 2.12.12 adds an opaque callback context parameter.  The bridge
+ * is built from a selected hosted release, so accept both the original 2.12.3
+ * API and the newer API rather than silently generating an incompatible C6
+ * image. */
+#if (PROJECT_VERSION_MAJOR_1 > 2) || \
+    ((PROJECT_VERSION_MAJOR_1 == 2) && (PROJECT_VERSION_MINOR_1 > 12)) || \
+    ((PROJECT_VERSION_MAJOR_1 == 2) && (PROJECT_VERSION_MINOR_1 == 12) && \
+     (PROJECT_VERSION_PATCH_1 >= 12))
+#define ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT 1
+#else
+#define ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT 0
+#endif
 
 /* -------------------------------------------------------------------------
  * Constants – replicated from the shared protocol header since this is a
@@ -182,9 +196,16 @@ static void espnow_tx_task(void *arg)
  * queue state those callers rely on being consistent. A zero timeout keeps
  * the exact same non-blocking, drop-if-full behaviour as before.
  * ---------------------------------------------------------------------- */
-static void video_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+static void video_cb(uint32_t msg_id, const uint8_t *data, size_t data_len
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+                     , void *local_context
+#endif
+)
 {
     (void)msg_id;
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    (void)local_context;
+#endif
 
     uint8_t *buf = malloc(data_len);
     if (!buf) {
@@ -210,9 +231,16 @@ static void video_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
  * Invoked for PEER_MSG_COMMAND.  Commands are small and latency-sensitive so
  * they bypass the queue and go directly to esp_now_send().
  * ---------------------------------------------------------------------- */
-static void command_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+static void command_cb(uint32_t msg_id, const uint8_t *data, size_t data_len
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+                       , void *local_context
+#endif
+)
 {
     (void)msg_id;
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    (void)local_context;
+#endif
 
     if (!s_espnow_ready) {
         ESP_LOGW(TAG, "command_cb: ESP-NOW not ready, dropping command");
@@ -242,9 +270,16 @@ static void command_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
  * Initialises ESP-NOW, adds the peer, and registers the receive callback.
  * Idempotent: if called again esp_now_deinit() is called first to reset state.
  * ---------------------------------------------------------------------- */
-static void init_cb(uint32_t msg_id, const uint8_t *data, size_t data_len)
+static void init_cb(uint32_t msg_id, const uint8_t *data, size_t data_len
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+                    , void *local_context
+#endif
+)
 {
     (void)msg_id;
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    (void)local_context;
+#endif
 
     if (data_len < 1 + ESP_NOW_ETH_ALEN) {
         ESP_LOGE(TAG, "init_cb: payload too short (%zu bytes, need %d)",
@@ -416,19 +451,31 @@ esp_err_t espnow_bridge_init(void)
     /* Register hosted callbacks */
     esp_err_t err;
 
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    err = esp_hosted_register_custom_callback(PEER_MSG_VIDEO, video_cb, NULL);
+#else
     err = esp_hosted_register_custom_callback(PEER_MSG_VIDEO, video_cb);
+#endif
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register video_cb failed: %s", esp_err_to_name(err));
         goto fail;
     }
 
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    err = esp_hosted_register_custom_callback(PEER_MSG_COMMAND, command_cb, NULL);
+#else
     err = esp_hosted_register_custom_callback(PEER_MSG_COMMAND, command_cb);
+#endif
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register command_cb failed: %s", esp_err_to_name(err));
         goto fail;
     }
 
+#if ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT
+    err = esp_hosted_register_custom_callback(PEER_MSG_INIT, init_cb, NULL);
+#else
     err = esp_hosted_register_custom_callback(PEER_MSG_INIT, init_cb);
+#endif
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register init_cb failed: %s", esp_err_to_name(err));
         goto fail;

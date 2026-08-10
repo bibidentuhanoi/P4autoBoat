@@ -6,8 +6,8 @@ Builds the esp-hosted `network_adapter` firmware for the ESP32-C6 co-processor.
 
 ```bash
 cd tools/slave_firmware
-./build.sh           # builds latest (v2.12.3)
-./build.sh 2.12.3    # or specify version
+./build.sh           # builds the P4-paired release (v2.12.12)
+./build.sh 2.12.12   # or specify a supported version
 ```
 
 ## Output

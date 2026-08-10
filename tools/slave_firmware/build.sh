@@ -12,7 +12,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build_slave"
-VERSION="${1:-2.12.3}"
+VERSION="${1:-2.12.12}"
 
 echo "=== Building ESP-Hosted slave firmware v${VERSION} for ESP32-C6 ==="
 
