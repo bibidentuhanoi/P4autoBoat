@@ -105,6 +105,16 @@ typedef struct {
     int64_t requested_us;
 } arm_request_message_t;
 
+/* Pure command recency -- deliberately does NOT treat an open WS connection
+ * as sufficient on its own. tests/test_runtime_architecture.py's
+ * test_pipeline_handlers_do_not_write_actuators asserts throttle/winch/steer
+ * all zero out after CONTROL_LINK_TIMEOUT_US of silence with the WS-client
+ * stub fixed at "connected" the whole time -- i.e. a stale browser tab
+ * holding an open socket must still fail safe. (2026-08-10: an earlier
+ * revision of this fix OR'd in ws_transport_client_count() > 0 to solve the
+ * ARMING-duration problem below; that broke this exact test, correctly --
+ * "still connected" and "still receiving commands" are different safety
+ * claims, and only the second one should keep throttle live.) */
 static inline bool control_link_alive(void)
 {
     int64_t last;
@@ -627,9 +637,40 @@ static void control_apply_decision(control_decision_t *decision)
 {
     bool changed = false;
     bool explicit_off = decision->servo_power_off;
-    bool safe_stop = explicit_off || decision->disarm || decision->failsafe;
+    /* Arm-gating and the failsafe-zeroing branch below both use general link
+     * liveness (control_link_alive(), refreshed by ANY accepted arbiter
+     * command incl. the arm click itself), not decision->failsafe.
+     * decision->failsafe is drive-proposal-specific: drive->valid only
+     * becomes true once a throttle/rudder command has actually been
+     * submitted, so on a fresh connect (arm clicked before ever touching the
+     * throttle) failsafe was permanently true, which alone blocked arming,
+     * and ALSO used to gate the zeroing branch below (which unconditionally
+     * clears s_arm_power_allowed whenever it fires) -- the two branches were
+     * fighting until both were switched to safe_stop (2026-08-10).
+     *
+     * safe_stop ALSO grants a grace exception while ESC_STATE_ARMING:
+     * CONTROL_LINK_TIMEOUT_US (400ms) is shorter than ARMING_DURATION_US
+     * (3s), so a user who clicks ARM once and touches nothing else for the
+     * rest of the sequence would otherwise have control_link_alive() go
+     * false ~400ms in, well before ARM_ACTION_COMPLETE arrives 3s later --
+     * confirmed on hardware, ARMING pulsed for the full duration then
+     * reverted to DISARMED right at completion. Scoped to ESC_STATE_ARMING
+     * specifically (not "connected", not any other state) so it can't mask
+     * a genuinely dead link once armed and driving: an earlier revision
+     * tried OR-ing in ws_transport_client_count() > 0 instead, which fixed
+     * this but broke tests/test_runtime_architecture.py's
+     * test_pipeline_handlers_do_not_write_actuators -- that test explicitly
+     * holds a WS-connected stub for CONTROL_LINK_TIMEOUT_US of silence and
+     * asserts throttle/winch/steer all zero out anyway, i.e. a stale
+     * browser tab holding an open socket must still fail safe. "Still
+     * connected" and "still receiving commands" are different safety
+     * claims; only mid-arming specifically needed the exception. */
+    bool safe_stop = explicit_off || decision->disarm ||
+                     (!control_link_alive() &&
+                      esc_driver_get_state() != ESC_STATE_ARMING);
     bool internal_disarm = control_apply_arm_action(decision, safe_stop, &changed);
-    safe_stop = explicit_off || decision->disarm || decision->failsafe;
+    safe_stop = explicit_off || decision->disarm ||
+               (!control_link_alive() && esc_driver_get_state() != ESC_STATE_ARMING);
 
     if (explicit_off) {
         s_rail_cut = true;
@@ -648,7 +689,7 @@ static void control_apply_decision(control_decision_t *decision)
         }
         s_manual_rudder = 1.0f;
         heading_assist_reset();
-    } else if (decision->disarm || decision->failsafe) {
+    } else if (safe_stop) {
         s_arm_power_allowed = false;
         float left;
         float right;
@@ -673,7 +714,7 @@ static void control_apply_decision(control_decision_t *decision)
         s_manual_right = 0.0f;
         s_manual_rudder = 0.0f;
         heading_assist_reset();
-        if (decision->failsafe && changed) {
+        if (!control_link_alive() && changed) {
             ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
         }
     }
