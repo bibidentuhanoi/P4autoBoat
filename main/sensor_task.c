@@ -39,7 +39,11 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
 }
 
 #define SNAPSHOT_INTERVAL_MS  50   /* 20 Hz sensor publish */
-#define TOF_EVERY_N           4    /* ToF at every 4th tick = 5 Hz (keeps WS traffic low) */
+#define TOF_EVERY_N           2    /* ToF at every 2nd tick = 10 Hz, matching
+                                     * SENSOR_TOF_PERIOD_US in sensor_schedule.c
+                                     * -- no point publishing faster than the
+                                     * cache actually refreshes, or slower and
+                                     * sitting on fresher data than we send. */
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
 
 /* ─── ToF acquisition and processing ────────────────────────────────────────
@@ -61,6 +65,21 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
  * ───────────────────────────────────────────────────────────────────────────*/
 #define SENSOR_BUS_INTERVAL_MS 20
 #define TOF_INITIAL_BUDGET_US 15000U
+/* Ceiling for the learned worst-case ToF read time (see max_read_us_a/b in
+ * task_sensor_bus). A read slower than this cannot fit in a single
+ * SensorBus tick's remaining slack no matter what -- letting the learned
+ * value exceed it makes sensor_schedule_choose_tof()'s deadline-protection
+ * check permanently unsatisfiable, which silently disables that sensor's
+ * ToF reads for the rest of the session. Confirmed on hardware 2026-08-10:
+ * one ~35.7ms read latched max_read_us_a and ToFProc dropped from an
+ * expected ~5Hz to 2 total runs in over a minute, with no error anywhere --
+ * skipped_tof_reads/deadline_protection_skips aren't logged. Clamping means
+ * an occasional slow read still overruns that one SensorBus tick (visible
+ * via its `misses` metric, already tolerated -- Fusion's own 40ms deadline
+ * absorbed the observed 35.7ms stretch with misses=0) instead of disabling
+ * ToF permanently and invisibly. Value: comfortably under one 20ms tick
+ * after sensor_schedule.c's 2ms guard and IMU-read overhead. */
+#define TOF_BUDGET_CEILING_US 14000U
 #define TOF_STALE_US   (1000 * 1000)  /* cached grid older than this = not valid */
 
 #define TOF_NVALS  (64 * VL53L5CX_NB_TARGET_PER_ZONE)
@@ -413,10 +432,12 @@ void task_sensor_bus(void *pvParameters)
                 esp_err_t result =
                     tof_read_grid(device, &channel->buffers[slot]);
                 uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_started);
-                if (selected == SENSOR_TOF_A && read_us > max_read_us_a) {
-                    max_read_us_a = read_us;
-                } else if (selected == SENSOR_TOF_B && read_us > max_read_us_b) {
-                    max_read_us_b = read_us;
+                uint32_t clamped_read_us = read_us > TOF_BUDGET_CEILING_US
+                    ? TOF_BUDGET_CEILING_US : read_us;
+                if (selected == SENSOR_TOF_A && clamped_read_us > max_read_us_a) {
+                    max_read_us_a = clamped_read_us;
+                } else if (selected == SENSOR_TOF_B && clamped_read_us > max_read_us_b) {
+                    max_read_us_b = clamped_read_us;
                 }
                 if (result == ESP_OK) {
                     atomic_store_explicit(&channel->generation, generation,

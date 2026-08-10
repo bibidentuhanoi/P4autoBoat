@@ -254,11 +254,13 @@ void task_runtime_diagnostics(void *arg)
                     runtime_metrics_set_stack(id, uxTaskGetStackHighWaterMark(handle));
                 }
                 runtime_metrics_snapshot(id, &metrics);
-                ESP_LOGI(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u",
+                ESP_LOGI(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u skips=%u errors=%u",
                          spec->name, spec->core, (unsigned)spec->priority,
                          (unsigned)metrics.runs, (unsigned)metrics.max_exec_us,
                          (unsigned)metrics.max_gap_us, (unsigned)metrics.max_jitter_us,
-                         (unsigned)metrics.deadline_misses, (unsigned)metrics.stack_free_words);
+                         (unsigned)metrics.deadline_misses, (unsigned)metrics.stack_free_words,
+                         (unsigned)metrics.events[RUNTIME_EVENT_SENSOR_SKIP],
+                         (unsigned)metrics.events[RUNTIME_EVENT_SENSOR_ERROR]);
             }
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1) && \
     (configUSE_CORE_AFFINITY == 1) && (configNUMBER_OF_CORES > 1)

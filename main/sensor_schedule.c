@@ -1,8 +1,15 @@
 #include "sensor_schedule.h"
 
 #define SENSOR_IMU_PERIOD_US 20000U
-#define SENSOR_TOF_PERIOD_US 200000U
-#define SENSOR_TOF_B_OFFSET_US 100000U
+/* 5Hz->10Hz per sensor (2026-08-10, "make ToF more real time"). A single
+ * VL53L5CX read measures ~35ms (see TOF_BUDGET_CEILING_US in sensor_task.c),
+ * comfortably under this 100ms period with no back-to-back overlap risk.
+ * Keep SENSOR_TOF_B_OFFSET_US at half of this if tuning further, so A/B stay
+ * evenly interleaved. Faster than this starts eating into the recovery
+ * margin between SensorBus tick overruns -- check the RTM log's
+ * SensorBus/Fusion misses/max_gap_us after changing. */
+#define SENSOR_TOF_PERIOD_US 100000U
+#define SENSOR_TOF_B_OFFSET_US 50000U
 #define SENSOR_TOF_GUARD_US 2000U
 
 void sensor_schedule_init(sensor_schedule_t *schedule, uint64_t start_us)
