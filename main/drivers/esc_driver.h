@@ -20,11 +20,18 @@ typedef enum {
 esp_err_t   esc_driver_init(void);
 
 /**
- * Begin the 3-second arming sequence (neutral pulse held throughout).
- * Transitions state DISARMED -> ARMING -> ARMED on completion.
+ * Begin the arming sequence by holding minimum throttle.
+ * Transitions state DISARMED -> ARMING without waiting.
  * Returns ESP_ERR_INVALID_STATE if not currently DISARMED.
  */
-esp_err_t   esc_driver_arm(void);
+esp_err_t   esc_driver_arm_begin(void);
+
+/**
+ * Complete an arming sequence after the caller-managed hold interval.
+ * Transitions state ARMING -> ARMED without waiting.
+ * Returns ESP_ERR_INVALID_STATE if not currently ARMING.
+ */
+esp_err_t   esc_driver_arm_complete(void);
 
 /**
  * Set throttle for both ESCs. Only valid in ARMED state.

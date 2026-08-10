@@ -1,7 +1,9 @@
 #pragma once
 
 #include "esp_err.h"
+#include "proto/boat.pb.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,12 +16,19 @@ extern "C" {
 esp_err_t motor_control_init_hw(void);
 
 /**
- * Register pipeline handlers and start watchdog. Call AFTER pipeline_init().
+ * Register manual pipeline ingress and start the persistent ControlTask.
+ * Call AFTER pipeline_init().
  */
 esp_err_t motor_control_init(void);
 
-esp_err_t motor_control_arm(bool force);
-esp_err_t motor_control_disarm(void);
+/** Immediately command propulsion and auxiliary actuators to a safe state. */
+void motor_control_disarm(void);
+
+/** Refresh manual-control liveness. Call only after accepting a manual command. */
+void motor_control_notify_link_rx(int64_t received_us);
+
+/** Copy a stable MotorStatus snapshot and return its generation. */
+uint32_t motor_control_get_status(boat_MotorStatus *out);
 
 #ifdef __cplusplus
 }

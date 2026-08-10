@@ -8,6 +8,10 @@
 #include "linux/videodev2.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
+#include "runtime_metrics.h"
+#include "runtime_startup.h"
+#include "runtime_task.h"
 #include <string.h>
 #include <inttypes.h>
 #include <unistd.h>
@@ -20,6 +24,7 @@ static const char *TAG = "CAM_STREAM";
 #define BOUNDARY      "frame"
 #define PART_BOUNDARY "\r\n--" BOUNDARY "\r\n"
 #define PART_HEADER   "Content-Type: image/jpeg\r\nContent-Length: %"PRIu32"\r\n\r\n"
+#define CAMERA_DRAIN_PERIOD_MS 30
 
 /* ---- Frame drain ----
  * The ISP pipeline runs continuously after VIDIOC_STREAMON.
@@ -31,12 +36,22 @@ static volatile bool s_client_streaming = false;
 
 static void camera_drain_task(void *pvParameters)
 {
+    uint64_t metric_scheduled = esp_timer_get_time();
     while (true) {
-        if (g_inference_active) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (g_inference_active) {
+            runtime_metrics_count(RUNTIME_TASK_CAMERA_DRAIN, RUNTIME_EVENT_FEATURE_DISABLED);
+            while (g_inference_active) vTaskDelay(pdMS_TO_TICKS(10));
+            metric_scheduled = esp_timer_get_time();
+            continue;
+        }
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_CAMERA_DRAIN, metric_scheduled, metric_started);
         if (!s_client_streaming) {
             camera_drain_frame();
         }
-        vTaskDelay(pdMS_TO_TICKS(30));
+        runtime_metrics_cycle_end(RUNTIME_TASK_CAMERA_DRAIN, esp_timer_get_time());
+        metric_scheduled += (uint64_t)CAMERA_DRAIN_PERIOD_MS * 1000U;
+        vTaskDelay(pdMS_TO_TICKS(CAMERA_DRAIN_PERIOD_MS));
     }
 }
 
@@ -136,7 +151,13 @@ esp_err_t camera_stream_server_start(void)
                         TAG, "register /stream failed");
 
     /* Lightweight drain — keeps ISP pipeline alive when no MJPEG client */
-    xTaskCreate(camera_drain_task, "CamDrain", 2048, NULL, 2, NULL);
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_CAMERA_DRAIN,
+                                               camera_drain_task, NULL, NULL);
+    if (task_error != ESP_OK) {
+        httpd_stop(server);
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_CAMERA_DRAIN,
+                                                   task_error);
+    }
 
     return ESP_OK;
 }

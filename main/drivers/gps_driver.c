@@ -6,8 +6,12 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+
+#include "gps_snapshot.h"
+#include "gps_uart_events.h"
+#include "runtime_task.h"
 
 #include "sdkconfig.h"
 #include <stdlib.h>
@@ -17,9 +21,6 @@ static const char *TAG = "GPS";
 
 #define NMEA_MAX_LINE     100   /* NMEA 0183 caps at 82 chars incl CRLF; 100 is safe. */
 #define UART_RX_BUF       2048
-#define GPS_TASK_STACK    4096
-#define GPS_TASK_PRIORITY 3
-
 #define UBX_SYNC1         0xB5
 #define UBX_SYNC2         0x62
 #define UBX_CLASS_NAV     0x01
@@ -28,16 +29,16 @@ static const char *TAG = "GPS";
 #define GPS_LOCK_MIN_SATS 5     /* valid fix + this many sats = "locked" for arming */
 
 static int              s_uart_num = -1;
-static SemaphoreHandle_t s_mutex   = NULL;
-static TaskHandle_t     s_task     = NULL;
-static gps_fix_t        s_fix      = {0};
+static QueueHandle_t    s_uart_events = NULL;
+static TaskHandle_t     s_task = NULL;
+static gps_snapshot_t   s_snapshot;
+static gps_snapshot_entry_t s_parser_entry;
 /* When NAV-PVT is flowing it is authoritative; NMEA is ignored while fresh. */
 static int64_t          s_last_ubx_us = 0;
 /* Link-alive tracking — bumped on ANY checksum-valid sentence/frame, even one
  * we don't otherwise parse (e.g. GSV). Deliberately separate from s_fix's own
  * last_update_us: that one only moves on sentences that carry usable fix
  * fields, this one only means "the module is talking to the UART at all". */
-static int64_t          s_last_rx_us       = 0;
 static bool              s_logged_first_talk = false;
 static bool              s_logged_first_bytes = false;   /* ANY byte at all, valid or not */
 /* Config ACK results — written ONCE, synchronously, inside gps_configure_ublox()
@@ -65,6 +66,11 @@ static bool                s_raw_looks_ubx = false;
  * "this baud is verified working" from "this is just the fallback guess". */
 static uint32_t           s_detected_baud = 0;
 static bool                s_baud_confirmed = false;
+
+static void publish_parser_entry(void)
+{
+    gps_snapshot_publish(&s_snapshot, &s_parser_entry);
+}
 
 /* ---------- little-endian readers ---------- */
 static inline uint16_t rd_u16(const uint8_t *p){ return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -165,28 +171,29 @@ static void parse_navpvt(const uint8_t *p) {
     uint16_t year = rd_u16(p + 4);
     int mon = p[6], day = p[7], hh = p[8], mm = p[9], ss = p[10];
 
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_fix.valid         = fixOk && (fixType == 2 || fixType == 3);
-    s_fix.latitude      = (double)lat * 1e-7;
-    s_fix.longitude     = (double)lon * 1e-7;
-    s_fix.altitude_m    = (float)hMSL / 1000.0f;
-    s_fix.speed_mps     = (float)gSpeed / 1000.0f;
-    s_fix.course_deg    = (float)headMot * 1e-5f;
-    s_fix.speed_acc_mps = (float)sAcc / 1000.0f;
-    s_fix.vel_n_mps     = (float)velN / 1000.0f;
-    s_fix.vel_e_mps     = (float)velE / 1000.0f;
-    s_fix.vel_d_mps     = (float)velD / 1000.0f;
-    s_fix.fix_quality   = fixType;
-    s_fix.satellites    = numSV;
-    s_fix.hdop          = (float)pDOP * 0.01f;   /* position DOP as a proxy */
+    gps_fix_t *fix = &s_parser_entry.fix;
+    fix->valid         = fixOk && (fixType == 2 || fixType == 3);
+    fix->latitude      = (double)lat * 1e-7;
+    fix->longitude     = (double)lon * 1e-7;
+    fix->altitude_m    = (float)hMSL / 1000.0f;
+    fix->speed_mps     = (float)gSpeed / 1000.0f;
+    fix->course_deg    = (float)headMot * 1e-5f;
+    fix->speed_acc_mps = (float)sAcc / 1000.0f;
+    fix->vel_n_mps     = (float)velN / 1000.0f;
+    fix->vel_e_mps     = (float)velE / 1000.0f;
+    fix->vel_d_mps     = (float)velD / 1000.0f;
+    fix->fix_quality   = fixType;
+    fix->satellites    = numSV;
+    fix->hdop          = (float)pDOP * 0.01f;   /* position DOP as a proxy */
     uint64_t ms = utc_to_epoch_ms(year, mon, day, hh, mm, ss, 0.0);
-    if (ms) s_fix.utc_ms = ms;
-    s_fix.last_update_us = esp_timer_get_time();
-    s_last_ubx_us = s_fix.last_update_us;
-    xSemaphoreGive(s_mutex);
+    if (ms) fix->utc_ms = ms;
+    fix->last_update_us = esp_timer_get_time();
+    s_parser_entry.runtime.protocol_authority = GPS_PROTOCOL_UBX;
+    s_last_ubx_us = fix->last_update_us;
+    publish_parser_entry();
 }
 
-/* ---------- NMEA sentence parsers (fallback; caller holds s_mutex) ---------- */
+/* ---------- NMEA sentence parsers (fallback; GPS task is sole writer) ---------- */
 
 static void parse_gga(char *body, gps_fix_t *fix) {
     char *p = body;
@@ -255,21 +262,21 @@ static void parse_rmc(char *body, gps_fix_t *fix) {
 }
 
 /* Dispatch a validated, null-terminated NMEA payload (no '$', no '*cs'). */
-static void dispatch_sentence(char *body) {
-    if (strlen(body) < 5) return;
+static bool dispatch_sentence(char *body) {
+    if (strlen(body) < 5) return false;
     /* NAV-PVT is authoritative while fresh — ignore NMEA to avoid fighting. */
-    if (s_last_ubx_us != 0 && (esp_timer_get_time() - s_last_ubx_us) < 2000000) return;
+    if (s_last_ubx_us != 0 && (esp_timer_get_time() - s_last_ubx_us) < 2000000) {
+        return false;
+    }
 
     const char *sent = body + 2;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if      (!strncmp(sent, "GGA", 3)) parse_gga(body, &s_fix);
-    else if (!strncmp(sent, "RMC", 3)) parse_rmc(body, &s_fix);
-    else {
-        xSemaphoreGive(s_mutex);
-        return;
-    }
-    s_fix.last_update_us = esp_timer_get_time();
-    xSemaphoreGive(s_mutex);
+    if      (!strncmp(sent, "GGA", 3)) parse_gga(body, &s_parser_entry.fix);
+    else if (!strncmp(sent, "RMC", 3)) parse_rmc(body, &s_parser_entry.fix);
+    else return false;
+    s_parser_entry.fix.last_update_us = esp_timer_get_time();
+    s_parser_entry.runtime.protocol_authority = GPS_PROTOCOL_NMEA;
+    publish_parser_entry();
+    return true;
 }
 
 /* ---------- u-blox UBX configuration ---------- */
@@ -446,9 +453,11 @@ static void gps_configure_ublox(int uart) {
 
 /* Called on every checksum-valid NMEA sentence, whatever its talker/type. */
 static void mark_alive_nmea(const char *body) {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_last_rx_us = esp_timer_get_time();
-    xSemaphoreGive(s_mutex);
+    int64_t now = esp_timer_get_time();
+    s_parser_entry.runtime.last_frame_us = now;
+    if (s_last_ubx_us == 0 || now - s_last_ubx_us >= 2000000) {
+        s_parser_entry.runtime.protocol_authority = GPS_PROTOCOL_NMEA;
+    }
     if (!s_logged_first_talk) {
         s_logged_first_talk = true;
         ESP_LOGI(TAG, "GPS module responding on UART%d — first NMEA sentence: $%s",
@@ -458,9 +467,8 @@ static void mark_alive_nmea(const char *body) {
 
 /* Called on every checksum-valid UBX frame, whatever its class/ID. */
 static void mark_alive_ubx(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    s_last_rx_us = esp_timer_get_time();
-    xSemaphoreGive(s_mutex);
+    s_parser_entry.runtime.last_frame_us = esp_timer_get_time();
+    s_parser_entry.runtime.protocol_authority = GPS_PROTOCOL_UBX;
     if (!s_logged_first_talk) {
         s_logged_first_talk = true;
         char hex[3 * 16 + 1] = {0};
@@ -476,113 +484,227 @@ static void mark_alive_ubx(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t 
 
 /* ---------- UART task: hybrid UBX (primary) + NMEA (fallback) ---------- */
 
-static void gps_task(void *arg) {
-    uint8_t rx[256];
-    /* NMEA line accumulator */
-    char   line[NMEA_MAX_LINE];
-    size_t line_len = 0;
-    bool   in_nmea = false;
-    /* UBX frame state machine */
-    enum { U_IDLE, U_S2, U_CLS, U_ID, U_L1, U_L2, U_PL, U_CKA, U_CKB } ust = U_IDLE;
-    uint8_t  ucls = 0, uid = 0, ucka = 0, uckb = 0, rcka = 0;
-    uint16_t ulen = 0, uidx = 0;
-    static uint8_t upayload[128];
+typedef enum { U_IDLE, U_S2, U_CLS, U_ID, U_L1, U_L2, U_PL, U_CKA, U_CKB } ubx_state_t;
 
+typedef struct {
+    char line[NMEA_MAX_LINE];
+    size_t line_len;
+    bool in_nmea;
+    ubx_state_t ubx_state;
+    uint8_t ucls;
+    uint8_t uid;
+    uint8_t ucka;
+    uint8_t uckb;
+    uint8_t received_cka;
+    uint16_t payload_len;
+    uint16_t payload_index;
+    uint8_t payload[128];
+} gps_parser_state_t;
+
+static gps_parser_state_t s_parser;
+
+static void gps_reset_parser(void *context)
+{
+    (void)context;
+    memset(&s_parser, 0, sizeof(s_parser));
+}
+
+static void gps_publish_parse_error(void)
+{
+    ++s_parser_entry.runtime.parse_errors;
+    publish_parser_entry();
+}
+
+static void gps_process_bytes(const uint8_t *bytes, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t b = bytes[i];
+
+        if (s_parser.ubx_state != U_IDLE) {
+            switch (s_parser.ubx_state) {
+            case U_S2:
+                if (b == UBX_SYNC2) {
+                    s_parser.ubx_state = U_CLS;
+                } else {
+                    s_parser.ubx_state = U_IDLE;
+                    gps_publish_parse_error();
+                }
+                break;
+            case U_CLS:
+                s_parser.ucls = b;
+                s_parser.ucka = b;
+                s_parser.uckb = b;
+                s_parser.ubx_state = U_ID;
+                break;
+            case U_ID:
+                s_parser.uid = b;
+                s_parser.ucka += b;
+                s_parser.uckb += s_parser.ucka;
+                s_parser.ubx_state = U_L1;
+                break;
+            case U_L1:
+                s_parser.payload_len = b;
+                s_parser.ucka += b;
+                s_parser.uckb += s_parser.ucka;
+                s_parser.ubx_state = U_L2;
+                break;
+            case U_L2:
+                s_parser.payload_len |= (uint16_t)b << 8;
+                s_parser.ucka += b;
+                s_parser.uckb += s_parser.ucka;
+                s_parser.payload_index = 0;
+                if (s_parser.payload_len == 0) {
+                    s_parser.ubx_state = U_CKA;
+                } else if (s_parser.payload_len <= sizeof(s_parser.payload)) {
+                    s_parser.ubx_state = U_PL;
+                } else {
+                    s_parser.ubx_state = U_IDLE;
+                    gps_publish_parse_error();
+                }
+                break;
+            case U_PL:
+                s_parser.payload[s_parser.payload_index++] = b;
+                s_parser.ucka += b;
+                s_parser.uckb += s_parser.ucka;
+                if (s_parser.payload_index >= s_parser.payload_len) {
+                    s_parser.ubx_state = U_CKA;
+                }
+                break;
+            case U_CKA:
+                s_parser.received_cka = b;
+                s_parser.ubx_state = U_CKB;
+                break;
+            case U_CKB:
+                if (s_parser.received_cka == s_parser.ucka && b == s_parser.uckb) {
+                    mark_alive_ubx(s_parser.ucls, s_parser.uid,
+                                   s_parser.payload, s_parser.payload_len);
+                    if (s_parser.ucls == UBX_CLASS_NAV &&
+                        s_parser.uid == UBX_ID_NAV_PVT &&
+                        s_parser.payload_len >= UBX_NAV_PVT_LEN) {
+                        parse_navpvt(s_parser.payload);
+                    } else {
+                        publish_parser_entry();
+                    }
+                } else {
+                    gps_publish_parse_error();
+                }
+                s_parser.ubx_state = U_IDLE;
+                break;
+            default:
+                s_parser.ubx_state = U_IDLE;
+                break;
+            }
+            continue;
+        }
+
+        if (b == UBX_SYNC1) {
+            s_parser.ubx_state = U_S2;
+            s_parser.in_nmea = false;
+            s_parser.line_len = 0;
+            continue;
+        }
+        if (b == '$') {
+            s_parser.in_nmea = true;
+            s_parser.line_len = 0;
+            s_parser.line[s_parser.line_len++] = '$';
+            continue;
+        }
+
+        if (!s_parser.in_nmea) continue;
+        if (b == '\r' || b == '\n') {
+            s_parser.line[s_parser.line_len] = 0;
+            char *body = nmea_validate(s_parser.line, s_parser.line_len);
+            if (body) {
+                mark_alive_nmea(body);
+                if (!dispatch_sentence(body)) publish_parser_entry();
+            } else {
+                gps_publish_parse_error();
+            }
+            s_parser.in_nmea = false;
+            s_parser.line_len = 0;
+        } else if (s_parser.line_len < sizeof(s_parser.line) - 1) {
+            s_parser.line[s_parser.line_len++] = (char)b;
+        } else {
+            s_parser.in_nmea = false;
+            s_parser.line_len = 0;
+            ++s_parser_entry.runtime.parser_line_overflows;
+            publish_parser_entry();
+        }
+    }
+}
+
+static void gps_log_first_bytes(const uint8_t *rx, int n)
+{
+    if (s_logged_first_bytes || n <= 0) return;
+    s_logged_first_bytes = true;
+    char hex[3 * 16 + 1] = {0};
+    int m = (n < 16) ? n : 16;
+    int printable = 0;
+    for (int i = 0; i < m; i++) {
+        snprintf(hex + i * 3, sizeof(hex) - (size_t)(i * 3), "%02X ", rx[i]);
+        bool is_printable = (rx[i] >= 0x20 && rx[i] < 0x7F);
+        s_raw_preview[i] = is_printable ? (char)rx[i] : '.';
+        if (is_printable) printable++;
+    }
+    s_raw_preview[m] = 0;
+    s_raw_printable_pct = printable * 100 / m;
+    s_raw_looks_ubx = (m >= 2 && rx[0] == UBX_SYNC1 && rx[1] == UBX_SYNC2);
+    const char *verdict = s_raw_looks_ubx ? "looks like valid UBX binary"
+                        : (s_raw_printable_pct >= 70) ? "looks like TEXT"
+                        : "looks like GARBAGE";
+    ESP_LOGI(TAG, "GPS UART%d: first raw bytes seen (%d bytes this read, up to 16 shown) "
+                  "hex=[%s] ascii=[%s] — %d%% printable (%s)",
+             s_uart_num, n, hex, s_raw_preview, s_raw_printable_pct, verdict);
+}
+
+static void gps_read_available(void *context, size_t available)
+{
+    (void)context;
+    uint8_t rx[256];
+    while (available > 0) {
+        size_t requested = available < sizeof(rx) ? available : sizeof(rx);
+        int n = uart_read_bytes(s_uart_num, rx, requested, portMAX_DELAY);
+        if (n <= 0) return;
+        gps_log_first_bytes(rx, n);
+        gps_process_bytes(rx, (size_t)n);
+        available -= (size_t)n;
+    }
+}
+
+static void gps_flush_input(void *context)
+{
+    (void)context;
+    (void)uart_flush_input(s_uart_num);
+}
+
+static void gps_reset_event_queue(void *context)
+{
+    (void)context;
+    (void)xQueueReset(s_uart_events);
+}
+
+static void gps_task(void *arg)
+{
+    (void)arg;
+    const gps_uart_event_ops_t ops = {
+        .read_available = gps_read_available,
+        .flush_input = gps_flush_input,
+        .reset_queue = gps_reset_event_queue,
+        .reset_parser = gps_reset_parser,
+    };
+    uart_event_t event;
     ESP_LOGI(TAG, "GPS task started on UART%d", s_uart_num);
 
     while (true) {
-        int n = uart_read_bytes(s_uart_num, rx, sizeof(rx), pdMS_TO_TICKS(200));
-        if (n <= 0) continue;
-
-        /* Fires on ANY byte at all, valid or garbage — the most fundamental
-         * "is the wire carrying anything" check, independent of whether it
-         * ever parses as valid NMEA/UBX. If this never prints, no bytes are
-         * reaching the UART at all (wiring/power). If THIS prints but
-         * "module responding" (mark_alive_*) never does, bytes are arriving
-         * but not validating — most likely a baud mismatch. */
-        if (!s_logged_first_bytes) {
-            s_logged_first_bytes = true;
-            char hex[3 * 16 + 1] = {0};
-            int m = (n < 16) ? n : 16;
-            int printable = 0;
-            for (int i = 0; i < m; i++) {
-                snprintf(hex + i * 3, sizeof(hex) - (size_t)(i * 3), "%02X ", rx[i]);
-                bool is_printable = (rx[i] >= 0x20 && rx[i] < 0x7F);
-                s_raw_preview[i] = is_printable ? (char)rx[i] : '.';
-                if (is_printable) printable++;
-            }
-            s_raw_preview[m] = 0;
-            s_raw_printable_pct = (m > 0) ? (printable * 100 / m) : 0;
-            /* Binary UBX check FIRST: a real UBX frame starts with the fixed
-             * 0xB5 0x62 sync bytes and will naturally score low on printable%
-             * (it's binary, not text) — that low score must not be read as
-             * "garbage" when the sync bytes prove it's a correctly-framed
-             * protocol. Only fall back to the printable-ASCII heuristic
-             * (>=70% = text-like NMEA, below = scrambled bit-timing from a
-             * baud mismatch) when the sync check doesn't already settle it. */
-            s_raw_looks_ubx = (m >= 2 && rx[0] == UBX_SYNC1 && rx[1] == UBX_SYNC2);
-            const char *verdict = s_raw_looks_ubx ? "looks like valid UBX binary"
-                                : (s_raw_printable_pct >= 70) ? "looks like TEXT"
-                                : "looks like GARBAGE";
-            ESP_LOGI(TAG, "GPS UART%d: first raw bytes seen (%d bytes this read, up to 16 shown) "
-                          "hex=[%s] ascii=[%s] — %d%% printable (%s)",
-                     s_uart_num, n, hex, s_raw_preview, s_raw_printable_pct, verdict);
-        }
-
-        for (int i = 0; i < n; i++) {
-            uint8_t b = rx[i];
-
-            /* --- inside a UBX frame: consume until complete --- */
-            if (ust != U_IDLE) {
-                switch (ust) {
-                case U_S2:  ust = (b == UBX_SYNC2) ? U_CLS : U_IDLE; break;
-                case U_CLS: ucls = b; ucka = b; uckb = b; ust = U_ID;  break;
-                case U_ID:  uid  = b; ucka += b; uckb += ucka; ust = U_L1; break;
-                case U_L1:  ulen = b; ucka += b; uckb += ucka; ust = U_L2; break;
-                case U_L2:
-                    ulen |= (uint16_t)b << 8; ucka += b; uckb += ucka; uidx = 0;
-                    ust = (ulen == 0) ? U_CKA
-                        : (ulen <= sizeof(upayload) ? U_PL : U_IDLE);
-                    break;
-                case U_PL:
-                    upayload[uidx++] = b; ucka += b; uckb += ucka;
-                    if (uidx >= ulen) ust = U_CKA;
-                    break;
-                case U_CKA: rcka = b; ust = U_CKB; break;
-                case U_CKB:
-                    if (rcka == ucka && b == uckb) {
-                        mark_alive_ubx(ucls, uid, upayload, ulen);
-                        if (ucls == UBX_CLASS_NAV && uid == UBX_ID_NAV_PVT &&
-                            ulen >= UBX_NAV_PVT_LEN) {
-                            parse_navpvt(upayload);
-                        }
-                    }
-                    ust = U_IDLE;
-                    break;
-                default: ust = U_IDLE; break;
-                }
-                continue;
-            }
-
-            /* --- idle: look for a UBX sync or an NMEA '$' --- */
-            if (b == UBX_SYNC1) { ust = U_S2; in_nmea = false; line_len = 0; continue; }
-            if (b == '$')       { in_nmea = true; line_len = 0; line[line_len++] = '$'; continue; }
-
-            if (in_nmea) {
-                if (b == '\r' || b == '\n') {
-                    line[line_len] = 0;
-                    char *body = nmea_validate(line, line_len);
-                    if (body) {
-                        mark_alive_nmea(body);
-                        dispatch_sentence(body);
-                    }
-                    in_nmea = false; line_len = 0;
-                } else if (line_len < sizeof(line) - 1) {
-                    line[line_len++] = (char)b;
-                } else {
-                    in_nmea = false; line_len = 0;   /* overflow — reset */
-                }
-            }
+        if (xQueueReceive(s_uart_events, &event, portMAX_DELAY) != pdTRUE) continue;
+        gps_uart_event_kind_t kind = GPS_UART_EVENT_OTHER;
+        if (event.type == UART_DATA) kind = GPS_UART_EVENT_DATA;
+        else if (event.type == UART_FIFO_OVF) kind = GPS_UART_EVENT_FIFO_OVERFLOW;
+        else if (event.type == UART_BUFFER_FULL) kind = GPS_UART_EVENT_BUFFER_FULL;
+        gps_uart_event_handle(&s_parser_entry.runtime, kind, event.size, &ops, NULL);
+        if (kind == GPS_UART_EVENT_FIFO_OVERFLOW ||
+            kind == GPS_UART_EVENT_BUFFER_FULL) {
+            publish_parser_entry();
         }
     }
 }
@@ -595,8 +717,9 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_mutex = xSemaphoreCreateMutex();
-    if (!s_mutex) return ESP_ERR_NO_MEM;
+    memset(&s_parser_entry, 0, sizeof(s_parser_entry));
+    gps_snapshot_init(&s_snapshot);
+    gps_reset_parser(NULL);
 
     const uart_config_t cfg = {
         .baud_rate           = baud,          /* module's power-on baud (9600) */
@@ -608,7 +731,8 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
         .source_clk          = UART_SCLK_DEFAULT,
     };
 
-    ESP_RETURN_ON_ERROR(uart_driver_install(uart_num, UART_RX_BUF, 0, 0, NULL, 0),
+    ESP_RETURN_ON_ERROR(uart_driver_install(uart_num, UART_RX_BUF, 0, 16,
+                                            &s_uart_events, 0),
                         TAG, "uart_driver_install");
     ESP_RETURN_ON_ERROR(uart_param_config(uart_num, &cfg),
                         TAG, "uart_param_config");
@@ -633,13 +757,12 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
      * Best-effort — on failure the NMEA fallback parser keeps a fix flowing.
      * Starts from whatever baud the scan above actually confirmed works. */
     gps_configure_ublox(uart_num);
+    uart_flush_input(uart_num);
+    xQueueReset(s_uart_events);
 
-    BaseType_t ok = xTaskCreate(gps_task, "GPS_Task", GPS_TASK_STACK,
-                                 NULL, GPS_TASK_PRIORITY, &s_task);
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "xTaskCreate failed");
-        return ESP_ERR_NO_MEM;
-    }
+    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_GPS, gps_task, NULL,
+                                            &s_task),
+                        TAG, "GPS task create");
 
     ESP_LOGI(TAG, "GPS init OK (UART%d RX=%d TX=%d, %d->%d baud, %d Hz NAV-PVT)",
              uart_num, rx_pin, tx_pin, baud, CONFIG_GPS_HIGH_BAUD, CONFIG_GPS_MEAS_RATE_HZ);
@@ -649,14 +772,12 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud) {
 esp_err_t gps_driver_get_fix(gps_fix_t *out) {
     if (!out) return ESP_ERR_INVALID_ARG;
 
-    if (!s_mutex) {
+    gps_snapshot_entry_t entry;
+    if (!gps_snapshot_read(&s_snapshot, &entry)) {
         memset(out, 0, sizeof(*out));
         return ESP_OK;
     }
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    *out = s_fix;
-    xSemaphoreGive(s_mutex);
+    *out = entry.fix;
 
     /* Force invalid + clear stale-looking fields if the fix is old (receiver
      * unplugged / lost reception) — otherwise a dead link still shows the last
@@ -672,6 +793,25 @@ esp_err_t gps_driver_get_fix(gps_fix_t *out) {
     return ESP_OK;
 }
 
+esp_err_t gps_driver_get_runtime_status(gps_runtime_status_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+
+    gps_snapshot_entry_t entry;
+    if (!gps_snapshot_read(&s_snapshot, &entry)) {
+        memset(out, 0, sizeof(*out));
+        return ESP_OK;
+    }
+    *out = entry.runtime;
+    if (entry.fix.last_update_us != 0) {
+        int64_t now = esp_timer_get_time();
+        out->fix_age_us = now > entry.fix.last_update_us
+                              ? now - entry.fix.last_update_us
+                              : 0;
+    }
+    return ESP_OK;
+}
+
 bool gps_driver_has_lock(void) {
     gps_fix_t f;
     gps_driver_get_fix(&f);   /* copies + applies staleness */
@@ -679,12 +819,10 @@ bool gps_driver_has_lock(void) {
 }
 
 bool gps_driver_is_alive(void) {
-    if (!s_mutex) return false;
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int64_t last = s_last_rx_us;
-    xSemaphoreGive(s_mutex);
-    if (last == 0) return false;
-    return (esp_timer_get_time() - last) <= GPS_STALE_US;
+    gps_runtime_status_t status;
+    if (gps_driver_get_runtime_status(&status) != ESP_OK ||
+        status.last_frame_us == 0) return false;
+    return (esp_timer_get_time() - status.last_frame_us) <= GPS_STALE_US;
 }
 
 /* baud: the value in effect (either a confirmed scan hit or the fallback).

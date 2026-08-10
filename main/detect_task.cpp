@@ -11,6 +11,9 @@ extern "C" {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "runtime_metrics.h"
+#include "runtime_startup.h"
+#include "runtime_task.h"
 #include <string.h>
 }
 
@@ -43,6 +46,8 @@ static void detect_task_fn(void *arg)
 
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint64_t metric_started = esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_DETECT, metric_started, metric_started);
 
         int64_t t0 = esp_timer_get_time();
 
@@ -64,6 +69,8 @@ static void detect_task_fn(void *arg)
         }
         if (cap_ret != ESP_OK) {
             ESP_LOGE(TAG, "Frame capture failed after retries");
+            runtime_metrics_count(RUNTIME_TASK_DETECT, RUNTIME_EVENT_SENSOR_ERROR);
+            runtime_metrics_cycle_end(RUNTIME_TASK_DETECT, esp_timer_get_time());
             continue;
         }
 
@@ -82,6 +89,8 @@ static void detect_task_fn(void *arg)
 
         if (!img.data) {
             ESP_LOGE(TAG, "JPEG decode returned NULL");
+            runtime_metrics_count(RUNTIME_TASK_DETECT, RUNTIME_EVENT_SENSOR_ERROR);
+            runtime_metrics_cycle_end(RUNTIME_TASK_DETECT, esp_timer_get_time());
             continue;
         }
 
@@ -162,6 +171,7 @@ static void detect_task_fn(void *arg)
 
         int64_t total_ms = (esp_timer_get_time() - t0) / 1000;
         ESP_LOGI(TAG, "Detection cycle complete in %lld ms", total_ms);
+        runtime_metrics_cycle_end(RUNTIME_TASK_DETECT, esp_timer_get_time());
     }
 }
 
@@ -184,7 +194,8 @@ extern "C" esp_err_t detect_init(void)
     s_cache_mutex = xSemaphoreCreateMutex();
     if (!s_cache_mutex) {
         ESP_LOGE(TAG, "Failed to create detect cache mutex");
-        return ESP_ERR_NO_MEM;
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_DETECT,
+                                                   ESP_ERR_NO_MEM);
     }
 
     /* Create the task BEFORE the model preload: its 32KB stack needs one
@@ -192,12 +203,13 @@ extern "C" esp_err_t detect_init(void)
      * badly enough that grabbing it afterwards fails (seen on hardware with
      * 214KB free but no 32KB block). The task parks on ulTaskNotifyTake and
      * cannot run until a WS trigger — long after this function returns. */
-    BaseType_t ret = xTaskCreate(detect_task_fn, "Detect", 32768,
-                                  NULL, 5, &s_detect_task);
-    if (ret != pdPASS) {
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_DETECT, detect_task_fn,
+                                               NULL, &s_detect_task);
+    if (task_error != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create detect task (largest internal block: %u B)",
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        return ESP_ERR_NO_MEM;
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_DETECT,
+                                                   task_error);
     }
 
     /* Preload model NOW (before WiFi starts) — allocates PSRAM bulk

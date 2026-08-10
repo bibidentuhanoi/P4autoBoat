@@ -1,4 +1,5 @@
 #include "motor_control.h"
+#include "arm_sequence.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
@@ -6,27 +7,32 @@
 #include "drivers/imu_driver.h"
 #include "sensor_fusion.h"
 #include "pipeline.h"
-#include "transports/ws_transport.h"
+#include "control_arbiter.h"
+#include "runtime_metrics.h"
+#include "runtime_task.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 
 static const char *TAG = "MOTOR_CTL";
 
-#define WATCHDOG_INTERVAL_US (100 * 1000)
+#define CONTROL_PERIOD_MS    10
+#define HEADING_DIVIDER      10
 #define STATUS_DIVIDER       10
+#define ARMING_DURATION_US   3000000LL
+#define ARM_REQUEST_QUEUE_LENGTH 4
+#define ARM_ACTION_QUEUE_LENGTH 4
 
-/* How long a control link may go silent before it's treated as lost. Only
- * matters when no WS client is connected (see control_link_alive()) — field
- * mode streams at 10-20Hz, so this survives a couple of dropped ESP-NOW
- * packets without false-tripping, while still stopping the boat well inside
- * a second of a genuine link loss. */
-#define CONTROL_LINK_TIMEOUT_US (400 * 1000)
+/* How long accepted manual-control traffic may go silent before failsafe.
+ * Detect and all other decodable protobuf traffic are deliberately excluded. */
+#define CONTROL_LINK_TIMEOUT_US CONTROL_DRIVE_TIMEOUT_US
 
 /* New Kconfig symbols are absent until sdkconfig is regenerated. Keep safe
  * fallback defaults so this branch builds and dry-run works immediately. */
@@ -70,36 +76,58 @@ static const char *TAG = "MOTOR_CTL";
  *    • A zero/stop command never powers the rail (spring-back-to-0 must not
  *      re-energise it).
  *    • ARM powers the rail and clears the cut; DISARM cuts rail power.
- *    • Control-link-loss failsafe (100 ms poll) zeroes throttle + winch,
+ *    • Control-link-loss failsafe (10 ms control loop) zeroes throttle + winch,
  *      centres rudders, and DE-ENERGISES the rail — loss of the control link
  *      returns to a safe, unpowered state, not a hot rail holding torque
- *      forever. "Link alive" means EITHER an open WS client (dashboard sends
- *      only on slider drag/change, then goes silent holding a steady value —
- *      so a connected client is alive on its own, independent of command
- *      recency) OR a BoatMessage received within CONTROL_LINK_TIMEOUT_US
- *      (ESP-NOW/field mode: connectionless, so recent traffic is the only
- *      substitute for "connected").
+ *      forever. A failsafe rail cut is not latched; only an explicit PWR-OFF
+ *      suppresses later non-zero steering/winch auto-power.
  * ───────────────────────────────────────────────────────────────────────────── */
 
-static bool s_was_nonzero = false;
-static esp_timer_handle_t s_watchdog = NULL;
+static control_arbiter_t s_arbiter;
+static portMUX_TYPE s_arbiter_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile int64_t s_last_control_rx_us = 0;
+static bool s_control_failsafe = true;
+static TaskHandle_t s_control_task = NULL;
+static TaskHandle_t s_arm_sequence_task = NULL;
+static QueueHandle_t s_arm_request_queue = NULL;
+static QueueHandle_t s_arm_action_queue = NULL;
 
+static boat_MotorStatus s_status_buffers[2];
+static uint32_t s_status_generation;
+static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static atomic_uintptr_t s_status_reader_task;
+
+static bool s_arm_power_allowed;
+
+typedef struct {
+    arm_request_t request;
+    bool force;
+    int64_t requested_us;
+} arm_request_message_t;
+
+/* Pure command recency -- deliberately does NOT treat an open WS connection
+ * as sufficient on its own. tests/test_runtime_architecture.py's
+ * test_pipeline_handlers_do_not_write_actuators asserts throttle/winch/steer
+ * all zero out after CONTROL_LINK_TIMEOUT_US of silence with the WS-client
+ * stub fixed at "connected" the whole time -- i.e. a stale browser tab
+ * holding an open socket must still fail safe. (2026-08-10: an earlier
+ * revision of this fix OR'd in ws_transport_client_count() > 0 to solve the
+ * ARMING-duration problem below; that broke this exact test, correctly --
+ * "still connected" and "still receiving commands" are different safety
+ * claims, and only the second one should keep throttle live.) */
 static inline bool control_link_alive(void)
 {
-    return ws_transport_client_count() > 0 ||
-           pipeline_recent_command(CONTROL_LINK_TIMEOUT_US);
+    int64_t last;
+    portENTER_CRITICAL(&s_arbiter_lock);
+    last = s_last_control_rx_us;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    return last != 0 && esp_timer_get_time() - last < CONTROL_LINK_TIMEOUT_US;
 }
-
-/* Set when motor/servo state changes so the next 100ms watchdog tick publishes
- * status immediately (vs the ~1s cadence). Only the timer publishes it: doing so
- * from an incoming-command handler would deadlock — that path holds the shared
- * pipeline envelope mutex that publish also takes. */
-static volatile bool s_status_dirty = false;
 
 /* True after an explicit PWR-OFF: suppresses auto-power until an explicit PWR-ON
  * (or ARM). Without it the rail re-energised on the very next command — even a
  * spring-back-to-zero winch stop — so the operator's kill never held. */
-static volatile bool s_rail_cut = false;
+static bool s_rail_cut = false;
 
 /* Last manual inputs, used only by the heading-assist dry-run logger for now.
  * The actual actuator path remains unchanged until dry-run is explicitly
@@ -272,173 +300,545 @@ static void heading_assist_dry_run_tick(void)
 #endif
 }
 
-static void motor_command_handler(const boat_MotorCommand *cmd)
+static bool motor_status_equal(const boat_MotorStatus *a, const boat_MotorStatus *b)
 {
-    float left, right;
-
-    if (cmd->left != 0.0f || cmd->right != 0.0f) {
-        left  = cmd->left;
-        right = cmd->right;
-    } else {
-        float throttle = cmd->throttle;
-        float rudder   = cmd->rudder;
-        left  = throttle + rudder;
-        right = throttle - rudder;
-        float max_abs = fmaxf(fabsf(left), fabsf(right));
-        if (max_abs > 1.0f) {
-            left  /= max_abs;
-            right /= max_abs;
-        }
-    }
-
-    s_was_nonzero = (left != 0.0f || right != 0.0f);
-    s_manual_left = clampf(left, 0.0f, 1.0f);
-    s_manual_right = clampf(right, 0.0f, 1.0f);
-    esc_driver_set_throttle(left, right);
+    return a->state == b->state &&
+           a->left_throttle == b->left_throttle &&
+           a->right_throttle == b->right_throttle &&
+           a->winch_speed == b->winch_speed &&
+           a->servo_power == b->servo_power;
 }
 
-/* Winch + rudders share the pin-36 servo rail. A non-zero command auto-powers
- * it (zero-friction manual driving) — unless the operator explicitly cut it. */
-static void ensure_servo_rail(void)
+static void status_commit_current(bool force)
 {
-    if (s_rail_cut) return;                 /* respect an explicit PWR-OFF */
-    if (!winch_driver_get_power()) {
-        steer_driver_reassert();            /* guarantee the pad matches before power arrives */
-        winch_driver_set_power(true);
-        s_status_dirty = true;              /* reflect PWR-on to the dashboard next tick */
+    boat_MotorStatus status = boat_MotorStatus_init_zero;
+    status.state = (uint32_t)esc_driver_get_state();
+    esc_driver_get_throttle(&status.left_throttle, &status.right_throttle);
+    status.winch_speed = winch_driver_get_speed();
+    status.servo_power = winch_driver_get_power();
+
+    portENTER_CRITICAL(&s_status_lock);
+    uint32_t generation = s_status_generation;
+    if (!force && motor_status_equal(&status, &s_status_buffers[generation & 1U])) {
+        portEXIT_CRITICAL(&s_status_lock);
+        return;
     }
+
+    uint32_t next = generation + 1U;
+    s_status_buffers[next & 1U] = status;
+    s_status_generation = next;
+    portEXIT_CRITICAL(&s_status_lock);
+
+    TaskHandle_t reader = (TaskHandle_t)atomic_load_explicit(&s_status_reader_task,
+                                                             memory_order_acquire);
+    if (reader) xTaskNotifyGive(reader);
+}
+
+uint32_t motor_control_get_status(boat_MotorStatus *out)
+{
+    if (!out) return 0;
+    atomic_store_explicit(&s_status_reader_task, (uintptr_t)xTaskGetCurrentTaskHandle(),
+                          memory_order_release);
+
+    portENTER_CRITICAL(&s_status_lock);
+    uint32_t generation = s_status_generation;
+    *out = s_status_buffers[generation & 1U];
+    portEXIT_CRITICAL(&s_status_lock);
+    return generation;
+}
+
+static void notify_link_rx_locked(int64_t received_us)
+{
+    if (received_us > s_last_control_rx_us) s_last_control_rx_us = received_us;
+
+    control_drive_proposal_t *drive = &s_arbiter.drive[CONTROL_SOURCE_MANUAL];
+    if (drive->valid && received_us > drive->rx_us) drive->rx_us = received_us;
+}
+
+void motor_control_notify_link_rx(int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+}
+
+static void count_submit_result(control_submit_result_t result, bool overwrote)
+{
+    if (result == CONTROL_ACCEPTED && overwrote) {
+        runtime_metrics_count(RUNTIME_TASK_CONTROL, RUNTIME_EVENT_COMMAND_OVERWRITE);
+    } else if (result != CONTROL_ACCEPTED) {
+        runtime_metrics_count(RUNTIME_TASK_CONTROL, RUNTIME_EVENT_INVALID_COMMAND);
+    }
+}
+
+/* This module is the manual transport boundary. Source-less discrete arbiter
+ * events are reachable only through this static wrapper, never from a future
+ * waypoint or ML producer. */
+static control_submit_result_t manual_transport_control_arbiter_submit_drive(
+    float throttle, float rudder, int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool overwrote = s_arbiter.drive[CONTROL_SOURCE_MANUAL].changed;
+    control_submit_result_t result = control_arbiter_submit_drive(
+        &s_arbiter, CONTROL_SOURCE_MANUAL, throttle, rudder, received_us);
+    if (result == CONTROL_ACCEPTED) notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    count_submit_result(result, overwrote);
+    return result;
+}
+
+static control_submit_result_t manual_transport_control_arbiter_submit_winch(
+    float winch, int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool overwrote = s_arbiter.winch.changed;
+    control_submit_result_t result = control_arbiter_submit_winch(
+        &s_arbiter, CONTROL_SOURCE_MANUAL, winch, received_us);
+    if (result == CONTROL_ACCEPTED) notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    count_submit_result(result, overwrote);
+    return result;
+}
+
+static control_submit_result_t manual_transport_control_arbiter_submit_steer(
+    float steer, int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool overwrote = s_arbiter.steer.changed;
+    control_submit_result_t result = control_arbiter_submit_steer(
+        &s_arbiter, CONTROL_SOURCE_MANUAL, steer, received_us);
+    if (result == CONTROL_ACCEPTED) notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    count_submit_result(result, overwrote);
+    return result;
+}
+
+static control_submit_result_t manual_transport_control_arbiter_submit_steer_raw(
+    uint32_t pulse_us, int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool overwrote = s_arbiter.steer.changed;
+    control_submit_result_t result = control_arbiter_submit_steer_raw(
+        &s_arbiter, CONTROL_SOURCE_MANUAL, pulse_us, received_us);
+    if (result == CONTROL_ACCEPTED) notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    count_submit_result(result, overwrote);
+    return result;
+}
+
+static bool manual_transport_control_arbiter_push_event(control_event_kind_t event,
+                                                        int64_t received_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool accepted = control_arbiter_push_event(&s_arbiter, event);
+    if (accepted) notify_link_rx_locked(received_us);
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    if (!accepted) runtime_metrics_count(RUNTIME_TASK_CONTROL, RUNTIME_EVENT_INVALID_COMMAND);
+    return accepted;
+}
+
+static void motor_command_handler(const boat_MotorCommand *cmd)
+{
+    float left = cmd->left != 0.0f || cmd->right != 0.0f
+               ? cmd->left : cmd->throttle + cmd->rudder;
+    float right = cmd->left != 0.0f || cmd->right != 0.0f
+                ? cmd->right : cmd->throttle - cmd->rudder;
+    if (fmaxf(fabsf(left), fabsf(right)) > 1.0f) {
+        float scale = fmaxf(fabsf(left), fabsf(right));
+        left /= scale;
+        right /= scale;
+    }
+
+    float throttle = 0.5f * (left + right);
+    float rudder = 0.5f * (left - right);
+    manual_transport_control_arbiter_submit_drive(throttle, rudder,
+                                                   esp_timer_get_time());
 }
 
 static void winch_command_handler(const boat_WinchCommand *cmd)
 {
-    if (cmd->speed != 0.0f) ensure_servo_rail();   /* a stop never powers the rail */
-    winch_driver_set_speed(cmd->speed);
+    manual_transport_control_arbiter_submit_winch(cmd->speed, esp_timer_get_time());
 }
 
 static void steer_command_handler(const boat_SteerCommand *cmd)
 {
-    /* One unified rudder. Collapse the legacy left/right wire fields into the
-     * single physical steering axis. */
     float steer = 0.0f;
     if (cmd->left != 0.0f && cmd->right != 0.0f) {
         steer = 0.5f * (cmd->left + cmd->right);
     } else {
         steer = (cmd->left != 0.0f) ? cmd->left : cmd->right;
     }
-    s_manual_rudder = clampf(steer, -1.0f, 1.0f);
-    if (steer != 0.0f) ensure_servo_rail();
-    steer_driver_set(steer);
+    manual_transport_control_arbiter_submit_steer(steer, esp_timer_get_time());
 }
 
-/* Calibration only — see steer_driver_set_raw_us(). Always powers the rail:
- * there's no point sending a raw pulse to find a mechanical stop if the
- * servo can't move to prove it. */
 static void steer_raw_command_handler(const boat_SteerRawCommand *cmd)
 {
-    ensure_servo_rail();
-    steer_driver_set_raw_us(cmd->pulse_us);
+    manual_transport_control_arbiter_submit_steer_raw(cmd->pulse_us,
+                                                       esp_timer_get_time());
 }
 
-/* Explicit servo-rail switch. PWR-OFF latches s_rail_cut so auto-power stays off
- * until PWR-ON — the operator's kill holds. Off also zeroes the commanded winch
- * and homes steer back to STEER_HOME (full-right) — the operator's confirmed
- * hand-positioned reference — so the state firmware reports matches where the
- * rudder should physically be re-homed to before the next power-up. */
 static void servo_power_command_handler(bool on)
 {
-    s_rail_cut = !on;
-    if (winch_driver_set_power(on) == ESP_OK && !on) {
-        winch_driver_set_speed(0.0f);   /* rail off ⇒ make commanded state match */
-        if (steer_driver_get() != 1.0f) {
-            steer_driver_set(1.0f);
-            s_manual_rudder = 1.0f;
-        }
-        heading_assist_reset();
+    control_event_kind_t event = on ? CONTROL_EVENT_SERVO_POWER_ON
+                                    : CONTROL_EVENT_SERVO_POWER_OFF;
+    if (manual_transport_control_arbiter_push_event(event, esp_timer_get_time()) &&
+        !on && s_control_task) {
+        xTaskNotifyGive(s_control_task);
     }
-    s_status_dirty = true;
-}
-
-static void arm_task_fn(void *arg)
-{
-    intptr_t v = (intptr_t)arg;
-    bool do_arm = (v & 1) != 0;
-    bool force  = (v & 2) != 0;
-    if (do_arm) {
-        motor_control_arm(force);
-    } else {
-        motor_control_disarm();
-    }
-    vTaskDelete(NULL);
 }
 
 static void arm_command_handler(bool arm, bool force)
 {
     ESP_LOGI(TAG, "%s command received%s", arm ? "Arm" : "Disarm",
              (arm && force) ? " (GPS override)" : "");
-    if (arm && esc_driver_get_state() != ESC_STATE_DISARMED) return;
-    if (!arm && esc_driver_get_state() == ESC_STATE_DISARMED) return;
-    intptr_t v = (arm ? 1 : 0) | (force ? 2 : 0);
-    /* 2048 was too tight: esc_driver_arm() (MCPWM setup + 3s arm delay + logging)
-     * followed by steer_driver_reassert() (mutex + MCPWM + a float-formatted log
-     * line) overflowed it — confirmed via a Stack protection fault with the
-     * reported SP sitting just below the task's own stack bounds. 4096 gives
-     * real headroom instead of refitting to the exact previous call depth. */
-    xTaskCreate(arm_task_fn, "esc_arm", 4096, (void *)v, 5, NULL);
+    control_event_kind_t event = arm
+        ? (force ? CONTROL_EVENT_FORCE_ARM : CONTROL_EVENT_ARM)
+        : CONTROL_EVENT_DISARM;
+    if (manual_transport_control_arbiter_push_event(event, esp_timer_get_time()) &&
+        !arm && s_control_task) {
+        xTaskNotifyGive(s_control_task);
+    }
 }
 
-static void publish_status(void)
+static bool submit_arm_request(arm_request_t request, bool force, int64_t requested_us)
 {
-    boat_MotorStatus ms = boat_MotorStatus_init_zero;
-    ms.state = (uint32_t)esc_driver_get_state();
-    esc_driver_get_throttle(&ms.left_throttle, &ms.right_throttle);
-    ms.winch_speed = winch_driver_get_speed();
-    ms.servo_power = winch_driver_get_power();
-    pipeline_publish_motor_status(&ms);
+    arm_request_message_t message = {
+        .request = request,
+        .force = force,
+        .requested_us = requested_us,
+    };
+
+    BaseType_t queued;
+    if (request == ARM_REQUEST_DISARM) {
+        xQueueReset(s_arm_request_queue);
+        queued = xQueueSendToFront(s_arm_request_queue, &message, 0);
+    } else {
+        queued = xQueueSend(s_arm_request_queue, &message, 0);
+    }
+    if (queued != pdTRUE) {
+        runtime_metrics_count(RUNTIME_TASK_ARM_SEQUENCE,
+                              RUNTIME_EVENT_INVALID_COMMAND);
+        ESP_LOGE(TAG, "ArmSeq request queue full");
+        return false;
+    }
+    return true;
 }
 
-static void watchdog_cb(void *arg)
+static void publish_arm_action(arm_action_t action)
+{
+    if (action == ARM_ACTION_REJECT_NO_GPS) {
+        ESP_LOGW(TAG, "Arm refused — waiting for GPS lock (use override to bypass)");
+        return;
+    }
+    if (action == ARM_ACTION_NONE) return;
+
+    BaseType_t queued;
+    if (action == ARM_ACTION_DISARM) {
+        xQueueReset(s_arm_action_queue);
+        queued = xQueueSendToFront(s_arm_action_queue, &action, 0);
+    } else {
+        queued = xQueueSend(s_arm_action_queue, &action, 0);
+    }
+    if (queued != pdTRUE) {
+        runtime_metrics_count(RUNTIME_TASK_ARM_SEQUENCE,
+                              RUNTIME_EVENT_INVALID_COMMAND);
+        ESP_LOGE(TAG, "ArmSeq action queue full");
+        return;
+    }
+    if (s_control_task) xTaskNotifyGive(s_control_task);
+}
+
+static TickType_t arm_sequence_wait_ticks(const arm_sequence_t *sequence,
+                                          int64_t now_us)
+{
+    if (sequence->state != ARM_SEQUENCE_ARMING) return portMAX_DELAY;
+    if (sequence->deadline_us <= now_us) return 0;
+
+    uint64_t remaining_ms = (uint64_t)(sequence->deadline_us - now_us + 999) / 1000;
+    TickType_t ticks = pdMS_TO_TICKS(remaining_ms);
+    return ticks == 0 ? 1 : ticks;
+}
+
+static void task_arm_sequence(void *arg)
 {
     (void)arg;
-    static int tick = 0;
+    arm_sequence_t sequence;
+    arm_sequence_init(&sequence, ARMING_DURATION_US);
 
-    /* Failsafe on control-link loss: covers ARMED, and the bench case where the
-     * servo rail is powered while disarmed. Return to a safe, DE-ENERGISED state. */
-    if ((esc_driver_get_state() == ESC_STATE_ARMED || winch_driver_get_power()) &&
-        !control_link_alive()) {
-        bool acted = false;
-        if (s_was_nonzero) {
-            esc_driver_set_throttle(0.0f, 0.0f);
-            s_was_nonzero = false;
-            s_manual_left = 0.0f;
-            s_manual_right = 0.0f;
-            acted = true;
+    for (;;) {
+        arm_request_message_t message;
+        int64_t before_wait_us = esp_timer_get_time();
+        TickType_t wait = arm_sequence_wait_ticks(&sequence, before_wait_us);
+        if (xQueueReceive(s_arm_request_queue, &message, wait) == pdTRUE) {
+            arm_sequence_request(&sequence, message.request, message.force,
+                                 message.requested_us);
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        bool gps_locked = false;
+        if (sequence.state == ARM_SEQUENCE_ARM_PENDING) {
+            gps_locked = sequence.force || gps_driver_has_lock();
+        }
+        publish_arm_action(arm_sequence_step(&sequence, now_us, gps_locked));
+    }
+}
+
+static bool control_apply_arm_action(control_decision_t *decision, bool safe_stop,
+                                     bool *changed)
+{
+    arm_action_t action;
+    if (xQueueReceive(s_arm_action_queue, &action, 0) != pdTRUE) return false;
+
+    switch (action) {
+    case ARM_ACTION_BEGIN:
+        if (safe_stop || !s_arm_power_allowed) {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        } else if (esc_driver_arm_begin() == ESP_OK) {
+            *changed = true;
+        } else {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        }
+        break;
+
+    case ARM_ACTION_COMPLETE:
+        if (safe_stop || !s_arm_power_allowed) {
+            if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+                esc_driver_disarm();
+                *changed = true;
+            }
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        } else if (esc_driver_arm_complete() == ESP_OK) {
+            decision->servo_power_on = true;
+            *changed = true;
+        } else {
+            submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        }
+        break;
+
+    case ARM_ACTION_DISARM:
+        if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+            esc_driver_disarm();
+            *changed = true;
+        }
+        decision->arm = false;
+        decision->force_arm = false;
+        decision->disarm = true;
+        return true;
+
+    case ARM_ACTION_NONE:
+    case ARM_ACTION_REJECT_NO_GPS:
+    default:
+        break;
+    }
+    return false;
+}
+
+static void control_apply_decision(control_decision_t *decision)
+{
+    bool changed = false;
+    bool explicit_off = decision->servo_power_off;
+    /* Arm-gating and the failsafe-zeroing branch below both use general link
+     * liveness (control_link_alive(), refreshed by ANY accepted arbiter
+     * command incl. the arm click itself), not decision->failsafe.
+     * decision->failsafe is drive-proposal-specific: drive->valid only
+     * becomes true once a throttle/rudder command has actually been
+     * submitted, so on a fresh connect (arm clicked before ever touching the
+     * throttle) failsafe was permanently true, which alone blocked arming,
+     * and ALSO used to gate the zeroing branch below (which unconditionally
+     * clears s_arm_power_allowed whenever it fires) -- the two branches were
+     * fighting until both were switched to safe_stop (2026-08-10).
+     *
+     * safe_stop ALSO grants a grace exception while ESC_STATE_ARMING:
+     * CONTROL_LINK_TIMEOUT_US (400ms) is shorter than ARMING_DURATION_US
+     * (3s), so a user who clicks ARM once and touches nothing else for the
+     * rest of the sequence would otherwise have control_link_alive() go
+     * false ~400ms in, well before ARM_ACTION_COMPLETE arrives 3s later --
+     * confirmed on hardware, ARMING pulsed for the full duration then
+     * reverted to DISARMED right at completion. Scoped to ESC_STATE_ARMING
+     * specifically (not "connected", not any other state) so it can't mask
+     * a genuinely dead link once armed and driving: an earlier revision
+     * tried OR-ing in ws_transport_client_count() > 0 instead, which fixed
+     * this but broke tests/test_runtime_architecture.py's
+     * test_pipeline_handlers_do_not_write_actuators -- that test explicitly
+     * holds a WS-connected stub for CONTROL_LINK_TIMEOUT_US of silence and
+     * asserts throttle/winch/steer all zero out anyway, i.e. a stale
+     * browser tab holding an open socket must still fail safe. "Still
+     * connected" and "still receiving commands" are different safety
+     * claims; only mid-arming specifically needed the exception. */
+    bool safe_stop = explicit_off || decision->disarm ||
+                     (!control_link_alive() &&
+                      esc_driver_get_state() != ESC_STATE_ARMING);
+    bool internal_disarm = control_apply_arm_action(decision, safe_stop, &changed);
+    safe_stop = explicit_off || decision->disarm ||
+               (!control_link_alive() && esc_driver_get_state() != ESC_STATE_ARMING);
+
+    if (explicit_off) {
+        s_rail_cut = true;
+        s_arm_power_allowed = false;
+        if (winch_driver_get_power()) {
+            winch_driver_set_power(false);
+            changed = true;
         }
         if (winch_driver_get_speed() != 0.0f) {
             winch_driver_set_speed(0.0f);
-            acted = true;
+            changed = true;
+        }
+        if (steer_driver_get() != 1.0f) {
+            steer_driver_set(1.0f);
+            changed = true;
+        }
+        s_manual_rudder = 1.0f;
+        heading_assist_reset();
+    } else if (safe_stop) {
+        s_arm_power_allowed = false;
+        float left;
+        float right;
+        esc_driver_get_throttle(&left, &right);
+        if (left != 0.0f || right != 0.0f) {
+            esc_driver_set_throttle(0.0f, 0.0f);
+            changed = true;
+        }
+        if (winch_driver_get_speed() != 0.0f) {
+            winch_driver_set_speed(0.0f);
+            changed = true;
         }
         if (steer_driver_get() != 0.0f) {
-            steer_driver_set(0.0f);   /* link-loss: center, not STEER_HOME — safer than a hard-over rudder */
-            s_manual_rudder = 0.0f;
-            acted = true;
+            steer_driver_set(0.0f);
+            changed = true;
         }
         if (winch_driver_get_power()) {
-            winch_driver_set_power(false);   /* de-energise the rail — don't hold torque forever */
-            heading_assist_reset();
-            acted = true;
+            winch_driver_set_power(false);
+            changed = true;
         }
-        if (acted) {
+        s_manual_left = 0.0f;
+        s_manual_right = 0.0f;
+        s_manual_rudder = 0.0f;
+        heading_assist_reset();
+        if (!control_link_alive() && changed) {
             ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
-            s_status_dirty = true;
         }
     }
 
-    heading_assist_dry_run_tick();
+    if (decision->disarm && !internal_disarm) {
+        submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+    }
 
-    ++tick;
-    if (s_status_dirty || (tick % STATUS_DIVIDER) == 0) {
-        s_status_dirty = false;
-        publish_status();
+    if (!safe_stop) {
+        if (decision->arm || decision->force_arm) {
+            s_arm_power_allowed = true;
+            submit_arm_request(ARM_REQUEST_ARM, decision->force_arm,
+                               esp_timer_get_time());
+        }
+
+        if (decision->servo_power_on) {
+            s_rail_cut = false;
+            s_arm_power_allowed = true;
+            if (!winch_driver_get_power()) {
+                steer_driver_reassert();
+                winch_driver_set_power(true);
+                changed = true;
+            }
+        }
+
+        if (decision->drive_changed) {
+            float left;
+            float right;
+            esc_driver_get_throttle(&left, &right);
+            if (left != decision->left || right != decision->right) {
+                esc_driver_set_throttle(decision->left, decision->right);
+                changed = true;
+            }
+            s_manual_left = clampf(decision->left, 0.0f, 1.0f);
+            s_manual_right = clampf(decision->right, 0.0f, 1.0f);
+        }
+
+        if (decision->winch_changed) {
+            if (decision->winch != 0.0f && !s_rail_cut && !winch_driver_get_power()) {
+                steer_driver_reassert();
+                winch_driver_set_power(true);
+                changed = true;
+            }
+            if (winch_driver_get_speed() != decision->winch) {
+                winch_driver_set_speed(decision->winch);
+                changed = true;
+            }
+        }
+
+        if (decision->steer_changed) {
+            bool needs_power = decision->steer_raw || decision->steer != 0.0f;
+            if (needs_power && !s_rail_cut && !winch_driver_get_power()) {
+                steer_driver_reassert();
+                winch_driver_set_power(true);
+                changed = true;
+            }
+            if (decision->steer_raw) {
+                steer_driver_set_raw_us(decision->steer_raw_us);
+                changed = true;
+            } else if (steer_driver_get() != decision->steer) {
+                steer_driver_set(decision->steer);
+                changed = true;
+            }
+            s_manual_rudder = decision->steer_raw
+                ? s_manual_rudder : clampf(decision->steer, -1.0f, 1.0f);
+        }
+    }
+
+    status_commit_current(changed);
+}
+
+static void run_control_cycle(bool scheduled, int64_t scheduled_us)
+{
+    static uint8_t heading_divider = 0;
+    int64_t start_us = esp_timer_get_time();
+    control_decision_t decision;
+
+    runtime_metrics_cycle_begin(RUNTIME_TASK_CONTROL, (uint64_t)scheduled_us,
+                                (uint64_t)start_us);
+    portENTER_CRITICAL(&s_arbiter_lock);
+    control_arbiter_decide(&s_arbiter, start_us, &decision);
+    bool failsafe = s_last_control_rx_us == 0 ||
+                    start_us - s_last_control_rx_us >= CONTROL_LINK_TIMEOUT_US;
+    if (failsafe != s_control_failsafe) decision.drive_changed = true;
+    decision.failsafe = failsafe;
+    s_control_failsafe = failsafe;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+
+    control_apply_decision(&decision);
+    status_commit_current(false);
+
+    if (scheduled && ++heading_divider == HEADING_DIVIDER) {
+        heading_divider = 0;
+        heading_assist_dry_run_tick();
+    }
+    runtime_metrics_cycle_end(RUNTIME_TASK_CONTROL, (uint64_t)esp_timer_get_time());
+}
+
+static void task_control(void *arg)
+{
+    (void)arg;
+    const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
+    TickType_t next = xTaskGetTickCount();
+    int64_t scheduled_us = esp_timer_get_time();
+
+    for (;;) {
+        run_control_cycle(true, scheduled_us);
+        next += period;
+        scheduled_us += CONTROL_PERIOD_MS * 1000LL;
+
+        for (;;) {
+            TickType_t now = xTaskGetTickCount();
+            if (next <= now) {
+                if (next < now) {
+                    runtime_metrics_count(RUNTIME_TASK_CONTROL,
+                                          RUNTIME_EVENT_DEADLINE_MISS);
+                    next = now;
+                    scheduled_us = esp_timer_get_time();
+                }
+                break;
+            }
+            if (ulTaskNotifyTake(pdTRUE, next - now) == 0) break;
+            run_control_cycle(false, esp_timer_get_time());
+        }
     }
 }
 
@@ -451,8 +851,31 @@ esp_err_t motor_control_init_hw(void)
     return ret;
 }
 
+void motor_control_disarm(void)
+{
+    s_arm_power_allowed = false;
+    (void)esc_driver_disarm();
+    (void)winch_driver_set_speed(0.0f);
+    (void)winch_driver_set_power(false);
+    (void)steer_driver_set(0.0f);
+}
+
 esp_err_t motor_control_init(void)
 {
+    control_arbiter_init(&s_arbiter);
+    s_last_control_rx_us = 0;
+    s_control_failsafe = true;
+    s_rail_cut = false;
+    s_status_generation = 0;
+    atomic_store(&s_status_reader_task, (uintptr_t)NULL);
+    s_arm_power_allowed = false;
+    s_arm_request_queue = xQueueCreate(ARM_REQUEST_QUEUE_LENGTH,
+                                       sizeof(arm_request_message_t));
+    s_arm_action_queue = xQueueCreate(ARM_ACTION_QUEUE_LENGTH,
+                                      sizeof(arm_action_t));
+    if (!s_arm_request_queue || !s_arm_action_queue) return ESP_ERR_NO_MEM;
+    status_commit_current(true);
+
     pipeline_register_motor_handler(motor_command_handler);
     pipeline_register_arm_handler(arm_command_handler);
     pipeline_register_winch_handler(winch_command_handler);
@@ -460,45 +883,24 @@ esp_err_t motor_control_init(void)
     pipeline_register_servo_power_handler(servo_power_command_handler);
     pipeline_register_steer_raw_handler(steer_raw_command_handler);
 
-    const esp_timer_create_args_t timer_args = {
-        .callback = watchdog_cb,
-        .name     = "motor_wd",
-    };
-    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &s_watchdog), TAG, "timer_create");
-    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_watchdog, WATCHDOG_INTERVAL_US), TAG, "timer_start");
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
+                                               task_arm_sequence, NULL,
+                                               &s_arm_sequence_task);
+    if (task_error != ESP_OK) {
+        motor_control_disarm();
+        (void)winch_driver_set_power(false);
+        ESP_LOGE(TAG, "critical task failed to start: ArmSeq");
+        return task_error;
+    }
+    task_error = runtime_task_create(RUNTIME_TASK_CONTROL, task_control,
+                                     NULL, &s_control_task);
+    if (task_error != ESP_OK) {
+        motor_control_disarm();
+        (void)winch_driver_set_power(false);
+        ESP_LOGE(TAG, "critical task failed to start: Control");
+        return task_error;
+    }
 
-    ESP_LOGI(TAG, "Motor control initialized (status ~1 Hz)");
+    ESP_LOGI(TAG, "Motor control initialized (ControlTask 10 ms, persistent ArmSeq)");
     return ESP_OK;
-}
-
-esp_err_t motor_control_arm(bool force)
-{
-    if (!force && !gps_driver_has_lock()) {
-        ESP_LOGW(TAG, "Arm refused — waiting for GPS lock (use override to bypass)");
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t ret = esc_driver_arm();
-    if (ret == ESP_OK) {
-        s_rail_cut = false;             /* arming = go live: re-enable the rail */
-        steer_driver_reassert();        /* guarantee the pad matches before power arrives */
-        winch_driver_set_power(true);   /* arming always powers the servo rail */
-    }
-    s_status_dirty = true;
-    return ret;
-}
-
-esp_err_t motor_control_disarm(void)
-{
-    s_was_nonzero = false;
-    s_manual_left = 0.0f;
-    s_manual_right = 0.0f;
-    s_manual_rudder = 0.0f;
-    heading_assist_reset();
-    winch_driver_set_speed(0.0f);       /* stop the winch */
-    winch_driver_set_power(false);      /* cut servo power */
-    if (steer_driver_get() != 0.0f) {   /* disarm: center, not STEER_HOME — see WS-loss failsafe */
-        steer_driver_set(0.0f);
-    }
-    s_status_dirty = true;
-    return esc_driver_disarm();
 }

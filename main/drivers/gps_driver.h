@@ -26,6 +26,22 @@ typedef struct {
     int64_t  last_update_us;  // esp_timer_get_time() when any field was last updated.
 } gps_fix_t;
 
+typedef enum {
+    GPS_PROTOCOL_NONE = 0,
+    GPS_PROTOCOL_NMEA,
+    GPS_PROTOCOL_UBX,
+} gps_protocol_authority_t;
+
+typedef struct {
+    uint32_t uart_fifo_overflows;
+    uint32_t uart_buffer_full_events;
+    uint32_t parser_line_overflows;
+    uint32_t parse_errors;
+    gps_protocol_authority_t protocol_authority;
+    int64_t last_frame_us;
+    int64_t fix_age_us;
+} gps_runtime_status_t;
+
 /* Stale threshold — if no NMEA update within this window, get_fix() forces valid=false. */
 #define GPS_STALE_US  (5LL * 1000 * 1000)
 
@@ -44,6 +60,9 @@ esp_err_t gps_driver_init(int uart_num, int rx_pin, int tx_pin, int baud);
  * Copy the most recent fix snapshot. Always fills *out; valid=false if no recent fix.
  */
 esp_err_t gps_driver_get_fix(gps_fix_t *out);
+
+/** Copy a bounded, stable runtime-health snapshot without entering parser internals. */
+esp_err_t gps_driver_get_runtime_status(gps_runtime_status_t *out);
 
 /**
  * True when there is a usable, fresh fix (valid + >= min satellites) — the

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a deterministic two-core runtime in which Core 0 exclusively protects manual control, actuator safety, GPS, IMU/magnetometer, and I2C deadlines while Core 1 runs camera, detection, snapshots, telemetry, diagnostics, and future autonomy workloads.
+**Goal:** Build a deterministic two-core runtime in which Core 0 exclusively protects manual control, actuator safety, GPS, IMU/magnetometer, and I2C deadlines while Core 1 runs camera, detection, snapshots, telemetry, diagnostics, optional microSD training recording, and future autonomy workloads.
 
-**Architecture:** Add one central task registry, a bounded metrics layer, a manual-only command ingress/arbiter, one Core 0 actuator owner, and one Core 0 I2C owner. Pass timestamped fixed-size snapshots across cores; reserve disabled waypoint/ML drive slots and a passive LP-core heartbeat without implementing autonomous driving or LP hardware actuation.
+**Architecture:** Add one central task registry, a bounded metrics layer, a manual-only command ingress/arbiter, one Core 0 actuator owner, and one Core 0 I2C owner. Pass timestamped fixed-size snapshots across cores; record optional training samples through a bounded Core 1 JPEG-copy pool and event-driven microSD writer; reserve disabled waypoint/ML drive slots and a passive LP-core heartbeat without implementing autonomous driving or LP hardware actuation.
 
 **Tech Stack:** ESP-IDF 5.4, ESP32-P4 SMP FreeRTOS, C11/C++17, ESP timer, I2C master, UART, MCPWM, nanopb, ESP-DL, ULP LP-core build system, Python `unittest`/`pytest`, host C compiler.
 
@@ -17,8 +17,11 @@
 - ToF A and B each target 5 Hz and must yield to the next IMU deadline.
 - P4 receive-to-physical-command latency, servo-power OFF, and winch stop must each remain at or below 20 ms under stress.
 - Camera or inference work must never gate Core 0 control, IMU, magnetometer, fusion, ToF scheduling, or snapshot production.
+- Training recording is optional and runs only on Core 1. Its only producer-side work is a bounded JPEG copy into a preallocated PSRAM slot; a full pool, queue, slow card, write failure, or missing card drops the training sample and increments metrics rather than blocking any camera, radio, sensor, or control path.
+- No task on Core 0 may mount, open, write, flush, or close microSD files. An unavailable card must leave boot, Wi-Fi/ESP-NOW, manual driving, and all safety behavior unchanged.
 - Future ML remains unimplemented; preserve and measure room for the agreed 260 ms path (50 ms capture/preprocess, 100 ms inference hard budget, 20 ms policy, 10 ms handoff, 80 ms contingency) while the currently tested PicoDet inference is approximately 57 ms.
 - Runtime publishing and metrics use fixed-size startup allocations; no control/sensor update allocates memory after startup.
+- Tests must demonstrate externally observable behavior using host fakes, test seams, or hardware acceptance evidence. Earlier task prose that proposes source-text/token scanning is superseded: do not add source-scanning tests merely to enforce an implementation shape.
 - Critical Core 0 task creation failure keeps outputs de-energized and aborts startup visibly; optional Core 1 failure disables only that feature.
 - LP core is an observer only and must not include or call GPIO, MCPWM, ESC, winch, or steering APIs.
 - No C6 or S3 firmware changes are part of this implementation.
@@ -38,6 +41,8 @@
 | `main/sensor_schedule.h/.c` | Pure-C 20 ms IMU / alternating 5 Hz ToF deadline policy |
 | `main/imu_sample.h` | Timestamped raw IMU/magnetometer sample contract |
 | `main/sample_snapshot.h/.c` | Fixed-size versioned double-buffer for cross-task samples |
+| `main/training_logger.h/.c` | Fixed-size Core 1 JPEG pool, metadata contract, and non-blocking microSD training writer |
+| `main/Kconfig.projbuild` | Opt-in training-recorder configuration and conservative capture/pool limits |
 | `main/sensor_task.c/.h` | Sole Core 0 I2C owner plus Core 1 ToF processing and existing snapshot publication |
 | `main/sensor_fusion.c/.h` | Fusion math from cached raw samples; no I2C access |
 | `main/lp_supervisor.h/.c` | HP-side LP binary loader, heartbeat writer, and observation reader |
@@ -76,10 +81,12 @@ int main(void) {
     const runtime_task_spec_t *bus = runtime_schedule_get(RUNTIME_TASK_SENSOR_BUS);
     const runtime_task_spec_t *gps = runtime_schedule_get(RUNTIME_TASK_GPS);
     const runtime_task_spec_t *detect = runtime_schedule_get(RUNTIME_TASK_DETECT);
+    const runtime_task_spec_t *training = runtime_schedule_get(RUNTIME_TASK_TRAINING_LOG);
     assert(control->core == 0 && control->priority == 10 && control->period_us == 10000);
     assert(bus->core == 0 && bus->priority == 8 && bus->period_us == 20000);
     assert(gps->core == 0 && gps->priority == 6);
     assert(detect->core == 1 && detect->priority == 7 && detect->stack_size == 32768);
+    assert(training->core == 1 && training->priority == 2 && !training->critical);
     assert(runtime_schedule_get(RUNTIME_TASK_WAYPOINT) == 0);
     assert(runtime_schedule_get(RUNTIME_TASK_ML_CONTROL) == 0);
     return 0;
@@ -111,6 +118,7 @@ typedef enum {
     RUNTIME_TASK_TOF_PROCESS,
     RUNTIME_TASK_WS_TX,
     RUNTIME_TASK_DIAGNOSTICS,
+    RUNTIME_TASK_TRAINING_LOG,
     RUNTIME_TASK_STATUS_LED,
     RUNTIME_TASK_COUNT,
     RUNTIME_TASK_WAYPOINT,
@@ -128,7 +136,7 @@ typedef struct {
 } runtime_task_spec_t;
 ```
 
-Populate the table with: Control `4096/10/0/10000/10000/critical`; ArmSeq `4096/9/0/event/critical`; SensorBus `8192/8/0/20000/20000/critical`; Fusion `4096/7/0/event/40000/critical`; GPS `4096/6/0/event/soft`; Detect `32768/7/1/event/soft`; CamDrain `2048/6/1/event/soft`; Snapshot `16384/5/1/50000/50000/soft`; ToFProc `6144/4/1/event/200000/soft`; WS_TX `8192/3/1/event/soft`; Diagnostics `4096/2/1/1000000/soft`; StatusLED `2048/2/1/event/soft`. Return `NULL` for the waypoint and ML IDs.
+Populate the table with: Control `4096/10/0/10000/10000/critical`; ArmSeq `4096/9/0/event/critical`; SensorBus `8192/8/0/20000/20000/critical`; Fusion `4096/7/0/event/40000/critical`; GPS `4096/6/0/event/soft`; Detect `32768/7/1/event/soft`; CamDrain `2048/6/1/event/soft`; Snapshot `16384/5/1/50000/50000/soft`; ToFProc `6144/4/1/event/200000/soft`; WS_TX `8192/3/1/event/soft`; Diagnostics `4096/2/1/1000000/soft`; TrainingLog `8192/2/1/event/soft`; StatusLED `2048/2/1/event/soft`. Return `NULL` for the waypoint and ML IDs.
 
 - [ ] **Step 4: Implement checked pinned task creation**
 
@@ -744,7 +752,7 @@ Control and ArmSeq were migrated in Tasks 4-5; Diagnostics was migrated in Task 
 
 For Control, ArmSeq, SensorBus, and Fusion creation failure: call `motor_control_disarm()`, force `winch_driver_set_power(false)`, log the task name, and return through `ESP_ERROR_CHECK` so startup cannot continue with partial Core 0 safety services.
 
-For GPS, Detect, CamDrain, ToFProc, Snapshot, WS_TX, Diagnostics, and StatusLED: return/log the error, set that feature unavailable, and continue manual Core 0 control. Snapshot/WS failure is highly visible but does not energize hardware.
+For GPS, Detect, CamDrain, ToFProc, Snapshot, WS_TX, Diagnostics, TrainingLog, and StatusLED: return/log the error, set that feature unavailable, and continue manual Core 0 control. Snapshot/WS failure is highly visible but does not energize hardware. TrainingLog failure never changes camera/detection operation and merely increments the optional-feature-disabled metric.
 
 - [ ] **Step 4: Make GPS UART reception event-driven and measurable**
 
@@ -782,7 +790,66 @@ git add main/main.c main/drivers/gps_driver.h main/drivers/gps_driver.c main/det
 git commit -m "feat(runtime): pin application tasks to control and heavy lanes"
 ```
 
-### Task 10: Add the passive LP-core heartbeat observer
+### Task 10: Add an optional, bounded microSD training recorder
+
+**Files:**
+- Create: `main/training_logger.h`
+- Create: `main/training_logger.c`
+- Create: `tests/test_training_logger.c`
+- Create: `tests/test_training_logger.py`
+- Modify: `main/Kconfig.projbuild`
+- Modify: `main/CMakeLists.txt`
+- Modify: `main/main.c`
+- Modify: `main/detect_task.cpp`
+- Modify: `main/runtime_metrics.h/.c`
+
+**Interfaces:**
+- Produces: `training_logger_init()`, `training_logger_reserve()`, `training_logger_copy_jpeg()`, `training_logger_commit()`, `training_logger_cancel()`, and `training_logger_get_status()`.
+- Consumes: the optional `sd_card_ready()` mount, the existing camera JPEG only while its capture buffer is valid, Task 7/8 timestamped sensor snapshots, Task 4 motor/control status, and PicoDet result metadata.
+- Does not consume or call any actuator, I2C, Wi-Fi, ESP-NOW, GPS-parser, or transport send API.
+
+- [ ] **Step 1: Write the failing bounded-pool and serialization tests**
+
+Create a host-C test for the platform-independent pool/state-machine code. Verify that two reservations succeed, a third reservation returns immediately with `TRAINING_LOGGER_DROPPED_FULL`, `cancel` returns the slot, and only `commit` makes a completed job visible to the writer. Verify metadata is copied by value: mutate every producer-side input after commit and ensure the job retains its original capture timestamp, sensor generations/ages, manual control state, GPS validity, and detection result count. Test file-name construction rejects `/`, `..`, and overlong session IDs, and test that an image is published only after a closed `.part` file is renamed to its final `.jpg` name.
+
+The Python wrapper compiles the pure-C pool/serialization source with `cc -std=c11 -Wall -Wextra -Werror -Imain` and runs it in a temporary directory. It must not require a card, ESP-IDF headers, camera hardware, or a serial device.
+
+- [ ] **Step 2: Run the focused test and confirm the missing-module failure**
+
+Run: `python -m pytest tests/test_training_logger.py -q`
+
+Expected: FAIL because `training_logger.h` and `training_logger.c` do not exist.
+
+- [ ] **Step 3: Define the recording contract and implement the fixed pool**
+
+Add opt-in Kconfig values: `CONFIG_TRAINING_LOG_ENABLED` defaults to `n`, `CONFIG_TRAINING_LOG_PERIOD_MS` defaults to `1000`, `CONFIG_TRAINING_LOG_POOL_COUNT` defaults to `2`, and `CONFIG_TRAINING_LOG_MAX_JPEG_BYTES` defaults to a value no greater than the active camera JPEG buffer. Allocate exactly that many JPEG slots in PSRAM during `training_logger_init`; allocate no heap memory after init.
+
+Use slot states `FREE`, `FILLING`, `QUEUED`, and `WRITING`. `reserve()` and `commit()` are non-blocking. `copy_jpeg()` makes the bounded PSRAM copy while the camera capture is still valid; it never writes a file. If no slot exists, the request is skipped before copying and the caller continues normal detection. `commit()` transfers a fixed-size descriptor to a fixed-length queue; if enqueue fails it releases the slot, records a queue-drop event, and returns immediately. Record accepted, pool-full, queue-full, card-unavailable, write-error, and successful-write counters through `runtime_metrics`.
+
+Define a versioned metadata record containing at minimum: sequence and `capture_us`; width, height, pixel format and JPEG length; GPS fix plus age/generation; fusion orientation plus age/generation; ToF A/B values plus age/generation; manual throttle/rudder/winch/servo-power/failsafe state; current drive-mode identifier; and PicoDet detections/results plus their inference duration. These are observational labels only: recording never changes drive behavior.
+
+- [ ] **Step 4: Write samples only from the Core 1 TrainingLog task**
+
+Create `RUNTIME_TASK_TRAINING_LOG` as `TrainingLog`, `8192` stack words, priority `2`, Core `1`, event-driven, non-critical. Start it only after the existing optional SD initialization reports `sd_card_ready()`; otherwise mark the feature disabled and continue normal startup.
+
+For each queued job, create a collision-safe session directory below `/sdcard/training/`, write `<sequence>.jpg.part`, close it, and rename it to `<sequence>.jpg`. Then write its `<sequence>.json.part`, close it, and rename it to `<sequence>.json`. A reset/power loss can therefore leave only an ignored `.part` file, never a falsely complete sample. On an open/write/close/rename error, release the slot, increment the write-error counter, and continue with the next job. The writer is the only code that opens, writes, flushes, closes, or renames training files.
+
+- [ ] **Step 5: Connect the recorder to the Core 1 detection owner**
+
+At the configured one-Hz initial rate, the detect task first attempts `reserve()`. If it succeeds, copy the captured JPEG into the slot before `camera_release_frame()`, run normal inference, snapshot the already-published sensor/control/GPS state, attach the inference results, and `commit()` the job. On any capture/inference error, call `cancel()`. If recording is disabled or unavailable, take no training path at all. Camera/drain/inference scheduling and all Core 0 deadlines remain unchanged; training loss is explicitly acceptable.
+
+- [ ] **Step 6: Verify optional-failure behavior and build**
+
+Run `python -m pytest tests/test_training_logger.py -q`, then all host tests and `idf.py reconfigure && idf.py build`. Boot once with no card and once with a deliberately unwritable/full card: confirm manual RC, ESP-NOW/Wi-Fi, telemetry, IMU/ToF/GPS, and detection continue; diagnostics shows the recorder unavailable or write errors; no control deadline-miss counter changes. With a writable card and the config enabled, confirm one recoverable JPG/JSON pair per second and that a forced reset leaves only ignorable `.part` files.
+
+- [ ] **Step 7: Commit the training-recorder task**
+
+```bash
+git add main/training_logger.h main/training_logger.c main/Kconfig.projbuild main/CMakeLists.txt main/main.c main/detect_task.cpp main/runtime_schedule.h main/runtime_schedule.c main/runtime_metrics.h main/runtime_metrics.c tests/test_training_logger.c tests/test_training_logger.py tests/test_runtime_schedule.py
+git commit -m "feat(training): add bounded microSD sample recorder"
+```
+
+### Task 11: Add the passive LP-core heartbeat observer
 
 **Files:**
 - Create: `main/lp_heartbeat_shared.h`
@@ -895,7 +962,7 @@ git add main/lp_heartbeat_shared.h main/lp_supervisor.h main/lp_supervisor.c mai
 git commit -m "feat(safety): add passive LP heartbeat observer"
 ```
 
-### Task 11: Automate final log checks and run full verification
+### Task 12: Automate final log checks and run full verification
 
 **Files:**
 - Create: `tools/runtime_stress_check.py`
@@ -976,7 +1043,7 @@ git commit -m "test(runtime): enforce P4 scheduling thresholds"
 Run:
 
 ```bash
-git diff --check HEAD~11..HEAD
+git diff --check HEAD~12..HEAD
 python -m pytest tests -q
 source /opt/esp/idf/export.sh >/dev/null
 idf.py build

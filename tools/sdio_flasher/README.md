@@ -30,21 +30,37 @@ The ESP32-P4-Function-EV-Board has the SDIO bus and reset pin already wired:
 
 ### 1. Build the C6 slave firmware
 
+Use `tools/slave_firmware/build.sh` rather than recreating the project by hand —
+it also injects and verifies the ESP-NOW bridge, which a manual
+`create-project-from-example` skips (the bridge gets silently stripped by
+`--gc-sections` otherwise; see the comments in build.sh).
+
 ```bash
-cd /tmp
-idf.py create-project-from-example "espressif/esp_hosted=2.12.3:slave"
-cd slave
-idf.py set-target esp32c6
-echo "CONFIG_ESP_SDIO_HOST_INTERFACE=y" >> sdkconfig.defaults
-idf.py build
+cd tools/slave_firmware
+./build.sh          # defaults to the version pinned in build.sh; pass an explicit
+                     # version to override, e.g. ./build.sh 2.12.3
 ```
+
+**The version must match the P4 host's `espressif/esp_hosted` entry, which is
+pinned explicitly in `main/idf_component.yml`** (not left to float in
+`dependencies.lock` — a component-manager re-resolve can silently drift it, as
+happened 2026-08-10). A host/slave version gap causes SDIO write failures at
+runtime (`Failed to send data`); a host running 2.12.12 specifically crashes at
+boot on this board regardless of the slave (`sdio_mempool_create` assert — see
+the comment on the `esp_hosted` entry in `main/idf_component.yml` for the full
+story). Check `grep -A2 espressif/esp_hosted: main/idf_component.yml` before
+building if it's been a while since the two were last matched.
 
 ### 2. Copy binaries to target-firmware/
 
+`build.sh` builds under `tools/slave_firmware/build_slave/slave/` and prints
+these exact commands at the end of a successful run:
+
 ```bash
-cp build/bootloader/bootloader.bin       <project>/tools/sdio_flasher/target-firmware/
-cp build/partition_table/partition-table.bin <project>/tools/sdio_flasher/target-firmware/
-cp build/network_adapter.bin             <project>/tools/sdio_flasher/target-firmware/app.bin
+cd tools/slave_firmware/build_slave/slave
+cp build/bootloader/bootloader.bin        ../../../sdio_flasher/target-firmware/
+cp build/partition_table/partition-table.bin ../../../sdio_flasher/target-firmware/
+cp build/network_adapter.bin              ../../../sdio_flasher/target-firmware/app.bin
 ```
 
 ### 3. Build the flasher

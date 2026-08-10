@@ -2,9 +2,7 @@
 #define SENSOR_FUSION_H
 
 #include "common.h"
-#include "drivers/imu_driver.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+#include "imu_sample.h"
 
 // Structures
 typedef struct {
@@ -14,7 +12,7 @@ typedef struct {
 } FusionResult;
 
 void fusion_init(CalibrationData* calib_data);
-void fusion_update(void);
+void fusion_update_sample(const imu_sample_t *sample);
 void fusion_get_result(FusionResult* res);
 void task_imu_fusion(void *pvParameters);
 

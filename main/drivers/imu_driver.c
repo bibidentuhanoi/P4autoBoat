@@ -250,7 +250,7 @@ esp_err_t imu_reinit_accel_gyro(void) {
  * NACKs, so this tears the device down and re-probes BOTH straps (0x69 then
  * 0x68) in case a brownout/reset moved AD0, then re-applies the wake + range
  * config. Reappearing at the alternate address is direct evidence of a power
- * glitch rather than a bus fault. Caller holds g_i2c_mutex. */
+ * glitch rather than a bus fault. Call only from SensorBusTask after startup. */
 esp_err_t imu_recover_accel_gyro(void) {
     if (!s_bus) return ESP_ERR_INVALID_STATE;
 
@@ -299,7 +299,7 @@ esp_err_t imu_recover_accel_gyro(void) {
  * who ACKs — ground truth, independent of the registered device handles and the
  * fusion read path. If the mag (0x0D) shows but the IMU (0x68/0x69) doesn't, the
  * bus/power/pull-ups are fine and the fault is the ICM chip or its own pins.
- * Caller holds g_i2c_mutex. */
+ * Call only from SensorBusTask after startup. */
 void imu_bus_scan(void) {
     if (!s_bus) return;
     ESP_LOGW(TAG, "--- I2C bus scan (ground truth of who is answering) ---");
@@ -316,7 +316,8 @@ void imu_bus_scan(void) {
 }
 
 /* Full recovery for a fully-unresponsive QMC5883L (single address 0x0D): same
- * idea as the ICM path, minus the strap re-probe. Caller holds g_i2c_mutex. */
+ * idea as the ICM path, minus the strap re-probe. Call only from SensorBusTask
+ * after startup. */
 esp_err_t imu_recover_mag(void) {
     if (!s_bus) return ESP_ERR_INVALID_STATE;
 
@@ -385,7 +386,8 @@ esp_err_t imu_mag_ensure_continuous(void) {
 }
 
 /* Read back the QMC control register 0x09 (0x05 = continuous, 0x00 = standby)
- * for the fusion task's wiring-vs-firmware diagnostic. Call under g_i2c_mutex. */
+ * for SensorBusTask's wiring-vs-firmware diagnostic. Call only from
+ * SensorBusTask after startup. */
 esp_err_t imu_mag_read_ctrl(uint8_t *ctrl09) {
     if (!h_qmc || !ctrl09) return ESP_ERR_INVALID_STATE;
     return i2c_read_bytes(h_qmc, 0x09, ctrl09, 1);
