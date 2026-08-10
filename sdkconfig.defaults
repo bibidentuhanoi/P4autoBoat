@@ -112,6 +112,9 @@ CONFIG_HEAP_POISONING_LIGHT=y
 # --- ESP-NOW field mode ---
 CONFIG_ESPNOW_ENABLED=y
 CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8
-CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+# MEMPOOL_PREFER_SPIRAM removed 2026-08-10: prime suspect for the boot-time
+# sdio_mempool_create/buf_mp_g assert and a runtime SDIO write EINVAL — the
+# CMD53 IO-function write path esp-hosted uses does not reliably accept a
+# PSRAM-resident buffer on this board. Leave unset (component default).
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

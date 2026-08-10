@@ -12,6 +12,17 @@ dependencies:
   ## WiFi on ESP32-P4 (via coprocessor, e.g. ESP32-C6)
   espressif/esp_wifi_remote:
     version: "1.4.2"
+  ## Pinned explicitly: esp_wifi_remote -> wifi_remote_over_eppp declares
+  ## esp_hosted as ">=2.11", so a component-manager re-resolve (e.g. from the
+  ## cat_detect override_path change below) can silently drift this forward.
+  ## 2.12.12 rewrote the SDIO mempool to one eager ~48KB contiguous internal
+  ## DMA allocation during global ctors (pre-scheduler); this board can't
+  ## satisfy that and hits `assert failed: sdio_mempool_create (buf_mp_g)` on
+  ## every boot (2026-08-10). 2.12.3 is what main runs and is proven stable —
+  ## pinned here so it can't drift again. If bumping intentionally in future,
+  ## the C6 slave (tools/slave_firmware/build.sh) must be rebuilt to match.
+  espressif/esp_hosted:
+    version: "2.12.3"
   ## Protobuf encoding for telemetry pipeline
   livekit/nanopb:
     version: "^0.4.9"
