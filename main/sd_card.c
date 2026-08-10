@@ -3,16 +3,14 @@
  *
  * Board wiring (ESP32-P4 Function EV Board / this build):
  *     D0 GPIO39   D1 GPIO40   D2 GPIO41   D3 GPIO42
- *     CLK GPIO43  CMD GPIO44  EN  GPIO45
+ *     CLK GPIO43  CMD GPIO44
  *
  * Slot 0 pins are fixed by the IO MUX, so they are not configured individually
  * — only the width, and the card power.
  *
- * Two separate power concerns, both handled here:
- *   1. GPIO45 EN — board-level MOSFET on the card's 3.3V supply.
- *   2. On-chip LDO channel 4 — VDD_SDIO rail. Slot 0 is the UHS-I capable
- *      slot and needs controllable IO voltage; without this the card either
- *      fails to enumerate or is stuck at low speed.
+ * The board's SD_PWRn function is associated with the SDMMC peripheral; GPIO45
+ * must not be reconfigured as an ordinary GPIO. Slot 0 also uses on-chip LDO
+ * channel 4 for its VDD_SDIO rail.
  */
 #include "sd_card.h"
 
@@ -30,7 +28,6 @@
 
 static const char *TAG = "SD";
 
-#define SD_EN_GPIO        GPIO_NUM_45
 #define SD_LDO_CHAN_ID    4          /* VDD_SDIO on-chip LDO channel */
 #define SD_MAX_FILES      8
 
@@ -44,25 +41,11 @@ esp_err_t sd_card_init(void)
         return ESP_OK;
     }
 
-    /* 1. Board power-enable. Give the card a moment to come up before probing;
-     *    probing a rail that is still rising looks like a missing card. */
-    gpio_config_t en = {
-        .pin_bit_mask = 1ULL << SD_EN_GPIO,
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&en), TAG, "EN gpio_config");
-    gpio_set_level(SD_EN_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    /* 2. VDD_SDIO via the on-chip LDO — required for slot 0. */
+    /* VDD_SDIO via the on-chip LDO — required for slot 0. */
     sd_pwr_ctrl_ldo_config_t ldo_cfg = { .ldo_chan_id = SD_LDO_CHAN_ID };
     esp_err_t err = sd_pwr_ctrl_new_on_chip_ldo(&ldo_cfg, &s_pwr);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "on-chip LDO init failed: %s", esp_err_to_name(err));
-        gpio_set_level(SD_EN_GPIO, 0);
         return err;
     }
 
@@ -92,12 +75,11 @@ esp_err_t sd_card_init(void)
         if (err == ESP_FAIL) {
             ESP_LOGW(TAG, "mount failed — card not formatted FAT? (not reformatting)");
         } else {
-            ESP_LOGW(TAG, "card init failed: %s (inserted? EN=GPIO%d wired?)",
-                     esp_err_to_name(err), SD_EN_GPIO);
+            ESP_LOGW(TAG, "card init failed: %s (inserted and powered?)",
+                     esp_err_to_name(err));
         }
         sd_pwr_ctrl_del_on_chip_ldo(s_pwr);
         s_pwr = NULL;
-        gpio_set_level(SD_EN_GPIO, 0);
         return err;
     }
 
