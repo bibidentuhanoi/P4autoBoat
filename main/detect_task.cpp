@@ -12,6 +12,7 @@ extern "C" {
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "runtime_metrics.h"
+#include "runtime_startup.h"
 #include "runtime_task.h"
 #include <string.h>
 }
@@ -193,7 +194,8 @@ extern "C" esp_err_t detect_init(void)
     s_cache_mutex = xSemaphoreCreateMutex();
     if (!s_cache_mutex) {
         ESP_LOGE(TAG, "Failed to create detect cache mutex");
-        return ESP_ERR_NO_MEM;
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_DETECT,
+                                                   ESP_ERR_NO_MEM);
     }
 
     /* Create the task BEFORE the model preload: its 32KB stack needs one
@@ -201,10 +203,13 @@ extern "C" esp_err_t detect_init(void)
      * badly enough that grabbing it afterwards fails (seen on hardware with
      * 214KB free but no 32KB block). The task parks on ulTaskNotifyTake and
      * cannot run until a WS trigger — long after this function returns. */
-    if (runtime_task_create(RUNTIME_TASK_DETECT, detect_task_fn, NULL, &s_detect_task) != ESP_OK) {
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_DETECT, detect_task_fn,
+                                               NULL, &s_detect_task);
+    if (task_error != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create detect task (largest internal block: %u B)",
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        return ESP_ERR_NO_MEM;
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_DETECT,
+                                                   task_error);
     }
 
     /* Preload model NOW (before WiFi starts) — allocates PSRAM bulk

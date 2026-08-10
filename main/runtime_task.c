@@ -4,6 +4,8 @@
 
 #include "esp_log.h"
 
+#include <stddef.h>
+
 esp_err_t runtime_task_create(runtime_task_id_t id, TaskFunction_t fn,
                               void *arg, TaskHandle_t *out)
 {

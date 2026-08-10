@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "runtime_metrics.h"
+#include "runtime_startup.h"
 #include "runtime_task.h"
 #include <string.h>
 #include <errno.h>
@@ -341,9 +342,11 @@ esp_err_t ws_transport_init(httpd_handle_t server)
      * (client crash, network drop), so stale fds are removed when send fails. */
 
     /* Start TX task — owns all WiFi sends, decoupled from sensor task */
-    if (runtime_task_create(RUNTIME_TASK_WS_TX, ws_tx_task, NULL, &s_tx_task) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create WS TX task");
-        return ESP_ERR_NO_MEM;
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_WS_TX, ws_tx_task,
+                                               NULL, &s_tx_task);
+    if (task_error != ESP_OK) {
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_WS_TX,
+                                                   task_error);
     }
 
     /* Register with pipeline */

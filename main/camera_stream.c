@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "runtime_metrics.h"
+#include "runtime_startup.h"
 #include "runtime_task.h"
 #include <string.h>
 #include <inttypes.h>
@@ -150,8 +151,13 @@ esp_err_t camera_stream_server_start(void)
                         TAG, "register /stream failed");
 
     /* Lightweight drain — keeps ISP pipeline alive when no MJPEG client */
-    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_CAMERA_DRAIN, camera_drain_task, NULL, NULL),
-                        TAG, "camera drain task failed");
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_CAMERA_DRAIN,
+                                               camera_drain_task, NULL, NULL);
+    if (task_error != ESP_OK) {
+        httpd_stop(server);
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_CAMERA_DRAIN,
+                                                   task_error);
+    }
 
     return ESP_OK;
 }

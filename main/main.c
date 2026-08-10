@@ -35,6 +35,7 @@
 #include "transports/espnow_transport.h"
 #include "sd_card.h"
 #include "runtime_metrics.h"
+#include "runtime_startup.h"
 #include "runtime_task.h"
 static const char* TAG = "MAIN";
 
@@ -202,6 +203,7 @@ void app_main(void) {
                                          CONFIG_GPS_TX_PIN,
                                          CONFIG_GPS_BAUD);
     if (gps_ret != ESP_OK) {
+        runtime_startup_handle_task_failure(RUNTIME_TASK_GPS, gps_ret);
         ESP_LOGW(TAG, "GPS init failed (%s) — snapshots will omit GPS fix",
                  esp_err_to_name(gps_ret));
     }
@@ -216,7 +218,11 @@ void app_main(void) {
 
     // Initialize detection task (lazy-loads model on first trigger)
     ESP_LOGI(TAG, "Initializing detection task...");
-    detect_init();
+    esp_err_t detect_ret = detect_init();
+    if (detect_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Detection unavailable (%s) — manual control continues",
+                 esp_err_to_name(detect_ret));
+    }
 
     // 10. Bring up the radio WITHOUT associating. The co-processor needs
     //     esp_wifi_start() before esp_now_init(), and not connecting yet keeps
@@ -272,9 +278,17 @@ void app_main(void) {
 #endif
         // 11. Start servers — stream on port 81, API/dashboard on port 80
         if (camera_ok) {
-            ESP_ERROR_CHECK(camera_stream_server_start());
+            esp_err_t stream_ret = camera_stream_server_start();
+            if (stream_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Camera stream unavailable (%s)",
+                         esp_err_to_name(stream_ret));
+            }
         }
-        ESP_ERROR_CHECK(http_server_start());
+        esp_err_t http_ret = http_server_start();
+        if (http_ret != ESP_OK) {
+            ESP_LOGW(TAG, "HTTP/WebSocket unavailable (%s) — manual control continues",
+                     esp_err_to_name(http_ret));
+        }
 
         // 11b. ESCs stay DISARMED at boot. Arming is gated on a GPS lock and
         //      requested by the user from the dashboard (bench override available).
@@ -295,8 +309,12 @@ void app_main(void) {
     //     telemetry at all (dashboard shows no IMU/ToF/GPS and arming stays locked).
     ESP_LOGI(TAG, "Starting tasks...");
     TaskHandle_t fusion_task = NULL;
-    if (runtime_task_create(RUNTIME_TASK_FUSION, task_imu_fusion, NULL, &fusion_task) != ESP_OK) {
-        ESP_LOGE(TAG, "FATAL: IMU_Task create failed (out of internal RAM)");
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_FUSION,
+                                               task_imu_fusion, NULL,
+                                               &fusion_task);
+    if (task_error != ESP_OK) {
+        ESP_ERROR_CHECK(runtime_startup_handle_task_failure(RUNTIME_TASK_FUSION,
+                                                            task_error));
     } else {
         sensor_task_register_fusion_task(fusion_task);
     }
@@ -309,17 +327,26 @@ void app_main(void) {
     }
 
     ESP_ERROR_CHECK(sensor_task_init());
-    if (runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_sensor_bus, &tof_devs, NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "FATAL: SensorBus create failed — no runtime sensor acquisition");
+    task_error = runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_sensor_bus,
+                                     &tof_devs, NULL);
+    if (task_error != ESP_OK) {
+        ESP_ERROR_CHECK(runtime_startup_handle_task_failure(RUNTIME_TASK_SENSOR_BUS,
+                                                            task_error));
     }
-    if (runtime_task_create(RUNTIME_TASK_TOF_PROCESS, task_tof_processor, NULL, NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "FATAL: ToFProc create failed — snapshots will carry no ToF");
+    task_error = runtime_task_create(RUNTIME_TASK_TOF_PROCESS,
+                                     task_tof_processor, NULL, NULL);
+    if (task_error != ESP_OK) {
+        runtime_startup_handle_task_failure(RUNTIME_TASK_TOF_PROCESS, task_error);
     }
-    if (runtime_task_create(RUNTIME_TASK_SNAPSHOT, task_sensor_snapshot, &tof_devs, NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "FATAL: Snap_Task create failed (out of internal RAM) — no telemetry");
+    task_error = runtime_task_create(RUNTIME_TASK_SNAPSHOT,
+                                     task_sensor_snapshot, &tof_devs, NULL);
+    if (task_error != ESP_OK) {
+        runtime_startup_handle_task_failure(RUNTIME_TASK_SNAPSHOT, task_error);
     }
-    if (runtime_task_create(RUNTIME_TASK_DIAGNOSTICS, task_runtime_diagnostics, NULL, NULL) != ESP_OK) {
-        ESP_LOGE(TAG, "Diagnostics task create failed");
+    task_error = runtime_task_create(RUNTIME_TASK_DIAGNOSTICS,
+                                     task_runtime_diagnostics, NULL, NULL);
+    if (task_error != ESP_OK) {
+        runtime_startup_handle_task_failure(RUNTIME_TASK_DIAGNOSTICS, task_error);
     }
 
     ESP_LOGI(TAG, "System running.");

@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "drivers/gps_driver.h"
 #include "motor_control.h"
 #include "pipeline.h"
 #include <string.h>
@@ -230,6 +231,17 @@ void task_runtime_diagnostics(void *arg)
         }
 
         if (periodic_report) {
+            gps_runtime_status_t gps_status;
+            if (gps_driver_get_runtime_status(&gps_status) == ESP_OK) {
+                ESP_LOGI(tag, "gps fifo_ovf=%u buffer_full=%u line_ovf=%u parse_errors=%u protocol=%u last_frame_us=%lld fix_age_us=%lld",
+                         (unsigned)gps_status.uart_fifo_overflows,
+                         (unsigned)gps_status.uart_buffer_full_events,
+                         (unsigned)gps_status.parser_line_overflows,
+                         (unsigned)gps_status.parse_errors,
+                         (unsigned)gps_status.protocol_authority,
+                         (long long)gps_status.last_frame_us,
+                         (long long)gps_status.fix_age_us);
+            }
             for (runtime_task_id_t id = RUNTIME_TASK_CONTROL; id < RUNTIME_TASK_COUNT; ++id) {
                 runtime_metric_record_t *record = &s_records[id];
                 const runtime_task_spec_t *spec = runtime_schedule_get(id);

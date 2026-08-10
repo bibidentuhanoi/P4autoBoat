@@ -810,6 +810,15 @@ esp_err_t motor_control_init_hw(void)
     return ret;
 }
 
+void motor_control_disarm(void)
+{
+    s_arm_power_allowed = false;
+    (void)esc_driver_disarm();
+    (void)winch_driver_set_speed(0.0f);
+    (void)winch_driver_set_power(false);
+    (void)steer_driver_set(0.0f);
+}
+
 esp_err_t motor_control_init(void)
 {
     control_arbiter_init(&s_arbiter);
@@ -833,13 +842,23 @@ esp_err_t motor_control_init(void)
     pipeline_register_servo_power_handler(servo_power_command_handler);
     pipeline_register_steer_raw_handler(steer_raw_command_handler);
 
-    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
-                                            task_arm_sequence, NULL,
-                                            &s_arm_sequence_task),
-                        TAG, "ArmSeq task create");
-    ESP_RETURN_ON_ERROR(runtime_task_create(RUNTIME_TASK_CONTROL, task_control,
-                                            NULL, &s_control_task),
-                        TAG, "Control task create");
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
+                                               task_arm_sequence, NULL,
+                                               &s_arm_sequence_task);
+    if (task_error != ESP_OK) {
+        motor_control_disarm();
+        (void)winch_driver_set_power(false);
+        ESP_LOGE(TAG, "critical task failed to start: ArmSeq");
+        return task_error;
+    }
+    task_error = runtime_task_create(RUNTIME_TASK_CONTROL, task_control,
+                                     NULL, &s_control_task);
+    if (task_error != ESP_OK) {
+        motor_control_disarm();
+        (void)winch_driver_set_power(false);
+        ESP_LOGE(TAG, "critical task failed to start: Control");
+        return task_error;
+    }
 
     ESP_LOGI(TAG, "Motor control initialized (ControlTask 10 ms, persistent ArmSeq)");
     return ESP_OK;

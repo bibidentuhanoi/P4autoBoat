@@ -21,6 +21,9 @@ esp_err_t motor_control_init_hw(void);
  */
 esp_err_t motor_control_init(void);
 
+/** Immediately command propulsion and auxiliary actuators to a safe state. */
+void motor_control_disarm(void);
+
 /** Refresh manual-control liveness. Call only after accepting a manual command. */
 void motor_control_notify_link_rx(int64_t received_us);
 

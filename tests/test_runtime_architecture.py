@@ -244,6 +244,7 @@ static bool gps_lock;
 static esc_state_t esc_state = ESC_STATE_DISARMED;
 static TaskFunction_t control_fn;
 static TaskFunction_t arm_sequence_fn;
+static runtime_task_id_t runtime_task_failure = RUNTIME_TASK_COUNT;
 static jmp_buf control_wait;
 static jmp_buf arm_sequence_wait;
 static bool stop_at_wait;
@@ -264,7 +265,7 @@ typedef struct {
     unsigned char items[4][24];
 } test_queue_t;
 
-static test_queue_t test_queues[2];
+static test_queue_t test_queues[6];
 static unsigned queue_create_count;
 
 static void run_one_control_cycle(void);
@@ -323,6 +324,7 @@ BaseType_t xTaskNotifyGive(TaskHandle_t task) { (void)task; ++control_notificati
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (TaskHandle_t)1; }
 esp_err_t runtime_task_create(runtime_task_id_t id, TaskFunction_t fn, void *arg, TaskHandle_t *out) {
     (void)arg;
+    if (id == runtime_task_failure) return ESP_ERR_NO_MEM;
     if (id == RUNTIME_TASK_CONTROL) {
         control_fn = fn;
         if (out) *out = (TaskHandle_t)2;
@@ -339,7 +341,7 @@ void runtime_metrics_cycle_end(runtime_task_id_t id, uint64_t finished) { (void)
 
 QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size) {
     assert(length <= 4 && item_size <= sizeof(test_queues[0].items[0]));
-    assert(queue_create_count < 2);
+    assert(queue_create_count < 6);
     test_queue_t *queue = &test_queues[queue_create_count++];
     queue->item_size = item_size;
     return queue;
@@ -576,6 +578,24 @@ int main(void) {
     assert(arm_script_stage == 6);
     assert(observed_arm_wait == pdMS_TO_TICKS(3000));
     assert(arm_begin_calls == 2 && arm_complete_calls == 1 && disarm_calls == 2);
+
+    esc_state = ESC_STATE_ARMED;
+    servo_power = true;
+    runtime_task_failure = RUNTIME_TASK_ARM_SEQUENCE;
+    unsigned disarms_before_failure = disarm_calls;
+    assert(motor_control_init() == ESP_ERR_NO_MEM);
+    assert(disarm_calls == disarms_before_failure + 1);
+    assert(esc_state == ESC_STATE_DISARMED);
+    assert(!servo_power);
+
+    esc_state = ESC_STATE_ARMED;
+    servo_power = true;
+    runtime_task_failure = RUNTIME_TASK_CONTROL;
+    disarms_before_failure = disarm_calls;
+    assert(motor_control_init() == ESP_ERR_NO_MEM);
+    assert(disarm_calls == disarms_before_failure + 1);
+    assert(esc_state == ESC_STATE_DISARMED);
+    assert(!servo_power);
     return 0;
 }
 """
@@ -786,6 +806,7 @@ def test_detect_dispatch_does_not_enter_manual_control_ingress():
 
 
 DIAGNOSTICS_HEADERS = {
+    "esp_err.h": STUB_HEADERS["esp_err.h"],
     "esp_log.h": STUB_HEADERS["esp_log.h"],
     "freertos/FreeRTOS.h": STUB_HEADERS["freertos/FreeRTOS.h"],
     "freertos/task.h": STUB_HEADERS["freertos/task.h"] + r"""
@@ -804,6 +825,21 @@ uint32_t motor_control_get_status(boat_MotorStatus *out);
 #include "motor_control.h"
 void pipeline_publish_motor_status(const boat_MotorStatus *status);
 """,
+    "drivers/gps_driver.h": r"""
+#pragma once
+#include <stdint.h>
+#include "esp_err.h"
+typedef struct {
+    uint32_t uart_fifo_overflows;
+    uint32_t uart_buffer_full_events;
+    uint32_t parser_line_overflows;
+    uint32_t parse_errors;
+    unsigned protocol_authority;
+    int64_t last_frame_us;
+    int64_t fix_age_us;
+} gps_runtime_status_t;
+esp_err_t gps_driver_get_runtime_status(gps_runtime_status_t *out);
+""",
 }
 
 
@@ -812,9 +848,11 @@ DIAGNOSTICS_HARNESS = r"""
 #include <setjmp.h>
 #include <stddef.h>
 #include "runtime_metrics.h"
+#include "drivers/gps_driver.h"
 #include "motor_control.h"
 
 static unsigned motor_status_publishes;
+static unsigned gps_status_reads;
 static jmp_buf diagnostics_wait;
 
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
@@ -825,6 +863,11 @@ uint32_t motor_control_get_status(boat_MotorStatus *out) {
 void pipeline_publish_motor_status(const boat_MotorStatus *status) {
     assert(status->state == 2);
     ++motor_status_publishes;
+}
+esp_err_t gps_driver_get_runtime_status(gps_runtime_status_t *out) {
+    *out = (gps_runtime_status_t){.parse_errors = 3, .fix_age_us = 4000};
+    ++gps_status_reads;
+    return ESP_OK;
 }
 const runtime_task_spec_t *runtime_schedule_get(runtime_task_id_t id) {
     static runtime_task_spec_t specs[RUNTIME_TASK_COUNT];
@@ -847,6 +890,7 @@ int main(void) {
     runtime_metrics_init();
     if (setjmp(diagnostics_wait) == 0) task_runtime_diagnostics(NULL);
     assert(motor_status_publishes == 1);
+    assert(gps_status_reads == 1);
     return 0;
 }
 """

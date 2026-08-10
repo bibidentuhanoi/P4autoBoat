@@ -4,6 +4,8 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
+#include "runtime_startup.h"
+#include "runtime_task.h"
 
 static const char *TAG = "STATUS_LED";
 
@@ -91,9 +93,11 @@ esp_err_t status_led_init(void) {
     }
     led_write(false);
 
-    if (xTaskCreate(status_led_task, "status_led", 2048, NULL, 3, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "task create failed");
-        return ESP_ERR_NO_MEM;
+    esp_err_t task_error = runtime_task_create(RUNTIME_TASK_STATUS_LED,
+                                               status_led_task, NULL, NULL);
+    if (task_error != ESP_OK) {
+        return runtime_startup_handle_task_failure(RUNTIME_TASK_STATUS_LED,
+                                                   task_error);
     }
     s_inited = true;
     ESP_LOGI(TAG, "status LED on GPIO%d%s", CONFIG_STATUS_LED_PIN,
