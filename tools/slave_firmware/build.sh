@@ -12,6 +12,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build_slave"
+# Must match the P4 host's espressif/esp_hosted version, which is now pinned
+# explicitly in ../../main/idf_component.yml (not just dependencies.lock) —
+# a host/slave version gap causes SDIO write failures, and 2.12.12 specifically
+# rewrote the SDIO mempool in a way that crashes this board at boot (2026-08-10,
+# see main/idf_component.yml's esp_hosted comment for the full story). Check
+# `grep -A2 espressif/esp_hosted: ../../main/idf_component.yml` before assuming
+# this default is still current.
 VERSION="${1:-2.12.3}"
 
 echo "=== Building ESP-Hosted slave firmware v${VERSION} for ESP32-C6 ==="
