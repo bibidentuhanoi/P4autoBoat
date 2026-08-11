@@ -29,6 +29,7 @@ idf_component_register(
         "motor_control.c"
         "http_server.c"
         "sensor_task.c"
+        "training_log_task.c"
         "transports/ws_transport.c"
         "transports/espnow_transport.c"
         "proto/boat.pb.c"

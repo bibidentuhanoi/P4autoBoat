@@ -5,6 +5,17 @@
 #include <string.h>
 
 #ifdef ESP_PLATFORM
+/* File-local compile ceiling, NOT the global CONFIG_LOG_MAXIMUM_LEVEL: that
+ * Kconfig option is also what managed_components/espressif__esp_video's
+ * esp_video_isp_pipeline.c gates its own (commented-out, unrelated)
+ * per-frame debug dump behind, via `#if LOG_LOCAL_LEVEL >= ESP_LOG_DEBUG`
+ * with no override -- LOG_LOCAL_LEVEL defaults to CONFIG_LOG_MAXIMUM_LEVEL
+ * when a file doesn't set it. Raising that Kconfig option globally silently
+ * compiled that unrelated block in too (hw-confirmed: flooded the console
+ * with per-sequence ISP histogram/AF dumps, worse than RTM ever was). This
+ * define raises the ceiling for ESP_LOGD calls in *this file only*, so RTM
+ * can move to ESP_LOGD without touching any other component's behavior. */
+#define LOG_LOCAL_LEVEL ESP_LOG_DEBUG
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -233,7 +244,7 @@ void task_runtime_diagnostics(void *arg)
         if (periodic_report) {
             gps_runtime_status_t gps_status;
             if (gps_driver_get_runtime_status(&gps_status) == ESP_OK) {
-                ESP_LOGI(tag, "gps fifo_ovf=%u buffer_full=%u line_ovf=%u parse_errors=%u protocol=%u last_frame_us=%lld fix_age_us=%lld",
+                ESP_LOGD(tag, "gps fifo_ovf=%u buffer_full=%u line_ovf=%u parse_errors=%u protocol=%u last_frame_us=%lld fix_age_us=%lld",
                          (unsigned)gps_status.uart_fifo_overflows,
                          (unsigned)gps_status.uart_buffer_full_events,
                          (unsigned)gps_status.parser_line_overflows,
@@ -254,7 +265,7 @@ void task_runtime_diagnostics(void *arg)
                     runtime_metrics_set_stack(id, uxTaskGetStackHighWaterMark(handle));
                 }
                 runtime_metrics_snapshot(id, &metrics);
-                ESP_LOGI(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u skips=%u errors=%u",
+                ESP_LOGD(tag, "task=%s core=%d prio=%u runs=%u max_exec_us=%u max_gap_us=%u max_jitter_us=%u misses=%u stack_free_words=%u skips=%u errors=%u",
                          spec->name, spec->core, (unsigned)spec->priority,
                          (unsigned)metrics.runs, (unsigned)metrics.max_exec_us,
                          (unsigned)metrics.max_gap_us, (unsigned)metrics.max_jitter_us,
@@ -286,13 +297,13 @@ void task_runtime_diagnostics(void *arg)
                 (unsigned)(100ULL * (core_runtime[0] - idle_runtime[0]) / core_runtime[0]);
             unsigned core1_load = core_runtime[1] == 0 ? 0 :
                 (unsigned)(100ULL * (core_runtime[1] - idle_runtime[1]) / core_runtime[1]);
-            ESP_LOGI(tag, "core_load_supported=1 core0_load_pct=%u core1_load_pct=%u",
+            ESP_LOGD(tag, "core_load_supported=1 core0_load_pct=%u core1_load_pct=%u",
                      core0_load, core1_load);
         } else {
-            ESP_LOGI(tag, "core_load_supported=0");
+            ESP_LOGD(tag, "core_load_supported=0");
         }
 #else
-            ESP_LOGI(tag, "core_load_supported=0");
+            ESP_LOGD(tag, "core_load_supported=0");
 #endif
             next_report += pdMS_TO_TICKS(1000);
             if (next_report <= now) next_report = now + pdMS_TO_TICKS(1000);

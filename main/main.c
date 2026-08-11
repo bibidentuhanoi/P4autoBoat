@@ -31,6 +31,7 @@
 #include "http_server.h"
 #include "sensor_task.h"
 #include "detect_task.h"
+#include "training_log_task.h"
 #include "motor_control.h"
 #include "transports/espnow_transport.h"
 #include "drivers/sd_card.h"
@@ -355,6 +356,15 @@ void app_main(void) {
                                      task_runtime_diagnostics, NULL, NULL);
     if (task_error != ESP_OK) {
         runtime_startup_handle_task_failure(RUNTIME_TASK_DIAGNOSTICS, task_error);
+    }
+
+    // Dataset capture (JPEG + sensor sidecar to SD, trigger via WS/ESP-NOW).
+    // Needs sensor_task_init() (sensor_tof_cache_load()) above; does not
+    // need SD/camera to already be ready -- both are checked per-capture.
+    esp_err_t training_log_ret = training_log_init();
+    if (training_log_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Dataset capture unavailable (%s) — manual control continues",
+                 esp_err_to_name(training_log_ret));
     }
 
     ESP_LOGI(TAG, "System running.");

@@ -1,11 +1,23 @@
 #include "pipeline.h"
 #include "detect_task.h"
+#include "training_log_task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include <string.h>
 #include <pb_encode.h>
 #include <pb_decode.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+
+/* pipeline_publish_sensors() should be sub-millisecond (protobuf encode of
+ * a ~1-2KB struct + a non-blocking memcpy into the WS slot buffer) -- hw
+ * has shown it taking 107ms during a TrainingLog capture, well past
+ * task_sensor_snapshot's 50ms budget, cause not yet isolated to either
+ * waiting for s_msg_mutex (someone else holding it) or the work inside the
+ * lock. This threshold is deliberately far below the 50ms deadline so it
+ * fires before the deadline miss it's diagnosing, and split into wait vs
+ * work so the log states which one it actually was. */
+#define PIPELINE_PUBLISH_SLOW_US 10000U
 
 static const char *TAG = "PIPELINE";
 
@@ -59,19 +71,36 @@ static SemaphoreHandle_t s_msg_mutex = NULL;
 static boat_BoatMessage  s_rx_msg;
 static SemaphoreHandle_t s_rx_msg_mutex = NULL;
 
-/* Encode s_msg (caller set which_payload/payload under the mutex) and fan out. */
+/* Encode s_msg (caller set which_payload/payload under the mutex) and fan out.
+ * hw-confirmed (2026-08-11): publish_sensors's "work" phase hit 30-115ms with
+ * transports=1 and negligible mutex_wait, meaning the delay is in here --
+ * either pb_encode() or the one registered transport's own send(). Split so
+ * the next occurrence names which. */
 static void fanout_locked(uint8_t *buf, size_t bufsize, const char *what)
 {
+    uint64_t t_encode_start = (uint64_t)esp_timer_get_time();
     pb_ostream_t stream = pb_ostream_from_buffer(buf, bufsize);
     if (!pb_encode(&stream, boat_BoatMessage_fields, &s_msg)) {
         ESP_LOGE(TAG, "%s encode failed: %s", what, PB_GET_ERROR(&stream));
         return;
     }
     size_t len = stream.bytes_written;
+    uint64_t encode_us = (uint64_t)esp_timer_get_time() - t_encode_start;
+    if (encode_us > PIPELINE_PUBLISH_SLOW_US) {
+        ESP_LOGW(TAG, "%s pb_encode slow: %lluus (len=%u, camera_active=%d)",
+                 what, (unsigned long long)encode_us, (unsigned)len,
+                 (int)g_training_log_camera_active);
+    }
+
     for (int i = 0; i < s_transport_count; i++) {
+        uint64_t t_send_start = (uint64_t)esp_timer_get_time();
         esp_err_t ret = s_transports[i].send(buf, len, s_transports[i].ctx);
+        uint64_t send_us = (uint64_t)esp_timer_get_time() - t_send_start;
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "Transport %d %s send failed: %s", i, what, esp_err_to_name(ret));
+        }
+        if (send_us > PIPELINE_PUBLISH_SLOW_US) {
+            ESP_LOGW(TAG, "Transport %d %s send slow: %lluus", i, what, (unsigned long long)send_us);
         }
     }
 }
@@ -163,13 +192,22 @@ void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
      * Guarded by s_msg_mutex like s_msg. */
     static uint8_t buf[boat_BoatMessage_size + 16];
 
+    uint64_t t0 = (uint64_t)esp_timer_get_time();
     xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
+    uint64_t t1 = (uint64_t)esp_timer_get_time();
     /* No memset needed: which_payload selects the only member nanopb reads,
      * and we overwrite that member entirely. */
     s_msg.which_payload = boat_BoatMessage_sensors_tag;
     s_msg.payload.sensors = *snap;
     fanout_locked(buf, sizeof(buf), "sensors");
     xSemaphoreGive(s_msg_mutex);
+    uint64_t t2 = (uint64_t)esp_timer_get_time();
+
+    uint64_t wait_us = t1 - t0, work_us = t2 - t1;
+    if (wait_us + work_us > PIPELINE_PUBLISH_SLOW_US) {
+        ESP_LOGW(TAG, "publish_sensors slow: mutex_wait=%lluus work=%lluus (transports=%d)",
+                 (unsigned long long)wait_us, (unsigned long long)work_us, s_transport_count);
+    }
 }
 
 void pipeline_publish_status(const boat_SystemStatus *status)
@@ -230,6 +268,10 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
     case boat_BoatMessage_detect_tag:
         ESP_LOGI(TAG, "Detect command received");
         detect_trigger();
+        break;
+    case boat_BoatMessage_training_log_tag:
+        ESP_LOGI(TAG, "TrainingLog command received");
+        training_log_trigger();
         break;
     case boat_BoatMessage_arm_cmd_tag:
         ESP_LOGI(TAG, "Arm command received: %s%s",

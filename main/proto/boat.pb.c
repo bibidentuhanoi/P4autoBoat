@@ -18,6 +18,9 @@ PB_BIND(boat_Detection, boat_Detection, AUTO)
 PB_BIND(boat_DetectCommand, boat_DetectCommand, AUTO)
 
 
+PB_BIND(boat_TrainingLogCommand, boat_TrainingLogCommand, AUTO)
+
+
 PB_BIND(boat_GpsFix, boat_GpsFix, AUTO)
 
 

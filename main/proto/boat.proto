@@ -27,6 +27,12 @@ message Detection {
 message DetectCommand {
 }
 
+// Trigger one dataset capture: a full-quality JPEG + a time-synced sensor
+// sidecar written to SD. Empty payload -- the trigger itself carries no
+// parameters, matching DetectCommand.
+message TrainingLogCommand {
+}
+
 message GpsFix {
   bool   valid       = 1;
   double latitude    = 2;
@@ -130,5 +136,6 @@ message BoatMessage {
     SteerCommand   steer        = 9;
     ServoPowerCommand servo_power = 10;
     SteerRawCommand steer_raw   = 11;
+    TrainingLogCommand training_log = 12;
   }
 }

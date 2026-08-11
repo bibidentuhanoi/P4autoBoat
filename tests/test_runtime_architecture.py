@@ -665,6 +665,7 @@ typedef struct {
 #define boat_BoatMessage_sensors_tag 8
 #define boat_BoatMessage_status_tag 9
 #define boat_BoatMessage_motor_status_tag 10
+#define boat_BoatMessage_training_log_tag 11
 #define boat_BoatMessage_size 128
 #define boat_SystemStatus_size 32
 #define boat_BoatMessage_fields NULL
@@ -691,6 +692,8 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len);
     "esp_err.h": STUB_HEADERS["esp_err.h"],
     "esp_log.h": STUB_HEADERS["esp_log.h"],
     "detect_task.h": "#pragma once\nvoid detect_trigger(void);\n",
+    "training_log_task.h": "#pragma once\n#include <stdbool.h>\nvoid training_log_trigger(void);\nextern volatile bool g_training_log_camera_active;\n",
+    "esp_timer.h": "#pragma once\n#include <stdint.h>\nint64_t esp_timer_get_time(void);\n",
     "freertos/FreeRTOS.h": STUB_HEADERS["freertos/FreeRTOS.h"] + "\n#define portMAX_DELAY ((TickType_t)-1)\n",
     "freertos/semphr.h": r"""
 #pragma once
@@ -728,9 +731,13 @@ PIPELINE_HARNESS = r"""
 static int decoded_tag;
 static unsigned detect_calls;
 static unsigned manual_control_calls;
+static unsigned training_log_calls;
 
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 void detect_trigger(void) { ++detect_calls; }
+void training_log_trigger(void) { ++training_log_calls; }
+int64_t esp_timer_get_time(void) { return 0; }
+volatile bool g_training_log_camera_active = false;
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (SemaphoreHandle_t)1; }
 BaseType_t xSemaphoreTake(SemaphoreHandle_t semaphore, TickType_t wait) {
     (void)semaphore; (void)wait; return pdTRUE;
@@ -776,6 +783,11 @@ int main(void) {
     assert(detect_calls == 1);
     assert(manual_control_calls == 0);
 
+    decoded_tag = boat_BoatMessage_training_log_tag;
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(training_log_calls == 1);
+    assert(manual_control_calls == 0);
+
     decoded_tag = boat_BoatMessage_motor_tag;
     pipeline_handle_incoming(input, sizeof(input));
     assert(manual_control_calls == 1);
@@ -784,7 +796,7 @@ int main(void) {
 """
 
 
-def test_detect_dispatch_does_not_enter_manual_control_ingress():
+def test_non_motor_dispatch_does_not_enter_manual_control_ingress():
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         for relative, content in PIPELINE_HEADERS.items():

@@ -14,6 +14,7 @@
 #include "sensor_task.h"
 #include "detect_task.h"
 #include "pipeline.h"
+#include "training_log_task.h"
 #include "sensor_fusion.h"
 #include "drivers/gps_driver.h"
 #include "drivers/imu_driver.h"
@@ -96,6 +97,7 @@ typedef struct {
     uint16_t sigma[TOF_NVALS];
     uint8_t  status[TOF_NVALS];
     uint8_t  nb_target[64];
+    uint32_t generation;     /* verified (torn-frame-excluded) generation number */
     int64_t  ts_us;          /* 0 = never populated */
 } tof_grid_cache_t;
 
@@ -125,7 +127,8 @@ static uint32_t s_imu_sequence = 0;
 /* Apply per-slot gating + 3-frame median, then publish into the cache. */
 static void tof_cache_store(tof_grid_cache_t *cache,
                             const VL53L5CX_ResultsData *res,
-                            int16_t med[][3], uint8_t *med_idx)
+                            int16_t med[][3], uint8_t *med_idx,
+                            uint32_t generation)
 {
     int16_t  dist[TOF_NVALS];
     uint16_t sig[TOF_NVALS];
@@ -153,6 +156,7 @@ static void tof_cache_store(tof_grid_cache_t *cache,
     memcpy(cache->sigma,     sig,  sizeof(sig));
     memcpy(cache->status,    st,   sizeof(st));
     memcpy(cache->nb_target, nbt,  sizeof(nbt));
+    cache->generation = generation;
     cache->ts_us = esp_timer_get_time();
     xSemaphoreGive(s_cache_mutex);
 }
@@ -407,7 +411,7 @@ static void tof_process_latest(tof_result_channel_t *channel,
         tof_count_overwrites(*last_generation, generation);
         uint64_t started = esp_timer_get_time();
         runtime_metrics_cycle_begin(RUNTIME_TASK_TOF_PROCESS, started, started);
-        tof_cache_store(cache, result, median, median_index);
+        tof_cache_store(cache, result, median, median_index, generation);
         runtime_metrics_cycle_end(RUNTIME_TASK_TOF_PROCESS, esp_timer_get_time());
         *last_generation = generation;
     }
@@ -600,12 +604,22 @@ void task_tof_processor(void *pvParameters)
     }
 }
 
-/* Copy a cached grid into the snapshot. Returns false when nothing fresh.
- * Only ever called from the non-field-mode branch of task_sensor_snapshot
- * below -- field mode sends espnow_telemetry_t instead and never reaches
- * this function at all, so there is no g_field_mode check needed here. */
-static bool tof_cache_load(const tof_grid_cache_t *cache, boat_ToFGrid *out)
+/* Copy a cached grid out. Returns false when nothing fresh has been
+ * published yet or the cache has exceeded TOF_STALE_US. generation/age_us
+ * are optional (NULL-able, matching camera_capture_frame()'s convention) --
+ * task_sensor_snapshot's WS telemetry path doesn't need them, TrainingLog's
+ * dataset sidecar does, for honest per-field freshness disclosure. age_us
+ * measures time since this generation was stored into the cache, not since
+ * the sensor produced it -- ToFProc publishes promptly after ToFRead, so
+ * that gap is small, but it is what's actually being measured. */
+bool sensor_tof_cache_load(sensor_tof_id_t which, boat_ToFGrid *out,
+                           uint32_t *generation, int64_t *age_us)
 {
+    const tof_grid_cache_t *cache = (which == SENSOR_TOF_A) ? &s_cache_a
+                                    : (which == SENSOR_TOF_B) ? &s_cache_b
+                                    : NULL;
+    if (!cache || !out) return false;
+
     bool ok = false;
     xSemaphoreTake(s_cache_mutex, portMAX_DELAY);
     if (cache->ts_us != 0 && (esp_timer_get_time() - cache->ts_us) < TOF_STALE_US) {
@@ -618,6 +632,8 @@ static bool tof_cache_load(const tof_grid_cache_t *cache, boat_ToFGrid *out)
         memcpy(out->sigma, cache->sigma, sizeof(cache->sigma));
         memcpy(out->target_status, cache->status, sizeof(cache->status));
         memcpy(out->nb_target_detected, cache->nb_target, sizeof(cache->nb_target));
+        if (generation) *generation = cache->generation;
+        if (age_us) *age_us = esp_timer_get_time() - cache->ts_us;
         ok = true;
     }
     xSemaphoreGive(s_cache_mutex);
@@ -646,14 +662,28 @@ void task_sensor_snapshot(void *pvParameters)
         uint64_t metric_started = esp_timer_get_time();
         runtime_metrics_cycle_begin(RUNTIME_TASK_SNAPSHOT, metric_scheduled, metric_started);
 
+        /* Per-phase timing, cheap to capture unconditionally (esp_timer_get_time()
+         * is microsecond-scale overhead) but only logged on an actual overrun --
+         * see the xTaskDelayUntil() check at the bottom of the loop. Chasing a
+         * real, hw-observed correlation between TrainingLog SD writes and this
+         * task overrunning; esp_wifi_sta_get_ap_info() below is the prime
+         * suspect (RPC over the same SDIO transport SD writes contend for),
+         * but this covers every phase so the log proves it either way instead
+         * of assuming it. */
+        uint64_t t_tof_us = 0, t_publish_us = 0, t_wifi_status_us = 0;
+        bool sd_active_at_tof = false;
+        bool sd_active_at_publish = false, sd_active_at_wifi_status = false;
+
         /* IMU — always available, 20 Hz. GPS — whatever the driver currently
          * has cached. Both modes need these; ToF/detections/full-snapshot
          * assembly below is bench-mode only. */
+        uint64_t t_sensors_start = esp_timer_get_time();
         FusionResult imu;
         fusion_get_result(&imu);
 
         gps_fix_t gps;
         bool have_gps = (gps_driver_get_fix(&gps) == ESP_OK && gps.last_update_us != 0);
+        uint64_t t_sensors_us = esp_timer_get_time() - t_sensors_start;
 
         if (g_field_mode) {
             /* ESP-NOW: compact struct, IMU+GPS only -- see espnow_telemetry_t
@@ -685,15 +715,18 @@ void task_sensor_snapshot(void *pvParameters)
             snap.imu.heading = imu.heading;
 
             /* ToF — copied from ToFProc's processed cache (5 Hz publish). */
+            uint64_t t_tof_start = esp_timer_get_time();
             bool tof_tick = (iteration % TOF_EVERY_N == 0);
             if (tof_tick) {
                 if (devs->a_ok) {
-                    snap.has_tof_a = tof_cache_load(&s_cache_a, &snap.tof_a);
+                    snap.has_tof_a = sensor_tof_cache_load(SENSOR_TOF_A, &snap.tof_a, NULL, NULL);
                 }
                 if (devs->b_ok) {
-                    snap.has_tof_b = tof_cache_load(&s_cache_b, &snap.tof_b);
+                    snap.has_tof_b = sensor_tof_cache_load(SENSOR_TOF_B, &snap.tof_b, NULL, NULL);
                 }
             }
+            sd_active_at_tof = g_training_log_sd_active;
+            t_tof_us = esp_timer_get_time() - t_tof_start;
 
             /* Re-emit cached detections for up to 30s so the browser gets
              * them after WS reconnect — was 15s but post-detect WS reconnect
@@ -715,7 +748,10 @@ void task_sensor_snapshot(void *pvParameters)
                 snap.gps.utc_ms      = gps.utc_ms;
             }
 
+            uint64_t t_pub_start = esp_timer_get_time();
             pipeline_publish_sensors(&snap);
+            sd_active_at_publish = g_training_log_sd_active;
+            t_publish_us = esp_timer_get_time() - t_pub_start;
         }
 
         /* SystemStatus at ~1Hz */
@@ -733,12 +769,15 @@ void task_sensor_snapshot(void *pvParameters)
              * "snapshot loop overrun" seen after the ToF/struct fixes landed.
              * espnow_drive.py doesn't even decode MSG_STATUS right now, so
              * this was costing RPC time for a field nothing reads. */
+            uint64_t t_wifi_start = esp_timer_get_time();
             if (!g_field_mode) {
                 wifi_ap_record_t ap;
                 if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
                     sys.wifi_rssi = ap.rssi;
                 }
             }
+            sd_active_at_wifi_status = g_training_log_sd_active;
+            t_wifi_status_us = esp_timer_get_time() - t_wifi_start;
 
             sys.camera_ok = g_camera_ok;
             sys.tof_a_ok  = devs->a_ok;
@@ -760,8 +799,14 @@ void task_sensor_snapshot(void *pvParameters)
         metric_scheduled += (uint64_t)SNAPSHOT_INTERVAL_MS * 1000U;
         if (xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SNAPSHOT_INTERVAL_MS)) == pdFALSE) {
             if ((++overruns % 50) == 1) {
-                ESP_LOGW(TAG, "snapshot loop overrun (#%u): work exceeded %d ms",
-                         (unsigned)overruns, SNAPSHOT_INTERVAL_MS);
+                ESP_LOGW(TAG, "snapshot loop overrun (#%u): work exceeded %d ms "
+                              "(sensors=%lldus tof=%lldus(sd_active=%d) publish=%lldus(sd_active=%d) "
+                              "wifi_status=%lldus(sd_active=%d))",
+                         (unsigned)overruns, SNAPSHOT_INTERVAL_MS,
+                         (long long)t_sensors_us,
+                         (long long)t_tof_us, (int)sd_active_at_tof,
+                         (long long)t_publish_us, (int)sd_active_at_publish,
+                         (long long)t_wifi_status_us, (int)sd_active_at_wifi_status);
             }
         }
     }

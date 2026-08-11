@@ -16,9 +16,28 @@
  * Rotation handled in dashboard CSS instead. */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "camera_driver.h"
 
 static const char *TAG = "CAM_DRV";
+
+/* Serializes ALL camera access. The driver has exactly one frame-in-flight
+ * slot (s_frame_held/s_current_buf), one JPEG output buffer (s_jpeg_buf),
+ * one HW JPEG engine (s_jpeg_enc) and one shared quality global -- none of
+ * it safe for two capturers at once. httpd is single-threaded so the
+ * stream/snapshot handlers never overlap each other, but the dataset-log
+ * capture path is a genuinely concurrent third capturer, so the previous
+ * "check s_frame_held, then set it" pattern (racy: two tasks can both pass
+ * the check before either sets the flag) needs a real lock.
+ *
+ * Held from a successful capture_frame/capture_raw call through to
+ * release_frame -- that whole span is one borrow, matching the documented
+ * caller contract, not just the internal ioctl/encode moment. Acquire uses
+ * a timeout so a stuck/contended caller degrades to the existing
+ * retry-with-delay pattern already used by snapshot_handler and
+ * detect_task_fn, rather than deadlocking. */
+static SemaphoreHandle_t s_cam_mutex;
+#define CAM_LOCK_TIMEOUT_MS 100
 
 /* Encode quality, applied per frame. Runtime-settable because ESP-NOW field
  * mode needs far smaller images than the WiFi MJPEG stream: one lost chunk
@@ -54,6 +73,12 @@ esp_err_t camera_init(i2c_master_bus_handle_t sccb_handle)
 {
     esp_err_t ret = ESP_OK;
     bool video_inited = false;
+
+    s_cam_mutex = xSemaphoreCreateMutex();
+    if (!s_cam_mutex) {
+        ESP_LOGE(TAG, "Camera mutex allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* 1. Init esp_video — CSI config only, NO .jpeg field.
      *    Reference: example_init_video.c, SCCB_I2C_INIT_BY_APP branch (lines 185–268).
@@ -219,12 +244,22 @@ cleanup:
     if (video_inited) {
         esp_video_deinit();
     }
+    if (s_cam_mutex) {
+        vSemaphoreDelete(s_cam_mutex);
+        s_cam_mutex = NULL;
+    }
     return ret;
 }
 
-esp_err_t camera_capture_frame(void **buf, size_t *len,
-                                uint32_t *width, uint32_t *height,
-                                uint32_t *pixel_fmt)
+/* ---- Internal, lock-already-held bodies ----
+ * Callable only while s_cam_mutex is held by the calling context. Never
+ * take/give the mutex themselves -- that's the public wrappers' job, so
+ * camera_capture_copy() can compose capture+release under one acquisition
+ * (needed to make its quality-set atomic with the capture it applies to). */
+
+static esp_err_t camera_capture_frame_locked(void **buf, size_t *len,
+                                              uint32_t *width, uint32_t *height,
+                                              uint32_t *pixel_fmt)
 {
     if (s_cam_fd < 0 || s_frame_held) {
         return ESP_ERR_INVALID_STATE;
@@ -277,8 +312,8 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
     return ESP_OK;
 }
 
-esp_err_t camera_capture_raw(void **buf, size_t *len,
-                              uint32_t *width, uint32_t *height)
+static esp_err_t camera_capture_raw_locked(void **buf, size_t *len,
+                                            uint32_t *width, uint32_t *height)
 {
     if (s_cam_fd < 0 || s_frame_held) {
         return ESP_ERR_INVALID_STATE;
@@ -305,11 +340,96 @@ esp_err_t camera_capture_raw(void **buf, size_t *len,
     return ESP_OK;
 }
 
-void camera_release_frame(void)
+static void camera_release_frame_locked(void)
 {
     if (!s_frame_held || s_cam_fd < 0) return;
     ioctl(s_cam_fd, VIDIOC_QBUF, &s_current_buf);
     s_frame_held = false;
+}
+
+/* ---- Public entry points ---- */
+
+esp_err_t camera_capture_frame(void **buf, size_t *len,
+                                uint32_t *width, uint32_t *height,
+                                uint32_t *pixel_fmt)
+{
+    if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = camera_capture_frame_locked(buf, len, width, height, pixel_fmt);
+    if (ret != ESP_OK) {
+        xSemaphoreGive(s_cam_mutex);
+    }
+    /* else: mutex stays held until camera_release_frame() -- the borrow
+     * spans capture through release, matching the documented contract. */
+    return ret;
+}
+
+esp_err_t camera_capture_raw(void **buf, size_t *len,
+                              uint32_t *width, uint32_t *height)
+{
+    if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t ret = camera_capture_raw_locked(buf, len, width, height);
+    if (ret != ESP_OK) {
+        xSemaphoreGive(s_cam_mutex);
+    }
+    return ret;
+}
+
+void camera_release_frame(void)
+{
+    bool was_held = s_frame_held;
+    camera_release_frame_locked();
+    if (was_held) {
+        xSemaphoreGive(s_cam_mutex);
+    }
+}
+
+esp_err_t camera_capture_copy(uint8_t *dst, size_t dst_capacity, size_t *out_len,
+                               uint32_t *width, uint32_t *height)
+{
+    if (!dst || !out_len) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out_len = 0;
+
+    if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* Force full quality for this capture, restored before returning --
+     * atomic with the capture itself since both happen under the same
+     * lock. Guards against a future caller of camera_set_jpeg_quality()
+     * (currently none exist) leaving the ESP-NOW field link's reduced
+     * quality applied to a dataset frame. */
+    int saved_quality = s_jpeg_quality;
+    s_jpeg_quality = CONFIG_CAM_JPEG_QUALITY;
+
+    void *jpeg_buf = NULL;
+    size_t jpeg_len = 0;
+    esp_err_t ret = camera_capture_frame_locked(&jpeg_buf, &jpeg_len, width, height, NULL);
+
+    if (ret != ESP_OK) {
+        s_jpeg_quality = saved_quality;
+        xSemaphoreGive(s_cam_mutex);
+        return ret;
+    }
+
+    if (jpeg_len > dst_capacity) {
+        camera_release_frame_locked();
+        s_jpeg_quality = saved_quality;
+        xSemaphoreGive(s_cam_mutex);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(dst, jpeg_buf, jpeg_len);
+    *out_len = jpeg_len;
+    camera_release_frame_locked();
+    s_jpeg_quality = saved_quality;
+    xSemaphoreGive(s_cam_mutex);
+    return ESP_OK;
 }
 
 esp_err_t camera_start_streaming(void)
@@ -351,16 +471,25 @@ esp_err_t camera_stop_streaming(void)
 
 void camera_drain_frame(void)
 {
-    if (s_cam_fd < 0 || s_frame_held) return;
+    if (s_cam_fd < 0) return;
 
-    struct v4l2_buffer buf;
-    memset(&buf, 0, sizeof(buf));
-    buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
+    /* Non-blocking: CamDrain runs every 30ms just to keep the ISP pipeline
+     * moving when nobody else is. If another capturer holds the mutex, the
+     * pipeline is already being serviced by them -- skip this cycle rather
+     * than wait, so a dataset capture never stalls CamDrain's cadence. */
+    if (xSemaphoreTake(s_cam_mutex, 0) != pdTRUE) return;
 
-    if (ioctl(s_cam_fd, VIDIOC_DQBUF, &buf) == 0) {
-        ioctl(s_cam_fd, VIDIOC_QBUF, &buf);
+    if (!s_frame_held) {
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+
+        if (ioctl(s_cam_fd, VIDIOC_DQBUF, &buf) == 0) {
+            ioctl(s_cam_fd, VIDIOC_QBUF, &buf);
+        }
     }
+    xSemaphoreGive(s_cam_mutex);
 }
 
 void camera_get_frame_info(uint32_t *width, uint32_t *height, uint32_t *pixel_fmt)

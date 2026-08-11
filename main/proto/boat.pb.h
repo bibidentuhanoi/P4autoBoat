@@ -41,6 +41,13 @@ typedef struct _boat_DetectCommand {
     char dummy_field;
 } boat_DetectCommand;
 
+/* Trigger one dataset capture: a full-quality JPEG + a time-synced sensor
+ sidecar written to SD. Empty payload -- the trigger itself carries no
+ parameters, matching DetectCommand. */
+typedef struct _boat_TrainingLogCommand {
+    char dummy_field;
+} boat_TrainingLogCommand;
+
 typedef struct _boat_GpsFix {
     bool valid;
     double latitude;
@@ -146,6 +153,7 @@ typedef struct _boat_BoatMessage {
         boat_SteerCommand steer;
         boat_ServoPowerCommand servo_power;
         boat_SteerRawCommand steer_raw;
+        boat_TrainingLogCommand training_log;
     } payload;
 } boat_BoatMessage;
 
@@ -159,6 +167,7 @@ extern "C" {
 #define boat_ToFGrid_init_default                {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 #define boat_Detection_init_default              {0, 0, 0, 0, 0, 0}
 #define boat_DetectCommand_init_default          {0}
+#define boat_TrainingLogCommand_init_default     {0}
 #define boat_GpsFix_init_default                 {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_GpsCoordinate_init_default          {0, 0}
 #define boat_SensorSnapshot_init_default         {0, false, boat_IMUData_init_default, false, boat_ToFGrid_init_default, false, boat_ToFGrid_init_default, 0, {boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default, boat_Detection_init_default}, false, boat_GpsFix_init_default}
@@ -175,6 +184,7 @@ extern "C" {
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 #define boat_Detection_init_zero                 {0, 0, 0, 0, 0, 0}
 #define boat_DetectCommand_init_zero             {0}
+#define boat_TrainingLogCommand_init_zero        {0}
 #define boat_GpsFix_init_zero                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_GpsCoordinate_init_zero             {0, 0}
 #define boat_SensorSnapshot_init_zero            {0, false, boat_IMUData_init_zero, false, boat_ToFGrid_init_zero, false, boat_ToFGrid_init_zero, 0, {boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero, boat_Detection_init_zero}, false, boat_GpsFix_init_zero}
@@ -259,6 +269,7 @@ extern "C" {
 #define boat_BoatMessage_steer_tag               9
 #define boat_BoatMessage_servo_power_tag         10
 #define boat_BoatMessage_steer_raw_tag           11
+#define boat_BoatMessage_training_log_tag        12
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -291,6 +302,11 @@ X(a, STATIC,   SINGULAR, INT32,    y2,                6)
 
 #define boat_DetectCommand_CALLBACK NULL
 #define boat_DetectCommand_DEFAULT NULL
+
+#define boat_TrainingLogCommand_FIELDLIST(X, a) \
+
+#define boat_TrainingLogCommand_CALLBACK NULL
+#define boat_TrainingLogCommand_DEFAULT NULL
 
 #define boat_GpsFix_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     valid,             1) \
@@ -397,7 +413,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,arm_cmd,payload.arm_cmd),   7) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,winch,payload.winch),   8) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer,payload.steer),   9) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,servo_power,payload.servo_power),  10) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_raw,payload.steer_raw),  11)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_raw,payload.steer_raw),  11) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,training_log,payload.training_log),  12)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -411,11 +428,13 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_raw,payload.steer_raw),  11)
 #define boat_BoatMessage_payload_steer_MSGTYPE boat_SteerCommand
 #define boat_BoatMessage_payload_servo_power_MSGTYPE boat_ServoPowerCommand
 #define boat_BoatMessage_payload_steer_raw_MSGTYPE boat_SteerRawCommand
+#define boat_BoatMessage_payload_training_log_MSGTYPE boat_TrainingLogCommand
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
 extern const pb_msgdesc_t boat_Detection_msg;
 extern const pb_msgdesc_t boat_DetectCommand_msg;
+extern const pb_msgdesc_t boat_TrainingLogCommand_msg;
 extern const pb_msgdesc_t boat_GpsFix_msg;
 extern const pb_msgdesc_t boat_GpsCoordinate_msg;
 extern const pb_msgdesc_t boat_SensorSnapshot_msg;
@@ -434,6 +453,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_ToFGrid_fields &boat_ToFGrid_msg
 #define boat_Detection_fields &boat_Detection_msg
 #define boat_DetectCommand_fields &boat_DetectCommand_msg
+#define boat_TrainingLogCommand_fields &boat_TrainingLogCommand_msg
 #define boat_GpsFix_fields &boat_GpsFix_msg
 #define boat_GpsCoordinate_fields &boat_GpsCoordinate_msg
 #define boat_SensorSnapshot_fields &boat_SensorSnapshot_msg
@@ -464,6 +484,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_SteerRawCommand_size                6
 #define boat_SystemStatus_size                   50
 #define boat_ToFGrid_size                        6274
+#define boat_TrainingLogCommand_size             0
 #define boat_WinchCommand_size                   5
 
 #ifdef __cplusplus

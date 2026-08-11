@@ -79,7 +79,22 @@ esp_err_t fs_sdcard_write(const char *path, const void *data, size_t len)
     if (!data && len) return ESP_ERR_INVALID_ARG;
     char resolved[FS_SDCARD_PATH_MAX], temp[FS_SDCARD_PATH_MAX];
     if (!fs_sdcard_path(path, resolved)) return ESP_ERR_INVALID_ARG;
-    int n = snprintf(temp, sizeof(temp), "%s.tmp", resolved);
+
+    /* 8.3 FAT (CONFIG_FATFS_LFN_NONE=y, no Long File Name support) allows
+     * exactly one dot per name. Simply appending ".tmp" to a path that
+     * already has a real extension (e.g. "00000.JPG" -> "00000.JPG.tmp")
+     * is structurally invalid, not just too long -- fopen() fails with
+     * EINVAL, surfaced here as a generic ESP_FAIL (hw-confirmed). Swap the
+     * extension instead of appending one: find the basename's own '.' and
+     * replace everything from there with ".tmp". Always fits -- "tmp" is
+     * exactly 3 chars, and the original extension had to be <=3 chars too
+     * for the caller's own fopen() to have any chance of working. */
+    const char *base = strrchr(resolved, '/');
+    base = base ? base + 1 : resolved;
+    const char *dot = strrchr(base, '.');
+    int n = dot
+        ? snprintf(temp, sizeof(temp), "%.*s.tmp", (int)(dot - resolved), resolved)
+        : snprintf(temp, sizeof(temp), "%s.tmp", resolved);
     if (n <= 0 || n >= (int)sizeof(temp)) return ESP_ERR_INVALID_ARG;
     if (!fs_sdcard_lock()) return ESP_ERR_INVALID_STATE;
     FILE *fp = fopen(temp, "wb");

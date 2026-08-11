@@ -359,7 +359,7 @@
 
 <div class="grid">
   <div class="card" id="camera-card">
-    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<span style="display:flex;gap:6px;"><button id="detect-btn" style="background:var(--border);color:#0f0;border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Detect</button><button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button><button id="snap-overlay-btn" style="background:var(--border);color:var(--accent);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap+Overlay</button></span></div>
+    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center;">Camera + ToF overlay<span style="display:flex;gap:6px;"><button id="detect-btn" style="background:var(--border);color:#0f0;border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Detect</button><button id="snap-btn" style="background:var(--border);color:var(--text);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap</button><button id="snap-overlay-btn" style="background:var(--border);color:var(--accent);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">Snap+Overlay</button><button id="record-btn" title="Save a full-quality JPEG + sensor sidecar to SD" style="background:var(--border);color:var(--danger);border:none;border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;">● Record</button></span></div>
     <div id="cam-container">
       <img id="cam-img" src="" alt="No stream" />
       <canvas id="tof-overlay"></canvas>
@@ -491,8 +491,9 @@ message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_thr
 message ArmCommand { bool arm = 1; bool force = 2; }
 message ServoPowerCommand { bool on = 1; }
 message DetectCommand { }
+message TrainingLogCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; bool gps_ok = 9; uint32 gps_detected_baud = 16; bool gps_baud_confirmed = 17; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -2051,6 +2052,15 @@ $('arm-btn').addEventListener('click', () => {
 $('gps-override').addEventListener('change', () => {
   $('arm-hint').textContent = '';
   updateArmEnable();
+});
+
+// Dataset capture — fire-and-forget trigger, no ack channel. TrainingLog
+// saves the JPEG + sensor sidecar to SD independently; this just confirms
+// the command was sent, not that the capture succeeded.
+$('record-btn').addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(BoatMessage.encode(BoatMessage.create({ trainingLog: {} })).finish());
+  flashEl('record-btn');
 });
 
 // Servo rail switch — works without arming, so winch/rudders can be bench-tested.

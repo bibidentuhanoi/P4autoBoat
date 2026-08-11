@@ -24,6 +24,20 @@ esp_err_t camera_capture_raw(void **buf, size_t *len, uint32_t *width, uint32_t 
 /** @brief Return the held frame buffer back to the driver. */
 void camera_release_frame(void);
 
+/**
+ * @brief Capture one frame at full quality and copy it into the caller's
+ *        own buffer, fully atomic (capture + quality + release all happen
+ *        under one lock acquisition) -- no camera_release_frame() call
+ *        needed afterward, the frame is already released on return.
+ *        For dataset-log captures, where the JPEG must outlive the shared
+ *        driver buffer while it's written to SD.
+ * @param dst           caller-owned destination buffer
+ * @param dst_capacity  size of dst; ESP_ERR_INVALID_SIZE if the frame is larger
+ * @param out_len       bytes written to dst on success (0 otherwise)
+ */
+esp_err_t camera_capture_copy(uint8_t *dst, size_t dst_capacity, size_t *out_len,
+                               uint32_t *width, uint32_t *height);
+
 /** @brief Set JPEG encode quality (1-100, higher = better/larger). Applies to
  *  the next captured frame. Used to shrink images for the ESP-NOW field link. */
 void camera_set_jpeg_quality(int quality);
