@@ -54,32 +54,39 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
  * beat against each other and most polls missed — measured ~2 of 5.5 expected
  * ToF frames/s reaching the ground station.
  *
- * SensorBusTask now owns all runtime I2C and publishes raw fixed-buffer
- * generations to ToFProc on Core 1. The snapshot still only copies the
- * processed cache. Benefits:
+ * SensorBusTask used to own all runtime I2C (IMU + ToF) on one 20ms tick, but
+ * a single VL53L5CX read genuinely takes ~33ms (confirmed on hardware
+ * 2026-08-11 -- transferring the enabled result fields at NB_TARGET_PER_ZONE=4
+ * over I2C, not a fault) -- longer than SensorBus's own period, so
+ * interleaving it there guaranteed a deadline miss on every cycle ToF was
+ * selected (~38% sustained SensorBus miss rate). Split into task_tof_read(),
+ * its own lower-priority task (see runtime_schedule.c) -- IMU keeps its tight
+ * undisturbed 20ms cadence, ToF gets the ~100ms-per-sensor room it actually
+ * needs. Both still publish/consume through the same lock-free result
+ * channels to ToFProc on Core 1; that part is unchanged. Benefits:
  *   - reads happen when data actually is ready, so they succeed
  *   - the median filter runs per SENSOR frame, not per publish (feeding it the
  *     same cached frame repeatedly would make median3 a no-op)
  *   - the snapshot loop does no I2C at all
- *   - IMU acquisition runs first on an absolute 20 ms schedule
+ *   - IMU acquisition is no longer delayed by ToF's much longer read time
  * ───────────────────────────────────────────────────────────────────────────*/
 #define SENSOR_BUS_INTERVAL_MS 20
-#define TOF_INITIAL_BUDGET_US 15000U
-/* Ceiling for the learned worst-case ToF read time (see max_read_us_a/b in
- * task_sensor_bus). A read slower than this cannot fit in a single
- * SensorBus tick's remaining slack no matter what -- letting the learned
- * value exceed it makes sensor_schedule_choose_tof()'s deadline-protection
- * check permanently unsatisfiable, which silently disables that sensor's
- * ToF reads for the rest of the session. Confirmed on hardware 2026-08-10:
- * one ~35.7ms read latched max_read_us_a and ToFProc dropped from an
- * expected ~5Hz to 2 total runs in over a minute, with no error anywhere --
- * skipped_tof_reads/deadline_protection_skips aren't logged. Clamping means
- * an occasional slow read still overruns that one SensorBus tick (visible
- * via its `misses` metric, already tolerated -- Fusion's own 40ms deadline
- * absorbed the observed 35.7ms stretch with misses=0) instead of disabling
- * ToF permanently and invisibly. Value: comfortably under one 20ms tick
- * after sensor_schedule.c's 2ms guard and IMU-read overhead. */
-#define TOF_BUDGET_CEILING_US 14000U
+/* Log any single IMU I2C op slower than this -- normal accel/gyro/mag reads
+ * are ~0.6-2ms at 100kHz, so 5ms is well above jitter but well below the
+ * 20ms cycle budget. Now that ToF no longer shares this task, any op
+ * crossing this threshold is a genuine anomaly, not routine ToF timing. */
+#define SENSOR_BUS_SLOW_OP_US  5000U
+/* task_tof_read()'s own poll tick -- fine enough to hit each sensor's
+ * ~100ms-per-sensor due time (50ms A/B offset, see SENSOR_TOF_PERIOD_US /
+ * SENSOR_TOF_B_OFFSET_US in sensor_schedule.c) precisely, without the tight
+ * coupling to IMU timing SensorBus used to need. A no-op tick (nothing due)
+ * costs microseconds, so ticking this often is cheap. */
+#define TOF_READ_POLL_MS       20
+/* A single ToF read taking ~33ms is now expected, not diagnostic-worthy --
+ * logging every one would just be the same noise, differently attributed.
+ * This threshold is for genuine anomalies: something well beyond the normal
+ * ~33ms (e.g. a real bus fault), worth a look. */
+#define TOF_READ_ANOMALY_US    50000U
 #define TOF_STALE_US   (1000 * 1000)  /* cached grid older than this = not valid */
 
 #define TOF_NVALS  (64 * VL53L5CX_NB_TARGET_PER_ZONE)
@@ -186,9 +193,27 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
     }
 
     *sample = (imu_sample_t){0};
+
+    int64_t ag_t0 = esp_timer_get_time();
     esp_err_t ag_err = imu_read_accel_gyro(&sample->ax, &sample->ay, &sample->az,
                                             &sample->gx, &sample->gy, &sample->gz);
+    int64_t ag_read_us = esp_timer_get_time() - ag_t0;
+
+    int64_t mag_t0 = esp_timer_get_time();
     esp_err_t mag_err = imu_read_mag(&sample->mx, &sample->my, &sample->mz);
+    int64_t mag_read_us = esp_timer_get_time() - mag_t0;
+
+    if (ag_read_us > SENSOR_BUS_SLOW_OP_US || mag_read_us > SENSOR_BUS_SLOW_OP_US) {
+        /* One combined line, not two separate ones: shows both durations
+         * together so a single cycle where accel/gyro AND mag each collide
+         * with a ToF chunk (stacking toward a much larger total) is visible
+         * directly, instead of having to correlate two disjoint log lines. */
+        ESP_LOGW(TAG, "SensorBus: IMU read ag=%lldus(%s) mag=%lldus(%s) total=%lldus",
+                 (long long)ag_read_us, esp_err_to_name(ag_err),
+                 (long long)mag_read_us, esp_err_to_name(mag_err),
+                 (long long)(ag_read_us + mag_read_us));
+    }
+
     sample->accel_gyro_valid = (ag_err == ESP_OK);
     sample->mag_valid = (mag_err == ESP_OK);
     sample->captured_us = (uint64_t)esp_timer_get_time();
@@ -204,11 +229,20 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
             ESP_LOGW(TAG, "QMC5883L mag read failing (%lu fails, %s) — heading frozen",
                      (unsigned long)mag_fails, esp_err_to_name(mag_err));
         }
-        if ((mag_fails % 100) == 0 && imu_recover_mag() == ESP_OK) {
-            ESP_LOGI(TAG, "mag recovered after %lu fails — re-added + reconfigured",
-                     (unsigned long)mag_fails);
-            imu_set_mag_ok(true);
-            mag_fails = 0;
+        if ((mag_fails % 100) == 0) {
+            int64_t rec_t0 = esp_timer_get_time();
+            esp_err_t rec_err = imu_recover_mag();
+            int64_t rec_us = esp_timer_get_time() - rec_t0;
+            if (rec_us > SENSOR_BUS_SLOW_OP_US) {
+                ESP_LOGW(TAG, "SensorBus: imu_recover_mag() took %lldus (%s)",
+                         (long long)rec_us, esp_err_to_name(rec_err));
+            }
+            if (rec_err == ESP_OK) {
+                ESP_LOGI(TAG, "mag recovered after %lu fails — re-added + reconfigured",
+                         (unsigned long)mag_fails);
+                imu_set_mag_ok(true);
+                mag_fails = 0;
+            }
         }
     } else {
         if (sample->mx == last_mx && sample->my == last_my && sample->mz == last_mz) {
@@ -268,11 +302,20 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
             ESP_LOGW(TAG, "ICM20948 accel/gyro read failing (%lu fails, %s) — pitch/roll frozen",
                      (unsigned long)ag_fails, esp_err_to_name(ag_err));
         }
-        if ((ag_fails % 100) == 0 && imu_recover_accel_gyro() == ESP_OK) {
-            ESP_LOGI(TAG, "accel/gyro recovered after %lu fails — reprobed + reconfigured",
-                     (unsigned long)ag_fails);
-            imu_set_icm_ok(true);
-            ag_fails = 0;
+        if ((ag_fails % 100) == 0) {
+            int64_t rec_t0 = esp_timer_get_time();
+            esp_err_t rec_err = imu_recover_accel_gyro();
+            int64_t rec_us = esp_timer_get_time() - rec_t0;
+            if (rec_us > SENSOR_BUS_SLOW_OP_US) {
+                ESP_LOGW(TAG, "SensorBus: imu_recover_accel_gyro() took %lldus (%s)",
+                         (long long)rec_us, esp_err_to_name(rec_err));
+            }
+            if (rec_err == ESP_OK) {
+                ESP_LOGI(TAG, "accel/gyro recovered after %lu fails — reprobed + reconfigured",
+                         (unsigned long)ag_fails);
+                imu_set_icm_ok(true);
+                ag_fails = 0;
+            }
         }
     } else if (ag_fails) {
         if (ag_fails >= 50) {
@@ -372,17 +415,12 @@ static void tof_process_latest(tof_result_channel_t *channel,
 
 void task_sensor_bus(void *pvParameters)
 {
-    tof_devices_t *devs = (tof_devices_t *)pvParameters;
-    sensor_schedule_t schedule;
-    uint64_t started_us = (uint64_t)esp_timer_get_time();
-    sensor_schedule_init(&schedule, started_us);
+    (void)pvParameters;  /* ToF moved to task_tof_read(); this task is IMU-only now. */
 
     TickType_t last_wake = xTaskGetTickCount();
-    uint64_t metric_scheduled = started_us;
-    uint32_t max_read_us_a = TOF_INITIAL_BUDGET_US;
-    uint32_t max_read_us_b = TOF_INITIAL_BUDGET_US;
+    uint64_t metric_scheduled = (uint64_t)esp_timer_get_time();
 
-    ESP_LOGI(TAG, "SensorBus task started (IMU %d Hz, alternating ToF 5 Hz each)",
+    ESP_LOGI(TAG, "SensorBus task started (IMU-only, %d Hz)",
              1000 / SENSOR_BUS_INTERVAL_MS);
 
     for (;;) {
@@ -400,18 +438,56 @@ void task_sensor_bus(void *pvParameters)
             runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_ERROR);
         }
 
+        runtime_metrics_cycle_end(RUNTIME_TASK_SENSOR_BUS, esp_timer_get_time());
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_BUS_INTERVAL_MS));
+        metric_scheduled += (uint64_t)SENSOR_BUS_INTERVAL_MS * 1000U;
+    }
+}
+
+/* Independent ToF acquisition task (2026-08-11 SensorBus/ToF split -- see the
+ * file header comment above for why). Runs at its own pace, decoupled from
+ * SensorBus's IMU timing entirely. Lower priority than SensorBus/Fusion (see
+ * runtime_schedule.c) so IMU always wins any I2C scheduling contention; the
+ * bus itself is still shared and serialized by ESP-IDF's own per-transaction
+ * lock, not an application mutex around the whole ~33ms read -- wrapping the
+ * whole read would just relocate the same stall onto whichever task loses
+ * that lock instead of removing it. Publishes through the same lock-free
+ * result channels ToFProc already consumes; that hand-off is unchanged. */
+void task_tof_read(void *pvParameters)
+{
+    static uint32_t tof_torn_frames;
+
+    tof_devices_t *devs = (tof_devices_t *)pvParameters;
+    sensor_schedule_t schedule;
+    uint64_t started_us = (uint64_t)esp_timer_get_time();
+    sensor_schedule_init(&schedule, started_us);
+
+    TickType_t last_wake = xTaskGetTickCount();
+    uint64_t metric_scheduled = started_us;
+
+    ESP_LOGI(TAG, "ToFRead task started (polling every %d ms, alternating ToF ~10 Hz each)",
+             TOF_READ_POLL_MS);
+
+    for (;;) {
+        uint64_t metric_started = (uint64_t)esp_timer_get_time();
+        runtime_metrics_cycle_begin(RUNTIME_TASK_TOF_READ,
+                                    metric_scheduled, metric_started);
+
         uint64_t now_us = (uint64_t)esp_timer_get_time();
         sensor_tof_id_t due = tof_oldest_due(&schedule, now_us,
                                              devs->a_ok, devs->b_ok);
-        uint32_t budget_us = due == SENSOR_TOF_B ? max_read_us_b : max_read_us_a;
+        /* No IMU deadline to protect anymore -- ToF has its own task now.
+         * UINT64_MAX/0 disables sensor_schedule_choose_tof()'s
+         * budget-protection branch (built for the old SensorBus-shared-tick
+         * design) without touching that function's tested logic, so this
+         * always returns whatever's actually due by pure due-time. */
         sensor_tof_id_t selected = sensor_schedule_choose_tof(
-            &schedule, now_us, sensor_schedule_next_imu_deadline(&schedule),
-            budget_us, devs->a_ok, devs->b_ok);
+            &schedule, now_us, UINT64_MAX, 0, devs->a_ok, devs->b_ok);
 
         if (selected == SENSOR_TOF_NONE) {
             if (due != SENSOR_TOF_NONE) {
                 sensor_schedule_note_skip(&schedule, due);
-                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS, RUNTIME_EVENT_SENSOR_SKIP);
+                runtime_metrics_count(RUNTIME_TASK_TOF_READ, RUNTIME_EVENT_SENSOR_SKIP);
             }
         } else {
             tof_result_channel_t *channel =
@@ -425,19 +501,17 @@ void task_sensor_bus(void *pvParameters)
                     &channel->slot_state[slot], &expected, TOF_SLOT_WRITING,
                     memory_order_acq_rel, memory_order_acquire)) {
                 sensor_schedule_note_skip(&schedule, selected);
-                runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS,
+                runtime_metrics_count(RUNTIME_TASK_TOF_READ,
                                       RUNTIME_EVENT_SENSOR_SKIP);
             } else {
+                const char *tof_label = selected == SENSOR_TOF_A ? "A" : "B";
                 int64_t read_started = esp_timer_get_time();
                 esp_err_t result =
-                    tof_read_grid(device, &channel->buffers[slot]);
+                    tof_read_grid(device, &channel->buffers[slot], tof_label);
                 uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_started);
-                uint32_t clamped_read_us = read_us > TOF_BUDGET_CEILING_US
-                    ? TOF_BUDGET_CEILING_US : read_us;
-                if (selected == SENSOR_TOF_A && clamped_read_us > max_read_us_a) {
-                    max_read_us_a = clamped_read_us;
-                } else if (selected == SENSOR_TOF_B && clamped_read_us > max_read_us_b) {
-                    max_read_us_b = clamped_read_us;
+                if (read_us > TOF_READ_ANOMALY_US) {
+                    ESP_LOGW(TAG, "ToFRead: ToF-%s read took %luus (%s) -- well beyond the normal ~33ms",
+                             tof_label, (unsigned long)read_us, esp_err_to_name(result));
                 }
                 if (result == ESP_OK) {
                     atomic_store_explicit(&channel->generation, generation,
@@ -453,18 +527,39 @@ void task_sensor_bus(void *pvParameters)
                         atomic_load_explicit(&s_tof_processor_task,
                                              memory_order_acquire);
                     if (processor) xTaskNotifyGive(processor);
+                } else if (result == ESP_ERR_NOT_FINISHED) {
+                    /* Schedule polled before this sensor's ranging engine had
+                     * a new frame ready -- expected occasionally, not a
+                     * fault. Next ~20ms poll tick will normally catch it. */
+                    sensor_schedule_note_skip(&schedule, selected);
+                    runtime_metrics_count(RUNTIME_TASK_TOF_READ,
+                                          RUNTIME_EVENT_SENSOR_SKIP);
+                } else if (result == ESP_ERR_INVALID_CRC) {
+                    /* Possible chunk-boundary tear -- tof_read_grid() already
+                     * logged the streamcount/device detail. Do not publish:
+                     * channel->generation is only stored in the ESP_OK branch
+                     * above, so this frame structurally cannot reach ToFProc,
+                     * the dashboard, or dataset storage. Counted as a skip,
+                     * not an I2C error, since nothing on the bus failed --
+                     * the next poll acquires a clean frame instead. */
+                    ++tof_torn_frames;
+                    ESP_LOGW(TAG, "ToFRead: ToF-%s frame rejected (torn), total=%lu",
+                             tof_label, (unsigned long)tof_torn_frames);
+                    sensor_schedule_note_skip(&schedule, selected);
+                    runtime_metrics_count(RUNTIME_TASK_TOF_READ,
+                                          RUNTIME_EVENT_SENSOR_SKIP);
                 } else {
-                    runtime_metrics_count(RUNTIME_TASK_SENSOR_BUS,
+                    ESP_LOGW(TAG, "ToFRead: ToF-%s read failed: %s",
+                             tof_label, esp_err_to_name(result));
+                    runtime_metrics_count(RUNTIME_TASK_TOF_READ,
                                           RUNTIME_EVENT_SENSOR_ERROR);
                 }
             }
         }
 
-        runtime_metrics_cycle_end(RUNTIME_TASK_SENSOR_BUS, esp_timer_get_time());
-        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SENSOR_BUS_INTERVAL_MS));
-        metric_scheduled = schedule.next_imu_deadline_us;
-        schedule.next_imu_deadline_us +=
-            (uint64_t)SENSOR_BUS_INTERVAL_MS * 1000U;
+        runtime_metrics_cycle_end(RUNTIME_TASK_TOF_READ, esp_timer_get_time());
+        xTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TOF_READ_POLL_MS));
+        metric_scheduled += (uint64_t)TOF_READ_POLL_MS * 1000U;
     }
 }
 
@@ -478,6 +573,7 @@ void task_tof_processor(void *pvParameters)
     uint8_t med_idx_b = 0;
     uint32_t generation_a = 0;
     uint32_t generation_b = 0;
+    uint64_t last_gen_log_us = 0;
 
     atomic_store_explicit(&s_tof_processor_task, xTaskGetCurrentTaskHandle(),
                           memory_order_release);
@@ -488,6 +584,18 @@ void task_tof_processor(void *pvParameters)
                            &generation_a, &result);
         tof_process_latest(&s_tof_results_b, &s_cache_b, med_b, &med_idx_b,
                            &generation_b, &result);
+
+        /* Throttled per-sensor generation counters -- ToFProc's own RTM
+         * "runs=" is aggregate across both channels, so a stalled ToF-A with
+         * a healthy ToF-B would still show runs= climbing. This is the only
+         * per-sensor liveness signal. */
+        uint64_t now_us = (uint64_t)esp_timer_get_time();
+        if (now_us - last_gen_log_us >= 1000000ULL) {
+            ESP_LOGI(TAG, "ToFProc: gen_a=%lu gen_b=%lu",
+                     (unsigned long)generation_a, (unsigned long)generation_b);
+            last_gen_log_us = now_us;
+        }
+
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
 }

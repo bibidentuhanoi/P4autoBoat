@@ -19,6 +19,6 @@ typedef struct {
 } tof_devices_t;
 
 esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices);
-esp_err_t tof_read_grid(VL53L5CX_Configuration* dev, VL53L5CX_ResultsData* results);
+esp_err_t tof_read_grid(VL53L5CX_Configuration* dev, VL53L5CX_ResultsData* results, const char *label);
 
 #endif // TOF_DRIVER_H

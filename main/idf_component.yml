@@ -15,14 +15,40 @@ dependencies:
   ## Pinned explicitly: esp_wifi_remote -> wifi_remote_over_eppp declares
   ## esp_hosted as ">=2.11", so a component-manager re-resolve (e.g. from the
   ## cat_detect override_path change below) can silently drift this forward.
-  ## 2.12.12 rewrote the SDIO mempool to one eager ~48KB contiguous internal
-  ## DMA allocation during global ctors (pre-scheduler); this board can't
-  ## satisfy that and hits `assert failed: sdio_mempool_create (buf_mp_g)` on
-  ## every boot (2026-08-10). 2.12.3 is what main runs and is proven stable —
-  ## pinned here so it can't drift again. If bumping intentionally in future,
-  ## the C6 slave (tools/slave_firmware/build.sh) must be rebuilt to match.
+  ##
+  ## Version history that led to 2.12.11 (2026-08-10):
+  ## - 2.12.3 (previous pin): boots clean, but predates two fixes that match
+  ##   this board's SD-card-crashes-the-SDIO-link symptom exactly:
+  ##     2.12.10 "fixed SDIO RX heap corruption on transport deinit and
+  ##       hardened RX buffer allocation" -- matches the
+  ##       `assert failed: sdio_rx_get_buffer (*buf)` crash.
+  ##     2.12.11 "fixed SDIO deinit tearing down the shared SDMMC host (broke
+  ##       a co-existing SD card on the other slot)" -- this board's exact
+  ##       topology (SD card slot 0 + esp_hosted C6 link slot 1, one shared
+  ##       SDMMC controller; see upstream esp-idf#16233, which the
+  ##       esp-hosted-mcu host_sdcard_with_hosted example explicitly works
+  ##       around).
+  ## - 2.12.12: rewrote the SDIO mempool to one eager ~48KB contiguous
+  ##   internal DMA allocation during global ctors (pre-scheduler); this
+  ##   board can't satisfy that and hits
+  ##   `assert failed: sdio_mempool_create (buf_mp_g)` on every boot
+  ##   (hardware-confirmed 2026-08-10). This is why the pin didn't just go
+  ##   straight to latest.
+  ## 2.12.11 is the version between those two fixed points: has both SD-card
+  ## fixes, predates the mempool rewrite that broke boot. Needs the same
+  ## hardware boot test 2.12.3 vs 2.12.12 got before this comment is trusted
+  ## blindly again.
+  ##
+  ## esp_hosted_register_custom_callback's signature changed at 2.12.4 (see
+  ## upstream docs/migration_guide.md) to take a trailing `void *user`
+  ## context pointer -- main/transports/espnow_transport.c and
+  ## tools/slave_firmware/espnow_bridge.c both need to match whatever version
+  ## is pinned here (the C6 side auto-detects via
+  ## esp_hosted_coprocessor_fw_ver.h; the P4 side does not and must be
+  ## edited by hand). If bumping intentionally in future, the C6 slave
+  ## (tools/slave_firmware/build.sh) must be rebuilt to match.
   espressif/esp_hosted:
-    version: "2.12.3"
+    version: "2.12.11"
   ## Protobuf encoding for telemetry pipeline
   livekit/nanopb:
     version: "^0.4.9"

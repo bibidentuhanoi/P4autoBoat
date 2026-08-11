@@ -172,11 +172,29 @@ esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
     return ESP_OK;
 }
 
-esp_err_t tof_read_grid(VL53L5CX_Configuration* dev, VL53L5CX_ResultsData* results) {
-    uint8_t isReady;
-    if (vl53l5cx_check_data_ready(dev, &isReady) == 0 && isReady) {
-        vl53l5cx_get_ranging_data(dev, results);
-        return ESP_OK;
+esp_err_t tof_read_grid(VL53L5CX_Configuration* dev, VL53L5CX_ResultsData* results, const char *label) {
+    uint8_t isReady = 0;
+    if (vl53l5cx_check_data_ready(dev, &isReady) != 0) {
+        return ESP_FAIL;
     }
-    return ESP_FAIL;
+    if (!isReady) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    if (vl53l5cx_get_ranging_data(dev, results) != 0) {
+        return ESP_FAIL;
+    }
+
+    /* Chunk-boundary tear check: the chunked read takes ~35-45ms against a
+     * 100ms ranging period, so under normal timing the next frame cannot be
+     * ready yet. If it already is, this read took long enough that it may
+     * have straddled a frame boundary (some zones stale, some fresh). */
+    uint8_t frame_advanced = 0;
+    if (vl53l5cx_check_data_ready(dev, &frame_advanced) == 0 && frame_advanced) {
+        ESP_LOGW(TAG, "ToF-%s: next frame already ready immediately after read (streamcount=%u) "
+                      "-- rejecting frame, may have straddled a boundary",
+                 label ? label : "?", dev->streamcount);
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    return ESP_OK;
 }

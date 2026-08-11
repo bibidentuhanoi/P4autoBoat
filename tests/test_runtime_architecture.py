@@ -936,11 +936,21 @@ def test_fusion_only_consumes_versioned_raw_samples():
         assert forbidden not in fusion_source
 
 
-def test_sensor_bus_is_the_only_runtime_i2c_owner():
+def test_sensor_i2c_ownership_is_confined():
+    """Each sensor type has exactly one task that ever touches its I2C
+    device -- not "SensorBus owns everything" (that held until the
+    2026-08-11 split: a single VL53L5CX read takes ~33ms, longer than
+    SensorBus's own 20ms IMU period, so interleaving it there guaranteed a
+    deadline miss on every cycle ToF was selected -- hw-confirmed ~38%
+    sustained SensorBus miss rate. ToF moved to its own lower-priority task
+    instead). The bus itself is still shared and still relies on ESP-IDF's
+    own per-transaction lock, not an application-level mutex around either
+    read -- g_i2c_mutex must still not exist, and neither should a new one."""
     sources = application_sources()
     all_application_sources = "\n".join(sources.values())
 
     assert "g_i2c_mutex" not in all_application_sources
-    assert function_containing("tof_read_grid(") == "task_sensor_bus"
+    assert function_containing("sensor_read_imu_sample(") == "task_sensor_bus"
+    assert function_containing("tof_read_grid(") == "task_tof_read"
     assert "g_inference_active" not in sources["main/sensor_task.c"]
     assert "g_inference_active" not in sources["main/sensor_fusion.c"]

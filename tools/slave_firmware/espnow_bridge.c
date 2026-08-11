@@ -32,14 +32,18 @@
 #include "esp_hosted_coprocessor_fw_ver.h"
 #include "esp_hosted_peer_data.h"
 
-/* ESP-Hosted 2.12.12 adds an opaque callback context parameter.  The bridge
- * is built from a selected hosted release, so accept both the original 2.12.3
- * API and the newer API rather than silently generating an incompatible C6
- * image. */
+/* ESP-Hosted 2.12.4 adds an opaque callback context parameter (see upstream
+ * docs/migration_guide.md, "2.12.4 - Custom Msg Callback - User Ptr": Host
+ * and Slave < 2.12.4 need migration). NOT 2.12.12 -- an earlier version of
+ * this guard gated at PATCH_1 >= 12, which only happened to be correct at
+ * the two versions actually hardware-tested so far (2.12.3: old API; 2.12.12:
+ * new API) and would silently pick the WRONG signature for anything in
+ * between, e.g. 2.12.11. The bridge is built from a selected hosted release,
+ * so accept both API shapes rather than assuming one. */
 #if (PROJECT_VERSION_MAJOR_1 > 2) || \
     ((PROJECT_VERSION_MAJOR_1 == 2) && (PROJECT_VERSION_MINOR_1 > 12)) || \
     ((PROJECT_VERSION_MAJOR_1 == 2) && (PROJECT_VERSION_MINOR_1 == 12) && \
-     (PROJECT_VERSION_PATCH_1 >= 12))
+     (PROJECT_VERSION_PATCH_1 >= 4))
 #define ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT 1
 #else
 #define ESPNOW_HOSTED_CALLBACK_HAS_CONTEXT 0

@@ -101,6 +101,24 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # streaming). 64KB reserve makes generic mallocs spill to PSRAM sooner.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
+# --- Don't reboot the whole boat over a transient SDIO hiccup ---
+# microSD (SDMMC slot 0, sd_card.c) and esp_hosted's C6 link (SDMMC slot 1)
+# share the same physical SDMMC peripheral. Confirmed on hardware 2026-08-10:
+# with a card inserted, ~1-3s after sd_card_init() runs, a CMD53 write to the
+# C6 times out (sdmmc_io_rw_extended -> 0x107); esp_hosted allows only
+# MAX_SDIO_WRITE_RETRY=2 attempts before declaring "Unrecoverable host sdio
+# state" and -- because this option defaulted to y -- calling esp_restart(),
+# rebooting the P4 mid-operation. Root mechanism not fully pinned (ruled out:
+# double sdmmc_host_init() -- already guarded in this IDF snapshot; the
+# upstream esp-idf#17889 claim-failure regression -- wrong timing signature;
+# a shared on-chip LDO channel -- CONFIG_ESP_HOSTED_SD_PWR_CTRL_LDO_INTERNAL_IO
+# is unset, esp_hosted never touches the LDO on this board). Disabling this
+# turns a dropped packet into the failure mode instead of a full reboot; the
+# existing CONTROL_DRIVE_TIMEOUT_US failsafe in control_arbiter.c (400ms,
+# hardware-confirmed) already stops the boat if the link actually stays down,
+# so this doesn't remove a safety net.
+# CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE is not set
+
 # --- Heap poisoning (light) — catches corruption early, ~2% overhead ---
 CONFIG_HEAP_POISONING_LIGHT=y
 
@@ -112,9 +130,27 @@ CONFIG_HEAP_POISONING_LIGHT=y
 # --- ESP-NOW field mode ---
 CONFIG_ESPNOW_ENABLED=y
 CONFIG_ESP_HOSTED_MAX_CUSTOM_MSG_HANDLERS=8
-# MEMPOOL_PREFER_SPIRAM removed 2026-08-10: prime suspect for the boot-time
-# sdio_mempool_create/buf_mp_g assert and a runtime SDIO write EINVAL — the
-# CMD53 IO-function write path esp-hosted uses does not reliably accept a
-# PSRAM-resident buffer on this board. Leave unset (component default).
+# CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM -- BOTH states are broken on this
+# board with esp_hosted 2.12.11; this is the lesser evil, chosen 2026-08-11
+# after hardware-testing both:
+#   =y (this):  sdio_mempool_create() succeeds (allocates from PSRAM), but
+#     some CMD53 writes on that PSRAM buffer fail at RUNTIME with
+#     ESP_ERR_INVALID_ARG (0x102) -- seen sending a WS-dashboard httpd
+#     response. Non-fatal: TRANSPORT_RESTART_ON_FAILURE is off (see below),
+#     so this drops the one response/packet and keeps running.
+#   unset (n): sdio_mempool_create() itself fails -- this board cannot
+#     satisfy the internal-RAM-only contiguous allocation esp_hosted wants,
+#     even this early in boot (assert fires during global ctors, PRE-
+#     scheduler, immediately after the PSRAM pools register: `assert failed:
+#     sdio_mempool_create sdio_drv.c:255 (buf_mp_g)`). FATAL every boot, no
+#     recovery possible -- worse than the =y runtime failure by definition.
+# This isn't two independent bugs: both point at the same underlying thing --
+# esp_hosted's mempool sizing doesn't fit this board's actual RAM budget on
+# 2.12.11, PREFER_SPIRAM just changes WHEN that surfaces (immediately fatal
+# vs. deferred and survivable). A real fix likely means shrinking
+# ESP_HOSTED_SDIO_TX_Q_SIZE/RX_Q_SIZE (currently 20/20) or otherwise reducing
+# the mempool's footprint, not just toggling this flag. Don't flip this
+# without re-testing BOTH states again.
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

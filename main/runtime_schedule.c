@@ -8,6 +8,19 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
     [RUNTIME_TASK_SENSOR_BUS] = {"SensorBus", 8192, 8, 0, 20000, 20000, true},
     [RUNTIME_TASK_FUSION] = {"Fusion", 4096, 7, 0, 0, 40000, true},
     [RUNTIME_TASK_GPS] = {"GPS", 4096, 6, 0, 0, 0, false},
+    /* Split off SensorBus 2026-08-11: a single VL53L5CX read (~33ms) exceeds
+     * SensorBus's own 20ms IMU period, so interleaving it there guaranteed a
+     * deadline miss on every cycle ToF was selected (hw-confirmed: sustained
+     * ~38% SensorBus miss rate). Lower priority than SensorBus/Fusion so IMU
+     * always wins any scheduling contention -- I2C bus access itself is still
+     * serialized by ESP-IDF's own per-transaction bus lock, not an
+     * application mutex around the whole read (that would just relocate the
+     * same 33ms stall onto whichever task loses the lock). period/deadline
+     * here describe the poll tick (fine enough to hit each sensor's own
+     * ~100ms due-time precisely), not the read itself -- ticks with an
+     * actual read due will legitimately exceed the 25ms deadline (~33ms),
+     * that's expected now, not a fault. */
+    [RUNTIME_TASK_TOF_READ] = {"ToFRead", 4096, 5, 0, 20000, 25000, false},
     [RUNTIME_TASK_DETECT] = {"Detect", 32768, 7, 1, 0, 0, false},
     [RUNTIME_TASK_CAMERA_DRAIN] = {"CamDrain", 2048, 6, 1, 0, 0, false},
     [RUNTIME_TASK_SNAPSHOT] = {"Snapshot", 16384, 5, 1, 50000, 50000, false},

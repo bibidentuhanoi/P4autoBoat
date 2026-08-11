@@ -10,10 +10,17 @@
 void task_sensor_snapshot(void *pvParameters);
 
 /**
- * @brief Sole runtime I2C owner: acquire IMU at 50 Hz and scheduled ToF grids.
- *        Pass tof_devices_t* as pvParameters.
+ * @brief Acquire IMU at 50 Hz. Does not touch ToF -- see task_tof_read().
  */
 void task_sensor_bus(void *pvParameters);
+
+/**
+ * @brief Acquire ToF-A/ToF-B on their own ~10 Hz-each schedule, independent
+ *        of SensorBus's IMU timing. Shares the I2C bus with SensorBus via
+ *        ESP-IDF's own per-transaction bus lock (no application mutex around
+ *        the read itself). Pass tof_devices_t* as pvParameters.
+ */
+void task_tof_read(void *pvParameters);
 
 /** @brief Convert stable raw ToF generations into the existing processed cache. */
 void task_tof_processor(void *pvParameters);

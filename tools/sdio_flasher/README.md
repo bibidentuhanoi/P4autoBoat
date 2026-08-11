@@ -38,29 +38,38 @@ it also injects and verifies the ESP-NOW bridge, which a manual
 ```bash
 cd tools/slave_firmware
 ./build.sh          # defaults to the version pinned in build.sh; pass an explicit
-                     # version to override, e.g. ./build.sh 2.12.3
+                     # version to override, e.g. ./build.sh 2.12.11
 ```
 
 **The version must match the P4 host's `espressif/esp_hosted` entry, which is
 pinned explicitly in `main/idf_component.yml`** (not left to float in
 `dependencies.lock` — a component-manager re-resolve can silently drift it, as
 happened 2026-08-10). A host/slave version gap causes SDIO write failures at
-runtime (`Failed to send data`); a host running 2.12.12 specifically crashes at
-boot on this board regardless of the slave (`sdio_mempool_create` assert — see
-the comment on the `esp_hosted` entry in `main/idf_component.yml` for the full
-story). Check `grep -A2 espressif/esp_hosted: main/idf_component.yml` before
-building if it's been a while since the two were last matched.
+runtime (`Failed to send data`). Neither endpoint can just run "latest": a host
+on 2.12.12 crashes at boot on this board regardless of the slave
+(`sdio_mempool_create` assert), and anything before 2.12.11 carries the
+shared-SDMMC-controller bug that corrupts the SDIO link when an SD card is
+also mounted (see the comment on the `esp_hosted` entry in
+`main/idf_component.yml` for the full story — that's what pins it at exactly
+2.12.11, not "whatever's newest"). Check
+`grep -A2 espressif/esp_hosted: main/idf_component.yml` before building if
+it's been a while since the two were last matched.
 
 ### 2. Copy binaries to target-firmware/
 
 `build.sh` builds under `tools/slave_firmware/build_slave/slave/` and prints
-these exact commands at the end of a successful run:
+the first three of these commands at the end of a successful run; the fourth
+(`ota_data_initial.bin`, needed because the slave partition table is
+OTA-capable) isn't in build.sh's own echo but IS required — `main.c` embeds
+it via `create_resources()` same as the other three, and skipping it leaves a
+stale OTA boot-slot pointer on the target:
 
 ```bash
 cd tools/slave_firmware/build_slave/slave
 cp build/bootloader/bootloader.bin        ../../../sdio_flasher/target-firmware/
 cp build/partition_table/partition-table.bin ../../../sdio_flasher/target-firmware/
 cp build/network_adapter.bin              ../../../sdio_flasher/target-firmware/app.bin
+cp build/ota_data_initial.bin             ../../../sdio_flasher/target-firmware/
 ```
 
 ### 3. Build the flasher

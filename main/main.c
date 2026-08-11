@@ -33,7 +33,7 @@
 #include "detect_task.h"
 #include "motor_control.h"
 #include "transports/espnow_transport.h"
-#include "sd_card.h"
+#include "drivers/sd_card.h"
 #include "runtime_metrics.h"
 #include "runtime_startup.h"
 #include "runtime_task.h"
@@ -328,10 +328,18 @@ void app_main(void) {
 
     ESP_ERROR_CHECK(sensor_task_init());
     task_error = runtime_task_create(RUNTIME_TASK_SENSOR_BUS, task_sensor_bus,
-                                     &tof_devs, NULL);
+                                     NULL, NULL);
     if (task_error != ESP_OK) {
         ESP_ERROR_CHECK(runtime_startup_handle_task_failure(RUNTIME_TASK_SENSOR_BUS,
                                                             task_error));
+    }
+    /* ToF acquisition is its own task now (2026-08-11 split, see sensor_task.c) --
+     * decoupled from SensorBus's IMU timing, lower priority so IMU always
+     * wins any I2C contention. */
+    task_error = runtime_task_create(RUNTIME_TASK_TOF_READ,
+                                     task_tof_read, &tof_devs, NULL);
+    if (task_error != ESP_OK) {
+        runtime_startup_handle_task_failure(RUNTIME_TASK_TOF_READ, task_error);
     }
     task_error = runtime_task_create(RUNTIME_TASK_TOF_PROCESS,
                                      task_tof_processor, NULL, NULL);

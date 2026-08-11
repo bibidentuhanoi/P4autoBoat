@@ -3,8 +3,36 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "math.h"
+#include "sd_card.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <stdio.h>
+#include <string.h>
 
 static const char* TAG = "FS";
+static SemaphoreHandle_t s_sdcard_lock;
+
+#define FS_SDCARD_PATH_MAX 192
+
+static bool fs_sdcard_path(const char *path, char resolved[FS_SDCARD_PATH_MAX])
+{
+    if (!path || !path[0] || path[0] == '/' || strstr(path, "..")) {
+        return false;
+    }
+    int n = snprintf(resolved, FS_SDCARD_PATH_MAX, "%s/%s", SD_MOUNT_POINT, path);
+    return n > 0 && n < FS_SDCARD_PATH_MAX;
+}
+
+static bool fs_sdcard_lock(void)
+{
+    return s_sdcard_lock && sd_card_ready() &&
+           xSemaphoreTake(s_sdcard_lock, pdMS_TO_TICKS(1000)) == pdTRUE;
+}
+
+static void fs_sdcard_unlock(void)
+{
+    xSemaphoreGive(s_sdcard_lock);
+}
 
 void fs_init(void) {
     esp_err_t err = nvs_flash_init();
@@ -14,6 +42,68 @@ void fs_init(void) {
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    s_sdcard_lock = xSemaphoreCreateMutex();
+    if (!s_sdcard_lock) {
+        ESP_LOGE(TAG, "SD-card file mutex allocation failed");
+    }
+}
+
+bool fs_sdcard_ready(void)
+{
+    return sd_card_ready() && s_sdcard_lock != NULL;
+}
+
+esp_err_t fs_sdcard_read(const char *path, void *buffer, size_t capacity,
+                         size_t *out_len)
+{
+    if (out_len) *out_len = 0;
+    if (!buffer || !capacity || !out_len) return ESP_ERR_INVALID_ARG;
+    char resolved[FS_SDCARD_PATH_MAX];
+    if (!fs_sdcard_path(path, resolved)) return ESP_ERR_INVALID_ARG;
+    if (!fs_sdcard_lock()) return ESP_ERR_INVALID_STATE;
+    FILE *fp = fopen(resolved, "rb");
+    if (!fp) { fs_sdcard_unlock(); return ESP_ERR_NOT_FOUND; }
+    size_t n = fread(buffer, 1, capacity, fp);
+    bool too_large = n == capacity && fgetc(fp) != EOF;
+    bool read_failed = ferror(fp);
+    int close_err = fclose(fp);
+    fs_sdcard_unlock();
+    if (read_failed || close_err != 0) return ESP_FAIL;
+    if (too_large) return ESP_ERR_INVALID_SIZE;
+    *out_len = n;
+    return ESP_OK;
+}
+
+esp_err_t fs_sdcard_write(const char *path, const void *data, size_t len)
+{
+    if (!data && len) return ESP_ERR_INVALID_ARG;
+    char resolved[FS_SDCARD_PATH_MAX], temp[FS_SDCARD_PATH_MAX];
+    if (!fs_sdcard_path(path, resolved)) return ESP_ERR_INVALID_ARG;
+    int n = snprintf(temp, sizeof(temp), "%s.tmp", resolved);
+    if (n <= 0 || n >= (int)sizeof(temp)) return ESP_ERR_INVALID_ARG;
+    if (!fs_sdcard_lock()) return ESP_ERR_INVALID_STATE;
+    FILE *fp = fopen(temp, "wb");
+    if (!fp) { fs_sdcard_unlock(); return ESP_FAIL; }
+    size_t written = fwrite(data, 1, len, fp);
+    bool failed = written != len || fflush(fp) != 0 || fclose(fp) != 0;
+    if (!failed && rename(temp, resolved) != 0) failed = true;
+    if (failed) remove(temp);
+    fs_sdcard_unlock();
+    return failed ? ESP_FAIL : ESP_OK;
+}
+
+esp_err_t fs_sdcard_append(const char *path, const void *data, size_t len)
+{
+    if (!data && len) return ESP_ERR_INVALID_ARG;
+    char resolved[FS_SDCARD_PATH_MAX];
+    if (!fs_sdcard_path(path, resolved)) return ESP_ERR_INVALID_ARG;
+    if (!fs_sdcard_lock()) return ESP_ERR_INVALID_STATE;
+    FILE *fp = fopen(resolved, "ab");
+    if (!fp) { fs_sdcard_unlock(); return ESP_FAIL; }
+    size_t written = fwrite(data, 1, len, fp);
+    bool failed = written != len || fflush(fp) != 0 || fclose(fp) != 0;
+    fs_sdcard_unlock();
+    return failed ? ESP_FAIL : ESP_OK;
 }
 
 void fs_save_calibration(const CalibrationData* calib) {
