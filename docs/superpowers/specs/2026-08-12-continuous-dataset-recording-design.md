@@ -112,10 +112,10 @@ Indexes 0–3 are zone 0, indexes 4–7 are zone 1, and indexes 252–255 are zo
 
 ## BoatLog Storage Format
 
-Each session is one append-only binary file:
+Each session is one append-only binary file. Names remain FAT 8.3-compatible because this board's current FAT configuration has already rejected long session names on hardware:
 
 ```text
-/sdcard/training/session_NNNN.tmp
+/sdcard/training/00021.tmp
 ```
 
 The file header contains:
@@ -149,7 +149,7 @@ Record types include:
 - `RECORDER_EVENT`
 - `SESSION_END`
 
-Fixed binary payload layouts and direct copies are used instead of high-rate protobuf serialization. On normal completion, final counters and the termination reason are appended, the file is flushed/closed, and `.tmp` is renamed to `.boatlog`.
+Fixed binary payload layouts and direct copies are used instead of high-rate protobuf serialization. On normal completion, final counters and the termination reason are appended, the file is flushed/closed, and `00021.tmp` is renamed to `00021.blg`. The notebook treats `.blg` as a BoatLog file; the human-readable `session_0021` name is used only for the exported laptop directory.
 
 After reset or power loss, the notebook scans through the last record with a valid header, bounded length, and CRC. It discards only the incomplete/corrupt tail. A missing `SESSION_END` marks the session interrupted but does not invalidate its recovered prefix.
 
