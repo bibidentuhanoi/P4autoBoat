@@ -14,7 +14,7 @@ bool fs_load_calibration(CalibrationData* calib);
 void fs_save_tof_xtalk(const char* key, const uint8_t* data, size_t len);
 bool fs_load_tof_xtalk(const char* key, uint8_t* data, size_t len);
 
-void fs_save_esc_trim(const EscTrimNvsBlob *blob);
+bool fs_save_esc_trim(const EscTrimNvsBlob *blob);
 bool fs_load_esc_trim(EscTrimNvsBlob *blob);   /* true = valid blob loaded; false = defaulted to empty (blob->count = 0) */
 
 /* SD-card file API. Paths are relative to /sdcard and may not contain '..'. */

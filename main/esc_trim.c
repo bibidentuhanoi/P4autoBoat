@@ -1,8 +1,21 @@
 #include "esc_trim.h"
+#include <math.h>
+
+static float clamp01(float value)
+{
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static float maxf_local(float a, float b) { return a > b ? a : b; }
+static float minf_local(float a, float b) { return a < b ? a : b; }
 
 float esc_trim_lookup(const EscTrimPoint *pts, uint8_t count, float common_throttle)
 {
-    if (!pts || count == 0) return 0.0f;
+    if (!pts || count == 0 || !isfinite(common_throttle) || common_throttle <= 0.0f) {
+        return 0.0f;
+    }
 
     /* Find the lowest point >= throttle. Points are few (<= 8) and typically
      * already ascending, but do not assume it -- scan for the bracketing pair. */
@@ -31,8 +44,47 @@ float esc_trim_lookup(const EscTrimPoint *pts, uint8_t count, float common_throt
 void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t count)
 {
     if (!left || !right) return;
+    if (!isfinite(*left) || !isfinite(*right)) {
+        *left = 0.0f;
+        *right = 0.0f;
+        return;
+    }
     float common = 0.5f * (*left + *right);
+    if (common <= 0.0f) {
+        *left = 0.0f;
+        *right = 0.0f;
+        return;
+    }
     float trim = esc_trim_lookup(pts, count, common);
     *left  -= 0.5f * trim;
     *right += 0.5f * trim;
+}
+
+void esc_trim_mix(float throttle, float rudder, const EscTrimPoint *pts,
+                  uint8_t count, float *left, float *right)
+{
+    if (!left || !right || !isfinite(throttle) || !isfinite(rudder)) {
+        if (left) *left = 0.0f;
+        if (right) *right = 0.0f;
+        return;
+    }
+
+    /* Preserve the existing mixer semantics first. */
+    float base_left = clamp01(throttle + rudder);
+    float base_right = clamp01(throttle - rudder);
+    if (throttle <= 0.0f) {
+        *left = 0.0f;
+        *right = 0.0f;
+        return;
+    }
+
+    float trim = esc_trim_lookup(pts, count, clamp01(throttle));
+    /* d is applied as left -= d/2, right += d/2. Restrict d so the
+     * already-achievable pilot command is never clipped further. */
+    float d_lo = maxf_local(2.0f * (base_left - 1.0f), -2.0f * base_right);
+    float d_hi = minf_local(2.0f * base_left, 2.0f * (1.0f - base_right));
+    if (trim < d_lo) trim = d_lo;
+    if (trim > d_hi) trim = d_hi;
+    *left = clamp01(base_left - 0.5f * trim);
+    *right = clamp01(base_right + 0.5f * trim);
 }

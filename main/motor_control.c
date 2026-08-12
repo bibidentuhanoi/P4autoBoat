@@ -788,7 +788,9 @@ static void control_apply_decision(control_decision_t *decision)
             float target_left  = decision->left;
             float target_right = decision->right;
             if (!s_calibrating) {
-                esc_trim_apply(&target_left, &target_right, s_esc_trim, s_esc_trim_count);
+                esc_trim_mix(decision->throttle, decision->rudder,
+                             s_esc_trim, s_esc_trim_count,
+                             &target_left, &target_right);
             }
             if (left != target_left || right != target_right) {
                 esc_driver_set_throttle(target_left, target_right);
@@ -991,8 +993,17 @@ esp_err_t motor_control_init_hw(void)
 
 void motor_control_set_esc_trim(const EscTrimPoint *pts, uint8_t count)
 {
-    s_esc_trim_count = (count > ESC_TRIM_MAX_POINTS) ? ESC_TRIM_MAX_POINTS : count;
-    for (uint8_t i = 0; i < s_esc_trim_count; ++i) s_esc_trim[i] = pts[i];
+    s_esc_trim_count = 0;
+    if (!pts) return;
+    if (count > ESC_TRIM_MAX_POINTS) count = ESC_TRIM_MAX_POINTS;
+    for (uint8_t i = 0; i < count; ++i) {
+        if (!isfinite(pts[i].throttle_frac) || !isfinite(pts[i].trim_diff) ||
+            pts[i].throttle_frac < 0.0f || pts[i].throttle_frac > 1.0f) {
+            s_esc_trim_count = 0;
+            return;
+        }
+        s_esc_trim[s_esc_trim_count++] = pts[i];
+    }
 }
 
 void motor_control_disarm(void)

@@ -23,6 +23,11 @@ int main(void)
     assert(fabsf(esc_trim_lookup(pts, 3, 0.05f) - (-0.06f)) < 1e-6f);
     assert(fabsf(esc_trim_lookup(pts, 3, 0.95f) - (-0.18f)) < 1e-6f);
 
+    /* Zero command is always off: a learned trim must never wake one jet. */
+    float zero_left = 0.0f, zero_right = 0.0f;
+    esc_trim_apply(&zero_left, &zero_right, pts, 3);
+    assert(zero_left == 0.0f && zero_right == 0.0f);
+
     /* apply: common preserved, pilot turn preserved, trim symmetric.
      * left=0.5,right=0.5 -> common 0.5 -> trim(0.5)= -0.12 -> L=0.56,R=0.44. */
     float L = 0.5f, R = 0.5f;
@@ -34,6 +39,13 @@ int main(void)
     L = 0.6f; R = 0.4f;
     esc_trim_apply(&L, &R, pts, 3);
     assert(fabsf(L - 0.66f) < 1e-6f && fabsf(R - 0.34f) < 1e-6f);
+
+    /* Lookup uses original throttle, not the average of clipped commands;
+     * pilot steering remains the priority at saturation. */
+    L = 0.0f;
+    R = 0.0f;
+    esc_trim_mix(0.9f, 0.4f, pts, 3, &L, &R);
+    assert(fabsf(L - 1.0f) < 1e-6f && fabsf(R - 0.5f) < 1e-6f);
 
     /* Points need not be pre-sorted (per esc_trim_lookup's own doc comment):
      * a permuted table must produce identical results to the ascending
@@ -66,7 +78,7 @@ int main(void)
     EscTrimPoint pts_single[1] = {
         { .throttle_frac = 0.5f, .trim_diff = -0.09f },
     };
-    assert(fabsf(esc_trim_lookup(pts_single, 1, 0.0f) - (-0.09f)) < 1e-6f);
+    assert(esc_trim_lookup(pts_single, 1, 0.0f) == 0.0f);
     assert(fabsf(esc_trim_lookup(pts_single, 1, 0.5f) - (-0.09f)) < 1e-6f);
     assert(fabsf(esc_trim_lookup(pts_single, 1, 1.0f) - (-0.09f)) < 1e-6f);
 

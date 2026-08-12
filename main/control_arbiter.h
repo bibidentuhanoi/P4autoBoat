@@ -32,6 +32,10 @@ typedef enum {
 typedef struct {
     float left;
     float right;
+    /* Original manual command, retained so downstream shaping can operate
+     * before the saturated left/right mix loses pilot intent. */
+    float throttle;
+    float rudder;
     float winch;
     float steer;
     uint32_t steer_raw_us;

@@ -94,6 +94,8 @@ static void assert_latest_drive_is_selected_and_expires(control_arbiter_t *arbit
     assert(decision.drive_changed);
     assert(decision.left == 0.6f);
     assert(decision.right == 0.2f);
+    assert(decision.throttle == 0.4f);
+    assert(decision.rudder == 0.2f);
     assert(decision.newest_rx_us == 1000);
 
     assert(control_arbiter_submit_drive(arbiter, CONTROL_SOURCE_MANUAL,
@@ -102,6 +104,8 @@ static void assert_latest_drive_is_selected_and_expires(control_arbiter_t *arbit
     assert(!decision.failsafe);
     assert(decision.left == 0.0f);
     assert(decision.right == 0.2f);
+    assert(decision.throttle == 0.1f);
+    assert(decision.rudder == -0.1f);
     assert(decision.newest_rx_us == 3000);
 
     assert(control_arbiter_submit_drive(arbiter, CONTROL_SOURCE_MANUAL,

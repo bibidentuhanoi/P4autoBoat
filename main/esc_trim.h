@@ -32,3 +32,9 @@ float esc_trim_lookup(const EscTrimPoint *pts, uint8_t count, float common_throt
  * This is the exact "trim on common, pilot turn intentional" ordering; the
  * per-ESC floor/curve (esc_map) still runs AFTER this, in esc_driver. */
 void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t count);
+
+/* Mix an original normalized throttle/rudder command, applying static trim
+ * before saturation. Pilot steering is preserved first; trim is reduced when
+ * there is no remaining actuator headroom. */
+void esc_trim_mix(float throttle, float rudder, const EscTrimPoint *pts,
+                  uint8_t count, float *left, float *right);
