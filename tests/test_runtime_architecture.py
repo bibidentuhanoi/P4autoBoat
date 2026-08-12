@@ -617,6 +617,7 @@ def test_pipeline_handlers_do_not_write_actuators():
                 "-I", str(tmpdir), "-I", str(ROOT / "main"),
                 str(tmpdir / "motor_control.c"), str(ROOT / "main" / "control_arbiter.c"),
                 str(ROOT / "main" / "arm_sequence.c"),
+                str(ROOT / "main" / "esc_trim.c"),
                 str(tmpdir / "harness.c"), "-lm", "-o", str(binary),
             ],
             check=True,
