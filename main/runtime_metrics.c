@@ -227,6 +227,7 @@ void task_runtime_diagnostics(void *arg)
     static const char *tag = "RTM";
     TickType_t next_report = xTaskGetTickCount();
     uint32_t published_motor_generation = UINT32_MAX;
+    uint32_t published_calibrate_generation = 0;   /* 0 = nothing published yet; control task never emits gen 0 */
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1)
     static TaskStatus_t task_status[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
     static uint8_t affinity_masks[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
@@ -239,6 +240,16 @@ void task_runtime_diagnostics(void *arg)
         if (periodic_report || motor_generation != published_motor_generation) {
             pipeline_publish_motor_status(&motor_status);
             published_motor_generation = motor_generation;
+        }
+
+        /* ESC-trim calibration progress: publish only on a fresh update (never
+         * periodically -- an idle boat's generation stays put and nothing is
+         * sent). generation 0 = never calibrated this boot. */
+        boat_CalibrateStatus calibrate_status;
+        uint32_t calibrate_generation = motor_control_get_calibrate_status(&calibrate_status);
+        if (calibrate_generation != 0 && calibrate_generation != published_calibrate_generation) {
+            pipeline_publish_calibrate_status(&calibrate_status);
+            published_calibrate_generation = calibrate_generation;
         }
 
         if (periodic_report) {

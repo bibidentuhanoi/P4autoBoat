@@ -1,6 +1,8 @@
 #include "motor_control.h"
 #include "arm_sequence.h"
 #include "esc_trim.h"
+#include "esc_trim_cal.h"
+#include "file_system.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
@@ -22,6 +24,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 static const char *TAG = "MOTOR_CTL";
 
@@ -76,6 +79,44 @@ static const char *TAG = "MOTOR_CTL";
 #endif
 #define STAB_LOG_DIVIDER 5   /* throttle the CTRL_SAS,active line to ~every 5th correction */
 
+/* ESC differential-trim auto-calibration (Milestone 2). Its excessive-yaw abort
+ * is its OWN value, deliberately NOT reused from CONFIG_STABILITY_SAS_RMAX_DPS:
+ * calibration runs with SAS suppressed and must not inherit a dependency on how
+ * the pilot's stick feel was tuned (spec 2026-08-12-esc-trim-autocal-design.md
+ * sec 4/7). Seeded from the same number, separate symbol. */
+#ifndef CONFIG_STABILITY_TRIMCAL_KI
+#define CONFIG_STABILITY_TRIMCAL_KI "0.02"
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_CLAMP
+#define CONFIG_STABILITY_TRIMCAL_CLAMP "0.30"
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_ACCEPT_K
+#define CONFIG_STABILITY_TRIMCAL_ACCEPT_K "3.0"
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_MIN_SPEED_MPS
+#define CONFIG_STABILITY_TRIMCAL_MIN_SPEED_MPS "0.3"
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_MAX_YAW_DPS
+#define CONFIG_STABILITY_TRIMCAL_MAX_YAW_DPS 45
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_WINDOW_TICKS
+#define CONFIG_STABILITY_TRIMCAL_WINDOW_TICKS 100
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_NOISE_TICKS
+#define CONFIG_STABILITY_TRIMCAL_NOISE_TICKS 100
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_SETTLE_MS
+#define CONFIG_STABILITY_TRIMCAL_SETTLE_MS 400
+#endif
+#ifndef CONFIG_STABILITY_TRIMCAL_LEVEL_TIMEOUT_MS
+#define CONFIG_STABILITY_TRIMCAL_LEVEL_TIMEOUT_MS 15000
+#endif
+/* How long calibration may go without a CalibrateCommand keepalive from its
+ * dashboard before aborting. Longer than the 400ms driving-link timeout: the
+ * dashboard keepalive is ~1 Hz, and a tethered supervised sweep can tolerate a
+ * couple of seconds of dashboard silence before treating it as "operator gone". */
+#define CAL_LINK_TIMEOUT_US 2000000LL
+
 #define ASSIST_KP_MIN       0.012f
 #define ASSIST_KP_BASE      0.022f
 #define ASSIST_KP_MAX       0.050f
@@ -127,10 +168,38 @@ static bool s_arm_power_allowed;
 static EscTrimPoint s_esc_trim[ESC_TRIM_MAX_POINTS];
 static uint8_t s_esc_trim_count = 0;
 
-/* True while ESC-trim auto-calibration (Task 5, not implemented here) is
- * actively driving the ESCs itself -- gates trim application off so it
- * doesn't fight the calibration routine's own probing. */
+/* True while ESC-trim auto-calibration is actively driving the ESCs itself --
+ * gates trim application off (control_apply_decision) and suppresses SAS
+ * (stability_sas_tick) so neither fights the calibration routine's probing.
+ * Owned by the control task: only calibration_tick writes it. */
 static bool s_calibrating = false;
+
+/* ESC-trim calibration state. The pure state machine (esc_trim_cal) lives in
+ * s_cal; s_cal_cfg is loaded once from Kconfig. The two *_pending flags and
+ * s_cal_last_rx_us are the cross-task handoff from the pipeline RX task's
+ * calibrate_command_handler -- written only under s_arbiter_lock.
+ *
+ * s_cal_last_rx_us is calibration's OWN heartbeat, entirely separate from the
+ * general s_last_control_rx_us link timer: CalibrateCommand traffic must never
+ * refresh the driving-link liveness, and a manual command arriving mid-sweep
+ * (which DOES advance s_last_control_rx_us past s_cal_baseline_rx_us) is an
+ * abort, not a keep-alive. See design doc sec 7a. */
+static etc_t s_cal;
+static etc_cfg_t s_cal_cfg;
+static bool s_cal_cfg_loaded = false;
+static bool s_cal_start_pending = false;
+static bool s_cal_stop_pending = false;
+static bool s_cal_average = false;
+static int64_t s_cal_baseline_rx_us = 0;
+static int64_t s_cal_last_rx_us = 0;
+static etc_out_t s_cal_out;   /* this tick's step output (ESC commands + done/abort) */
+
+/* CalibrateStatus telemetry: written by the control task, read+published by the
+ * core-1 diagnostics task (same producer/consumer split as motor status).
+ * Guarded by s_status_lock; generation == 0 means "never updated" -> the
+ * diagnostics task publishes nothing when idle. */
+static boat_CalibrateStatus s_cal_status;
+static uint32_t s_cal_status_generation = 0;
 
 typedef struct {
     arm_request_t request;
@@ -388,6 +457,38 @@ uint32_t motor_control_get_status(boat_MotorStatus *out)
     return generation;
 }
 
+/* Publish one CalibrateStatus snapshot for the diagnostics task to pick up.
+ * Called from the control task (calibration_tick) only. Bumps the generation
+ * so the reader can tell a fresh update from a repeat. yaw_avg/making_way are
+ * computed by the caller (it already has the fusion sample and GPS fix). */
+static void cal_status_commit(const etc_t *cal, float yaw_avg, bool making_way)
+{
+    boat_CalibrateStatus st = boat_CalibrateStatus_init_zero;
+    st.state = (uint32_t)cal->state;
+    st.level_index = cal->level_idx;
+    st.level_throttle = (cal->level_idx < ESC_TRIM_MAX_POINTS)
+                            ? s_cal_cfg.levels[cal->level_idx] : 0.0f;
+    st.trim_diff = cal->trim_diff;
+    st.yaw_avg_dps = yaw_avg;
+    st.making_way = making_way;
+    st.points_done = cal->out_count;
+
+    portENTER_CRITICAL(&s_status_lock);
+    s_cal_status = st;
+    s_cal_status_generation++;
+    portEXIT_CRITICAL(&s_status_lock);
+}
+
+uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out)
+{
+    if (!out) return 0;
+    portENTER_CRITICAL(&s_status_lock);
+    uint32_t generation = s_cal_status_generation;
+    *out = s_cal_status;
+    portEXIT_CRITICAL(&s_status_lock);
+    return generation;
+}
+
 static void notify_link_rx_locked(int64_t received_us)
 {
     if (received_us > s_last_control_rx_us) s_last_control_rx_us = received_us;
@@ -539,6 +640,25 @@ static void arm_command_handler(bool arm, bool force)
         !arm && s_control_task) {
         xTaskNotifyGive(s_control_task);
     }
+}
+
+/* Runs in the pipeline RX task, NOT the control task. Only sets a pending flag
+ * for the control task's calibration_tick to consume -- it must never actuate
+ * from here, and it must NOT call notify_link_rx_locked / any manual_transport_*
+ * wrapper: CalibrateCommand traffic is deliberately invisible to the driving
+ * link heartbeat (design doc sec 7a). s_cal_last_rx_us is calibration's own,
+ * separate liveness signal. */
+static void calibrate_command_handler(bool start, bool average)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    if (start) {
+        s_cal_start_pending = true;
+        s_cal_average = average;
+    } else {
+        s_cal_stop_pending = true;
+    }
+    s_cal_last_rx_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_arbiter_lock);
 }
 
 static bool submit_arm_request(arm_request_t request, bool force, int64_t requested_us)
@@ -747,7 +867,14 @@ static void control_apply_decision(control_decision_t *decision)
             steer_driver_set(0.0f);
             changed = true;
         }
-        if (winch_driver_get_power()) {
+        /* Keep the servo rail powered WHILE calibrating: the driving link is
+         * stale by design during a sweep (sec 7a), so this safe_stop fires every
+         * tick -- but calibration is actively holding the rudder centred and
+         * needs the rail live to do it. Cutting it would let the rudder float
+         * off-centre and corrupt the yaw measurement. An explicit PWR-OFF still
+         * cuts the rail (the explicit_off branch above, not this one) and aborts
+         * calibration via s_rail_cut. */
+        if (winch_driver_get_power() && !s_calibrating) {
             winch_driver_set_power(false);
             changed = true;
         }
@@ -755,7 +882,7 @@ static void control_apply_decision(control_decision_t *decision)
         s_manual_right = 0.0f;
         s_manual_rudder = 0.0f;
         heading_assist_reset();
-        if (!control_link_alive() && changed) {
+        if (!control_link_alive() && changed && !s_calibrating) {
             ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
         }
     }
@@ -837,6 +964,11 @@ static void control_apply_decision(control_decision_t *decision)
 static void stability_sas_tick(bool steer_raw, int64_t now_us)
 {
 #if CONFIG_STABILITY_SAS_ENABLE
+    /* Calibration owns the rudder (holds it at 0) and the ESCs while it runs;
+     * SAS must not fight it. calibration_tick already ran this cycle. */
+    if (s_calibrating) {
+        return;
+    }
     if (!s_stab_cfg_loaded) {
         s_stab_cfg_loaded = true;
         s_stab_cfg.r_max_dps = (float)CONFIG_STABILITY_SAS_RMAX_DPS;
@@ -925,6 +1057,145 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
 #endif
 }
 
+static void load_cal_cfg(void)
+{
+    s_cal_cfg.ki = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_KI, 0.02f, 0.0f, 1.0f);
+    s_cal_cfg.trim_clamp = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_CLAMP, 0.30f, 0.05f, 1.0f);
+    s_cal_cfg.accept_k = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_ACCEPT_K, 3.0f, 0.5f, 10.0f);
+    s_cal_cfg.excessive_yaw_dps = (float)CONFIG_STABILITY_TRIMCAL_MAX_YAW_DPS;
+    s_cal_cfg.min_speed_mps = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_MIN_SPEED_MPS, 0.3f, 0.0f, 10.0f);
+    s_cal_cfg.window_ticks = CONFIG_STABILITY_TRIMCAL_WINDOW_TICKS;
+    s_cal_cfg.noise_ticks = CONFIG_STABILITY_TRIMCAL_NOISE_TICKS;
+    s_cal_cfg.settle_in_us = (int64_t)CONFIG_STABILITY_TRIMCAL_SETTLE_MS * 1000;
+    s_cal_cfg.level_timeout_us = (int64_t)CONFIG_STABILITY_TRIMCAL_LEVEL_TIMEOUT_MS * 1000;
+    /* Starting level list -- confirm on the water, config not commitment. */
+    const float levels[] = {0.2f, 0.4f, 0.6f, 0.8f};
+    s_cal_cfg.level_count = (uint8_t)(sizeof(levels) / sizeof(levels[0]));
+    for (uint8_t i = 0; i < s_cal_cfg.level_count && i < ESC_TRIM_MAX_POINTS; ++i) {
+        s_cal_cfg.levels[i] = levels[i];
+    }
+}
+
+/* One control-task tick of ESC-trim auto-calibration. Runs AFTER
+ * control_apply_decision (so calibration's own ESC writes are the last word of
+ * the cycle) and BEFORE stability_sas_tick (which self-suppresses while
+ * s_calibrating). Non-blocking: one esc_trim_cal_step per tick, no I/O except
+ * the NVS write on a clean finish. Owns nothing until a start command lands and
+ * the ARMED + link gates hold. See design doc sec 6/7/7a. */
+static void calibration_tick(int64_t now_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool start_req = s_cal_start_pending; s_cal_start_pending = false;
+    bool stop_req  = s_cal_stop_pending;  s_cal_stop_pending  = false;
+    bool average   = s_cal_average;
+    int64_t link_rx_us = s_last_control_rx_us;
+    int64_t cal_rx_us  = s_cal_last_rx_us;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+
+    if (!s_cal_cfg_loaded) {
+        load_cal_cfg();
+        s_cal_cfg_loaded = true;
+    }
+
+    /* Calibration's OWN link liveness, separate from the driving link. The
+     * dashboard sends periodic CalibrateCommand keepalives while a sweep runs
+     * (they refresh s_cal_last_rx_us but never the driving-link timer), so a
+     * dashboard that crashes or goes out of range aborts the sweep within
+     * CAL_LINK_TIMEOUT_US -- supervised, no dead-man hold required. Gating on
+     * the DRIVING link here would be wrong: calibration deliberately lets it go
+     * stale (sec 7a), so control_link_alive() is false for most of a real sweep. */
+    bool cal_link_alive = (now_us - cal_rx_us) < CAL_LINK_TIMEOUT_US;
+
+    if (start_req && !s_calibrating) {
+        if (esc_driver_get_state() == ESC_STATE_ARMED && cal_link_alive && !s_rail_cut) {
+            s_cal_cfg.average_into_existing = average;
+            esc_trim_cal_start(&s_cal, &s_cal_cfg);
+            s_cal_baseline_rx_us = link_rx_us;   /* any later manual cmd advances past this = abort */
+            s_cal_out = (etc_out_t){0};
+            s_calibrating = true;
+            ESP_LOGI(TAG, "CAL,start,avg=%d,levels=%u", (int)average, (unsigned)s_cal_cfg.level_count);
+        } else {
+            ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d",
+                     (int)(esc_driver_get_state() == ESC_STATE_ARMED), (int)s_rail_cut);
+        }
+    }
+
+    if (!s_calibrating) {
+        return;
+    }
+
+    /* Fusion freshness: a hung fusion task leaves imu_icm_ok() true but the
+     * yaw sample stale -- treat stale fusion as an IMU fault so the machine
+     * aborts rather than integrating a frozen yaw. Same age bound as SAS. */
+    FusionResult fusion = {0};
+    fusion_get_result(&fusion);
+    int64_t age_us = (fusion.captured_us != 0) ? (now_us - (int64_t)fusion.captured_us) : INT64_MAX;
+    bool fusion_fresh = (fusion.sequence != 0) &&
+                        (age_us <= (int64_t)CONFIG_STABILITY_SAS_MAX_AGE_MS * 1000);
+    bool imu_ok = imu_icm_ok() && fusion_fresh;
+
+    gps_fix_t gps = {0};
+    (void)gps_driver_get_fix(&gps);
+    bool making_way = gps.valid && gps.speed_mps >= s_cal_cfg.min_speed_mps;
+
+    /* Abort (handed to the state machine's manual_override gate) on any of:
+     *   - a real manual throttle/winch/steer command accepted since the sweep
+     *     began (it advanced s_last_control_rx_us past the baseline),
+     *   - an explicit Stop (CalibrateCommand{start:false} -> stop_req),
+     *   - an explicit servo-rail PWR-OFF (s_rail_cut) -- a hard operator kill.
+     * All three hand authority straight back to the pilot / safe state. */
+    bool manual_override = link_rx_us > s_cal_baseline_rx_us;
+
+    s_cal_out = esc_trim_cal_step(&s_cal, &s_cal_cfg, now_us,
+                                  fusion.yaw_rate, gps.speed_mps,
+                                  esc_driver_get_state() == ESC_STATE_ARMED,
+                                  cal_link_alive,
+                                  imu_ok,
+                                  manual_override || stop_req || s_rail_cut);
+
+    /* Telemetry: throttle to ~5 Hz so the 100 Hz control loop doesn't wake the
+     * diagnostics publisher every tick (trim shifts L/R every tick during
+     * SETTLE). Always emit the terminal DONE/ABORTED state so the UI sees it. */
+    static uint8_t cal_status_div = 0;
+    if ((++cal_status_div % 20) == 0 || s_cal_out.done || s_cal_out.aborted) {
+        float yaw_avg = fusion.yaw_rate - s_cal.b0;
+        cal_status_commit(&s_cal, yaw_avg, making_way);
+    }
+
+    if (s_cal_out.active) {
+        /* Calibration's own ESC command is the last write of the cycle,
+         * overriding control_apply_decision (which, with the driving link now
+         * stale, has been zeroing the ESCs each tick). Rudder held centered. */
+        esc_driver_set_throttle(s_cal_out.left_cmd, s_cal_out.right_cmd);
+        if (steer_driver_get() != 0.0f) {
+            steer_driver_set(0.0f);
+        }
+    }
+
+    if (s_cal_out.done) {
+        EscTrimNvsBlob blob;
+        memset(&blob, 0, sizeof(blob));
+        blob.magic_word = ESC_TRIM_NVS_MAGIC;
+        blob.count = (s_cal.out_count > ESC_TRIM_MAX_POINTS) ? ESC_TRIM_MAX_POINTS : s_cal.out_count;
+        for (uint8_t i = 0; i < blob.count; ++i) {
+            blob.points[i] = s_cal.out_table[i];
+        }
+        motor_control_set_esc_trim(blob.points, blob.count);
+        fs_save_esc_trim(&blob);
+        s_calibrating = false;
+        ESP_LOGI(TAG, "CAL,done,points=%u -> saved to NVS", (unsigned)blob.count);
+    } else if (s_cal_out.aborted) {
+        s_calibrating = false;
+        ESP_LOGW(TAG, "CAL,aborted,reason=%s -- table discarded",
+                 s_cal_out.reason ? s_cal_out.reason : "?");
+    }
+    /* On finish/abort we do NOT touch s_last_control_rx_us: it still holds the
+     * pilot's last real command time, so control_apply_decision's existing
+     * safe_stop path keeps the ESCs at 0 until a genuinely new manual command
+     * arrives (or, if that command is <400ms old, resumes it -- live intent,
+     * not a stale replay). No new failsafe logic (design doc sec 7a). */
+}
+
 static void run_control_cycle(bool scheduled, int64_t scheduled_us)
 {
     static uint8_t heading_divider = 0;
@@ -943,6 +1214,7 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
     portEXIT_CRITICAL(&s_arbiter_lock);
 
     control_apply_decision(&decision);
+    calibration_tick(start_us);
     stability_sas_tick(decision.steer_raw, start_us);
     status_commit_current(false);
 
@@ -1037,6 +1309,7 @@ esp_err_t motor_control_init(void)
     pipeline_register_steer_handler(steer_command_handler);
     pipeline_register_servo_power_handler(servo_power_command_handler);
     pipeline_register_steer_raw_handler(steer_raw_command_handler);
+    pipeline_register_calibrate_handler(calibrate_command_handler);
 
     esp_err_t task_error = runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
                                                task_arm_sequence, NULL,

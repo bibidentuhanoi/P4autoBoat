@@ -38,6 +38,13 @@ void motor_control_notify_link_rx(int64_t received_us);
 /** Copy a stable MotorStatus snapshot and return its generation. */
 uint32_t motor_control_get_status(boat_MotorStatus *out);
 
+/**
+ * Copy the latest ESC-trim CalibrateStatus snapshot and return its generation.
+ * Generation 0 means calibration has never run this boot (nothing to publish);
+ * a changed generation is a fresh progress update. Read by the diagnostics task.
+ */
+uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out);
+
 #ifdef __cplusplus
 }
 #endif

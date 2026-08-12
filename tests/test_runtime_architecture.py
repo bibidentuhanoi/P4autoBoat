@@ -44,11 +44,14 @@ STUB_HEADERS = {
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "esc_trim.h"
 #include "pipeline.h"
 esp_err_t motor_control_init_hw(void);
 esp_err_t motor_control_init(void);
 void motor_control_notify_link_rx(int64_t received_us);
+void motor_control_set_esc_trim(const EscTrimPoint *pts, uint8_t count);
 uint32_t motor_control_get_status(boat_MotorStatus *out);
+uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out);
 """,
     "esp_err.h": r"""
 #pragma once
@@ -153,7 +156,7 @@ esp_err_t steer_driver_set_raw_us(uint32_t pulse_us);
     "drivers/gps_driver.h": r"""
 #pragma once
 #include <stdbool.h>
-typedef struct { float speed_mps; } gps_fix_t;
+typedef struct { bool valid; float speed_mps; } gps_fix_t;
 bool gps_driver_has_lock(void);
 esp_err_t gps_driver_get_fix(gps_fix_t *fix);
 """,
@@ -165,7 +168,8 @@ bool imu_mag_ok(void);
 """,
     "sensor_fusion.h": r"""
 #pragma once
-typedef struct { float pitch; float roll; float heading; } FusionResult;
+#include <stdint.h>
+typedef struct { float pitch; float roll; float heading; float yaw_rate; uint32_t sequence; uint64_t captured_us; } FusionResult;
 void fusion_get_result(FusionResult *result);
 """,
     "transports/ws_transport.h": "#pragma once\nint ws_transport_client_count(void);\n",
@@ -179,20 +183,31 @@ typedef struct { float left; float right; } boat_SteerCommand;
 typedef struct { uint32_t pulse_us; } boat_SteerRawCommand;
 typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; } boat_MotorStatus;
 #define boat_MotorStatus_init_zero {0, 0, 0, 0, 0}
+typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
+#define boat_CalibrateStatus_init_zero {0, 0, 0, 0, 0, 0, 0}
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
 typedef void (*arm_command_handler_fn)(bool, bool);
 typedef void (*winch_command_handler_fn)(const boat_WinchCommand *);
 typedef void (*steer_command_handler_fn)(const boat_SteerCommand *);
 typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
+typedef void (*calibrate_command_handler_fn)(bool, bool);
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
 void pipeline_register_arm_handler(arm_command_handler_fn handler);
 void pipeline_register_winch_handler(winch_command_handler_fn handler);
 void pipeline_register_steer_handler(steer_command_handler_fn handler);
 void pipeline_register_servo_power_handler(servo_power_handler_fn handler);
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);
+void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
 void pipeline_publish_motor_status(const boat_MotorStatus *status);
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
 bool pipeline_recent_command(int64_t max_age_us);
+""",
+    "file_system.h": r"""
+#pragma once
+#include "esc_trim.h"
+bool fs_save_esc_trim(const EscTrimNvsBlob *blob);
+bool fs_load_esc_trim(EscTrimNvsBlob *blob);
 """,
 }
 
@@ -216,6 +231,7 @@ HARNESS = r"""
 #include "esp_timer.h"
 #include "freertos/queue.h"
 #include "sensor_fusion.h"
+#include "esc_trim.h"
 
 static motor_command_handler_fn motor_handler;
 static arm_command_handler_fn arm_handler;
@@ -223,6 +239,7 @@ static winch_command_handler_fn winch_handler;
 static steer_command_handler_fn steer_handler;
 static servo_power_handler_fn power_handler;
 static steer_raw_command_handler_fn raw_handler;
+static calibrate_command_handler_fn calibrate_handler;
 
 static unsigned throttle_writes;
 static unsigned winch_writes;
@@ -280,8 +297,10 @@ void pipeline_register_winch_handler(winch_command_handler_fn fn) { winch_handle
 void pipeline_register_steer_handler(steer_command_handler_fn fn) { steer_handler = fn; }
 void pipeline_register_servo_power_handler(servo_power_handler_fn fn) { power_handler = fn; }
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn fn) { raw_handler = fn; }
+void pipeline_register_calibrate_handler(calibrate_command_handler_fn fn) { calibrate_handler = fn; }
 void pipeline_publish_motor_status(const boat_MotorStatus *status) { (void)status; ++transport_publishes; }
 bool pipeline_recent_command(int64_t max_age_us) { (void)max_age_us; return true; }
+bool fs_save_esc_trim(const EscTrimNvsBlob *blob) { (void)blob; return true; }
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 
 esp_err_t esc_driver_init(void) { return ESP_OK; }
@@ -618,6 +637,7 @@ def test_pipeline_handlers_do_not_write_actuators():
                 str(tmpdir / "motor_control.c"), str(ROOT / "main" / "control_arbiter.c"),
                 str(ROOT / "main" / "arm_sequence.c"),
                 str(ROOT / "main" / "esc_trim.c"),
+                str(ROOT / "main" / "esc_trim_cal.c"),
                 str(tmpdir / "harness.c"), "-lm", "-o", str(binary),
             ],
             check=True,
@@ -852,12 +872,15 @@ void vTaskDelay(TickType_t ticks);
 #include <stdbool.h>
 #include <stdint.h>
 typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; } boat_MotorStatus;
+typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 uint32_t motor_control_get_status(boat_MotorStatus *out);
+uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out);
 """,
     "pipeline.h": r"""
 #pragma once
 #include "motor_control.h"
 void pipeline_publish_motor_status(const boat_MotorStatus *status);
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
 """,
     "drivers/gps_driver.h": r"""
 #pragma once
@@ -897,6 +920,13 @@ uint32_t motor_control_get_status(boat_MotorStatus *out) {
 void pipeline_publish_motor_status(const boat_MotorStatus *status) {
     assert(status->state == 2);
     ++motor_status_publishes;
+}
+uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out) {
+    *out = (boat_CalibrateStatus){0};
+    return 0;   /* generation 0 -> diagnostics publishes nothing (idle boat) */
+}
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status) {
+    (void)status;   /* never reached with generation 0 above */
 }
 esp_err_t gps_driver_get_runtime_status(gps_runtime_status_t *out) {
     *out = (gps_runtime_status_t){.parse_errors = 3, .fix_age_us = 4000};

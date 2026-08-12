@@ -268,6 +268,68 @@ menu "Board Configuration"
                 control-link failsafe -- this catches a hung SENSOR task even
                 while the control LINK stays alive.
 
+        comment "ESC differential-trim auto-calibration (triggered from a dashboard; runs only while armed+linked)"
+
+        config STABILITY_TRIMCAL_KI
+            string "TrimCal: integrator gain (trim per deg/s per second)"
+            default "0.02"
+            help
+                Slow integrator that settles onto the L/R differential which
+                nulls yaw. Small: this is a converge-then-record search, not a
+                fast loop.
+
+        config STABILITY_TRIMCAL_CLAMP
+            string "TrimCal: max differential trim before abort (0..1)"
+            default "0.30"
+            help
+                Guard rail. Hitting it means the feedback sign is wrong or the
+                imbalance is beyond trim -- the sweep aborts and saves nothing
+                (the wrong-sign fail-safe).
+
+        config STABILITY_TRIMCAL_ACCEPT_K
+            string "TrimCal: accept-band sigma multiple"
+            default "3.0"
+            help
+                A level records once the windowed mean yaw sits within
+                k*sigma/sqrt(N) of zero, where sigma is the boat's own measured
+                stationary gyro noise.
+
+        config STABILITY_TRIMCAL_MIN_SPEED_MPS
+            string "TrimCal: minimum GPS ground speed to record (m/s)"
+            default "0.3"
+            help
+                Making-way gate: rudder-less yaw balance is only meaningful while
+                the boat is actually moving.
+
+        config STABILITY_TRIMCAL_MAX_YAW_DPS
+            int "TrimCal: excessive-yaw abort threshold (deg/s)"
+            default 45
+            range 5 180
+            help
+                Its OWN value, deliberately NOT reused from SAS RMAX: calibration
+                runs with SAS suppressed and must not inherit a dependency on how
+                the pilot's stick feel was tuned.
+
+        config STABILITY_TRIMCAL_WINDOW_TICKS
+            int "TrimCal: convergence-window length (control ticks, 100 Hz)"
+            default 100
+            range 10 1000
+
+        config STABILITY_TRIMCAL_NOISE_TICKS
+            int "TrimCal: stationary noise/bias measurement window (control ticks)"
+            default 100
+            range 10 1000
+
+        config STABILITY_TRIMCAL_SETTLE_MS
+            int "TrimCal: settle wait after a throttle step before integrating (ms)"
+            default 400
+            range 0 5000
+
+        config STABILITY_TRIMCAL_LEVEL_TIMEOUT_MS
+            int "TrimCal: per-level give-up timeout (ms)"
+            default 15000
+            range 1000 60000
+
     endmenu
 
     menu "Winch / Servo Configuration"
