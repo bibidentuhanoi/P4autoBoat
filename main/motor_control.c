@@ -1,5 +1,6 @@
 #include "motor_control.h"
 #include "arm_sequence.h"
+#include "esc_trim.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
 #include "drivers/steer_driver.h"
@@ -118,6 +119,18 @@ static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uintptr_t s_status_reader_task;
 
 static bool s_arm_power_allowed;
+
+/* ESC differential-trim table -- own NVS record ("esc_trim"), loaded once at
+ * boot by main.c (fs_load_esc_trim) and handed in via motor_control_set_esc_trim().
+ * Applied on the common throttle in control_apply_decision(), before
+ * esc_driver_set_throttle(). Entirely independent of CalibrationData. */
+static EscTrimPoint s_esc_trim[ESC_TRIM_MAX_POINTS];
+static uint8_t s_esc_trim_count = 0;
+
+/* True while ESC-trim auto-calibration (Task 5, not implemented here) is
+ * actively driving the ESCs itself -- gates trim application off so it
+ * doesn't fight the calibration routine's own probing. */
+static bool s_calibrating = false;
 
 typedef struct {
     arm_request_t request;
@@ -772,8 +785,13 @@ static void control_apply_decision(control_decision_t *decision)
             float left;
             float right;
             esc_driver_get_throttle(&left, &right);
-            if (left != decision->left || right != decision->right) {
-                esc_driver_set_throttle(decision->left, decision->right);
+            float target_left  = decision->left;
+            float target_right = decision->right;
+            if (!s_calibrating) {
+                esc_trim_apply(&target_left, &target_right, s_esc_trim, s_esc_trim_count);
+            }
+            if (left != target_left || right != target_right) {
+                esc_driver_set_throttle(target_left, target_right);
                 changed = true;
             }
             s_manual_left = clampf(decision->left, 0.0f, 1.0f);
@@ -969,6 +987,12 @@ esp_err_t motor_control_init_hw(void)
         ESP_LOGE(TAG, "ESC driver init failed: %s", esp_err_to_name(ret));
     }
     return ret;
+}
+
+void motor_control_set_esc_trim(const EscTrimPoint *pts, uint8_t count)
+{
+    s_esc_trim_count = (count > ESC_TRIM_MAX_POINTS) ? ESC_TRIM_MAX_POINTS : count;
+    for (uint8_t i = 0; i < s_esc_trim_count; ++i) s_esc_trim[i] = pts[i];
 }
 
 void motor_control_disarm(void)

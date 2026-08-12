@@ -186,7 +186,8 @@ void app_main(void) {
     // independent of the IMU calibration blob loaded above. Empty table
     // (count == 0) is always a safe default.
     EscTrimNvsBlob esc_trim_blob;
-    fs_load_esc_trim(&esc_trim_blob);   /* Task 2 wires this into motor_control */
+    fs_load_esc_trim(&esc_trim_blob);
+    motor_control_set_esc_trim(esc_trim_blob.points, esc_trim_blob.count);
 
     // 8b. Winch servo + servo power. GPIO35 is dual-use with the BOOT button,
     //     so this MUST come after the button read above. Reconfigures GPIO35
