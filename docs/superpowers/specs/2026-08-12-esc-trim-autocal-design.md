@@ -15,6 +15,11 @@ We cannot measure motor RPM or thrust on a bench. So we learn the correction **f
 
 **This is the DC-bias half of "most stable boat."** The trim table removes the *permanent* thrust imbalance so the boat tracks straight open-loop; the SAS rudder loop (sibling spec) then handles only the *dynamic* disturbances (gusts, wake, current) instead of burning its limited authority fighting a constant lean. Neither alone gets there; together they do.
 
+**Three different things, stated so they can't be conflated:**
+- **ESC trim (this doc)** = **static**, learned once per throttle level, then replayed as a fixed lookup. Not a running controller — nothing on the ESC side reacts moment-to-moment during normal driving.
+- **SAS (sibling spec)** = **dynamic**, real-time, **rudder-only**. It has never written to an ESC.
+- **Dynamic differential-thrust steering** (described as a future idea in the sibling spec's §5.4) = **not built, not this**. That would be a live, continuous second steering channel on the ESCs; this spec produces one number per throttle level, applied once and left alone until recalibrated.
+
 **Hard constraint (the user's, and the spine of this design): no magic numbers that determine the result.** We cannot bench the motors, so the answer must come from sensor data, not from constants picked out of thin air. §4 accounts for every constant that remains and shows none of them decides whether the boat goes straight.
 
 ---

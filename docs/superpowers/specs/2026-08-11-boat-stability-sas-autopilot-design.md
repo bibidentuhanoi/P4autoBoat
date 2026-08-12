@@ -15,6 +15,13 @@ The controller must **run underneath the pilot at all times** — the human comm
 
 **Explicitly out of scope for this doc:** writing code. This is concept + staged plan.
 
+**Scope line, stated plainly so it can't be read as "SAS already controls both ESCs":**
+- **SAS (this doc, §5.2, Tasks A/B/C — built)** = a real-time, per-tick **rudder-only** correction. It reads gyro yaw-rate and moves the rudder. It has never written to an ESC and does not know the motors exist.
+- **ESC differential trim (sibling spec, `2026-08-12-esc-trim-autocal-design.md`)** = a **static, one-time-learned** per-throttle-level correction. It runs only when explicitly triggered, then bakes a fixed number into a lookup table applied at normal drive time. It is not a running controller and does not react to anything moment-to-moment.
+- **Dynamic differential-thrust steering (§5.4 below)** = a *third*, **not-yet-built** thing: a real-time second steering channel that would use the ESCs continuously, alongside the rudder. It is design-only, deferred, and is a completely different mechanism from ESC trim above — trim removes a *permanent* bias once; this would be a *live* loop, forever.
+
+Only the first of these three exists in the firmware today.
+
 ---
 
 ## 2. The setup as it actually is (ground truth from the firmware)
@@ -129,7 +136,9 @@ True ZV input-shaping is for lightly-damped oscillators; the boat's yaw is heavi
 4. **Anti-windup:** conditional integration on the trim (above).
 - *Ordering caveat:* if a true input-shaper is ever added, it must precede — not follow — the slew limiter, or the limiter degrades it.
 
-### 5.4 Allocation (rudder-primary + throttle-scheduled thrust assist) — confirmed
+### 5.4 Allocation (rudder-primary + throttle-scheduled thrust assist) — schedule confirmed, **mechanism NOT built**
+**Not implemented.** "Confirmed" below means the *schedule variable* (throttle, not boat speed — settled 2026-08-12) if and when this is ever built — not that it exists. Tasks A/B/C built the rudder-only inner loop (§9 Phase 3) directly; this allocation step (§9 Phase 2) was skipped, not done first. Do not confuse this with the separate ESC-trim-autocal spec: that is a static table applied once per drive session; this would be a live per-tick loop, permanently. Neither exists yet.
+
 `u_yaw → { rudder_angle, thrust_differential }`. **Rudder location is confirmed jet-efflux (§2.0)**, so the schedule is settled: rudder authority tracks **throttle**, not boat speed — it carries yaw at all speeds *whenever throttle is up*, independent of hull speed through the water. Differential thrust is **trim/assist only**, scheduled on **throttle** (added mainly when throttle is low, the regime where the jet stream is weakest and the rudder has the least to deflect), and is **unidirectional** (jets don't reverse) — model it as `thrust_i ≥ 0`; expect yaw-by-thrust to perturb forward speed (§5.5). Decide priority (hold-heading vs hold-speed) explicitly.
 The differential component is made honest by §5.5 before it reaches the motors.
 
