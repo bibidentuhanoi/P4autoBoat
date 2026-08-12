@@ -362,7 +362,11 @@ menu "Board Configuration"
                 entirely, so a wrong number here can't hide the true stop) —
                 walked down from 1000 until the servo hit its real limit. The
                 old 1000 default predates the GPIO34->32 rewiring and was never
-                actually verified against this wiring. Slider -100 maps here.
+                actually verified against this wiring. Slider +100 maps here
+                (dashboard.html negates the slider at its own JS boundary, so
+                -100 lines up with STEER_HOME/full-right instead -- this text
+                used to say "-100 maps here", true only before that negation
+                existed).
 
         config STEER_PULSE_NEUTRAL_US
             int "Steering Pulse Neutral (us) — centered"
