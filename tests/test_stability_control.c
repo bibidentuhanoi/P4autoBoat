@@ -43,5 +43,19 @@ int main(void)
     rudder = stab_rudder_update(&state, &cfg, 0.10f, 0.0f, 20.0f);
     float expected_filt = 0.5f * 20.0f;                        /* alpha=0.5 blend from 0 */
     assert(fabsf(rudder - (-0.010f * expected_filt)) < 1e-3f);
+
+    /* Non-finite yaw_rate must fail closed to 0.0f, not propagate a NaN that
+     * survives clampf() unclamped and hits undefined behaviour at the
+     * (uint32_t)NaN cast in steer_to_us() feeding the real servo. */
+    stab_reset(&state);
+    rudder = stab_rudder_update(&state, &cfg, 0.10f, 0.5f, NAN);
+    assert(rudder == 0.0f);
+    assert(!state.initialized);   /* reset, so a later good sample restarts clean */
+
+    /* Same guard for a non-finite pilot input (e.g. a malformed network float). */
+    stab_reset(&state);
+    rudder = stab_rudder_update(&state, &cfg, 0.10f, INFINITY, 5.0f);
+    assert(rudder == 0.0f);
+
     return 0;
 }

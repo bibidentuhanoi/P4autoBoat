@@ -827,13 +827,31 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
         s_stab_last_tick_us = 0;
     }
 
-    /* The decision was applied first, so an ineligible cycle stays manual.
-     * Reset all dynamic state before any later re-entry. */
-    if (steer_raw || esc_driver_get_state() != ESC_STATE_ARMED ||
+    /* Calibration escape hatch: never touch the rudder while the operator is
+     * raw-pulse probing -- not even to centre it, that would fight the exact
+     * thing they're doing. */
+    if (steer_raw) {
+        stab_reset(&s_stab_state);
+        s_stab_last_seq = 0;
+        s_stab_last_tick_us = 0;
+        return;
+    }
+
+    /* Not armed / link dead / IMU unhealthy: step back AND actively centre.
+     * Resetting internal state alone (the old behaviour) left SAS's last
+     * rudder correction physically applied to the servo, frozen, with
+     * nothing ever telling it otherwise -- worse than doing nothing.
+     * Idempotent against control_apply_decision's own centring for the
+     * ARMED/link cases; imu_icm_ok() is the one condition nothing else
+     * checks, so this is the only place that catches it. */
+    if (esc_driver_get_state() != ESC_STATE_ARMED ||
         !control_link_alive() || !imu_icm_ok()) {
         stab_reset(&s_stab_state);
         s_stab_last_seq = 0;
         s_stab_last_tick_us = 0;
+        if (steer_driver_get() != 0.0f) {
+            steer_driver_set(0.0f);
+        }
         return;
     }
 
@@ -845,16 +863,23 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
      * tells us "not a fresh sample this tick", not "how long has it been". */
     int64_t age_us = (fusion.captured_us != 0) ? (now_us - (int64_t)fusion.captured_us) : INT64_MAX;
     if (fusion.sequence == 0 || age_us > (int64_t)CONFIG_STABILITY_SAS_MAX_AGE_MS * 1000) {
-        if (fusion.sequence == 0) {
-            ESP_LOGW(TAG, "CTRL_SAS,no_fusion_yet -> centring");
-        } else {
-            ESP_LOGW(TAG, "CTRL_SAS,stale,age_ms=%lld,max_ms=%d -> centring",
-                     (long long)(age_us / 1000), (int)CONFIG_STABILITY_SAS_MAX_AGE_MS);
+        /* Throttled: this branch can otherwise log and write every 10ms tick
+         * for as long as the fault persists -- up to 100/s inside the
+         * highest-priority task in the system. */
+        if ((++s_stab_log_div % STAB_LOG_DIVIDER) == 0) {
+            if (fusion.sequence == 0) {
+                ESP_LOGW(TAG, "CTRL_SAS,no_fusion_yet -> centring");
+            } else {
+                ESP_LOGW(TAG, "CTRL_SAS,stale,age_ms=%lld,max_ms=%d -> centring",
+                         (long long)(age_us / 1000), (int)CONFIG_STABILITY_SAS_MAX_AGE_MS);
+            }
         }
         stab_reset(&s_stab_state);
         s_stab_last_seq = 0;
         s_stab_last_tick_us = 0;
-        steer_driver_set(0.0f);   /* fusion is gone -- centre, don't hold a stale command */
+        if (steer_driver_get() != 0.0f) {
+            steer_driver_set(0.0f);   /* fusion is gone -- centre, don't hold a stale command */
+        }
         return;
     }
     if (fusion.sequence == s_stab_last_seq) {

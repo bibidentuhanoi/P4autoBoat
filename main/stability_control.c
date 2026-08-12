@@ -1,4 +1,5 @@
 #include "stability_control.h"
+#include <math.h>
 
 static float clampf(float value, float lo, float hi)
 {
@@ -14,6 +15,16 @@ void stab_reset(stab_state_t *state)
 float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
                          float dt_s, float steer_cmd_norm, float yaw_rate_dps)
 {
+    /* Fail closed on a non-finite input rather than let it propagate: NaN
+     * survives clampf() unclamped (every comparison with NaN is false), and
+     * (uint32_t)NaN in steer_to_us() is undefined behaviour feeding a real
+     * servo. yaw_rate_dps can go bad from a corrupted sensor read;
+     * steer_cmd_norm from a malformed network float -- neither is defended
+     * upstream, so this pure function is the one place that must catch both. */
+    if (!isfinite(yaw_rate_dps) || !isfinite(steer_cmd_norm) || !isfinite(dt_s)) {
+        stab_reset(state);
+        return 0.0f;
+    }
     if (!state->initialized || dt_s <= 0.0f) {
         state->yaw_filt = yaw_rate_dps;   /* snap on first sample / non-positive dt */
         state->initialized = true;
