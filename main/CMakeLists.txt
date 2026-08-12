@@ -15,6 +15,7 @@ idf_component_register(
         "sensor_fusion.c"
         "esc_map.c"
         "esc_trim.c"
+        "esc_trim_cal.c"
         "stability_control.c"
         "calibration.c"
         "drivers/imu_driver.c"
