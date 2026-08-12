@@ -14,6 +14,7 @@ idf_component_register(
         "file_system.c"
         "sensor_fusion.c"
         "esc_map.c"
+        "stability_control.c"
         "calibration.c"
         "drivers/imu_driver.c"
         "drivers/tof_driver.c"

@@ -6,6 +6,7 @@
 #include "drivers/gps_driver.h"
 #include "drivers/imu_driver.h"
 #include "sensor_fusion.h"
+#include "stability_control.h"
 #include "pipeline.h"
 #include "control_arbiter.h"
 #include "runtime_metrics.h"
@@ -53,6 +54,21 @@ static const char *TAG = "MOTOR_CTL";
 #endif
 #ifndef CONFIG_HEADING_ASSIST_MAX_DIFF
 #define CONFIG_HEADING_ASSIST_MAX_DIFF "0.06"
+#endif
+#ifndef CONFIG_STABILITY_SAS_ENABLE
+#define CONFIG_STABILITY_SAS_ENABLE 0
+#endif
+#ifndef CONFIG_STABILITY_SAS_RMAX_DPS
+#define CONFIG_STABILITY_SAS_RMAX_DPS 45
+#endif
+#ifndef CONFIG_STABILITY_SAS_KR
+#define CONFIG_STABILITY_SAS_KR "0.010"
+#endif
+#ifndef CONFIG_STABILITY_SAS_YAW_LPF
+#define CONFIG_STABILITY_SAS_YAW_LPF "0.30"
+#endif
+#ifndef CONFIG_STABILITY_SAS_OUT_CAP
+#define CONFIG_STABILITY_SAS_OUT_CAP "0.50"
 #endif
 
 #define ASSIST_KP_MIN       0.012f
@@ -151,6 +167,12 @@ static float s_assist_kp = ASSIST_KP_BASE;
 static float s_assist_trim = 0.0f;
 static int64_t s_assist_center_since_us = 0;
 static int64_t s_assist_last_us = 0;
+#if CONFIG_STABILITY_SAS_ENABLE
+static stab_state_t s_stab_state;
+static stab_cfg_t s_stab_cfg;
+static bool s_stab_cfg_loaded = false;
+static uint32_t s_stab_last_seq = 0;
+#endif
 
 static float clampf(float v, float lo, float hi)
 {
@@ -786,6 +808,42 @@ static void control_apply_decision(control_decision_t *decision)
     status_commit_current(changed);
 }
 
+static void stability_sas_tick(bool steer_raw)
+{
+#if CONFIG_STABILITY_SAS_ENABLE
+    if (!s_stab_cfg_loaded) {
+        s_stab_cfg_loaded = true;
+        s_stab_cfg.r_max_dps = (float)CONFIG_STABILITY_SAS_RMAX_DPS;
+        s_stab_cfg.k_r = parse_cfg_float(CONFIG_STABILITY_SAS_KR, 0.010f, 0.0f, 1.0f);
+        s_stab_cfg.yaw_lpf = parse_cfg_float(CONFIG_STABILITY_SAS_YAW_LPF, 0.30f, 0.01f, 1.0f);
+        s_stab_cfg.out_cap = parse_cfg_float(CONFIG_STABILITY_SAS_OUT_CAP, 0.50f, 0.0f, 1.0f);
+        stab_reset(&s_stab_state);
+    }
+
+    /* The decision was applied first, so an ineligible cycle stays manual.
+     * Reset all dynamic state before any later re-entry. */
+    if (steer_raw || esc_driver_get_state() != ESC_STATE_ARMED ||
+        !control_link_alive() || !imu_icm_ok()) {
+        stab_reset(&s_stab_state);
+        s_stab_last_seq = 0;
+        return;
+    }
+
+    FusionResult fusion = {0};
+    fusion_get_result(&fusion);
+    if (fusion.sequence == 0 || fusion.sequence == s_stab_last_seq) {
+        return;
+    }
+    s_stab_last_seq = fusion.sequence;
+
+    float rudder = stab_rudder_update(&s_stab_state, &s_stab_cfg,
+                                      s_manual_rudder, fusion.yaw_rate);
+    steer_driver_set(rudder);
+#else
+    (void)steer_raw;
+#endif
+}
+
 static void run_control_cycle(bool scheduled, int64_t scheduled_us)
 {
     static uint8_t heading_divider = 0;
@@ -804,6 +862,7 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
     portEXIT_CRITICAL(&s_arbiter_lock);
 
     control_apply_decision(&decision);
+    stability_sas_tick(decision.steer_raw);
     status_commit_current(false);
 
     if (scheduled && ++heading_divider == HEADING_DIVIDER) {

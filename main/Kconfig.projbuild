@@ -229,6 +229,31 @@ menu "Board Configuration"
                 Hard cap for dry-run differential thrust in normalized ESC
                 units. This is only logged while dry-run mode is enabled.
 
+        config STABILITY_SAS_ENABLE
+            bool "Enable live rudder yaw-rate stabilizer (actuates the rudder)"
+            default n
+            help
+                OFF leaves manual steering unchanged. ON applies the capped
+                yaw-rate loop only while armed, linked, and IMU healthy. It
+                controls the rudder only; ESC commands remain manual.
+
+        config STABILITY_SAS_RMAX_DPS
+            int "SAS: yaw-rate at full stick (deg/s)"
+            default 45
+            range 5 180
+
+        config STABILITY_SAS_KR
+            string "SAS: rudder per deg/s of rate error"
+            default "0.010"
+
+        config STABILITY_SAS_YAW_LPF
+            string "SAS: yaw-rate low-pass factor (0..1)"
+            default "0.30"
+
+        config STABILITY_SAS_OUT_CAP
+            string "SAS: max rudder authority (0..1)"
+            default "0.50"
+
     endmenu
 
     menu "Winch / Servo Configuration"
