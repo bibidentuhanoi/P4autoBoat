@@ -15,7 +15,7 @@
 - **Worktree:** `/workspaces/BoatEspP4/.worktrees/stability-sas`, branch `feat/stability-sas`. **Activate the venv:** `source /workspaces/BoatEspP4/.venv/bin/activate` (exists only in the main checkout). Baseline: `python -m pytest tests/ -q` → **48 passed**.
 - **Host-test pattern:** each `tests/test_X.py` compiles the real `main/X.c` + a `tests/test_X.c` with `cc -std=c11 -Wall -Wextra -Werror` and runs it. Pure modules compile alone (template: `tests/test_control_arbiter.py`); the state-machine template to mirror is `tests/test_arm_sequence.{c,py}` — study it, `arm_sequence.c` is the same shape as what you build in Task 3.
 - **Two milestones.** Tasks 1–3 are **pure core** — they change *no runtime behavior* (the trim table starts empty → runtime trim is 0; the state machine isn't invoked yet), so Milestone 1 is safe to merge on its own. Tasks 4–6 wire it live (proto, ControlTask, UI) = Milestone 2, the on-water part.
-- **NVS upgrade path is automatic:** `fs_load_calibration` (`file_system.c:166`) rejects a blob whose size ≠ `sizeof(CalibrationData)`. Appending fields changes the size, so an old blob is rejected and `main.c`'s defaults load — an empty trim table. **You must ensure `main.c` default-inits `esc_trim_count = 0`** (Task 1) so that path is clean.
+- **ESC trim gets its OWN NVS record — it does NOT extend `CalibrationData`.** `fs_load_calibration` (`file_system.c:166`) rejects the *whole* `"imu_cal"` blob if its size doesn't exactly match `sizeof(CalibrationData)` — appending fields there would silently wipe the boat's existing, already-calibrated gyro/mag bias on the first boot after this ships, a regression unrelated to ESC trim. Task 1 instead mirrors the existing `fs_save_tof_xtalk`/`fs_load_tof_xtalk` keyed-blob pattern under a new `"esc_trim"` key. `main/include/common.h` is not touched by this plan at all.
 - **Proto parity is mandatory:** any `boat.proto` change MUST be mirrored into BOTH `main/dashboard.html`'s `protoSchema` string AND `tools/espnow_drive.py`'s generated `boat_pb2.py`, in the same commit — protobuf.js silently drops unknown fields, which has caused a UI lockout before.
 - **Safety (Tasks 3, 5):** the routine actuates live thrusters. It runs ONLY when ARMED + link-alive + IMU-healthy; any abort (Stop, link loss, disarm, IMU fault, manual steering, trim clamp, excessive yaw, timeout) → throttle 0, rudder centered, in-RAM table discarded. NVS write happens ONLY on a clean full sweep.
 - **Kconfig fallback pattern:** every new `CONFIG_*` gets an `#ifndef CONFIG_X / #define CONFIG_X <default> / #endif` block in the `.c` that reads it (as in `motor_control.c:57`).
@@ -30,8 +30,8 @@
 - `tests/test_esc_trim.{c,py}`, `tests/test_esc_trim_cal.{c,py}`.
 
 **Modified:**
-- `main/include/common.h` — append the trim table to `CalibrationData` (Task 1).
-- `main/main.c` — default-init `esc_trim_count = 0` (Task 1).
+- `main/file_system.{c,h}` — new `fs_save_esc_trim`/`fs_load_esc_trim`, own NVS key, independent of `CalibrationData` (Task 1).
+- `main/main.c` — load the trim blob at boot, separately from `fs_load_calibration` (Task 1).
 - `main/motor_control.c` — apply trim in the drive path (Task 2); run `calibration_tick`, telemetry, NVS save (Task 5).
 - `main/proto/boat.proto` (+ regenerated `boat.pb.{c,h}`, `proto/boat_pb2.py`) — `CalibrateCommand` + `CalibrateStatus` (Task 4).
 - `main/pipeline.{c,h}` — register the calibrate handler (Task 4).
@@ -42,52 +42,37 @@
 
 # MILESTONE 1 — pure core (safe to merge; no behavior change)
 
-## Task 1: Trim table storage + interpolation
+## Task 1: Trim table storage (own NVS record) + interpolation
 
-**Files:** create `main/esc_trim.{c,h}`, `tests/test_esc_trim.{c,py}`; modify `main/include/common.h`, `main/main.c`, `main/CMakeLists.txt`.
+**Files:** create `main/esc_trim.{c,h}`, `tests/test_esc_trim.{c,py}`; modify `main/file_system.{c,h}`, `main/main.c`, `main/CMakeLists.txt`. **`main/include/common.h` is NOT touched** — see Step 1.
 
-- [ ] **Step 1: Extend the persisted struct**
+- [ ] **Step 1: Define the types — a self-contained header, NOT an extension of `CalibrationData`**
 
-`main/include/common.h`, add above `CalibrationData` and append two fields (append only — order matters for the NVS blob):
+`file_system.c`'s `fs_load_calibration` (`file_system.c:166`) rejects the *entire* `"imu_cal"` blob if its stored size doesn't exactly match `sizeof(CalibrationData)`. Appending fields to that struct would mean the first boot after this ships silently wipes the boat's existing gyro bias / mag bias / mag scale / tares back to defaults — a real regression unrelated to ESC trim. This gets its own NVS record instead, mirroring the existing `fs_save_tof_xtalk`/`fs_load_tof_xtalk` keyed-blob pattern.
+
+`main/esc_trim.h`:
 
 ```c
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
 #define ESC_TRIM_MAX_POINTS 8
+#define ESC_TRIM_NVS_MAGIC 0x54524931u   /* "TRI1" -- bump if the on-disk layout ever changes */
 
 typedef struct __attribute__((packed)) {
     float throttle_frac;   /* common throttle 0..1 this point was learned at */
     float trim_diff;       /* signed differential: left = T - trim/2, right = T + trim/2 */
 } EscTrimPoint;
 
+/* The whole persisted record -- one NVS blob, one key ("esc_trim"), entirely
+ * independent of CalibrationData/"imu_cal". magic_word guards against a
+ * corrupted or absent blob; count==0 is always a safe "no trim" state. */
 typedef struct __attribute__((packed)) {
     uint32_t magic_word;
-    float g_bias[3];
-    float m_bias[3];
-    float m_scale[3];
-    float pitch_tare;
-    float roll_tare;
-    float heading_tare;
-    uint8_t esc_trim_count;                    /* 0 = no table (default / legacy blob) */
-    EscTrimPoint esc_trim[ESC_TRIM_MAX_POINTS];
-} CalibrationData;
-```
-
-- [ ] **Step 2: Default-init in main.c**
-
-`main/main.c`, wherever the default `CalibrationData` is set before `fs_load_calibration` (grep `m_scale` — defaults are set next to it). Add:
-
-```c
-    default_cal.esc_trim_count = 0;   /* empty table -> runtime trim is 0, no behavior change */
-```
-
-This is the path taken when NVS has a legacy (smaller) blob — `fs_load_calibration` rejects the size mismatch and these defaults stand. No `file_system.c` change is needed; the existing size check handles the upgrade.
-
-- [ ] **Step 3: Pure interpolation header**
-
-`main/esc_trim.h`:
-
-```c
-#pragma once
-#include "common.h"
+    uint8_t  count;
+    EscTrimPoint points[ESC_TRIM_MAX_POINTS];
+} EscTrimNvsBlob;
 
 /* Interpolate the learned differential trim for a given common throttle
  * (0..1). Points need not be pre-sorted. count==0 -> 0. Outside the
@@ -104,9 +89,63 @@ float esc_trim_lookup(const EscTrimPoint *pts, uint8_t count, float common_throt
 void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t count);
 ```
 
-- [ ] **Step 4: Write the failing test**
+- [ ] **Step 2: NVS load/save, mirroring `fs_save_tof_xtalk`/`fs_load_tof_xtalk`**
 
-`tests/test_esc_trim.py`: copy the pure pattern from `tests/test_control_arbiter.py`, sources `main/esc_trim.c` + `tests/test_esc_trim.c`. (The test `.c` includes `common.h`; add a minimal `common.h` to a temp `-I` dir OR just `-I main` since `common.h` is self-contained — check: `common.h` only needs `<stdint.h>`, so `-I main` compiles it directly. Use `-I main`.)
+`main/file_system.h`: add `#include "esc_trim.h"` and declare:
+
+```c
+void fs_save_esc_trim(const EscTrimNvsBlob *blob);
+bool fs_load_esc_trim(EscTrimNvsBlob *blob);   /* true = valid blob loaded; false = defaulted to empty (blob->count = 0) */
+```
+
+`main/file_system.c`, add near `fs_save_tof_xtalk`/`fs_load_tof_xtalk` (same `nvs_open("storage", ...)` namespace, different key — `"esc_trim"`):
+
+```c
+void fs_save_esc_trim(const EscTrimNvsBlob *blob)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed for esc_trim save: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_blob(h, "esc_trim", blob, sizeof(*blob));
+    if (err == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGI(TAG, "ESC trim table saved (%u points)", (unsigned)blob->count);
+    } else {
+        ESP_LOGE(TAG, "ESC trim save failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(h);
+}
+
+bool fs_load_esc_trim(EscTrimNvsBlob *blob)
+{
+    blob->magic_word = ESC_TRIM_NVS_MAGIC;
+    blob->count = 0;   /* the safe default if anything below fails */
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &h);
+    if (err != ESP_OK) return false;
+
+    EscTrimNvsBlob temp;
+    size_t len = sizeof(temp);
+    err = nvs_get_blob(h, "esc_trim", &temp, &len);
+    nvs_close(h);
+
+    if (err != ESP_OK || len != sizeof(temp) || temp.magic_word != ESC_TRIM_NVS_MAGIC) {
+        ESP_LOGI(TAG, "No valid ESC trim table in NVS -- starting with none");
+        return false;
+    }
+    *blob = temp;
+    ESP_LOGI(TAG, "ESC trim table loaded (%u points)", (unsigned)blob->count);
+    return true;
+}
+```
+
+- [ ] **Step 3: Write the failing test (interpolation)**
+
+`tests/test_esc_trim.py`: copy the pure pattern from `tests/test_control_arbiter.py`, sources `main/esc_trim.c` + `tests/test_esc_trim.c`, `-I main` — `esc_trim.h` is fully self-contained (`<stdint.h>`/`<stdbool.h>` only), no stub headers needed.
 
 `tests/test_esc_trim.c`:
 
@@ -153,7 +192,7 @@ int main(void)
 
 Run: `python -m pytest tests/test_esc_trim.py -q` → FAIL (no `esc_trim.c`).
 
-- [ ] **Step 5: Implement**
+- [ ] **Step 4: Implement the interpolation math**
 
 `main/esc_trim.c`:
 
@@ -200,13 +239,21 @@ void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t 
 
 Run: `python -m pytest tests/test_esc_trim.py -q` → PASS.
 
-- [ ] **Step 6: Register + full suite + commit**
+- [ ] **Step 5: Load at boot + register + full suite + commit**
+
+`main/main.c`, near (but NOT part of the same call as) wherever `fs_load_calibration` loads the IMU blob — add a separate, independent load:
+
+```c
+    EscTrimNvsBlob esc_trim_blob;
+    fs_load_esc_trim(&esc_trim_blob);   /* false -> blob.count already 0, safe default */
+    motor_control_set_esc_trim(esc_trim_blob.points, esc_trim_blob.count);   /* Task 2 provides this */
+```
 
 `main/CMakeLists.txt`: add `"esc_trim.c"` to `SRCS`.
 Run: `python -m pytest tests/ -q` → **49 passed**. `idf.py build` → exit 0.
 ```bash
-git add main/esc_trim.c main/esc_trim.h main/include/common.h main/main.c main/CMakeLists.txt tests/test_esc_trim.c tests/test_esc_trim.py
-git commit -m "feat(esc): NVS-persisted per-throttle trim table + interpolation"
+git add main/esc_trim.c main/esc_trim.h main/file_system.c main/file_system.h main/main.c main/CMakeLists.txt tests/test_esc_trim.c tests/test_esc_trim.py
+git commit -m "feat(esc): own-NVS-record trim table + interpolation (independent of CalibrationData)"
 ```
 
 ## Task 2: Apply the trim at runtime (control layer)
@@ -231,7 +278,7 @@ void motor_control_set_esc_trim(const EscTrimPoint *pts, uint8_t count)
     for (uint8_t i = 0; i < s_esc_trim_count; ++i) s_esc_trim[i] = pts[i];
 }
 ```
-Declare it in `motor_control.h`. Call it from `main.c` right after `fs_load_calibration`, passing `calib.esc_trim, calib.esc_trim_count`.
+Declare it in `motor_control.h`. Called from `main.c` (Task 1, Step 5) right after `fs_load_esc_trim` — a separate call from `fs_load_calibration`, not sharing its struct.
 
 - [ ] **Step 2: Apply in the drive path**
 
@@ -280,7 +327,7 @@ typedef struct {
     float   ki;                /* integrator gain (slow) */
     float   trim_clamp;        /* ± differential guard rail; hitting it aborts */
     float   accept_k;          /* sigma multiple for the accept band (e.g. 3) */
-    float   excessive_yaw_dps; /* abort trip (reuse SAS R_MAX) */
+    float   excessive_yaw_dps; /* abort trip; own value, NOT SAS's R_MAX (spec §4/§7) */
     float   min_speed_mps;     /* making-way gate */
     uint32_t window_ticks;     /* moving-average window length N */
     uint32_t noise_ticks;      /* stationary noise/bias measurement window */
@@ -318,13 +365,16 @@ void esc_trim_cal_init(etc_t *s, const etc_cfg_t *cfg);
 void esc_trim_cal_start(etc_t *s, const etc_cfg_t *cfg);
 void esc_trim_cal_abort(etc_t *s);   /* external stop / gate failure */
 
-/* One control tick. Gates (armed/link/imu/manual_steer) are evaluated by the
- * caller and passed in; any false-when-required aborts. yaw_rate_dps is raw
- * gyro; the routine subtracts its own measured b0. */
+/* One control tick. Gates (armed/link/imu/manual_override) are evaluated by
+ * the caller and passed in; any false-when-required aborts. yaw_rate_dps is
+ * raw gyro; the routine subtracts its own measured b0. manual_override means
+ * "the pilot submitted a new throttle, winch, or steer command since
+ * calibration started" -- any one of the three, not steering alone (Task 5
+ * computes it from a single timestamp comparison, see that task). */
 etc_out_t esc_trim_cal_step(etc_t *s, const etc_cfg_t *cfg, int64_t now_us,
                             float yaw_rate_dps, float gps_speed_mps,
                             bool armed, bool link_alive, bool imu_ok,
-                            bool manual_steer);
+                            bool manual_override);
 ```
 
 - [ ] **Step 2: Write the behavioral tests FIRST** (they are the real spec).
@@ -339,7 +389,7 @@ etc_out_t esc_trim_cal_step(etc_t *s, const etc_cfg_t *cfg, int64_t now_us,
 4. **Excessive-yaw abort:** inject a yaw spike > `excessive_yaw_dps`; assert immediate `aborted`.
 5. **Timeout:** feed persistent noise that never settles; assert `aborted` after `level_timeout_us`.
 6. **Making-way gate:** hold `gps_speed_mps < min_speed_mps`; assert the level does not record (either skipped or timeout-abort per your chosen policy — pick one and assert it).
-7. **Gate aborts:** each of `armed=false`, `link_alive=false`, `imu_ok=false`, `manual_steer=true` at any active tick → immediate `aborted`, `active` drops, outputs safe.
+7. **Gate aborts:** each of `armed=false`, `link_alive=false`, `imu_ok=false`, `manual_override=true` at any active tick → immediate `aborted`, `active` drops, outputs safe.
 
 Run → FAIL (no impl).
 
@@ -397,24 +447,78 @@ Add to the `BoatMessage` oneof: `CalibrateCommand calibrate = 13;` and `Calibrat
 
 ## Task 5: Wire into ControlTask + telemetry + NVS save
 
-**Files:** `main/motor_control.c`.
+**Files:** `main/motor_control.c` only — no arbiter changes (see the note below on why an earlier draft of this task that touched `control_arbiter.c` was wrong).
 
-- [ ] **Step 1: config + state.** Add `#ifndef` Kconfig fallbacks + `menuconfig` entries for the `etc_cfg_t` values (`STABILITY_TRIMCAL_KI`, `_CLAMP`, `_ACCEPT_K`, `_MIN_SPEED_MPS`, `_WINDOW_TICKS`, `_NOISE_TICKS`, `_SETTLE_MS`, `_LEVEL_TIMEOUT_MS`, and the level list). Reuse `CONFIG_STABILITY_SAS_RMAX_DPS` for `excessive_yaw_dps`. Add a file-scope `etc_t s_cal; etc_cfg_t s_cal_cfg;` and the `s_calibrating` bool from Task 2.
+**Read spec §7a before this task.** It defines the exact ownership/heartbeat contract this implements, and it is written against the real code — the paragraphs below restate the parts this task needs.
 
-- [ ] **Step 2: command handler** sets a pending start/stop (like arm events go through the arbiter). Start is honored only if ARMED + link-alive.
+**Ground truth this design leans on (verified by reading `motor_control.c`, not assumed):**
+- `s_last_control_rx_us` (file-scope, `motor_control.c:108`) is refreshed *only* by `notify_link_rx_locked()`, called *only* from inside the `manual_transport_control_arbiter_submit_*` wrappers and the event-push wrapper, *only* on an accepted submission (`motor_control.c:412,425,438,451,462`). Nothing else touches it. It already means, precisely, "a manual command was just accepted."
+- `control_apply_decision`'s zeroing branch (`safe_stop`) is driven directly by `control_link_alive()`, which reads that same timestamp (`motor_control.c:696-698,138-144`) — **not** by `decision->failsafe` or `decision->drive_changed`. The comment at `motor_control.c:668-677` says this explicitly.
+- `decision->drive_changed` is **not** a usable "fresh manual input" signal for this task: it's defined as `drive->changed || failsafe != previous_failsafe` inside the arbiter, and `run_control_cycle` layers a *second* failsafe recomputation on top (`motor_control.c:918-922`) that can also set it. It fires on any failsafe transition, including the natural one that happens ~400ms after a pilot goes hands-off to watch a calibration sweep — using it here would abort every real run shortly after it starts, with no new input at all. An earlier draft of this task also proposed invalidating the arbiter's manual proposal on calibration start; that's worse, because invalidating it *immediately* flips failsafe and self-triggers the same false abort on the very first tick. Neither is used below.
 
-- [ ] **Step 3: `calibration_tick(now_us)`** — called in `run_control_cycle` right before `stability_sas_tick(...)`. When a start is pending and gates hold: `s_calibrating = true`; call `esc_trim_cal_step(...)` with `fusion.yaw_rate` (raw), GPS speed (`gps_driver_get_fix`), and the gates; if `out.active`, write `esc_driver_set_throttle(out.left_cmd, out.right_cmd)` (bypassing the saved-table apply — that's what `s_calibrating` gates in Task 2) and `steer_driver_set(0.0f)`; publish a `CalibrateStatus` into the double-buffered status (the `s_status_buffers` generation pattern); on `out.done` call `motor_control_set_esc_trim(out.out_table, out.out_count)` **and** `fs_save_calibration(&updated_calib)` (merge the table into the current `CalibrationData` and persist); on `out.aborted` discard (do NOT save) and log the reason; either way clear `s_calibrating` and let SAS/manual resume.
+- [ ] **Step 1: config + state.** Add `#ifndef` Kconfig fallbacks + `menuconfig` entries for the `etc_cfg_t` values: `STABILITY_TRIMCAL_KI`, `_CLAMP`, `_ACCEPT_K`, `_MIN_SPEED_MPS`, `_WINDOW_TICKS`, `_NOISE_TICKS`, `_SETTLE_MS`, `_LEVEL_TIMEOUT_MS`, the level list, **and `STABILITY_TRIMCAL_MAX_YAW_DPS`** (its own value — do NOT reuse `CONFIG_STABILITY_SAS_RMAX_DPS`; see spec §4/§7 for why reusing it would create an ordering dependency between two subsystems that must stay independent, since calibration runs with SAS suppressed). A sensible starting default is the same number as `R_MAX`'s default — same physical idea ("a hard turn"), just not the same variable.
 
-- [ ] **Step 4: SAS suppression.** In `stability_sas_tick`, early-return while `s_calibrating` is true (one line). Manual-steer during calibration = abort (the command handler / gate sees a steer submit and aborts).
+Add file-scope statics (near `s_calibrating` from Task 2):
+```c
+static bool s_cal_start_pending = false;
+static bool s_cal_stop_pending = false;
+static int64_t s_cal_baseline_rx_us = 0;
+static int64_t s_cal_last_rx_us = 0;   /* calibration UI's own heartbeat */
+static etc_t s_cal;
+static etc_cfg_t s_cal_cfg;
+```
+`s_calibrating` itself (Task 2) stays Control-task-owned: only `calibration_tick` (Step 3, runs in the Control task) ever writes it. The two `_pending` flags are the cross-task handoff surface — the pipeline-handler task (Step 2) only ever sets them, under `s_arbiter_lock`, the same lock already used for every other cross-task write in this file.
+
+- [ ] **Step 2: command handler.** The `CalibrateCommand` pipeline handler does the following and nothing else:
+```c
+portENTER_CRITICAL(&s_arbiter_lock);
+if (cmd->start) s_cal_start_pending = true;
+else s_cal_stop_pending = true;
+s_cal_last_rx_us = received_us;
+portEXIT_CRITICAL(&s_arbiter_lock);
+```
+It must call **none** of `motor_control_notify_link_rx()` / `manual_transport_control_arbiter_submit_*` — those refresh `s_last_control_rx_us`, the general link heartbeat, which calibration traffic must never touch (spec §7a). `s_cal_last_rx_us` is calibration's own, separate liveness signal, used only to detect the calibration UI itself going quiet mid-run.
+
+- [ ] **Step 3: `calibration_tick(now_us)`** — called in `run_control_cycle` right after `control_apply_decision(&decision)` and right before `stability_sas_tick(...)` (so calibration's own actuator writes, when active, are always the last write of the tick — no overwrite race against `control_apply_decision`'s own zeroing branch).
+
+Consume the pending flags first, under the same lock:
+```c
+portENTER_CRITICAL(&s_arbiter_lock);
+bool start_req = s_cal_start_pending; s_cal_start_pending = false;
+bool stop_req  = s_cal_stop_pending;  s_cal_stop_pending  = false;
+int64_t link_rx_us = s_last_control_rx_us;
+portEXIT_CRITICAL(&s_arbiter_lock);
+```
+If `stop_req` and `s_calibrating`: treat exactly like an abort (falls into the same `out.aborted`-handling as below — do not special-case it, Stop is just an externally-forced abort). If `start_req` and not already `s_calibrating`: honor it only if `esc_driver_get_state() == ESC_STATE_ARMED && control_link_alive()`; otherwise log why and drop it (a rejected start is not retried automatically — the operator must press start again). On honoring: `s_cal_baseline_rx_us = link_rx_us` (the value just read above); `esc_trim_cal_init(&s_cal, &s_cal_cfg)`; `s_calibrating = true`.
+
+While `s_calibrating` (including the tick it just became true on): compute `bool manual_override = link_rx_us > s_cal_baseline_rx_us;` — any accepted throttle, winch, or steer submission since calibration started advances `s_last_control_rx_us`, so this one comparison covers all three, not steering alone. Also compute `bool cal_link_alive = (now_us - s_cal_last_rx_us) < CONTROL_DRIVE_TIMEOUT_US;` (reuse the existing 400ms constant — calibration's own dashboard going quiet is the same kind of staleness as a driving link going quiet). Call:
+```c
+etc_out_t out = esc_trim_cal_step(&s_cal, &s_cal_cfg, now_us,
+                                   fusion.yaw_rate, gps_speed_mps,
+                                   esc_driver_get_state() == ESC_STATE_ARMED,
+                                   control_link_alive() && cal_link_alive,
+                                   imu_icm_ok(),
+                                   manual_override || stop_req);
+```
+(`fusion.yaw_rate` from the same snapshot read `stability_sas_tick` already uses; `gps_speed_mps` from `gps_driver_get_fix`.) If `out.active`: `esc_driver_set_throttle(out.left_cmd, out.right_cmd)` (bypassing the saved-table apply — `s_calibrating` gates that in Task 2) and `steer_driver_set(0.0f)`; publish `CalibrateStatus` into the double-buffered status (`s_status_buffers` generation pattern, same mechanism `status_commit_current` already uses).
+
+On `out.done`: `motor_control_set_esc_trim(out.out_table, out.out_count)` **and `fs_save_esc_trim(&blob)`** (Task 1's own NVS record — building `blob` from `out.out_table`/`out.out_count` plus `ESC_TRIM_NVS_MAGIC`; never `fs_save_calibration`, which is the unrelated IMU blob and would silently fail its own size check on the next boot if this ever touched it). On `out.aborted`: discard, do not save, log `out.reason`. Either way: `s_calibrating = false`.
+
+Do **not** write `s_last_control_rx_us` anywhere in this function. Leaving it exactly where the pilot's last real command left it is what makes `control_apply_decision`'s existing `control_link_alive()`/`safe_stop` path correctly zero the actuators the instant calibration stops writing — the same mechanism that already holds throttle at zero through a dead link today, reused rather than reinvented. (If calibration aborts within the same tick it started — some gate already failing — the pilot's still-fresh, sub-400ms-old command may resume instead of a hard zero; that's correct, not a gap, per spec §7a.)
+
+- [ ] **Step 4: SAS suppression.** In `stability_sas_tick`, early-return while `s_calibrating` is true (one line).
 
 - [ ] **Step 5: build both configs + commit.** `idf.py build` with `STABILITY_SAS_ENABLE` off *and* on → exit 0. `python -m pytest tests/ -q` → 51 (wiring isn't host-tested; the pure core is).
-`git commit -m "feat(control): run ESC trim auto-cal in ControlTask, save to NVS on completion"`
+```bash
+git add main/motor_control.c
+git commit -m "feat(control): run ESC trim auto-cal in ControlTask, own heartbeat, save to its own NVS record"
+```
 
 ## Task 6: Dashboard triggers (both UIs)
 
 **Files:** `main/dashboard.html`, `tools/espnow_drive.py`.
 
-- [ ] Add a **Start Auto-Calibration** control + an `average_into_existing` toggle + a live progress readout (state, level, trim, windowed yaw, points done) fed by `CalibrateStatus`. **Stop reuses each tool's existing E-stop** — no new stop path. Confirm the E-stop already zeroes throttle/steer (it does); the firmware abort list catches it as a manual-steer/link event. Match each UI's existing send pattern (`BoatMessage.create({ calibrate: {...} })`). Commit.
+- [ ] Add a **Start Auto-Calibration** control + an `average_into_existing` toggle + a live progress readout (state, level, trim, windowed yaw, points done) fed by `CalibrateStatus`. **Stop reuses each tool's existing E-stop button** — no new stop button. Concretely: extend each dashboard's existing E-stop click handler to *also* send `CalibrateCommand{start:false}` alongside whatever it already sends. This is not redundant with the `armed` gate `esc_trim_cal_step` already checks every tick (Task 5, Step 3) — that gate catches a real disarm too, but disarm goes through the async arm-sequence task and may take more than one control tick to land, while `CalibrateCommand{start:false}` is a direct pipeline message processed the same tick it arrives (Task 5, Step 2/3's `stop_req` path). Both exist; `stop_req` is the fast path, `armed` going false is the backstop. Match each UI's existing send pattern (`BoatMessage.create({ calibrate: {...} })`). Commit.
 
 `git commit -m "feat(ui): ESC auto-calibration trigger + progress on both dashboards"`
 
@@ -427,8 +531,8 @@ Add to the `BoatMessage` oneof: `CalibrateCommand calibrate = 13;` and `Calibrat
 
 ## First-tethered-run acceptance (from spec §7 — do before trusting any saved value)
 - **Sign check:** induce/observe a right yaw at a fixed level; confirm `trim_diff` moves to *oppose* it (CTRL log). Wrong sign → runs to clamp and aborts within ~1–2 s (fails safe); fix = flip the `ki` sign in `esc_trim_cal_step`.
-- Calm water, tethered, hard-kill in hand. Verify each abort (Stop, disarm, link pull, manual steer) drops thrust immediately.
-- After a clean sweep: confirm NVS holds the table (reboot, check the load log), and that equal-throttle driving now tracks straighter than before.
+- Calm water, tethered, hard-kill in hand. Verify each abort (Stop/E-stop, disarm, link pull, manual throttle, manual steer) drops thrust immediately.
+- After a clean sweep: confirm NVS holds the table under its own `"esc_trim"` key (reboot, check the load log), that the separate `"imu_cal"` blob is untouched, and that equal-throttle driving now tracks straighter than before.
 
 ## Open items / do not assume
 - **AVERAGE (two-heading) mode** ships but is exercised by running twice (once each heading); no mid-sweep auto-reverse.
@@ -438,4 +542,4 @@ Add to the `BoatMessage` oneof: `CalibrateCommand calibrate = 13;` and `Calibrat
 ## Self-review
 - **Spec coverage:** integrator-search (§2)→T3; no-magic-numbers constants (§4, incl. making-way + b0)→T3 cfg/tests; runtime ordering (§8)→T1/T2; state machine (§5)→T3; scheduler model (§6)→T5 (one-tick tick, SAS suppression); safety/aborts (§7)→T3 tests + T5; storage (§8)→T1; both dashboards (§8)→T4/T6. ✔
 - **Placeholders:** pure units (T1, T3) carry full code/tests; wiring tasks (T2, T4–T6) are exact specs + build/parity gates, matching how this codebase leaves ESP-IDF-saturated files (motor_control, pipeline) to build-gate rather than host-test — consistent, not a gap. ✔
-- **Type consistency:** `EscTrimPoint`/`esc_trim_count` (T1) consumed by `esc_trim_apply` (T2), `esc_trim_cal` output table (T3), and `fs_save_calibration` (T5); `etc_cfg_t`/`etc_t`/`etc_out_t`/`esc_trim_cal_step` names match header↔tests↔wiring. ✔
+- **Type consistency:** `EscTrimPoint`/`esc_trim_count` (T1) consumed by `esc_trim_apply` (T2), `esc_trim_cal` output table (T3), and `fs_save_esc_trim`/`EscTrimNvsBlob` (T1, called from T5) — never `fs_save_calibration`, which stays untouched throughout; `etc_cfg_t`/`etc_t`/`etc_out_t`/`esc_trim_cal_step`/`manual_override` names match header↔tests↔wiring. ✔
