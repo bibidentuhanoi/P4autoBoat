@@ -429,7 +429,16 @@ git commit -m "feat(esc): calibration state machine (gyro-driven integral trim s
 
 ---
 
-# MILESTONE 2 — wire it live (proto, ControlTask, UI)  ·  NOT STARTED
+# MILESTONE 2 — wire it live (proto, ControlTask, UI)
+
+> **✅ MILESTONE 2 COMPLETE (2026-08-12), not yet on-water.** Task 4 `f658fd2` (CalibrateCommand/CalibrateStatus proto, nanopb+py regen, dashboard protoSchema mirror, pipeline handler+publish), Task 5 `4fe8076` (ControlTask `calibration_tick`, own heartbeat, own-NVS save), Task 6 `f76f5e7` (both dashboards + firmware start-latch). Verified: `idf.py build` exit 0 both `STABILITY_SAS_ENABLE` states; `pytest tests/ -q` → **53**; `node --check` on dashboard.html.
+>
+> **Deviations from this plan, all verified:**
+> - **CalibrateStatus telemetry** goes out via the existing **core-1 diagnostics task** (the motor-status producer/consumer split), throttled to ~5 Hz — NOT published from the control task (which the design forbids). New `motor_control_get_calibrate_status()` getter mirrors `motor_control_get_status()`.
+> - **`cal_link_alive` keepalive protocol** (not in the original Task 5 sketch): calibration gates on its OWN heartbeat (`s_cal_last_rx_us`, 2 s timeout), refreshed by the dashboards' ~1 Hz `CalibrateCommand{start:true}` keepalive. Gating on the *driving* link (as an earlier draft did) would abort every real sweep ~400 ms in, since §7a deliberately lets that link go stale. Two more bugs caught while wiring this: `safe_stop` was cutting the **servo rail** every tick during a sweep (rudder would float and corrupt the yaw measurement) — now suppressed while `s_calibrating`; and the **start-latch** (Task 6) stops stale keepalives re-triggering calibration after a sweep finishes.
+> - **AVERAGE mode is plumbed but a no-op**: the Milestone-1 state machine records FRESH-only (spec §10's v1 scope). The `average_into_existing` proto field + cfg flag are carried for a future averaging implementation; the dashboards always send `false`.
+>
+> **Remaining: the on-water first-tethered-run acceptance below.** Nothing past this point has touched real water.
 
 ## Task 4: Protocol — `CalibrateCommand` + `CalibrateStatus`
 
