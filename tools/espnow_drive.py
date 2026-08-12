@@ -879,7 +879,12 @@ $('throttle').addEventListener('input', (e) => {
 $('rudder').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('rudder-val').textContent = v + '%';
-  api('/api/state', 'POST', { rudder: v / 100 });
+  // Negated on purpose, matching dashboard.html's own JS boundary exactly:
+  // firmware's steer wire value is +1.0=full-right (STEER_HOME); dashboard.html
+  // lines slider -100 up with that. This tool's slider had no such flip and
+  // was silently the opposite of dashboard.html's -- same slider, same label,
+  // opposite real boat direction. Fixed here, at this UI's own boundary only.
+  api('/api/state', 'POST', { rudder: -v / 100 });
 });
 
 function winchMagnitude() {
