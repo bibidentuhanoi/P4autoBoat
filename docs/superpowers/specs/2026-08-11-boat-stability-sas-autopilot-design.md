@@ -23,7 +23,7 @@ The controller must **run underneath the pilot at all times** — the human comm
 `boatMainReimagine.FCStd`: a **water-jet catamaran** — `nozzle`, `jetpumphead`, two `A2212 BLDC` motors, mirrored `theboathull`, `hullconnector`, `MG995` steering servos, `corner keel`. ≈ **0.5 m LOA, ~0.3 m hull-to-hull beam**. Consequences:
 - **Water jets are unidirectional** (no reverse thrust — matches the arm-at-min ESC). Differential-thrust yaw is **one-sided** (you can only speed a jet *up*), and any yaw-by-thrust **adds** net forward thrust.
 - **Wide beam (~0.15 m half-beam) = strong differential-thrust yaw authority**, even at low speed — a catamaran advantage a monohull lacks.
-- **Rudder location is decisive and currently UNVERIFIED:** if the `MG995` rudders deflect the **jet efflux**, they steer strongly whenever *throttle* is up (independent of boat speed); if they sit in the **hull wake**, they need boat speed. This flips the §5.4 allocation logic — confirm on the physical boat.
+- **Rudder location CONFIRMED (2026-08-12, by the boat's designer):** the `MG995` rudders sit in front of each nozzle and deflect the **jet efflux** directly — rudder authority tracks *throttle*, not boat speed, and is available whenever the jet is thrusting, independent of hull speed through the water. §5.4's allocation logic is settled on this basis; the hull-wake branch is dropped.
 - Small + light + jet on/off ⇒ likely **fast, twitchy yaw** → sample-rate matters (§6, §9 Phase 0).
 
 ### 2.1 Effectors
@@ -129,12 +129,9 @@ True ZV input-shaping is for lightly-damped oscillators; the boat's yaw is heavi
 4. **Anti-windup:** conditional integration on the trim (above).
 - *Ordering caveat:* if a true input-shaper is ever added, it must precede — not follow — the slew limiter, or the limiter degrades it.
 
-### 5.4 Allocation (rudder-primary + thrust assist) — chosen, but branch on rudder location
-`u_yaw → { rudder_angle, thrust_differential }`. **The schedule depends on the unverified fact in §2.0:**
-- **If jet-efflux rudders:** rudder authority tracks **throttle**, not boat speed → rudder carries yaw at all speeds *whenever throttle is up*; differential thrust is **trim/assist only** (and one-sided — jets don't reverse). Schedule the split on **throttle**, adding differential thrust mainly when throttle is low (rudder starved).
-- **If hull-wake rudders:** the original plan holds — schedule on **GPS speed** `λ(v)`: rudder at cruise, differential thrust at low/zero speed.
-- **Either way:** differential thrust is **unidirectional** — model it as `thrust_i ≥ 0`; expect yaw-by-thrust to perturb forward speed (§5.5). Decide priority (hold-heading vs hold-speed) explicitly.
-- The differential component is made honest by §5.5 before it reaches the motors. Confirm rudder location by eye on the boat before committing the schedule.
+### 5.4 Allocation (rudder-primary + throttle-scheduled thrust assist) — confirmed
+`u_yaw → { rudder_angle, thrust_differential }`. **Rudder location is confirmed jet-efflux (§2.0)**, so the schedule is settled: rudder authority tracks **throttle**, not boat speed — it carries yaw at all speeds *whenever throttle is up*, independent of hull speed through the water. Differential thrust is **trim/assist only**, scheduled on **throttle** (added mainly when throttle is low, the regime where the jet stream is weakest and the rudder has the least to deflect), and is **unidirectional** (jets don't reverse) — model it as `thrust_i ≥ 0`; expect yaw-by-thrust to perturb forward speed (§5.5). Decide priority (hold-heading vs hold-speed) explicitly.
+The differential component is made honest by §5.5 before it reaches the motors.
 
 ### 5.5 Actuator linearisation (the asymmetric-ESC fix)
 Solve it **entirely below the controller** so neither human nor ML ever sees it — same pattern as `WINCH_DEADBAND_US`:
@@ -192,9 +189,9 @@ Because Intent is one interface, autopilot is *additive*:
 
 | Phase | What | Gate |
 |---|---|---|
-| **0. Enable + measure the plant** | **Publish `gz_rate`+timestamp from fusion** (unblocks the inner loop); confirm rudder location (jet-wash vs hull); measure per-motor spin-up floor + rough thrust curve; log heading-vs-throttle (mag distortion); observe yaw step-response (bandwidth → loop rate). | Yaw-rate live in `CTRL_*`; thresholds + mag/throttle + bandwidth known. |
+| **0. Enable + measure the plant** | **Publish `gz_rate`+timestamp from fusion** (unblocks the inner loop); ~~confirm rudder location~~ **done — jet-efflux, §2.0**; measure per-motor spin-up floor + rough thrust curve; log heading-vs-throttle (mag distortion); observe yaw step-response (bandwidth → loop rate). | Yaw-rate live in `CTRL_*`; thresholds + mag/throttle + bandwidth known. |
 | **1. Actuator linearisation** | Per-motor dead-band/curve comp in `throttle_to_us` (winch pattern). | Equal command → equal thrust; straight-line coast on bench/tub. |
-| **2. Allocation + shaping (dry-run)** | `u_yaw → rudder + speed-scheduled diff`; reference/output shaping; publish snapshot; extend `CTRL_DRY` logs. **Still logs-only.** | Logs show sane rudder/diff split vs speed & error. |
+| **2. Allocation + shaping (dry-run)** | `u_yaw → rudder + throttle-scheduled diff`; reference/output shaping; publish snapshot; extend `CTRL_DRY` logs. **Still logs-only.** | Logs show sane rudder/diff split vs throttle & error. |
 | **3. Inner loop live (SAS)** | Actuate **yaw-rate damping only** (gyro); rudder = rate demand. Promote from dry-run for the inner loop. | On-water: boat feels planted, damped; no oscillation; manual override crisp. |
 | **4. Outer loop live** | Add heading-hold (PD + bounded trim, mag-gated); auto-straighten on centre. | On-water: holds heading hands-off; rejects a nudge; degrades cleanly on mag-freeze. |
 | **5. System-ID + optional LQI / speed-schedule** | Zig-zag → fit Nomoto `K`,`T`; schedule gains on GPS speed; optional LQI gains. | Measurable tracking improvement; only if wanted. |
