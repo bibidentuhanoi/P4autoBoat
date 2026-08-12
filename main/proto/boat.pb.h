@@ -138,6 +138,27 @@ typedef struct _boat_SystemStatus {
     bool gps_baud_confirmed; /* true = actual scan hit, false = unverified fallback */
 } boat_SystemStatus;
 
+/* Trigger / stop ESC differential-trim auto-calibration. Shaped like ArmCommand
+ (transport-agnostic). start=false is an explicit stop/abort (reused by each
+ dashboard's E-stop). average_into_existing picks FRESH overwrite (false) vs
+ the both-heading AVERAGE mode (true). */
+typedef struct _boat_CalibrateCommand {
+    bool start;
+    bool average_into_existing;
+} boat_CalibrateCommand;
+
+/* Live calibration progress, published while a sweep runs so either dashboard
+ can show it. state mirrors etc_state_t. */
+typedef struct _boat_CalibrateStatus {
+    uint32_t state;
+    uint32_t level_index;
+    float level_throttle;
+    float trim_diff; /* live differential being learned */
+    float yaw_avg_dps; /* windowed mean of (yaw - b0) */
+    bool making_way; /* GPS says the boat is moving (making-way gate) */
+    uint32_t points_done;
+} boat_CalibrateStatus;
+
 /* Envelope — every message on the wire is a BoatMessage */
 typedef struct _boat_BoatMessage {
     pb_size_t which_payload;
@@ -154,6 +175,8 @@ typedef struct _boat_BoatMessage {
         boat_ServoPowerCommand servo_power;
         boat_SteerRawCommand steer_raw;
         boat_TrainingLogCommand training_log;
+        boat_CalibrateCommand calibrate;
+        boat_CalibrateStatus calibrate_status;
     } payload;
 } boat_BoatMessage;
 
@@ -179,6 +202,8 @@ extern "C" {
 #define boat_ArmCommand_init_default             {0, 0}
 #define boat_ServoPowerCommand_init_default      {0}
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_CalibrateCommand_init_default       {0, 0}
+#define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
@@ -196,6 +221,8 @@ extern "C" {
 #define boat_ArmCommand_init_zero                {0, 0}
 #define boat_ServoPowerCommand_init_zero         {0}
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_CalibrateCommand_init_zero          {0, 0}
+#define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -258,6 +285,15 @@ extern "C" {
 #define boat_SystemStatus_gps_ok_tag             9
 #define boat_SystemStatus_gps_detected_baud_tag  16
 #define boat_SystemStatus_gps_baud_confirmed_tag 17
+#define boat_CalibrateCommand_start_tag          1
+#define boat_CalibrateCommand_average_into_existing_tag 2
+#define boat_CalibrateStatus_state_tag           1
+#define boat_CalibrateStatus_level_index_tag     2
+#define boat_CalibrateStatus_level_throttle_tag  3
+#define boat_CalibrateStatus_trim_diff_tag       4
+#define boat_CalibrateStatus_yaw_avg_dps_tag     5
+#define boat_CalibrateStatus_making_way_tag      6
+#define boat_CalibrateStatus_points_done_tag     7
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
@@ -270,6 +306,8 @@ extern "C" {
 #define boat_BoatMessage_servo_power_tag         10
 #define boat_BoatMessage_steer_raw_tag           11
 #define boat_BoatMessage_training_log_tag        12
+#define boat_BoatMessage_calibrate_tag           13
+#define boat_BoatMessage_calibrate_status_tag    14
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -402,6 +440,23 @@ X(a, STATIC,   SINGULAR, BOOL,     gps_baud_confirmed,  17)
 #define boat_SystemStatus_CALLBACK NULL
 #define boat_SystemStatus_DEFAULT NULL
 
+#define boat_CalibrateCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     start,             1) \
+X(a, STATIC,   SINGULAR, BOOL,     average_into_existing,   2)
+#define boat_CalibrateCommand_CALLBACK NULL
+#define boat_CalibrateCommand_DEFAULT NULL
+
+#define boat_CalibrateStatus_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   state,             1) \
+X(a, STATIC,   SINGULAR, UINT32,   level_index,       2) \
+X(a, STATIC,   SINGULAR, FLOAT,    level_throttle,    3) \
+X(a, STATIC,   SINGULAR, FLOAT,    trim_diff,         4) \
+X(a, STATIC,   SINGULAR, FLOAT,    yaw_avg_dps,       5) \
+X(a, STATIC,   SINGULAR, BOOL,     making_way,        6) \
+X(a, STATIC,   SINGULAR, UINT32,   points_done,       7)
+#define boat_CalibrateStatus_CALLBACK NULL
+#define boat_CalibrateStatus_DEFAULT NULL
+
 #define boat_BoatMessage_FIELDLIST(X, a) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,sensors,payload.sensors),   1) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor,payload.motor),   2) \
@@ -414,7 +469,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,winch,payload.winch),   8) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer,payload.steer),   9) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,servo_power,payload.servo_power),  10) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_raw,payload.steer_raw),  11) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,training_log,payload.training_log),  12)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,training_log,payload.training_log),  12) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate,payload.calibrate),  13) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate_status,payload.calibrate_status),  14)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -429,6 +486,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,training_log,payload.training_log), 
 #define boat_BoatMessage_payload_servo_power_MSGTYPE boat_ServoPowerCommand
 #define boat_BoatMessage_payload_steer_raw_MSGTYPE boat_SteerRawCommand
 #define boat_BoatMessage_payload_training_log_MSGTYPE boat_TrainingLogCommand
+#define boat_BoatMessage_payload_calibrate_MSGTYPE boat_CalibrateCommand
+#define boat_BoatMessage_payload_calibrate_status_MSGTYPE boat_CalibrateStatus
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
@@ -446,6 +505,8 @@ extern const pb_msgdesc_t boat_MotorStatus_msg;
 extern const pb_msgdesc_t boat_ArmCommand_msg;
 extern const pb_msgdesc_t boat_ServoPowerCommand_msg;
 extern const pb_msgdesc_t boat_SystemStatus_msg;
+extern const pb_msgdesc_t boat_CalibrateCommand_msg;
+extern const pb_msgdesc_t boat_CalibrateStatus_msg;
 extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
@@ -465,12 +526,16 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_ArmCommand_fields &boat_ArmCommand_msg
 #define boat_ServoPowerCommand_fields &boat_ServoPowerCommand_msg
 #define boat_SystemStatus_fields &boat_SystemStatus_msg
+#define boat_CalibrateCommand_fields &boat_CalibrateCommand_msg
+#define boat_CalibrateStatus_fields &boat_CalibrateStatus_msg
 #define boat_BoatMessage_fields &boat_BoatMessage_msg
 
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
 #define boat_ArmCommand_size                     4
 #define boat_BoatMessage_size                    13270
+#define boat_CalibrateCommand_size               4
+#define boat_CalibrateStatus_size                35
 #define boat_DetectCommand_size                  0
 #define boat_Detection_size                      60
 #define boat_GpsCoordinate_size                  18

@@ -642,6 +642,8 @@ typedef struct { uint32_t pulse_us; } boat_SteerRawCommand;
 typedef struct { bool arm; bool force; } boat_ArmCommand;
 typedef struct { bool on; } boat_ServoPowerCommand;
 typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; } boat_MotorStatus;
+typedef struct { bool start; bool average_into_existing; } boat_CalibrateCommand;
+typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 typedef struct {
     int which_payload;
     union {
@@ -654,6 +656,8 @@ typedef struct {
         boat_SteerRawCommand steer_raw;
         boat_ArmCommand arm_cmd;
         boat_ServoPowerCommand servo_power;
+        boat_CalibrateCommand calibrate;
+        boat_CalibrateStatus calibrate_status;
     } payload;
 } boat_BoatMessage;
 #define boat_BoatMessage_motor_tag 1
@@ -667,8 +671,11 @@ typedef struct {
 #define boat_BoatMessage_status_tag 9
 #define boat_BoatMessage_motor_status_tag 10
 #define boat_BoatMessage_training_log_tag 11
+#define boat_BoatMessage_calibrate_tag 12
+#define boat_BoatMessage_calibrate_status_tag 13
 #define boat_BoatMessage_size 128
 #define boat_SystemStatus_size 32
+#define boat_CalibrateStatus_size 35
 #define boat_BoatMessage_fields NULL
 typedef esp_err_t (*transport_send_fn)(const uint8_t *, size_t, void *);
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
@@ -677,6 +684,7 @@ typedef void (*winch_command_handler_fn)(const boat_WinchCommand *);
 typedef void (*steer_command_handler_fn)(const boat_SteerCommand *);
 typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
+typedef void (*calibrate_command_handler_fn)(bool, bool);
 esp_err_t pipeline_init(void);
 esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx);
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
@@ -685,9 +693,11 @@ void pipeline_register_winch_handler(winch_command_handler_fn handler);
 void pipeline_register_steer_handler(steer_command_handler_fn handler);
 void pipeline_register_servo_power_handler(servo_power_handler_fn handler);
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);
+void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap);
 void pipeline_publish_status(const boat_SystemStatus *status);
 void pipeline_publish_motor_status(const boat_MotorStatus *status);
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
 void pipeline_handle_incoming(const uint8_t *buf, size_t len);
 """,
     "esp_err.h": STUB_HEADERS["esp_err.h"],
@@ -733,6 +743,7 @@ static int decoded_tag;
 static unsigned detect_calls;
 static unsigned manual_control_calls;
 static unsigned training_log_calls;
+static unsigned calibrate_calls;
 
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 void detect_trigger(void) { ++detect_calls; }
@@ -768,6 +779,7 @@ static void winch_handler(const boat_WinchCommand *command) { (void)command; ++m
 static void steer_handler(const boat_SteerCommand *command) { (void)command; ++manual_control_calls; }
 static void power_handler(bool on) { (void)on; ++manual_control_calls; }
 static void raw_handler(const boat_SteerRawCommand *command) { (void)command; ++manual_control_calls; }
+static void calibrate_handler(bool start, bool average) { (void)start; (void)average; ++calibrate_calls; }
 
 int main(void) {
     const uint8_t input[] = {0};
@@ -778,6 +790,7 @@ int main(void) {
     pipeline_register_steer_handler(steer_handler);
     pipeline_register_servo_power_handler(power_handler);
     pipeline_register_steer_raw_handler(raw_handler);
+    pipeline_register_calibrate_handler(calibrate_handler);
 
     decoded_tag = boat_BoatMessage_detect_tag;
     pipeline_handle_incoming(input, sizeof(input));
@@ -787,6 +800,14 @@ int main(void) {
     decoded_tag = boat_BoatMessage_training_log_tag;
     pipeline_handle_incoming(input, sizeof(input));
     assert(training_log_calls == 1);
+    assert(manual_control_calls == 0);
+
+    /* A calibrate command routes to its own handler, never manual-control
+     * ingress -- calibration owns the actuators through the control task, not
+     * the pipeline dispatch path. */
+    decoded_tag = boat_BoatMessage_calibrate_tag;
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(calibrate_calls == 1);
     assert(manual_control_calls == 0);
 
     decoded_tag = boat_BoatMessage_motor_tag;

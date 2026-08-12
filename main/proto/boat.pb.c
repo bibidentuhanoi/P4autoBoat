@@ -54,6 +54,12 @@ PB_BIND(boat_ServoPowerCommand, boat_ServoPowerCommand, AUTO)
 PB_BIND(boat_SystemStatus, boat_SystemStatus, AUTO)
 
 
+PB_BIND(boat_CalibrateCommand, boat_CalibrateCommand, AUTO)
+
+
+PB_BIND(boat_CalibrateStatus, boat_CalibrateStatus, AUTO)
+
+
 PB_BIND(boat_BoatMessage, boat_BoatMessage, 4)
 
 

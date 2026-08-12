@@ -122,6 +122,27 @@ message SystemStatus {
   // for the same info if this ever needs re-diagnosing.
 }
 
+// Trigger / stop ESC differential-trim auto-calibration. Shaped like ArmCommand
+// (transport-agnostic). start=false is an explicit stop/abort (reused by each
+// dashboard's E-stop). average_into_existing picks FRESH overwrite (false) vs
+// the both-heading AVERAGE mode (true).
+message CalibrateCommand {
+  bool start                 = 1;
+  bool average_into_existing = 2;
+}
+
+// Live calibration progress, published while a sweep runs so either dashboard
+// can show it. state mirrors etc_state_t.
+message CalibrateStatus {
+  uint32 state          = 1;
+  uint32 level_index    = 2;
+  float  level_throttle = 3;
+  float  trim_diff      = 4;  // live differential being learned
+  float  yaw_avg_dps    = 5;  // windowed mean of (yaw - b0)
+  bool   making_way     = 6;  // GPS says the boat is moving (making-way gate)
+  uint32 points_done    = 7;
+}
+
 // Envelope — every message on the wire is a BoatMessage
 message BoatMessage {
   oneof payload {
@@ -137,5 +158,7 @@ message BoatMessage {
     ServoPowerCommand servo_power = 10;
     SteerRawCommand steer_raw   = 11;
     TrainingLogCommand training_log = 12;
+    CalibrateCommand calibrate  = 13;
+    CalibrateStatus calibrate_status = 14;
   }
 }

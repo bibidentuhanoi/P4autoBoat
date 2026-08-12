@@ -39,6 +39,7 @@ static winch_command_handler_fn s_winch_handler = NULL;
 static steer_command_handler_fn s_steer_handler = NULL;
 static servo_power_handler_fn s_servo_power_handler = NULL;
 static steer_raw_command_handler_fn s_steer_raw_handler = NULL;
+static calibrate_command_handler_fn s_calibrate_handler = NULL;
 
 /* ---- Shared protobuf envelopes ----
  * boat_BoatMessage is a ~7KB union (SensorSnapshot member holds the 256-entry
@@ -116,6 +117,7 @@ esp_err_t pipeline_init(void)
     s_steer_handler = NULL;
     s_servo_power_handler = NULL;
     s_steer_raw_handler = NULL;
+    s_calibrate_handler = NULL;
     if (!s_msg_mutex) {
         s_msg_mutex = xSemaphoreCreateMutex();
         if (!s_msg_mutex) {
@@ -181,6 +183,11 @@ void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler)
     s_steer_raw_handler = handler;
 }
 
+void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler)
+{
+    s_calibrate_handler = handler;
+}
+
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
 {
     if (!s_msg_mutex) return;
@@ -235,6 +242,18 @@ void pipeline_publish_motor_status(const boat_MotorStatus *mstatus)
     s_msg.which_payload = boat_BoatMessage_motor_status_tag;
     s_msg.payload.motor_status = *mstatus;
     fanout_locked(buf, sizeof(buf), "motor_status");
+    xSemaphoreGive(s_msg_mutex);
+}
+
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status)
+{
+    if (!s_msg_mutex) return;
+
+    uint8_t buf[boat_CalibrateStatus_size + 16];
+    xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
+    s_msg.which_payload = boat_BoatMessage_calibrate_status_tag;
+    s_msg.payload.calibrate_status = *status;
+    fanout_locked(buf, sizeof(buf), "calibrate_status");
     xSemaphoreGive(s_msg_mutex);
 }
 
@@ -312,6 +331,17 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
             s_steer_raw_handler(&s_rx_msg.payload.steer_raw);
         } else {
             ESP_LOGW(TAG, "SteerRaw command received but no handler registered");
+        }
+        break;
+    case boat_BoatMessage_calibrate_tag:
+        ESP_LOGI(TAG, "Calibrate command: %s%s",
+                 s_rx_msg.payload.calibrate.start ? "START" : "STOP",
+                 s_rx_msg.payload.calibrate.average_into_existing ? " (average)" : "");
+        if (s_calibrate_handler) {
+            s_calibrate_handler(s_rx_msg.payload.calibrate.start,
+                                s_rx_msg.payload.calibrate.average_into_existing);
+        } else {
+            ESP_LOGW(TAG, "Calibrate command received but no handler registered");
         }
         break;
     default:

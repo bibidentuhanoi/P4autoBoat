@@ -98,3 +98,21 @@ typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *cmd);
  * @note  MUST be called before starting any FreeRTOS tasks.
  */
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);
+
+/**
+ * @brief ESC trim auto-calibration command handler callback type.
+ *        start=false is an explicit stop/abort (E-stop path).
+ */
+typedef void (*calibrate_command_handler_fn)(bool start, bool average_into_existing);
+
+/**
+ * @brief Register a handler for incoming CalibrateCommand messages.
+ * @note  MUST be called before starting any FreeRTOS tasks.
+ */
+void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
+
+/**
+ * @brief Encode a CalibrateStatus to protobuf and fan out to all transports.
+ *        Called from the control task while a calibration sweep runs.
+ */
+void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
