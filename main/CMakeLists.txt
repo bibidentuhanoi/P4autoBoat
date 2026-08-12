@@ -13,6 +13,7 @@ idf_component_register(
         "arm_sequence.c"
         "file_system.c"
         "sensor_fusion.c"
+        "esc_map.c"
         "calibration.c"
         "drivers/imu_driver.c"
         "drivers/tof_driver.c"

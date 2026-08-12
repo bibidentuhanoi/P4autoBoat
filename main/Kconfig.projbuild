@@ -161,6 +161,22 @@ menu "Board Configuration"
             default 1500
             range 1000 2000
 
+        config ESC_MIN_THR_LEFT_PCT
+            int "Left ESC minimum-thrust floor (% throttle where the LEFT jet just starts)"
+            default 5
+            range 0 95
+            help
+                Measured left-jet dead-band. Zero remains off; positive throttle
+                begins at this fraction of the usable ESC pulse span.
+
+        config ESC_MIN_THR_RIGHT_PCT
+            int "Right ESC minimum-thrust floor (% throttle where the RIGHT jet just starts)"
+            default 20
+            range 0 95
+            help
+                Measured right-jet dead-band. Tune each motor in water so equal
+                normalized commands produce comparable thrust.
+
     endmenu
 
     menu "Manual Heading Assist"

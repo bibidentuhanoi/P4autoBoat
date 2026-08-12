@@ -1,4 +1,5 @@
 #include "esc_driver.h"
+#include "esc_map.h"
 
 #include "driver/mcpwm_prelude.h"
 #include "driver/gpio.h"
@@ -8,6 +9,15 @@
 #include "freertos/semphr.h"
 
 #include "sdkconfig.h"
+
+/* New Kconfig symbols are absent until sdkconfig is regenerated. Keep the
+ * measured defaults safe for an existing generated configuration. */
+#ifndef CONFIG_ESC_MIN_THR_LEFT_PCT
+#define CONFIG_ESC_MIN_THR_LEFT_PCT 5
+#endif
+#ifndef CONFIG_ESC_MIN_THR_RIGHT_PCT
+#define CONFIG_ESC_MIN_THR_RIGHT_PCT 20
+#endif
 
 static const char *TAG = "ESC";
 
@@ -48,13 +58,10 @@ static bool                 s_inited    = false;
 
 /* Unidirectional ESC (HW-517 arms at min): 0 = MIN (off/stop), 1 = MAX (full).
  * No reverse — negative throttle clamps to stop. */
-static uint32_t throttle_to_us(float t)
+static uint32_t throttle_to_us(float t, float floor_frac)
 {
-    if (t < 0.0f) t = 0.0f;
-    if (t > 1.0f) t = 1.0f;
-    uint32_t min_us = CONFIG_ESC_PULSE_MIN_US;
-    uint32_t max_us = CONFIG_ESC_PULSE_MAX_US;
-    return (uint32_t)(min_us + t * (float)(max_us - min_us) + 0.5f);
+    return esc_throttle_to_us(t, CONFIG_ESC_PULSE_MIN_US,
+                               CONFIG_ESC_PULSE_MAX_US, floor_frac);
 }
 
 /* Set both channels' pulse width (us == MCPWM ticks at 1 MHz). */
@@ -197,7 +204,9 @@ esp_err_t esc_driver_set_throttle(float left, float right)
         xSemaphoreGive(s_mutex);
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t err = set_pulse_us(throttle_to_us(left), throttle_to_us(right));
+    esp_err_t err = set_pulse_us(
+        throttle_to_us(left, CONFIG_ESC_MIN_THR_LEFT_PCT / 100.0f),
+        throttle_to_us(right, CONFIG_ESC_MIN_THR_RIGHT_PCT / 100.0f));
     if (err == ESP_OK) {
         s_thr_left  = left;
         s_thr_right = right;
