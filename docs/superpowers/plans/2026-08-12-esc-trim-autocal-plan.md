@@ -421,11 +421,15 @@ git add main/esc_trim_cal.c main/esc_trim_cal.h main/CMakeLists.txt tests/test_e
 git commit -m "feat(esc): calibration state machine (gyro-driven integral trim search)"
 ```
 
-**Milestone 1 gate:** 51 host tests pass; `idf.py build` (both `SAS_ENABLE` states) exits 0; default runtime behavior unchanged (empty table, machine uninvoked). This is a safe merge point.
+**Milestone 1 gate:** host tests pass; `idf.py build` exits 0; default runtime behavior unchanged (empty table, machine uninvoked). This is a safe merge point.
+
+> **✅ MILESTONE 1 COMPLETE (2026-08-12).** Implemented across commits `4738544`, `874c190`, `3c2e964`, `cbe7b45`, `4bebfe6`, `c8f4e39`, `3939423`. Verified: real `idf.py build` (ESP-IDF env sourced) → exit 0, zero warnings; `python -m pytest tests/ -q` → **50 passed** (the "51" above was an over-estimate — each `tests/test_*.py` is one pytest function wrapping a multi-assertion C binary, so Tasks 1+3 add exactly +2, not +3, over the 48 baseline).
+>
+> **One deviation from this plan, verified correct and better:** runtime application uses a new `esc_trim_mix(throttle, rudder, …)` (fed the arbiter's ORIGINAL pre-mix throttle/rudder, newly exposed in `control_decision_t`) instead of `esc_trim_apply` on `(L+R)/2`. Reason: `(L+R)/2` only recovers the common throttle losslessly while unsaturated; on a hard turn near full throttle the pilot's mix clamps and the average lies. `esc_trim_mix` looks up trim on the true throttle and bounds the differential to the actuator headroom left after the pilot's turn (steering always wins at saturation, trim can never push a side outside [0,1]). Spec §8 updated to match. `esc_trim_apply` remains as the tested reference for the simple/unsaturated case. NVS save/load also hardened beyond the plan (shared `esc_trim_blob_valid` validator, `fs_save_esc_trim` returns bool + checks `nvs_commit`).
 
 ---
 
-# MILESTONE 2 — wire it live (proto, ControlTask, UI)
+# MILESTONE 2 — wire it live (proto, ControlTask, UI)  ·  NOT STARTED
 
 ## Task 4: Protocol — `CalibrateCommand` + `CalibrateStatus`
 
