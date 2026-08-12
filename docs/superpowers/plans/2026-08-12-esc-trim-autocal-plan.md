@@ -265,7 +265,7 @@ git commit -m "feat(esc): own-NVS-record trim table + interpolation (independent
 
 - [ ] **Step 1: Hold the loaded table**
 
-`main/motor_control.c`: add a file-scope copy of the trim table, populated at init from the loaded `CalibrationData`. Grep how `motor_control` / `main` already pass calibration around (`fusion_init(&calib)` uses it). Add a setter called once at startup:
+`main/motor_control.c`: add a file-scope copy of the trim table, populated at init from the independently-loaded `EscTrimNvsBlob` (Task 1's `fs_load_esc_trim` — nothing to do with `CalibrationData`). For the general shape of "load once at boot, hand to a motor_control setter," look at how `fusion_init(&calib)` already receives the unrelated IMU `CalibrationData` — same *pattern* (a setter called once from `main.c` at startup), different, independent data. Add a setter called once at startup:
 
 ```c
 #include "esc_trim.h"
@@ -283,20 +283,33 @@ Declare it in `motor_control.h`. Task 2 adds the `motor_control_set_esc_trim(...
 
 - [ ] **Step 2: Apply in the drive path**
 
-In `control_apply_decision`, the drive branch calls `esc_driver_set_throttle(decision->left, decision->right)` (around `motor_control.c:747`). Apply trim just before that call — but ONLY when calibration is NOT active (Task 5 sets `s_calibrating`; until Task 5 the symbol is `false`, so guard with a `#if`-free static bool defaulting false):
-
+In `control_apply_decision`, inside `if (decision->drive_changed) { ... }`, the drive branch currently reads (verify against the real file — this plan was written against an earlier line count and has already drifted once):
 ```c
-            float left  = decision->left;
-            float right = decision->right;
-            if (!s_calibrating) {                 /* s_calibrating: static bool, default false */
-                esc_trim_apply(&left, &right, s_esc_trim, s_esc_trim_count);
-            }
-            if (cur_left != left || cur_right != right) {
-                esc_driver_set_throttle(left, right);
+            float left;
+            float right;
+            esc_driver_get_throttle(&left, &right);
+            if (left != decision->left || right != decision->right) {
+                esc_driver_set_throttle(decision->left, decision->right);
                 changed = true;
             }
 ```
-(Adapt to the exact local names already there; the point is: `esc_trim_apply` runs on the mixed L/R before `esc_driver_set_throttle`, gated off during calibration.) Add `static bool s_calibrating = false;` near the other statics; Task 5 drives it.
+Note `left`/`right` here already name the *current* ESC state (from `esc_driver_get_throttle`), not the *target* — do not reuse those names for the trimmed target values, or you'll shadow/collide with them in the same scope. Apply trim to a *new* pair of locals holding the target, compare those against the current `left`/`right`, and pass the trimmed pair to `esc_driver_set_throttle` — but ONLY when calibration is NOT active (Task 5 sets `s_calibrating`; until Task 5 the symbol is `false`, so guard with a plain static bool defaulting false):
+
+```c
+            float left;
+            float right;
+            esc_driver_get_throttle(&left, &right);
+            float target_left  = decision->left;
+            float target_right = decision->right;
+            if (!s_calibrating) {                 /* s_calibrating: static bool, default false */
+                esc_trim_apply(&target_left, &target_right, s_esc_trim, s_esc_trim_count);
+            }
+            if (left != target_left || right != target_right) {
+                esc_driver_set_throttle(target_left, target_right);
+                changed = true;
+            }
+```
+The point that matters, however you name things: `esc_trim_apply` runs on the mixed L/R target *before* `esc_driver_set_throttle`, gated off during calibration, comparing against the pre-existing "did it actually change" check rather than replacing it. Add `static bool s_calibrating = false;` near the other statics; Task 5 drives it.
 
 - [ ] **Step 3: Build + suite + commit**
 
