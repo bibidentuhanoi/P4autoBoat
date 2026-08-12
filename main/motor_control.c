@@ -73,6 +73,7 @@ static const char *TAG = "MOTOR_CTL";
 #ifndef CONFIG_STABILITY_SAS_MAX_AGE_MS
 #define CONFIG_STABILITY_SAS_MAX_AGE_MS 200
 #endif
+#define STAB_LOG_DIVIDER 5   /* throttle the CTRL_SAS,active line to ~every 5th correction */
 
 #define ASSIST_KP_MIN       0.012f
 #define ASSIST_KP_BASE      0.022f
@@ -176,6 +177,7 @@ static stab_cfg_t s_stab_cfg;
 static bool s_stab_cfg_loaded = false;
 static uint32_t s_stab_last_seq = 0;
 static int64_t s_stab_last_tick_us = 0;
+static uint32_t s_stab_log_div = 0;
 #endif
 
 static float clampf(float v, float lo, float hi)
@@ -843,6 +845,12 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
      * tells us "not a fresh sample this tick", not "how long has it been". */
     int64_t age_us = (fusion.captured_us != 0) ? (now_us - (int64_t)fusion.captured_us) : INT64_MAX;
     if (fusion.sequence == 0 || age_us > (int64_t)CONFIG_STABILITY_SAS_MAX_AGE_MS * 1000) {
+        if (fusion.sequence == 0) {
+            ESP_LOGW(TAG, "CTRL_SAS,no_fusion_yet -> centring");
+        } else {
+            ESP_LOGW(TAG, "CTRL_SAS,stale,age_ms=%lld,max_ms=%d -> centring",
+                     (long long)(age_us / 1000), (int)CONFIG_STABILITY_SAS_MAX_AGE_MS);
+        }
         stab_reset(&s_stab_state);
         s_stab_last_seq = 0;
         s_stab_last_tick_us = 0;
@@ -861,6 +869,11 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
     float rudder = stab_rudder_update(&s_stab_state, &s_stab_cfg,
                                       dt_s, s_manual_rudder, fusion.yaw_rate);
     steer_driver_set(rudder);
+
+    if ((++s_stab_log_div % STAB_LOG_DIVIDER) == 0) {
+        ESP_LOGI(TAG, "CTRL_SAS,active,yaw=%.1f,rudder=%.2f,dt=%.3f,age_ms=%lld",
+                 fusion.yaw_rate, rudder, dt_s, (long long)(age_us / 1000));
+    }
 #else
     (void)steer_raw;
     (void)now_us;
