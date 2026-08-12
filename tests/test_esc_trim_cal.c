@@ -70,6 +70,17 @@ static void abort_gates_and_limits(void)
     o = esc_trim_cal_step(&s, &c, t, 1, 0, true, true, true, false);
     assert(o.aborted && strstr(o.reason, "timeout"));
 
+    /* A stationary boat cannot identify thrust bias; the making-way gate
+     * prevents a false point from being recorded. */
+    esc_trim_cal_init(&s, &c); esc_trim_cal_start(&s, &c); t = 0;
+    noise(&s, &c, &t, 0.0f);
+    for (int i = 0; i < 10 && s.state != ETC_ABORTED; ++i) {
+        (void)esc_trim_cal_step(&s, &c, t, 0.0f, 0.0f,
+                                true, true, true, false);
+        t += 100000;
+    }
+    assert(s.out_count == 0);
+
     const bool gates[][4] = {
         {false, true, true, false}, {true, false, true, false},
         {true, true, false, false}, {true, true, true, true},
