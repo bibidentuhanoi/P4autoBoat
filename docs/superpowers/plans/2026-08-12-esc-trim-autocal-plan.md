@@ -246,8 +246,9 @@ Run: `python -m pytest tests/test_esc_trim.py -q` → PASS.
 ```c
     EscTrimNvsBlob esc_trim_blob;
     fs_load_esc_trim(&esc_trim_blob);   /* false -> blob.count already 0, safe default */
-    motor_control_set_esc_trim(esc_trim_blob.points, esc_trim_blob.count);   /* Task 2 provides this */
 ```
+
+Note: the `motor_control_set_esc_trim(...)` call is deliberately NOT added here — that function doesn't exist until Task 2. Task 1's own gate is a clean `idf.py build`, so this step stops at the load. Task 2 adds the setter call in `main.c` itself, alongside the function definition (see Task 2 Step 1 below).
 
 `main/CMakeLists.txt`: add `"esc_trim.c"` to `SRCS`.
 Run: `python -m pytest tests/ -q` → **49 passed**. `idf.py build` → exit 0.
@@ -278,7 +279,7 @@ void motor_control_set_esc_trim(const EscTrimPoint *pts, uint8_t count)
     for (uint8_t i = 0; i < s_esc_trim_count; ++i) s_esc_trim[i] = pts[i];
 }
 ```
-Declare it in `motor_control.h`. Called from `main.c` (Task 1, Step 5) right after `fs_load_esc_trim` — a separate call from `fs_load_calibration`, not sharing its struct.
+Declare it in `motor_control.h`. Task 2 adds the `motor_control_set_esc_trim(...)` call in `main.c`, right after the `fs_load_esc_trim` line Task 1 added — a separate call from `fs_load_calibration`, not sharing its struct.
 
 - [ ] **Step 2: Apply in the drive path**
 

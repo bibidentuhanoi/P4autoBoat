@@ -266,8 +266,7 @@ void fs_save_esc_trim(const EscTrimNvsBlob *blob)
 
 bool fs_load_esc_trim(EscTrimNvsBlob *blob)
 {
-    blob->magic_word = ESC_TRIM_NVS_MAGIC;
-    blob->count = 0;   /* the safe default if anything below fails */
+    memset(blob, 0, sizeof(*blob));   /* safe default if anything below fails */
 
     nvs_handle_t h;
     esp_err_t err = nvs_open("storage", NVS_READONLY, &h);
@@ -278,7 +277,8 @@ bool fs_load_esc_trim(EscTrimNvsBlob *blob)
     err = nvs_get_blob(h, "esc_trim", &temp, &len);
     nvs_close(h);
 
-    if (err != ESP_OK || len != sizeof(temp) || temp.magic_word != ESC_TRIM_NVS_MAGIC) {
+    if (err != ESP_OK || len != sizeof(temp) || temp.magic_word != ESC_TRIM_NVS_MAGIC ||
+        temp.count > ESC_TRIM_MAX_POINTS) {
         ESP_LOGI(TAG, "No valid ESC trim table in NVS -- starting with none");
         return false;
     }
