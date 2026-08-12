@@ -37,6 +37,7 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         self.link.servo_rail_cut = None
         self.link.armed_cmd = False
         self.link.force = False
+        self.link.calibrating = False
         self.link.seq = 0
         self.link.last_error = None
 
@@ -103,6 +104,7 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.winch_lease_until = 0.0
         self.link.winch_command_seq = 0
         self.link.servo_rail_cut = False
+        self.link.calibrating = False
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -166,6 +168,53 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
                         if msg.WhichOneof('payload') == 'winch']
         self.assertTrue(winch_speeds)
         self.assertTrue(all(speed == 0.5 for speed in winch_speeds))
+
+    def test_calibrating_streams_only_keepalive_never_manual(self):
+        """While calibrating, the stream loop must send CalibrateCommand
+        keepalives and NEVER motor/steer/winch -- any manual command would trip
+        the firmware's calibration abort (the whole point of pausing the
+        stream)."""
+        self.link.armed_cmd = True
+        self.link.throttle = 0.5          # would be streamed if not calibrating
+        self.link.send_hz = 100.0
+        self.link._stop = threading.Event()
+
+        ok, err = self.link.set_calibrate(True, 1)
+        self.assertTrue(ok, err)
+        self.sent.clear()
+        stream = threading.Thread(target=self.link._stream_loop)
+        stream.start()
+        time.sleep(0.03)
+        self.link._stop.set()
+        stream.join(timeout=1.0)
+
+        kinds = {msg.WhichOneof('payload') for msg in self.messages()}
+        self.assertIn('calibrate', kinds)
+        self.assertNotIn('motor', kinds)
+        self.assertNotIn('steer', kinds)
+        self.assertNotIn('winch', kinds)
+        self.assertTrue(all(msg.calibrate.start is True for msg in self.messages()
+                            if msg.WhichOneof('payload') == 'calibrate'))
+
+    def test_calibrate_start_requires_arm(self):
+        """Calibration drives the thrusters -- refuse to start it unarmed."""
+        self.link.armed_cmd = False
+        ok, err = self.link.set_calibrate(True, 1)
+        self.assertFalse(ok)
+        self.assertIn('ARM', err)
+        self.assertFalse(self.link.calibrating)
+
+    def test_stop_ends_calibration_and_sends_stop(self):
+        """Panic STOP must end an in-progress sweep and re-arm the firmware
+        latch by sending CalibrateCommand{start:false}."""
+        self.link.armed_cmd = True
+        self.assertTrue(self.link.set_calibrate(True, 1)[0])
+        self.sent.clear()
+        self.link.stop(2)
+        self.assertFalse(self.link.calibrating)
+        stops = [msg for msg in self.messages()
+                 if msg.WhichOneof('payload') == 'calibrate' and msg.calibrate.start is False]
+        self.assertTrue(stops, 'STOP did not send a calibrate stop frame')
 
     def test_power_off_stops_winch_before_cutting_servo_rail(self):
         self.link.winch_speed = 0.6
@@ -311,6 +360,7 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         self.link.servo_rail_cut = False
         self.link.armed_cmd = False
         self.link.force = False
+        self.link.calibrating = False
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []

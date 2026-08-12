@@ -190,6 +190,7 @@ static bool s_cal_cfg_loaded = false;
 static bool s_cal_start_pending = false;
 static bool s_cal_stop_pending = false;
 static bool s_cal_average = false;
+static bool s_cal_ready = true;   /* start-latch: a start fires only on a clean edge (see calibration_tick) */
 static int64_t s_cal_baseline_rx_us = 0;
 static int64_t s_cal_last_rx_us = 0;
 static etc_out_t s_cal_out;   /* this tick's step output (ESC commands + done/abort) */
@@ -1106,13 +1107,25 @@ static void calibration_tick(int64_t now_us)
      * stale (sec 7a), so control_link_alive() is false for most of a real sweep. */
     bool cal_link_alive = (now_us - cal_rx_us) < CAL_LINK_TIMEOUT_US;
 
-    if (start_req && !s_calibrating) {
+    /* A stop (CalibrateCommand{start:false}) re-arms the start latch. The
+     * dashboards send start:true as a ~1 Hz keepalive while calibrating, so a
+     * bare "start:true when idle" cannot mean "start": it's usually a stale
+     * keepalive still arriving after a sweep already finished (the ESP-NOW
+     * dashboard can't see the DONE status to stop it; even the WiFi one has a
+     * ~1 s window). Without this latch those keepalives would endlessly
+     * re-trigger calibration. A start only fires on a clean edge: idle AND
+     * re-armed by a prior stop (or boot). */
+    if (stop_req) {
+        s_cal_ready = true;
+    }
+    if (start_req && !s_calibrating && s_cal_ready) {
         if (esc_driver_get_state() == ESC_STATE_ARMED && cal_link_alive && !s_rail_cut) {
             s_cal_cfg.average_into_existing = average;
             esc_trim_cal_start(&s_cal, &s_cal_cfg);
             s_cal_baseline_rx_us = link_rx_us;   /* any later manual cmd advances past this = abort */
             s_cal_out = (etc_out_t){0};
             s_calibrating = true;
+            s_cal_ready = false;                 /* latched until an explicit stop re-arms */
             ESP_LOGI(TAG, "CAL,start,avg=%d,levels=%u", (int)average, (unsigned)s_cal_cfg.level_count);
         } else {
             ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d",

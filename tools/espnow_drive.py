@@ -221,6 +221,10 @@ class BoatLink:
         self.servo_rail_cut = None
         self.armed_cmd = False
         self.force = False
+        # True while an ESC-trim calibration sweep is running. The firmware owns
+        # the actuators then; the stream loop sends ONLY a CalibrateCommand
+        # keepalive (never motor/steer/winch, which would trip the abort).
+        self.calibrating = False
         self.seq = 0
         self.last_error = None
         self.telemetry = self._blank_telemetry()
@@ -291,6 +295,12 @@ class BoatLink:
         msg.arm_cmd.arm = arm
         msg.arm_cmd.force = force
         self._write_locked(msg.SerializeToString())
+
+    def _send_calibrate_locked(self, start: bool):
+        msg = self.pb2.BoatMessage()
+        msg.calibrate.start = start
+        # average_into_existing left false: the firmware records FRESH in v1.
+        return self._write_locked(msg.SerializeToString())
 
     def _close_locked(self):
         try:
@@ -414,6 +424,8 @@ class BoatLink:
             self.rudder = 0.0
             self.winch_speed = 0.0
             self.winch_lease_until = 0.0
+            was_calibrating = self.calibrating
+            self.calibrating = False          # STOP is also a calibration kill
             if not self.connected:
                 return False, 'serial link is disconnected'
             writes_ok = (
@@ -421,7 +433,34 @@ class BoatLink:
                 self._send_steer_locked(0.0),
                 self._send_winch_locked(0.0),
             )
+            if was_calibrating:
+                self._send_calibrate_locked(False)   # re-arm the firmware start latch
             if not all(writes_ok):
+                return False, 'serial write failed'
+            return True, None
+
+    def set_calibrate(self, start: bool, command_seq: int):
+        """Start or stop an ESC-trim calibration sweep. While started, the stream
+        loop sends a CalibrateCommand keepalive (~send_hz) instead of the usual
+        motor/steer/winch triple -- the firmware gates calibration on its own
+        heartbeat and aborts on any manual command, so we must send neither. Stop
+        (or any manual re-engagement) hands authority straight back."""
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            if start and not self.armed_cmd:
+                return False, 'ARM first — calibration drives the thrusters'
+            self.calibrating = bool(start)
+            if not start:                    # leaving calibration: centre/zero
+                self.throttle = 0.0
+                self.rudder = 0.0
+                self.winch_speed = 0.0
+                self.winch_lease_until = 0.0
+            if not self._send_calibrate_locked(bool(start)):
+                self.calibrating = False
                 return False, 'serial write failed'
             return True, None
 
@@ -429,6 +468,10 @@ class BoatLink:
         with self._lock:
             self.armed_cmd = bool(do_arm)
             self.force = bool(force)
+            if not do_arm and self.calibrating:   # disarm must stop calibration
+                self.calibrating = False
+                if self.connected:
+                    self._send_calibrate_locked(False)
             if self.connected:
                 self._send_arm_locked(self.armed_cmd, self.force)
 
@@ -458,6 +501,7 @@ class BoatLink:
                 'servo_rail_cut': self.servo_rail_cut,
                 'armed_cmd': self.armed_cmd,
                 'force': self.force,
+                'calibrating': self.calibrating,
                 'seq': self.seq,
                 'last_error': self.last_error,
                 'telemetry': self._with_age(self.telemetry, TELEMETRY_STALE_S),
@@ -472,12 +516,17 @@ class BoatLink:
         while not self._stop.is_set():
             with self._lock:
                 if self.connected:
-                    if (self.winch_speed != 0.0 and
-                            time.monotonic() >= self.winch_lease_until):
-                        self.winch_speed = 0.0
-                    self._send_motor_locked(self.throttle)
-                    self._send_steer_locked(self.rudder)
-                    self._send_winch_locked(self.winch_speed)
+                    if self.calibrating:
+                        # Firmware owns the actuators; send ONLY the keepalive.
+                        # Any motor/steer/winch here would trip the abort.
+                        self._send_calibrate_locked(True)
+                    else:
+                        if (self.winch_speed != 0.0 and
+                                time.monotonic() >= self.winch_lease_until):
+                            self.winch_speed = 0.0
+                        self._send_motor_locked(self.throttle)
+                        self._send_steer_locked(self.rudder)
+                        self._send_winch_locked(self.winch_speed)
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -760,6 +809,10 @@ PAGE = """<!DOCTYPE html>
     <button id="winch-up-btn">UP / REEL IN</button>
     <button id="winch-down-btn">DOWN / PAY OUT</button>
   </div>
+  <div class="row" style="margin-top:6px;">
+    <button id="calibrate-btn" style="flex:1;" title="Learn per-throttle L/R ESC trim from gyro yaw. ARM first; calm water, making way. The boat thrusts itself through a level sweep and saves the trim to NVS on a clean finish. Click again, or STOP / DISARM, to abort.">Calibrate ESC</button>
+    <span id="calibrate-status" style="font-size:10px;color:var(--dim);flex:1;text-align:right;overflow-wrap:break-word;">idle</span>
+  </div>
   <button id="stop-btn">STOP</button>
 </div>
 
@@ -801,6 +854,7 @@ const $ = id => document.getElementById(id);
 let connected = false;
 let armedCmd = false;
 let servoRailOn = false;
+let calibrating = false;
 let winchCommandSeq = 0;
 let winchRenewTimer = null;
 const WINCH_RENEW_MS = 100;
@@ -991,6 +1045,18 @@ $('arm-btn').addEventListener('click', async () => {
   await api('/api/arm', 'POST', { arm: nextArm, force });
 });
 
+$('calibrate-btn').addEventListener('click', async () => {
+  if (!connected) return;
+  const start = !calibrating;
+  if (start && !armedCmd) {
+    $('hint').textContent = 'ARM first -- calibration drives the thrusters';
+    return;
+  }
+  // While started, the tool streams a CalibrateCommand keepalive instead of
+  // motor/steer/winch, so the boat never sees a manual command (which aborts).
+  await api('/api/calibrate', 'POST', { start, seq: ++winchCommandSeq });
+});
+
 function applyStatus(s) {
     if (Number.isInteger(s.winch_command_seq)) {
       winchCommandSeq = Math.max(winchCommandSeq, s.winch_command_seq);
@@ -1002,8 +1068,17 @@ function applyStatus(s) {
     $('arm-btn').textContent = s.armed_cmd ? 'DISARM' : 'ARM';
     $('arm-btn').classList.toggle('arm', !s.armed_cmd);
     $('arm-btn').classList.toggle('disarm', s.armed_cmd);
-    $('servo-state').textContent = s.servo_rail_cut === null ? 'UNKNOWN'
-      : s.servo_rail_cut ? 'PWR OFF sent' : 'PWR ON sent';
+    calibrating = !!s.calibrating;
+    $('calibrate-btn').textContent = calibrating ? 'Stop Calibration' : 'Calibrate ESC';
+    $('calibrate-btn').classList.toggle('disarm', calibrating);
+    // ESP-NOW telemetry is SensorSnapshot-only, so we cannot show the firmware's
+    // live CalibrateStatus here -- only that WE are keeping the sweep alive. The
+    // boat's own serial log has the per-level progress; a finished sweep leaves
+    // the boat stopped (the firmware's start-latch ignores our keepalive until
+    // an explicit Stop). So: watch the boat, and STOP when it settles or drifts.
+    $('calibrate-status').textContent = calibrating
+      ? 'sweeping — watch the boat; STOP when done or if it drifts'
+      : 'idle';
     servoRailOn = s.servo_rail_cut === false;
     updateWinchControls();
     $('seq').textContent = s.seq;
@@ -1237,6 +1312,20 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/arm':
             self.link.arm(bool(body.get('arm')), bool(body.get('force')))
             self._json({'ok': True})
+        elif self.path == '/api/calibrate':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            start = body.get('start')
+            if not isinstance(start, bool):
+                self._json({'ok': False, 'error': 'start must be a boolean'}, 400)
+                return
+            ok, err = self.link.set_calibrate(start, command_seq)
+            code = 200 if ok else (503 if err in (
+                'serial link is disconnected', 'serial write failed') else 409)
+            self._json({'ok': ok, 'error': err}, code)
         else:
             self.send_response(404)
             self.end_headers()
