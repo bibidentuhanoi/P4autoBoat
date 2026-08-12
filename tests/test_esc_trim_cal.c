@@ -54,6 +54,31 @@ static void bias_is_subtracted(void)
     assert(fabsf(s.out_table[0].trim_diff) < 0.02f);
 }
 
+/* The wrong-sign fail-safe (spec's mandatory first-water-run check): if the
+ * feedback sign is inverted, the integrator is positive feedback and must run
+ * to the clamp and ABORT -- never saturate-and-keep-going, never record. Model
+ * a sustained yaw the trim never nulls (measured b0 = 0, then a constant
+ * corrected yaw that stays below excessive_yaw_dps so THAT abort can't mask
+ * this one). trim_diff must wind to +-trim_clamp and abort with a clamp reason,
+ * recording nothing. */
+static void runaway_aborts_at_clamp(void)
+{
+    etc_cfg_t c = cfg(); etc_t s; int64_t t = 0;
+    esc_trim_cal_init(&s, &c); esc_trim_cal_start(&s, &c);
+    noise(&s, &c, &t, 0.0f);                 /* b0 = 0 */
+    etc_out_t o = (etc_out_t){0};
+    bool aborted = false;
+    for (int i = 0; i < 50 && !aborted; ++i) {
+        /* 3 dps << excessive_yaw_dps (20); never responds to trim_diff. */
+        o = esc_trim_cal_step(&s, &c, t, 3.0f, 1.0f, true, true, true, false);
+        aborted = o.aborted;
+        t += 100000;
+    }
+    assert(aborted && strstr(o.reason, "clamp"));
+    assert(s.out_count == 0);                /* nothing recorded on a runaway */
+    assert(fabsf(s.trim_diff) >= c.trim_clamp);
+}
+
 static void abort_gates_and_limits(void)
 {
     etc_cfg_t c = cfg(); etc_t s; int64_t t = 0;
@@ -97,6 +122,7 @@ int main(void)
 {
     converges_and_records();
     bias_is_subtracted();
+    runaway_aborts_at_clamp();
     abort_gates_and_limits();
     return 0;
 }
