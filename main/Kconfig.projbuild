@@ -246,13 +246,27 @@ menu "Board Configuration"
             string "SAS: rudder per deg/s of rate error"
             default "0.010"
 
-        config STABILITY_SAS_YAW_LPF
-            string "SAS: yaw-rate low-pass factor (0..1)"
-            default "0.30"
+        config STABILITY_SAS_YAW_TAU_S
+            string "SAS: yaw-rate low-pass time constant (seconds)"
+            default "0.15"
+            help
+                Time constant, not a per-sample blend fraction -- the effective
+                filter stays the same even if the fusion tick rate changes.
 
         config STABILITY_SAS_OUT_CAP
             string "SAS: max rudder authority (0..1)"
             default "0.50"
+
+        config STABILITY_SAS_MAX_AGE_MS
+            int "SAS: max fusion-data age before centring the rudder (ms)"
+            default 200
+            range 50 2000
+            help
+                If the newest FusionResult is older than this, treat fusion as
+                stalled: reset the controller and centre the rudder rather than
+                holding the last command forever. Independent of the 400ms
+                control-link failsafe -- this catches a hung SENSOR task even
+                while the control LINK stays alive.
 
     endmenu
 

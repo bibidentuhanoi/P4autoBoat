@@ -64,11 +64,14 @@ static const char *TAG = "MOTOR_CTL";
 #ifndef CONFIG_STABILITY_SAS_KR
 #define CONFIG_STABILITY_SAS_KR "0.010"
 #endif
-#ifndef CONFIG_STABILITY_SAS_YAW_LPF
-#define CONFIG_STABILITY_SAS_YAW_LPF "0.30"
+#ifndef CONFIG_STABILITY_SAS_YAW_TAU_S
+#define CONFIG_STABILITY_SAS_YAW_TAU_S "0.15"
 #endif
 #ifndef CONFIG_STABILITY_SAS_OUT_CAP
 #define CONFIG_STABILITY_SAS_OUT_CAP "0.50"
+#endif
+#ifndef CONFIG_STABILITY_SAS_MAX_AGE_MS
+#define CONFIG_STABILITY_SAS_MAX_AGE_MS 200
 #endif
 
 #define ASSIST_KP_MIN       0.012f
@@ -172,6 +175,7 @@ static stab_state_t s_stab_state;
 static stab_cfg_t s_stab_cfg;
 static bool s_stab_cfg_loaded = false;
 static uint32_t s_stab_last_seq = 0;
+static int64_t s_stab_last_tick_us = 0;
 #endif
 
 static float clampf(float v, float lo, float hi)
@@ -808,16 +812,17 @@ static void control_apply_decision(control_decision_t *decision)
     status_commit_current(changed);
 }
 
-static void stability_sas_tick(bool steer_raw)
+static void stability_sas_tick(bool steer_raw, int64_t now_us)
 {
 #if CONFIG_STABILITY_SAS_ENABLE
     if (!s_stab_cfg_loaded) {
         s_stab_cfg_loaded = true;
         s_stab_cfg.r_max_dps = (float)CONFIG_STABILITY_SAS_RMAX_DPS;
         s_stab_cfg.k_r = parse_cfg_float(CONFIG_STABILITY_SAS_KR, 0.010f, 0.0f, 1.0f);
-        s_stab_cfg.yaw_lpf = parse_cfg_float(CONFIG_STABILITY_SAS_YAW_LPF, 0.30f, 0.01f, 1.0f);
+        s_stab_cfg.yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_SAS_YAW_TAU_S, 0.15f, 0.01f, 5.0f);
         s_stab_cfg.out_cap = parse_cfg_float(CONFIG_STABILITY_SAS_OUT_CAP, 0.50f, 0.0f, 1.0f);
         stab_reset(&s_stab_state);
+        s_stab_last_tick_us = 0;
     }
 
     /* The decision was applied first, so an ineligible cycle stays manual.
@@ -826,21 +831,39 @@ static void stability_sas_tick(bool steer_raw)
         !control_link_alive() || !imu_icm_ok()) {
         stab_reset(&s_stab_state);
         s_stab_last_seq = 0;
+        s_stab_last_tick_us = 0;
         return;
     }
 
     FusionResult fusion = {0};
     fusion_get_result(&fusion);
-    if (fusion.sequence == 0 || fusion.sequence == s_stab_last_seq) {
+
+    /* Bounded-age check on the real IMU timestamp -- catches a hung fusion
+     * task even while the control link stays alive. sequence alone only
+     * tells us "not a fresh sample this tick", not "how long has it been". */
+    int64_t age_us = (fusion.captured_us != 0) ? (now_us - (int64_t)fusion.captured_us) : INT64_MAX;
+    if (fusion.sequence == 0 || age_us > (int64_t)CONFIG_STABILITY_SAS_MAX_AGE_MS * 1000) {
+        stab_reset(&s_stab_state);
+        s_stab_last_seq = 0;
+        s_stab_last_tick_us = 0;
+        steer_driver_set(0.0f);   /* fusion is gone -- centre, don't hold a stale command */
+        return;
+    }
+    if (fusion.sequence == s_stab_last_seq) {
         return;
     }
     s_stab_last_seq = fusion.sequence;
 
+    float dt_s = (s_stab_last_tick_us == 0) ? 0.0f
+               : clampf((float)(now_us - s_stab_last_tick_us) / 1000000.0f, 0.0f, 0.5f);
+    s_stab_last_tick_us = now_us;
+
     float rudder = stab_rudder_update(&s_stab_state, &s_stab_cfg,
-                                      s_manual_rudder, fusion.yaw_rate);
+                                      dt_s, s_manual_rudder, fusion.yaw_rate);
     steer_driver_set(rudder);
 #else
     (void)steer_raw;
+    (void)now_us;
 #endif
 }
 
@@ -862,7 +885,7 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
     portEXIT_CRITICAL(&s_arbiter_lock);
 
     control_apply_decision(&decision);
-    stability_sas_tick(decision.steer_raw);
+    stability_sas_tick(decision.steer_raw, start_us);
     status_commit_current(false);
 
     if (scheduled && ++heading_divider == HEADING_DIVIDER) {

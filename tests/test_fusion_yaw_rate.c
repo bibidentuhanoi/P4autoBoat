@@ -30,5 +30,6 @@ int main(void)
     fusion_get_result(&r);
     assert(r.sequence == 2);
     assert(fabsf(r.yaw_rate - 10.0f) < 0.5f);
+    assert(r.captured_us == 1020000);
     return 0;
 }

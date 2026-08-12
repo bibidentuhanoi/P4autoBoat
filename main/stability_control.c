@@ -12,13 +12,17 @@ void stab_reset(stab_state_t *state)
 }
 
 float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
-                         float steer_cmd_norm, float yaw_rate_dps)
+                         float dt_s, float steer_cmd_norm, float yaw_rate_dps)
 {
-    if (!state->initialized) {
-        state->yaw_filt = yaw_rate_dps;
+    if (!state->initialized || dt_s <= 0.0f) {
+        state->yaw_filt = yaw_rate_dps;   /* snap on first sample / non-positive dt */
         state->initialized = true;
     } else {
-        state->yaw_filt += cfg->yaw_lpf * (yaw_rate_dps - state->yaw_filt);
+        /* Discrete first-order low-pass, dt-aware: alpha = dt/(tau+dt). Same
+         * steady-state behaviour as the classic exp(-dt/tau) form without
+         * needing expf() on this target, and stable for any dt_s >= 0. */
+        float alpha = dt_s / (cfg->yaw_tau_s + dt_s);
+        state->yaw_filt += alpha * (yaw_rate_dps - state->yaw_filt);
     }
 
     float rate_command = clampf(steer_cmd_norm, -1.0f, 1.0f) * cfg->r_max_dps;
