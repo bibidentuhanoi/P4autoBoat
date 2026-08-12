@@ -26,6 +26,7 @@ typedef struct {
     atomic_uint pitch_bits;
     atomic_uint roll_bits;
     atomic_uint heading_bits;
+    atomic_uint yaw_rate_bits;
 } fusion_result_slot_t;
 
 typedef struct {
@@ -73,6 +74,7 @@ static void fusion_result_snapshot_init(void)
         atomic_init(&slot->pitch_bits, float_bits(0.0f));
         atomic_init(&slot->roll_bits, float_bits(0.0f));
         atomic_init(&slot->heading_bits, float_bits(0.0f));
+        atomic_init(&slot->yaw_rate_bits, float_bits(0.0f));
     }
     atomic_init(&result_snapshot.published_sequence, 0);
 }
@@ -85,6 +87,7 @@ static void fusion_publish_result(uint32_t sequence, const FusionResult *result)
     atomic_store_explicit(&slot->pitch_bits, float_bits(result->pitch), memory_order_relaxed);
     atomic_store_explicit(&slot->roll_bits, float_bits(result->roll), memory_order_relaxed);
     atomic_store_explicit(&slot->heading_bits, float_bits(result->heading), memory_order_relaxed);
+    atomic_store_explicit(&slot->yaw_rate_bits, float_bits(result->yaw_rate), memory_order_relaxed);
     atomic_store_explicit(&slot->version, stable_version, memory_order_release);
     atomic_store_explicit(&result_snapshot.published_sequence, sequence, memory_order_release);
 }
@@ -122,6 +125,8 @@ void fusion_get_result(FusionResult *res)
             .pitch = bits_float((uint32_t)atomic_load_explicit(&slot->pitch_bits, memory_order_relaxed)),
             .roll = bits_float((uint32_t)atomic_load_explicit(&slot->roll_bits, memory_order_relaxed)),
             .heading = bits_float((uint32_t)atomic_load_explicit(&slot->heading_bits, memory_order_relaxed)),
+            .yaw_rate = bits_float((uint32_t)atomic_load_explicit(&slot->yaw_rate_bits, memory_order_relaxed)),
+            .sequence = sequence,
         };
         /* Full reader-side barrier: validate only after this entire result
          * payload was loaded, including on weakly ordered RISC-V cores. */
@@ -197,6 +202,7 @@ void fusion_update_sample(const imu_sample_t *sample)
         .roll = roll - calib->roll_tare,
         .pitch = pitch - calib->pitch_tare,
         .heading = heading,
+        .yaw_rate = gz_rate,
     });
 }
 
