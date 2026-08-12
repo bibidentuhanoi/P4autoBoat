@@ -182,6 +182,13 @@ void app_main(void) {
         status_led_set(STATUS_LED_OFF);   // cal-only LED: dark once we're running
     }
 
+    // ESC differential-trim table -- own NVS record ("esc_trim"), entirely
+    // independent of the IMU calibration blob loaded above. Empty table
+    // (count == 0) is always a safe default.
+    EscTrimNvsBlob esc_trim_blob;
+    fs_load_esc_trim(&esc_trim_blob);   // false -> blob.count already 0, safe default
+    motor_control_set_esc_trim(esc_trim_blob.points, esc_trim_blob.count);   // provided by Task 2, not yet implemented
+
     // 8b. Winch servo + servo power. GPIO35 is dual-use with the BOOT button,
     //     so this MUST come after the button read above. Reconfigures GPIO35
     //     from input to MCPWM output (neutral/stop) and GPIO36 to output (off).
