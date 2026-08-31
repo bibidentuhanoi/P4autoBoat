@@ -1607,8 +1607,20 @@ function applyStatus(s) {
     // Always signed, so +0.20 and -0.20 cannot be misread at a glance.
     // toFixed(2) supplies the minus; only the plus has to be added. Raw value
     // -- no negation, no magnitude, no smoothing: this is the measurement.
-    $('t-yawrate').textContent = (t.have && typeof t.yaw_rate === 'number')
-      ? `${t.yaw_rate >= 0 ? '+' : ''}${t.yaw_rate.toFixed(2)} °/s` : '--';
+    //
+    // Stricter than the rows above it, which show the last value they saw for
+    // as long as the page is open. That is tolerable for an ANGLE (a stale
+    // heading is merely old) and not for a RATE: a frozen "+12.34 °/s" reads
+    // as "the boat is turning right now", which is the opposite of true once
+    // the link has dropped -- and actively misleading while the whole point of
+    // this readout is to establish which way the boat turns. Blank it instead.
+    // Same reasoning as dashboard.html blanking on ws.onclose.
+    //
+    // Number.isFinite also rejects a NaN/absent value outright; it is false for
+    // non-numbers, so it covers the missing-key case on its own.
+    $('t-yawrate').textContent =
+      (t.have && !t.stale && Number.isFinite(t.yaw_rate))
+        ? `${t.yaw_rate >= 0 ? '+' : ''}${t.yaw_rate.toFixed(2)} °/s` : '--';
     const fixEl = $('t-fix');
     fixEl.textContent = t.have ? (t.gps_valid ? 'VALID' : 'NO FIX') : '--';
     fixEl.classList.toggle('warn', t.have && !t.gps_valid);

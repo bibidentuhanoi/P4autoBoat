@@ -24,9 +24,12 @@ mirrored into dashboard.html produces no error anywhere -- it just makes the
 value vanish. That has already cost this project a UI lockout once.
 """
 
+import importlib.util
+import math
 import re
 import struct
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -34,6 +37,43 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from proto import boat_pb2  # noqa: E402
+
+TOOL = ROOT / 'tools' / 'espnow_drive.py'
+
+
+def _yawrate_render_expression():
+    """The live JS expression that decides what the Telemetry card shows.
+
+    Read out of the real source rather than restated here, so the behavioural
+    test below cannot drift away from the code it claims to be testing."""
+    src = TOOL.read_text()
+    m = re.search(r"\$\('t-yawrate'\)\.textContent =\s*(.*?);\n", src, re.S)
+    assert m, "the t-yawrate render expression moved"
+    return m.group(1)
+
+
+def _render_yawrate(t):
+    """Python mirror of that JS expression, evaluated against a real telemetry
+    dict. Kept honest by test_the_renderer_guards_on_have_stale_and_finite,
+    which checks each guard is actually present in the JS."""
+    ok = (bool(t.get('have'))
+          and not t.get('stale')
+          and isinstance(t.get('yaw_rate'), (int, float))
+          and not isinstance(t.get('yaw_rate'), bool)
+          and math.isfinite(t['yaw_rate']))
+    if not ok:
+        return '--'
+    v = t['yaw_rate']
+    return '%s%.2f °/s' % ('+' if v >= 0 else '', v)
+
+
+def _load_tool():
+    """Same loader the existing tool tests use -- the module guards its main(),
+    so importing it is side-effect free."""
+    spec = importlib.util.spec_from_file_location('espnow_drive_yaw_test', TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class YawRateProtoTest(unittest.TestCase):
@@ -150,12 +190,19 @@ class YawRatePythonToolTest(unittest.TestCase):
     def test_the_renderer_shows_it_signed_and_falls_back_to_dashes(self):
         self.assertIn("$('t-yawrate')", self.src)
         self.assertIn('<span class="val" id="t-yawrate">--</span>', self.src)
-        m = re.search(r"\$\('t-yawrate'\)\.textContent = (.*?);", self.src, re.S)
-        self.assertIsNotNone(m)
-        expr = m.group(1)
+        expr = _yawrate_render_expression()
         self.assertIn("'+'", expr, 'positive values must carry an explicit +')
         self.assertIn('toFixed(2)', expr)
         self.assertIn("'--'", expr, 'no value must render as --')
+
+    def test_the_renderer_guards_on_have_stale_and_finite(self):
+        """All three, and `stale` in particular: the rows above this one show
+        their last value indefinitely, which is fine for an ANGLE and wrong for
+        a RATE."""
+        expr = _yawrate_render_expression()
+        for guard in ('t.have', '!t.stale', 'Number.isFinite(t.yaw_rate)'):
+            self.assertIn(guard, expr,
+                          'the yaw-rate render guard is missing %s' % guard)
 
     def test_the_tool_does_not_alter_the_value(self):
         for bad in ('-t.yaw_rate', 'Math.abs(t.yaw_rate)', "-yaw_rate",
@@ -209,6 +256,71 @@ class YawRateDashboardTest(unittest.TestCase):
                         continue
                     self.fail('%s labels a yaw-rate sign as left/right before '
                               'it was measured: %s' % (name, line.strip()))
+
+
+class YawRateStalenessTest(unittest.TestCase):
+    """A stale RATE is worse than no rate: frozen at "+12.34 °/s" it reads as
+    "the boat is turning right now" long after the link has gone.
+
+    Staleness is produced by the tool's OWN _with_age(), driven by a real
+    last_rx_monotonic timestamp -- not by hand-setting a 'stale' key. So this
+    also proves the field the renderer depends on is really there and really
+    flips, which a source-inspection test cannot show."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tool = _load_tool()
+
+    def _aged(self, age_s, yaw_rate=12.34):
+        """A telemetry dict as the UI receives it, last heard `age_s` ago."""
+        d = self.tool.BoatLink._blank_telemetry()
+        d['have'] = True
+        d['yaw_rate'] = yaw_rate
+        d['last_rx_monotonic'] = time.monotonic() - age_s
+        return self.tool.BoatLink._with_age(d, self.tool.TELEMETRY_STALE_S)
+
+    def test_the_staleness_threshold_is_what_the_ui_actually_uses(self):
+        self.assertGreater(self.tool.TELEMETRY_STALE_S, 0)
+
+    def test_a_fresh_reading_is_shown(self):
+        t = self._aged(0.0)
+        self.assertFalse(t['stale'])
+        self.assertEqual(_render_yawrate(t), '+12.34 °/s')
+
+    def test_a_stale_reading_blanks_even_though_the_value_is_still_there(self):
+        """The value survives in the dict -- that is exactly the trap. Only the
+        staleness guard stops it being displayed."""
+        t = self._aged(self.tool.TELEMETRY_STALE_S + 1.0)
+        self.assertTrue(t['stale'], 'the fixture did not actually go stale')
+        self.assertEqual(t['yaw_rate'], 12.34, 'the value should still be present')
+        self.assertEqual(_render_yawrate(t), '--')
+
+    def test_a_negative_stale_reading_blanks_too(self):
+        t = self._aged(self.tool.TELEMETRY_STALE_S + 1.0, yaw_rate=-12.34)
+        self.assertTrue(t['stale'])
+        self.assertEqual(_render_yawrate(t), '--')
+
+    def test_never_having_heard_from_the_boat_blanks(self):
+        t = self.tool.BoatLink._blank_telemetry()
+        t = self.tool.BoatLink._with_age(t, self.tool.TELEMETRY_STALE_S)
+        self.assertTrue(t['stale'], 'no timestamp must count as stale')
+        self.assertEqual(_render_yawrate(t), '--')
+
+    def test_a_missing_or_nonfinite_value_blanks(self):
+        for bad in (None, float('nan'), float('inf'), 'ok'):
+            t = self._aged(0.0)
+            t['yaw_rate'] = bad
+            self.assertEqual(_render_yawrate(t), '--',
+                             'yaw_rate=%r should blank' % (bad,))
+        t = self._aged(0.0)
+        del t['yaw_rate']
+        self.assertEqual(_render_yawrate(t), '--')
+
+    def test_zero_is_a_real_reading_and_must_not_blank(self):
+        """A boat holding perfectly straight reads 0.00. Blanking that would
+        hide the most interesting measurement of all."""
+        t = self._aged(0.0, yaw_rate=0.0)
+        self.assertEqual(_render_yawrate(t), '+0.00 °/s')
 
 
 class YawRateFormattingTest(unittest.TestCase):
