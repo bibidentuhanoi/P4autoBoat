@@ -1021,8 +1021,32 @@ static void trim_learn_tick(const control_decision_t *decision)
     if (s_trim_last_capture_us != 0 && f.captured_us > s_trim_last_capture_us) {
         dt_s = (float)(f.captured_us - s_trim_last_capture_us) / 1000000.0f;
     }
-    /* Any rudder demand means the boat is MEANT to be turning. */
-    bool steering = fabsf(decision->rudder) > 0.02f;
+    /* Any rudder demand means the boat is MEANT to be turning, and this boat
+     * can be turned three different ways. All three must count, because the
+     * learner cannot tell a commanded turn from a motor imbalance -- it would
+     * happily "correct" the pilot's own steering into c and keep it there.
+     *
+     *   decision->rudder    differential thrust, folded into the drive command
+     *   decision->steer     the physical rudder servos, a separate SteerCommand
+     *   decision->steer_raw a raw microsecond pulse (bench/servo probing)
+     *
+     * steer is its OWN arbiter channel, not derived from rudder: a boat
+     * turning purely on its rudder servos has decision->rudder == 0, so the
+     * old rudder-only test saw a straight line and learned from a turn.
+     *
+     * steer_raw is a bare flag, deliberately: control_arbiter_submit_steer_raw
+     * forces value to 0.0f and only carries the pulse, so there is no
+     * normalized position to threshold. Any raw pulse at all means someone is
+     * driving the servo by hand. Same call SAS makes (stability_sas_tick bails
+     * outright on steer_raw rather than fighting the operator).
+     *
+     * Neither channel goes stale -- update_continuous() has no timeout, so the
+     * last SteerCommand holds until the next one. That is what makes recovery
+     * work: a SteerCommand of 0.0 both zeroes steer and clears the raw flag,
+     * so returning the rudder to neutral resumes learning by itself. */
+    bool steering = fabsf(decision->rudder) > 0.02f ||
+                    fabsf(decision->steer) > 0.02f ||
+                    decision->steer_raw;
 
     /* A held-up throttle slider on a DISARMED boat is not a measurement: the
      * jets are dead, the boat is not moving, and every degree the gyro reads is

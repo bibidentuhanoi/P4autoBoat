@@ -20,6 +20,7 @@ class NormalDrivingLearnsTest(unittest.TestCase):
                 "-std=c11", "-Wall", "-Wextra", "-Werror",
                 "-I", str(ROOT / "main"),
                 str(ROOT / "main" / "trim_learn.c"),
+                str(ROOT / "main" / "trim_assist.c"),
                 str(ROOT / "main" / "esc_trim.c"),
                 str(ROOT / "tests" / "test_normal_driving_learns.c"),
                 "-lm", "-o", str(binary),

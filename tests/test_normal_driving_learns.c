@@ -18,6 +18,7 @@
 
 #include "esc_trim.h"
 #include "trim_learn.h"
+#include "trim_assist.h"
 
 #define FUSION_HZ 50
 #define DT (1.0f / (float)FUSION_HZ)
@@ -38,41 +39,103 @@ static trim_learn_cfg_t shipped_cfg(void)
     return c;
 }
 
+/* The shipped P-assist configuration (CONFIG_STABILITY_PASSIST_*). */
+static trim_assist_cfg_t shipped_assist_cfg(void)
+{
+    trim_assist_cfg_t c = { .kp = 0.035f, .tau_s = 0.25f, .cap = 0.075f };
+    return c;
+}
+
 /* ---------------------------------------------------------------------------
  * The ordinary-driving branch of trim_learn_tick(), mirrored.
  *
  * motor_control.c, with no bench run and no calibration in progress:
  *
- *     bool steering = fabsf(decision->rudder) > 0.02f;
+ *     bool steering = fabsf(decision->rudder) > 0.02f ||
+ *                     fabsf(decision->steer) > 0.02f ||
+ *                     decision->steer_raw;
  *     bool driving  = (esc_driver_get_state() == ESC_STATE_ARMED);
  *     float thr     = driving ? decision->throttle : 0.0f;
  *     trim_learn_update(..., f.sequence, dt_s, f.yaw_rate, thr, steering, healthy);
+ *     p_gate = s_p_assist_on && healthy && driving && !steering &&
+ *              thr >= min_throttle && fabsf(yaw) <= TRIM_LEARN_REJECT_DPS;
+ *     s_p_correction = trim_assist_update(..., dt_s, yaw, p_gate);
  *
- * tests/test_runtime_architecture.py pins those four lines against the real
- * source, so this mirror cannot drift away from the firmware unnoticed.
+ * tests/test_runtime_architecture.py pins those lines against the real source,
+ * so this mirror cannot drift away from the firmware unnoticed.
  * ------------------------------------------------------------------------- */
 static uint32_t s_seq = 0;
 
-static bool drive_sample(trim_learn_t *s, const trim_learn_cfg_t *cfg,
-                         float yaw_dps, float throttle, float rudder,
-                         bool armed, bool healthy)
+/* One tick's worth of pilot input -- the three ways this boat can be turned,
+ * plus the throttle. Mirrors the fields of control_decision_t that the tick
+ * actually reads. */
+typedef struct {
+    float yaw_dps;
+    float throttle;
+    float rudder;      /* differential thrust */
+    float steer;       /* physical rudder servos */
+    bool  steer_raw;   /* raw microsecond pulse in force */
+    bool  armed;
+    bool  healthy;
+    bool  p_on;        /* the runtime P switch */
+} pilot_t;
+
+/* A neutral, straight-ahead, everything-healthy input at 40% throttle. */
+static pilot_t cruising(void)
 {
-    const bool steering = fabsf(rudder) > 0.02f;
-    const float thr = armed ? throttle : 0.0f;
-    return trim_learn_update(s, cfg, ++s_seq, DT, yaw_dps, thr, steering, healthy);
+    pilot_t p = { .yaw_dps = -2.0f, .throttle = 0.40f, .rudder = 0.0f,
+                  .steer = 0.0f, .steer_raw = false, .armed = true,
+                  .healthy = true, .p_on = false };
+    return p;
+}
+
+static bool mirror_steering(const pilot_t *p)
+{
+    return fabsf(p->rudder) > 0.02f || fabsf(p->steer) > 0.02f || p->steer_raw;
+}
+
+/* Returns true when c moved; writes the P correction actually applied. */
+static bool drive_sample(trim_learn_t *s, const trim_learn_cfg_t *cfg,
+                         trim_assist_t *pa, const trim_assist_cfg_t *pcfg,
+                         const pilot_t *p, float *p_corr_out)
+{
+    const bool steering = mirror_steering(p);
+    const float thr = p->armed ? p->throttle : 0.0f;
+    const bool moved = trim_learn_update(s, cfg, ++s_seq, DT, p->yaw_dps,
+                                         thr, steering, p->healthy);
+    const bool p_gate = p->p_on && p->healthy && p->armed && !steering &&
+                        (thr >= cfg->min_throttle) &&
+                        (fabsf(p->yaw_dps) <= TRIM_LEARN_REJECT_DPS);
+    const float corr = trim_assist_update(pa, pcfg, DT, p->yaw_dps, p_gate);
+    if (p_corr_out) *p_corr_out = corr;
+    return moved;
 }
 
 /* Hold a steady stick for `seconds` and report how many times c moved. */
-static int drive_for(trim_learn_t *s, const trim_learn_cfg_t *cfg,
-                     float seconds, float yaw_dps, float throttle, float rudder,
-                     bool armed, bool healthy)
+static int drive_pilot_for(trim_learn_t *s, const trim_learn_cfg_t *cfg,
+                           trim_assist_t *pa, const trim_assist_cfg_t *pcfg,
+                           float seconds, const pilot_t *p, float *p_corr_out)
 {
     const int n = (int)(seconds * FUSION_HZ);
     int moved = 0;
     for (int i = 0; i < n; ++i) {
-        if (drive_sample(s, cfg, yaw_dps, throttle, rudder, armed, healthy)) moved++;
+        if (drive_sample(s, cfg, pa, pcfg, p, p_corr_out)) moved++;
     }
     return moved;
+}
+
+/* Convenience for the cases that do not care about P. */
+static int drive_for(trim_learn_t *s, const trim_learn_cfg_t *cfg,
+                     float seconds, float yaw_dps, float throttle, float rudder,
+                     bool armed, bool healthy)
+{
+    trim_assist_t pa;
+    trim_assist_reset(&pa);
+    const trim_assist_cfg_t pcfg = shipped_assist_cfg();
+    pilot_t p = cruising();
+    p.yaw_dps = yaw_dps; p.throttle = throttle; p.rudder = rudder;
+    p.armed = armed; p.healthy = healthy;
+    return drive_pilot_for(s, cfg, &pa, &pcfg, seconds, &p, NULL);
 }
 
 /* --- 1. the whole point: forward driving, no bench run, and c moves -------- */
@@ -229,6 +292,113 @@ static void learning_resumes_once_the_gate_reopens(void)
     assert(!s.faulted);
 }
 
+/* --- 8. a SteerCommand on the PHYSICAL rudder freezes c and zeroes P ------
+ *
+ * This is the channel the old rudder-only test missed entirely: turning on the
+ * rudder servos leaves decision->rudder at 0, so the learner saw a straight
+ * line and integrated the yaw of a deliberate turn straight into c.
+ */
+static void a_physical_rudder_command_freezes_c_and_zeroes_p(void)
+{
+    const trim_learn_cfg_t cfg = shipped_cfg();
+    const trim_assist_cfg_t pcfg = shipped_assist_cfg();
+    trim_learn_t s;
+    trim_assist_t pa;
+    trim_learn_init(&s, &cfg);
+    trim_assist_reset(&pa);
+
+    /* Straight and level with P switched on: both loops are working. */
+    pilot_t p = cruising();
+    p.p_on = true;
+    float corr = 0.0f;
+    const int moved_straight = drive_pilot_for(&s, &cfg, &pa, &pcfg, 2.0f, &p, &corr);
+    assert(moved_straight > 0);
+    assert(corr > 0.0f);                /* P is pushing back on the lean */
+    const float c_before = s.c;
+    assert(c_before > cfg.c_init);
+
+    /* Now the pilot turns the rudder. Differential thrust is untouched --
+     * only the SteerCommand moves. */
+    p.steer = 0.50f;
+    const int moved_turning = drive_pilot_for(&s, &cfg, &pa, &pcfg, 3.0f, &p, &corr);
+
+    assert(moved_turning == 0);         /* c FROZEN */
+    assert(s.c == c_before);            /* and unchanged, not merely slowed */
+    assert(corr == 0.0f);               /* P zeroed, exactly -- no decay */
+    assert(pa.correction == 0.0f);
+    assert(!pa.initialized);            /* reset, so it cannot carry over */
+    assert(!s.faulted);
+    printf("  physical rudder: c held at %.4f, P zeroed\n", (double)c_before);
+
+    /* Rudder back to neutral. A SteerCommand of 0.0 is what does this on the
+     * real boat -- it clears both the value and the raw flag. */
+    p.steer = 0.0f;
+    const int moved_after = drive_pilot_for(&s, &cfg, &pa, &pcfg, 2.0f, &p, &corr);
+
+    assert(moved_after > 0);            /* learning RESUMED */
+    assert(s.c > c_before);             /* and carried on from where it was */
+    assert(corr > 0.0f);                /* P came back too */
+    printf("  back to neutral: learning resumed, c %.4f -> %.4f\n",
+           (double)c_before, (double)s.c);
+}
+
+/* --- 9. all three steering channels, each on its own ---------------------- */
+static void each_steering_channel_freezes_independently(void)
+{
+    const trim_learn_cfg_t cfg = shipped_cfg();
+    const trim_assist_cfg_t pcfg = shipped_assist_cfg();
+
+    struct { const char *what; float rudder, steer; bool raw; } chans[] = {
+        { "differential thrust (decision->rudder)", 0.50f, 0.00f, false },
+        { "physical rudder     (decision->steer)",  0.00f, 0.50f, false },
+        { "raw pulse           (steer_raw)",        0.00f, 0.00f, true  },
+        /* A raw pulse carries value 0.0f by construction -- submit_steer_raw
+         * forces it -- so the flag is the ONLY thing that can catch it. */
+    };
+
+    for (unsigned i = 0; i < sizeof(chans) / sizeof(chans[0]); ++i) {
+        trim_learn_t s;
+        trim_assist_t pa;
+        trim_learn_init(&s, &cfg);
+        trim_assist_reset(&pa);
+        pilot_t p = cruising();
+        p.p_on = true;
+        p.rudder = chans[i].rudder;
+        p.steer = chans[i].steer;
+        p.steer_raw = chans[i].raw;
+
+        const float c0 = s.c;
+        float corr = 1.0f;              /* seed non-zero so a no-op would show */
+        const int moved = drive_pilot_for(&s, &cfg, &pa, &pcfg, 4.0f, &p, &corr);
+
+        assert(moved == 0);
+        assert(s.c == c0);
+        assert(corr == 0.0f);
+        assert(!s.faulted);
+        printf("  frozen by %s\n", chans[i].what);
+    }
+}
+
+/* --- 10. a rudder nudge below the threshold is still straight driving ----- */
+static void a_tiny_rudder_offset_does_not_stop_learning(void)
+{
+    const trim_learn_cfg_t cfg = shipped_cfg();
+    const trim_assist_cfg_t pcfg = shipped_assist_cfg();
+    trim_learn_t s;
+    trim_assist_t pa;
+    trim_learn_init(&s, &cfg);
+    trim_assist_reset(&pa);
+
+    /* 0.02 is the threshold; 0.01 on the physical rudder is trim slop, not a
+     * turn. If this froze, a servo that never quite reads zero would disable
+     * the whole feature. */
+    pilot_t p = cruising();
+    p.steer = 0.01f;
+    const int moved = drive_pilot_for(&s, &cfg, &pa, &pcfg, 2.0f, &p, NULL);
+    assert(moved > 0);
+    assert(s.c > cfg.c_init);
+}
+
 int main(void)
 {
     ordinary_forward_driving_teaches_the_learner();
@@ -238,6 +408,9 @@ int main(void)
     the_safety_gates_all_freeze_learning();
     hitting_something_is_not_learned_from();
     learning_resumes_once_the_gate_reopens();
+    a_physical_rudder_command_freezes_c_and_zeroes_p();
+    each_steering_channel_freezes_independently();
+    a_tiny_rudder_offset_does_not_stop_learning();
     printf("test_normal_driving_learns: OK\n");
     return 0;
 }

@@ -1215,7 +1215,7 @@ def test_ordinary_forward_driving_is_not_bench_only():
         "driving may no longer reach trim_learn_update")
 
     # 2. the pilot's own command is what the learner measures.
-    assert "bool steering = fabsf(decision->rudder) > 0.02f;" in tick
+    assert "bool steering = fabsf(decision->rudder) > 0.02f ||" in tick
     assert "float thr = driving ? decision->throttle : 0.0f;" in tick
 
     # 3. and those are the values actually handed over.
@@ -1230,6 +1230,39 @@ def test_ordinary_forward_driving_is_not_bench_only():
     assert "if (bench_learning) {" in tick
     bench_branch = tick.split("if (bench_learning) {", 1)[1].split("    }", 1)[0]
     assert "thr = driving ? s_bench.base : 0.0f;" in bench_branch
+
+
+def test_every_way_of_steering_the_boat_freezes_the_learner():
+    """This boat turns three different ways, and the learner cannot tell a
+    commanded turn from a motor imbalance. Miss one channel and it quietly
+    learns the pilot's own steering into c and keeps it there.
+
+      decision->rudder     differential thrust (folded into the drive command)
+      decision->steer      the physical rudder servos -- a SEPARATE arbiter
+                           channel, so a boat turning purely on its rudders has
+                           decision->rudder == 0 and the old rudder-only test
+                           saw a straight line
+      decision->steer_raw  a raw microsecond pulse; submit_steer_raw() forces
+                           value to 0.0f and carries only the pulse, so there
+                           is no normalized position to threshold -- the flag
+                           itself is the signal, the same call SAS makes"""
+    src = (ROOT / "main" / "motor_control.c").read_text()
+    tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
+
+    assert ("bool steering = fabsf(decision->rudder) > 0.02f ||\n"
+            "                    fabsf(decision->steer) > 0.02f ||\n"
+            "                    decision->steer_raw;") in tick, (
+        "the steering test no longer covers all three channels -- a turn on "
+        "one of them would be learned as trim")
+
+    # steer_raw must be a bare flag, never thresholded: its value is always 0.
+    assert "fabsf(decision->steer_raw)" not in tick
+    assert "decision->steer_raw > " not in tick
+
+    # Both consumers must key off the same flag, or the slow and fast loops
+    # would disagree about whether the boat is being steered.
+    assert "thr, steering, healthy);" in tick, "the learner is not given `steering`"
+    assert "!steering" in tick, "the P gate no longer excludes steering"
 
 
 def test_a_left_or_right_run_never_teaches_the_learner():
