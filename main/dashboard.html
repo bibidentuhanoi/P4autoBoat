@@ -383,6 +383,15 @@
       <div class="imu-val"><div class="imu-label">Pitch</div><div class="imu-num" id="imu-pitch">—</div><div class="imu-unit">deg</div></div>
       <div class="imu-val"><div class="imu-label">Roll</div><div class="imu-num" id="imu-roll">—</div><div class="imu-unit">deg</div></div>
       <div class="imu-val"><div class="imu-label">Heading</div><div class="imu-num" id="imu-hdg">—</div><div class="imu-unit">deg</div></div>
+      <!-- Spans the row: the value is wider than the three above it (signed,
+           2dp), and it is a different KIND of quantity — a rate, not an angle.
+           Deliberately NOT labelled left/right: which sign is which depends on
+           how the IMU is physically mounted and that has not been measured. -->
+      <div class="imu-val" style="grid-column:1 / -1;">
+        <div class="imu-label">Yaw rate · gyro Z</div>
+        <div class="imu-num" id="imu-yawrate">--</div>
+        <div class="imu-unit">deg/s · signed, direction not yet established</div>
+      </div>
     </div>
   </div>
 
@@ -482,7 +491,7 @@ const DEG2RAD = Math.PI / 180;
 const protoSchema = `
 syntax = "proto3";
 package boat;
-message IMUData { float pitch = 1; float roll = 2; float heading = 3; }
+message IMUData { float pitch = 1; float roll = 2; float heading = 3; float yaw_rate = 4; }
 message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
 message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
 message GpsFix { bool valid = 1; double latitude = 2; double longitude = 3; float altitude_m = 4; float speed_mps = 5; float course_deg = 6; uint32 fix_quality = 7; uint32 satellites = 8; float hdop = 9; uint64 utc_ms = 10; }
@@ -529,6 +538,14 @@ const FLIP = {
 let overlayMode = 'threshold3d';
 let thresholdMM = 2000;
 let imuPitch = 0, imuRoll = 0;
+
+// Signed yaw rate, always with an explicit sign so +0.20 and -0.20 cannot be
+// confused at a glance: "+12.34" / "-12.34", or "--" when there is no value.
+// toFixed(2) already emits the minus, so only + has to be added.
+function yawRateText(v) {
+  if (typeof v !== 'number' || !isFinite(v)) return '--';
+  return (v >= 0 ? '+' : '') + v.toFixed(2);
+}
 let lastTofA = null, lastTofB = null;
 
 // ═══════════════════════════════════════════════════════════════
@@ -1291,6 +1308,17 @@ function connectWS() {
           $('imu-pitch').textContent = s.imu.pitch.toFixed(1);
           $('imu-roll').textContent  = s.imu.roll.toFixed(1);
           $('imu-hdg').textContent   = s.imu.heading.toFixed(1);
+          // Raw and signed, straight from FusionResult.yaw_rate. No negation,
+          // no absolute value, no extra filtering -- the point of showing it is
+          // to establish which way the installed IMU reads, so anything applied
+          // here would corrupt the measurement being made.
+          //
+          // A boat running firmware older than this field sends nothing, and
+          // protobuf.js fills an absent proto3 scalar with 0 -- indistinguishable
+          // from genuinely not turning. This guard therefore only catches a
+          // missing/NaN value, which is the honest limit of what is knowable
+          // here; it does not pretend to detect an out-of-date boat.
+          $('imu-yawrate').textContent = yawRateText(s.imu.yawRate);
           drawHorizon(s.imu.pitch, s.imu.roll);
           drawCompass(s.imu.heading);
         }
@@ -1402,6 +1430,9 @@ function connectWS() {
     updateArmEnable();
     $('status-dot').className = 'err';
     $('status-label').textContent = 'disconnected';
+    // A frozen attitude reads as "the boat is level"; a frozen RATE reads as
+    // "the boat is turning right now", which is far more misleading. Blank it.
+    $('imu-yawrate').textContent = '--';
     reconnectTimer = setTimeout(connectWS, _reconnectDelay);
     _reconnectDelay = Math.min(_reconnectDelay * 2, 8000);
   };

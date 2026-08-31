@@ -5,6 +5,15 @@ message IMUData {
   float pitch   = 1;
   float roll    = 2;
   float heading = 3;
+  // Gyro-Z turn rate, deg/s, SIGNED and raw -- the same FusionResult.yaw_rate
+  // the trim learner and SAS run on, not a separate copy. Mag-independent, so
+  // it stays meaningful when the heading does not.
+  //
+  // Which sign means which way round the boat turns is NOT yet established:
+  // it depends on how the IMU is physically mounted, and that has not been
+  // measured. Display it signed and unlabelled until it has been. Do not
+  // negate it, take its magnitude, or "fix" it to match an expectation.
+  float yaw_rate = 4;
 }
 
 message ToFGrid {

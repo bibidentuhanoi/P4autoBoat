@@ -958,6 +958,12 @@ class BoatLink:
             self.telemetry = {
                 'have': True, 'last_rx_monotonic': time.monotonic(),
                 'heading': s.imu.heading, 'pitch': s.imu.pitch, 'roll': s.imu.roll,
+                # Signed, raw, straight through -- same field and same meaning
+                # as the compact ESP-NOW path above. This assignment REPLACES
+                # the whole dict, so omitting a key does not merely hide the
+                # value, it removes it: the renderer would then KeyError on
+                # every full-snapshot frame. Both paths must carry the same set.
+                'yaw_rate': s.imu.yaw_rate,
                 'gps_valid': s.gps.valid, 'lat': s.gps.latitude, 'lon': s.gps.longitude,
                 'speed_mps': s.gps.speed_mps, 'course_deg': s.gps.course_deg,
                 'satellites': s.gps.satellites, 'hdop': s.gps.hdop,
@@ -1190,6 +1196,10 @@ PAGE = """<!DOCTYPE html>
   <div class="card-title">Telemetry <span class="pill" id="telem-pill" style="margin-left:6px;">NO DATA YET</span></div>
   <div class="telem-row"><label>Heading</label><span class="val" id="t-heading">--</span></div>
   <div class="telem-row"><label>Pitch / Roll</label><span class="val" id="t-attitude">--</span></div>
+  <!-- Signed on purpose and NOT labelled left/right: which sign corresponds to
+       which way the boat turns depends on how the IMU is mounted, and that has
+       not been measured yet. This display is how we measure it. -->
+  <div class="telem-row"><label>Yaw rate (gyro Z)</label><span class="val" id="t-yawrate">--</span></div>
   <div class="telem-row"><label>GPS Fix</label><span class="val" id="t-fix">--</span></div>
   <div class="telem-row"><label>GPS chip</label><span class="val" id="t-gps-chip">--</span></div>
   <div class="telem-row"><label>Lat / Lon</label><span class="val" id="t-latlon">--</span></div>
@@ -1594,6 +1604,11 @@ function applyStatus(s) {
     }
     $('t-heading').textContent = t.have ? `${t.heading.toFixed(1)}°` : '--';
     $('t-attitude').textContent = t.have ? `${t.pitch.toFixed(1)}° / ${t.roll.toFixed(1)}°` : '--';
+    // Always signed, so +0.20 and -0.20 cannot be misread at a glance.
+    // toFixed(2) supplies the minus; only the plus has to be added. Raw value
+    // -- no negation, no magnitude, no smoothing: this is the measurement.
+    $('t-yawrate').textContent = (t.have && typeof t.yaw_rate === 'number')
+      ? `${t.yaw_rate >= 0 ? '+' : ''}${t.yaw_rate.toFixed(2)} °/s` : '--';
     const fixEl = $('t-fix');
     fixEl.textContent = t.have ? (t.gps_valid ? 'VALID' : 'NO FIX') : '--';
     fixEl.classList.toggle('warn', t.have && !t.gps_valid);

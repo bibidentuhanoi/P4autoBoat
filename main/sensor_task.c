@@ -711,9 +711,13 @@ void task_sensor_snapshot(void *pvParameters)
             snap = (boat_SensorSnapshot)boat_SensorSnapshot_init_zero;
             snap.timestamp_us = (uint64_t)esp_timer_get_time();
             snap.has_imu     = true;
-            snap.imu.pitch   = imu.pitch;
-            snap.imu.roll    = imu.roll;
-            snap.imu.heading = imu.heading;
+            snap.imu.pitch    = imu.pitch;
+            snap.imu.roll     = imu.roll;
+            snap.imu.heading  = imu.heading;
+            /* Same FusionResult field the ESP-NOW path sends and the trim
+             * learner runs on -- signed, unfiltered, straight through. Both
+             * transports must agree or the two UIs disagree about the boat. */
+            snap.imu.yaw_rate = imu.yaw_rate;
 
             /* ToF — copied from ToFProc's processed cache (5 Hz publish). */
             uint64_t t_tof_start = esp_timer_get_time();
