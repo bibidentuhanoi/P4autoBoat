@@ -159,7 +159,43 @@ typedef struct _boat_CalibrateStatus {
     uint32_t points_done;
 } boat_CalibrateStatus;
 
-/* Envelope — every message on the wire is a BoatMessage */
+/* Envelope — every message on the wire is a BoatMessage
+ Bench throttle-mismatch test. The BOAT runs the whole profile and records to
+ its OWN SD card, so a radio dropout cannot spoil the measurement -- the link
+ is only used to press the button. kind: 0 = BASE (both equal, so any turn IS
+ the mismatch), 1 = LEFT stronger, 2 = RIGHT stronger.
+ Runtime switch for the temporary proportional yaw assist. Runtime, not
+ compile-time, so the A and B arms of an experiment run the SAME firmware --
+ a rebuild between arms would let a build difference look like a result. */
+typedef struct _boat_AssistCommand {
+    bool p_on;
+} boat_AssistCommand;
+
+typedef struct _boat_BenchCommand {
+    uint32_t kind;
+    float base; /* both motors at this throttle, 0..1 */
+    float delta; /* split added to one side and taken off the other */
+    /* ONE-SHOT: set the trim learner's c to this before the run, and clear its
+ filter and any latched fault. Applied only if the run is actually
+ accepted. 0 (or absent) leaves the learner exactly as it was, which is
+ what every ordinary BASE run sends -- c must carry over between runs or
+ convergence can never be observed. */
+    float reset_c;
+} boat_BenchCommand;
+
+/* No string field on purpose: nanopb strings need a size option, and the file
+ name is fully derivable from kind/base/file_index (T<pct>_<K>_<NN>.CSV). */
+typedef struct _boat_BenchStatus {
+    uint32_t state; /* 0 idle, 1 baseline, 2 run, 3 coast, 4 saved, 5 failed */
+    uint32_t kind;
+    float base;
+    uint32_t samples;
+    uint32_t file_index;
+    float elapsed_s;
+    float learn_c; /* the trim learner's c right now (0 if compiled out) */
+    bool p_on; /* the BOAT's own P-assist state, not the tool's */
+} boat_BenchStatus;
+
 typedef struct _boat_BoatMessage {
     pb_size_t which_payload;
     union {
@@ -177,6 +213,9 @@ typedef struct _boat_BoatMessage {
         boat_TrainingLogCommand training_log;
         boat_CalibrateCommand calibrate;
         boat_CalibrateStatus calibrate_status;
+        boat_BenchCommand bench;
+        boat_BenchStatus bench_status;
+        boat_AssistCommand assist;
     } payload;
 } boat_BoatMessage;
 
@@ -204,6 +243,9 @@ extern "C" {
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_default       {0, 0}
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
+#define boat_AssistCommand_init_default          {0}
+#define boat_BenchCommand_init_default           {0, 0, 0, 0}
+#define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
@@ -223,6 +265,9 @@ extern "C" {
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_zero          {0, 0}
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
+#define boat_AssistCommand_init_zero             {0}
+#define boat_BenchCommand_init_zero              {0, 0, 0, 0}
+#define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -294,6 +339,19 @@ extern "C" {
 #define boat_CalibrateStatus_yaw_avg_dps_tag     5
 #define boat_CalibrateStatus_making_way_tag      6
 #define boat_CalibrateStatus_points_done_tag     7
+#define boat_AssistCommand_p_on_tag              1
+#define boat_BenchCommand_kind_tag               1
+#define boat_BenchCommand_base_tag               2
+#define boat_BenchCommand_delta_tag              3
+#define boat_BenchCommand_reset_c_tag            4
+#define boat_BenchStatus_state_tag               1
+#define boat_BenchStatus_kind_tag                2
+#define boat_BenchStatus_base_tag                3
+#define boat_BenchStatus_samples_tag             4
+#define boat_BenchStatus_file_index_tag          5
+#define boat_BenchStatus_elapsed_s_tag           6
+#define boat_BenchStatus_learn_c_tag             7
+#define boat_BenchStatus_p_on_tag                8
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
@@ -308,6 +366,9 @@ extern "C" {
 #define boat_BoatMessage_training_log_tag        12
 #define boat_BoatMessage_calibrate_tag           13
 #define boat_BoatMessage_calibrate_status_tag    14
+#define boat_BoatMessage_bench_tag               15
+#define boat_BoatMessage_bench_status_tag        16
+#define boat_BoatMessage_assist_tag              17
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -457,6 +518,31 @@ X(a, STATIC,   SINGULAR, UINT32,   points_done,       7)
 #define boat_CalibrateStatus_CALLBACK NULL
 #define boat_CalibrateStatus_DEFAULT NULL
 
+#define boat_AssistCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     p_on,              1)
+#define boat_AssistCommand_CALLBACK NULL
+#define boat_AssistCommand_DEFAULT NULL
+
+#define boat_BenchCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   kind,              1) \
+X(a, STATIC,   SINGULAR, FLOAT,    base,              2) \
+X(a, STATIC,   SINGULAR, FLOAT,    delta,             3) \
+X(a, STATIC,   SINGULAR, FLOAT,    reset_c,           4)
+#define boat_BenchCommand_CALLBACK NULL
+#define boat_BenchCommand_DEFAULT NULL
+
+#define boat_BenchStatus_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   state,             1) \
+X(a, STATIC,   SINGULAR, UINT32,   kind,              2) \
+X(a, STATIC,   SINGULAR, FLOAT,    base,              3) \
+X(a, STATIC,   SINGULAR, UINT32,   samples,           4) \
+X(a, STATIC,   SINGULAR, UINT32,   file_index,        5) \
+X(a, STATIC,   SINGULAR, FLOAT,    elapsed_s,         6) \
+X(a, STATIC,   SINGULAR, FLOAT,    learn_c,           7) \
+X(a, STATIC,   SINGULAR, BOOL,     p_on,              8)
+#define boat_BenchStatus_CALLBACK NULL
+#define boat_BenchStatus_DEFAULT NULL
+
 #define boat_BoatMessage_FIELDLIST(X, a) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,sensors,payload.sensors),   1) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor,payload.motor),   2) \
@@ -471,7 +557,10 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,servo_power,payload.servo_power),  1
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_raw,payload.steer_raw),  11) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,training_log,payload.training_log),  12) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate,payload.calibrate),  13) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate_status,payload.calibrate_status),  14)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate_status,payload.calibrate_status),  14) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,bench,payload.bench),  15) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,bench_status,payload.bench_status),  16) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,assist,payload.assist),  17)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -488,6 +577,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,calibrate_status,payload.calibrate_s
 #define boat_BoatMessage_payload_training_log_MSGTYPE boat_TrainingLogCommand
 #define boat_BoatMessage_payload_calibrate_MSGTYPE boat_CalibrateCommand
 #define boat_BoatMessage_payload_calibrate_status_MSGTYPE boat_CalibrateStatus
+#define boat_BoatMessage_payload_bench_MSGTYPE boat_BenchCommand
+#define boat_BoatMessage_payload_bench_status_MSGTYPE boat_BenchStatus
+#define boat_BoatMessage_payload_assist_MSGTYPE boat_AssistCommand
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
@@ -507,6 +599,9 @@ extern const pb_msgdesc_t boat_ServoPowerCommand_msg;
 extern const pb_msgdesc_t boat_SystemStatus_msg;
 extern const pb_msgdesc_t boat_CalibrateCommand_msg;
 extern const pb_msgdesc_t boat_CalibrateStatus_msg;
+extern const pb_msgdesc_t boat_AssistCommand_msg;
+extern const pb_msgdesc_t boat_BenchCommand_msg;
+extern const pb_msgdesc_t boat_BenchStatus_msg;
 extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
@@ -528,11 +623,17 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_SystemStatus_fields &boat_SystemStatus_msg
 #define boat_CalibrateCommand_fields &boat_CalibrateCommand_msg
 #define boat_CalibrateStatus_fields &boat_CalibrateStatus_msg
+#define boat_AssistCommand_fields &boat_AssistCommand_msg
+#define boat_BenchCommand_fields &boat_BenchCommand_msg
+#define boat_BenchStatus_fields &boat_BenchStatus_msg
 #define boat_BoatMessage_fields &boat_BoatMessage_msg
 
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
 #define boat_ArmCommand_size                     4
+#define boat_AssistCommand_size                  2
+#define boat_BenchCommand_size                   21
+#define boat_BenchStatus_size                    41
 #define boat_BoatMessage_size                    13270
 #define boat_CalibrateCommand_size               4
 #define boat_CalibrateStatus_size                35

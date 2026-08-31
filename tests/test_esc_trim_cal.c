@@ -41,6 +41,28 @@ static void converges_and_records(void)
     assert(fabsf(s.out_table[0].trim_diff - 0.24f) < 0.08f);
 }
 
+/* Force-arm / no-GPS path: motor_control sets min_speed_mps = 0 for the run, so
+ * the state machine's making-way gate always passes and a level records on yaw
+ * settling alone, even with gps_speed = 0 (operator confirms movement by eye).
+ * This pins the mechanism that the force-arm wiring in motor_control relies on. */
+static void records_without_gps_when_min_speed_zero(void)
+{
+    etc_cfg_t c = cfg(); c.min_speed_mps = 0.0f; c.level_count = 1;
+    etc_t s; int64_t t = 0;
+    esc_trim_cal_init(&s, &c); esc_trim_cal_start(&s, &c);
+    noise(&s, &c, &t, 0.0f);
+    bool done = false;
+    for (int i = 0; i < 300 && !done; ++i) {
+        float yaw = 0.24f - s.trim_diff;
+        etc_out_t o = esc_trim_cal_step(&s, &c, t, yaw, 0.0f,   /* gps_speed = 0 */
+                                        true, true, true, false);
+        done = o.done;
+        t += 100000;
+    }
+    assert(done && s.out_count == 1);
+    assert(fabsf(s.out_table[0].trim_diff - 0.24f) < 0.08f);
+}
+
 static void bias_is_subtracted(void)
 {
     etc_cfg_t c = cfg(); c.level_count = 1; etc_t s; int64_t t = 0;
@@ -121,6 +143,7 @@ static void abort_gates_and_limits(void)
 int main(void)
 {
     converges_and_records();
+    records_without_gps_when_min_speed_zero();
     bias_is_subtracted();
     runaway_aborts_at_clamp();
     abort_gates_and_limits();

@@ -36,5 +36,32 @@ void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t 
 /* Mix an original normalized throttle/rudder command, applying static trim
  * before saturation. Pilot steering is preserved first; trim is reduced when
  * there is no remaining actuator headroom. */
+/* Apply a trim to an already-mixed (left,right) pair, the same way
+ * esc_trim_mix does: left -= trim/2, right += trim/2, clamped to [0,1].
+ *
+ * Stopped stays stopped: if BOTH inputs are zero the pair is returned
+ * untouched. Without that guard a trim would spin one motor up while the
+ * caller believes the motors are off -- which silently ruins the bench run's
+ * motors-off baseline, the very measurement the trim is derived from. */
+void esc_trim_apply_pair(float trim, float *left, float *right);
+
+/* Build the table that makes the trim PROPORTIONAL to throttle:
+ *
+ *     trim(T) = 2*c*T   ->   left = T*(1-c),  right = T*(1+c)
+ *
+ * One dimensionless number covers the whole throttle range. That is what the
+ * bench measured: the split that makes the boat go straight is 2.3% at T10,
+ * 6.5% at T30, 7.0% at T35 and 7.5% at T40 -- not a constant, but a constant
+ * FRACTION (c ~ 0.20) of throttle. A flat trim tuned at T40 over-corrects
+ * badly at T10 (measured +8.4 deg/s), which is exactly the failure this fixes.
+ *
+ * Two points, (0,0) and (1, 2c), because esc_trim_lookup interpolates linearly
+ * between them -- so the straight line through the origin IS the model, and no
+ * per-throttle table has to be filled in.
+ *
+ * `out` must have room for 2 points. Returns the point count, or 0 when c is
+ * unusable (NaN or zero), which the caller reads as "no trim". */
+uint8_t esc_trim_build_proportional(float c, EscTrimPoint *out);
+
 void esc_trim_mix(float throttle, float rudder, const EscTrimPoint *pts,
                   uint8_t count, float *left, float *right);

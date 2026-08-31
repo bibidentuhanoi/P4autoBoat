@@ -16,6 +16,9 @@ idf_component_register(
         "esc_map.c"
         "esc_trim.c"
         "esc_trim_cal.c"
+        "bench_run.c"
+        "trim_learn.c"
+        "trim_assist.c"
         "stability_control.c"
         "calibration.c"
         "drivers/imu_driver.c"
@@ -48,3 +51,8 @@ idf_component_register(
         fatfs sdmmc esp_driver_sdmmc
     INCLUDE_DIRS "include" "drivers" "." "proto"
     EMBED_TXTFILES "dashboard.html")
+
+# The ESP32-C6 coprocessor configuration guard. Kept in its own file so the
+# logic can be exercised standalone (tests/test_hosted_config_guard.py) --
+# a guard that has never been seen to fire is not a guard.
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/hosted_config_guard.cmake")

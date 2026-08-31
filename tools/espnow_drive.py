@@ -75,7 +75,9 @@ import base64
 import hashlib
 import json
 import math
+import csv
 import os
+import re
 import struct
 import sys
 import threading
@@ -93,15 +95,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MSG_SENSOR = 0x02              # espnow_pkt_hdr_t.msg_type -- legacy full SensorSnapshot
 MSG_BRIDGE_STATUS = 0x13       # S3's own self-report -- USB-only, never over the air
 MSG_MOTOR_CMD = 0x03           # espnow_pkt_hdr_t.msg_type -- see module docstring
+MSG_MOTOR_STATUS = 0x06        # MotorStatus -- the boat's ACTUAL arm/throttle/servo state (vs commanded)
+MSG_STATUS = 0x07              # SystemStatus (sensor-health / boot report); sent over the field link too
 # Field-mode telemetry, IMU+GPS only -- a hand-packed struct (main/transports/
 # espnow_protocol.h: espnow_telemetry_t), NOT a boat.proto message. Replaces
 # MSG_SENSOR on the ESP-NOW link: fits one ESP-NOW packet (no fragmentation),
 # where a full SensorSnapshot with ToF needed ~55 fragments and could stall
 # the boat's own publish loop. Layout must match espnow_telemetry_t exactly:
 # pitch,roll,heading (f) + gps_valid (B) + lat,lon (d) + speed,course (f) +
-# satellites (B) + hdop (f), packed, little-endian.
+# satellites (B) + hdop (f) + yaw_rate (f), packed, little-endian.
+# yaw_rate is gyro-Z deg/s -- the signal the bench mismatch test reads.
 MSG_FIELD_TELEMETRY = 0x08
-FIELD_TELEMETRY_FMT = '<fffBddffBf'
+FIELD_TELEMETRY_FMT = '<fffBddffBff'
 ESPNOW_HDR_SIZE = 4
 ESP_NOW_MAX_DATA_LEN = 250     # ESP-NOW v1 single-packet limit
 SEND_HZ = 15
@@ -179,6 +184,33 @@ def clamp(v, lo, hi):
     return lo if v < lo else hi if v > hi else v
 
 
+# ---- bench throttle-mismatch test -------------------------------------------
+# Three runs -- left-stronger, right-stronger, both-same. The both-same run IS
+# the mismatch (equal commands, so any turn is the two motors disagreeing); the
+# two lopsided runs give the scale, in deg/s per unit of commanded difference.
+# Every run starts with the motors OFF so the gyro's own drift can be measured
+# at run temperature and subtracted -- that drift lands directly on top of the
+# both-same reading, which is the one number the trim depends on.
+# Bench throttle-mismatch test. The BOAT owns the run: it drives the profile
+# and records every sample to its OWN SD card, so a radio dropout cannot spoil
+# the measurement -- this tool only presses the button and shows progress.
+# Reading the runs afterwards is tools/bench_analyze.py.
+BENCH_KIND = {'both': 0, 'left': 1, 'right': 2}
+BENCH_KIND_NAME = {0: 'BASE', 1: 'LEFT', 2: 'RIGHT'}
+BENCH_STATE_NAME = {0: 'idle', 1: 'still', 2: 'driving', 3: 'coasting',
+                    4: 'SAVED', 5: 'FAILED'}
+# A live run publishes its state at ~5 Hz. Anything older than this cannot
+# still be running -- most likely the terminal SAVED packet was lost over the
+# air. Without this the tool latches on 'driving' and refuses every later run.
+BENCH_RUNNING_STALE_S = 3.0
+
+# The learner's clamp, mirrored from motor_control.c (.c_min / .c_max). A value
+# outside this is refused by the boat, so refuse it here too rather than send a
+# command that will be silently dropped.
+TRIMLEARN_C_MIN = 0.10
+TRIMLEARN_C_MAX = 0.35
+
+
 def load_boat_pb2():
     try:
         from proto import boat_pb2
@@ -211,7 +243,10 @@ class BoatLink:
         self.ser = None
         self.port = None
         self.connected = False
-        self.throttle = 0.0
+        self.throttle = 0.0          # linked "both motors" value
+        self.motor_left = 0.0        # per-motor values, used when unlinked (split)
+        self.motor_right = 0.0
+        self.motor_split = False     # False = linked (throttle -> both); True = independent L/R
         self.rudder = 0.0
         self.winch_speed = 0.0
         self.winch_lease_until = 0.0
@@ -228,6 +263,13 @@ class BoatLink:
         self.seq = 0
         self.last_error = None
         self.telemetry = self._blank_telemetry()
+        self.calibrate_status = self._blank_calibrate_status()
+        self.system_status = self._blank_system_status()
+        self.motor_status = self._blank_motor_status()
+        self.bench_status = self._blank_bench_status()
+        # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
+        # the default so a forgotten toggle cannot silently make every run a B.
+        self.p_assist_on = False
         self.bridge_status = self._blank_bridge_status()
         self._diag_counts = {}
         self._stop = threading.Event()
@@ -241,7 +283,45 @@ class BoatLink:
             'heading': 0.0, 'pitch': 0.0, 'roll': 0.0,
             'gps_valid': False, 'lat': 0.0, 'lon': 0.0,
             'speed_mps': 0.0, 'course_deg': 0.0,
-            'satellites': 0, 'hdop': 0.0,
+            'satellites': 0, 'hdop': 0.0, 'yaw_rate': 0.0,
+        }
+
+    @staticmethod
+    def _blank_calibrate_status() -> dict:
+        return {
+            'have': False, 'last_rx_monotonic': None,
+            'state': 0, 'level_index': 0, 'level_throttle': 0.0,
+            'trim_diff': 0.0, 'yaw_avg_dps': 0.0, 'making_way': False,
+            'points_done': 0,
+        }
+
+    @staticmethod
+    def _blank_system_status() -> dict:
+        return {
+            'have': False, 'last_rx_monotonic': None,
+            'camera_ok': False, 'tof_a_ok': False, 'tof_b_ok': False,
+            'imu_ok': False, 'mag_ok': False, 'gps_ok': False,
+            'gps_detected_baud': 0, 'gps_baud_confirmed': False,
+        }
+
+    @staticmethod
+    def _blank_motor_status() -> dict:
+        return {
+            'have': False, 'last_rx_monotonic': None,
+            'state': 0, 'left_throttle': 0.0, 'right_throttle': 0.0,
+            'winch_speed': 0.0, 'servo_power': False,
+        }
+
+    @staticmethod
+    def _blank_bench_status() -> dict:
+        """Boat-reported bench-run state. The run itself lives on the boat and
+        the data lands on its SD card; this is only progress and which file
+        number it saved as."""
+        return {
+            'have': False, 'last_rx_monotonic': None,
+            'state': 0, 'kind': 0, 'base': 0.0,
+            'samples': 0, 'file_index': 0, 'elapsed_s': 0.0,
+            'learn_c': 0.0, 'p_on': False,
         }
 
     @staticmethod
@@ -268,10 +348,10 @@ class BoatLink:
             self.last_error = str(exc)
             return False
 
-    def _send_motor_locked(self, throttle: float):
+    def _send_motor_locked(self, left: float, right: float):
         msg = self.pb2.BoatMessage()
-        msg.motor.left = throttle
-        msg.motor.right = throttle
+        msg.motor.left = left
+        msg.motor.right = right
         return self._write_locked(msg.SerializeToString())
 
     def _send_steer_locked(self, rudder: float):
@@ -288,6 +368,11 @@ class BoatLink:
     def _send_servo_power_locked(self, on: bool):
         msg = self.pb2.BoatMessage()
         msg.servo_power.on = on
+        return self._write_locked(msg.SerializeToString())
+
+    def _send_training_log_locked(self):
+        msg = self.pb2.BoatMessage()
+        msg.training_log.SetInParent()   # empty message -- its presence IS the trigger
         return self._write_locked(msg.SerializeToString())
 
     def _send_arm_locked(self, arm: bool, force: bool):
@@ -329,6 +414,9 @@ class BoatLink:
             # Every connect starts from a known-safe, all-zero, disarmed
             # state -- never carry over values from a previous session.
             self.throttle = 0.0
+            self.motor_left = 0.0
+            self.motor_right = 0.0
+            self.motor_split = False
             self.rudder = 0.0
             self.winch_speed = 0.0
             self.winch_lease_until = 0.0
@@ -346,10 +434,13 @@ class BoatLink:
                 return
             self.winch_command_seq += 1
             self.throttle = 0.0
+            self.motor_left = 0.0
+            self.motor_right = 0.0
+            self.motor_split = False
             self.rudder = 0.0
             self.winch_speed = 0.0
             self.winch_lease_until = 0.0
-            self._send_motor_locked(0.0)
+            self._send_motor_locked(0.0, 0.0)
             self._send_steer_locked(0.0)
             self._send_winch_locked(0.0)
             if self.armed_cmd:
@@ -357,10 +448,17 @@ class BoatLink:
                 self.armed_cmd = False
             self._close_locked()
 
-    def set_state(self, throttle=None, rudder=None):
+    def set_state(self, throttle=None, rudder=None, left=None, right=None):
         with self._lock:
             if throttle is not None:
                 self.throttle = clamp(float(throttle), -1.0, 1.0)
+                self.motor_split = False          # linked: throttle drives both
+            if left is not None:
+                self.motor_left = clamp(float(left), -1.0, 1.0)
+                self.motor_split = True           # unlinked: independent per-motor
+            if right is not None:
+                self.motor_right = clamp(float(right), -1.0, 1.0)
+                self.motor_split = True
             if rudder is not None:
                 self.rudder = clamp(float(rudder), -1.0, 1.0)
 
@@ -421,6 +519,9 @@ class BoatLink:
                 return False, 'stale command sequence'
             self.winch_command_seq = command_seq
             self.throttle = 0.0
+            self.motor_left = 0.0
+            self.motor_right = 0.0
+            self.motor_split = False
             self.rudder = 0.0
             self.winch_speed = 0.0
             self.winch_lease_until = 0.0
@@ -429,7 +530,7 @@ class BoatLink:
             if not self.connected:
                 return False, 'serial link is disconnected'
             writes_ok = (
-                self._send_motor_locked(0.0),
+                self._send_motor_locked(0.0, 0.0),
                 self._send_steer_locked(0.0),
                 self._send_winch_locked(0.0),
             )
@@ -453,9 +554,14 @@ class BoatLink:
                 return False, 'serial link is disconnected'
             if start and not self.armed_cmd:
                 return False, 'ARM first — calibration drives the thrusters'
+            if start and self._bench_running_locked():
+                return False, 'a bench run is going \u2014 wait for it to finish'
             self.calibrating = bool(start)
             if not start:                    # leaving calibration: centre/zero
                 self.throttle = 0.0
+                self.motor_left = 0.0
+                self.motor_right = 0.0
+                self.motor_split = False
                 self.rudder = 0.0
                 self.winch_speed = 0.0
                 self.winch_lease_until = 0.0
@@ -468,12 +574,125 @@ class BoatLink:
         with self._lock:
             self.armed_cmd = bool(do_arm)
             self.force = bool(force)
+            # NOTE: disarming is also how a boat-side bench run is stopped --
+            # the boat's own bench_step aborts the moment it sees !armed.
             if not do_arm and self.calibrating:   # disarm must stop calibration
                 self.calibrating = False
                 if self.connected:
                     self._send_calibrate_locked(False)
             if self.connected:
                 self._send_arm_locked(self.armed_cmd, self.force)
+
+    def _bench_running_locked(self):
+        """True only for a run we have HEARD FROM recently. The boat publishes
+        the terminal state exactly once, so a lost packet must never leave this
+        stuck at 'running' -- that would refuse every run until a restart."""
+        if self.bench_status['state'] not in (1, 2, 3):
+            return False
+        last = self.bench_status.get('last_rx_monotonic')
+        if last is None:
+            return False
+        return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
+
+    def send_assist(self, p_on):
+        """Turn the temporary P yaw assist on or off, at RUNTIME.
+
+        Runtime and not a rebuild, so both arms of an A/B experiment run the
+        same binary -- rebuilding between arms would let a build difference
+        pass for a result. OFF returns the boat to exactly the pre-P path: the
+        firmware drops the correction rather than letting it decay."""
+        with self._lock:
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            msg = self.pb2.BoatMessage()
+            msg.assist.p_on = bool(p_on)
+            if not self._write_locked(msg.SerializeToString()):
+                return False, 'serial write failed'
+            self.p_assist_on = bool(p_on)
+            return True, None
+
+    def send_bench(self, kind, base, delta, command_seq, reset_c=0.0):
+        """Ask the BOAT to run one bench test and record it to its own SD card.
+
+        Once this is sent the boat owns the run end to end, so a radio dropout
+        afterwards cannot spoil the measurement. Stopping a run mid-flight is
+        done by DISARM -- the boat aborts the moment it sees itself disarmed.
+
+        reset_c > 0 additionally restarts the trim learner from that c, ONCE,
+        and only if the boat accepts the run. It exists for one experiment:
+        start low, start high, and see whether both walk to the same place.
+        Every ordinary run must send 0 -- c carrying over between runs is what
+        makes convergence observable, so a reset on every run would destroy
+        the measurement."""
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
+            if kind not in BENCH_KIND:
+                return False, 'unknown run type'
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            if not self.armed_cmd:
+                return False, 'ARM first \u2014 the bench run spins the thrusters'
+            if self.calibrating:
+                return False, 'calibration is running \u2014 stop it first'
+            if self._bench_running_locked():
+                return False, 'a bench run is already going'
+            try:
+                base = clamp(float(base), 0.0, 1.0)
+                delta = clamp(float(delta), 0.0, 1.0)
+                reset_c = float(reset_c)
+            except (TypeError, ValueError):
+                return False, 'throttle, delta and reset-c must be numbers'
+            if not math.isfinite(reset_c):
+                return False, 'reset-c must be a finite number'
+            # NOT clamped: silently pulling an out-of-range value to the edge
+            # would start the experiment from a c the operator never chose.
+            if reset_c != 0.0 and not (TRIMLEARN_C_MIN <= reset_c <= TRIMLEARN_C_MAX):
+                return False, ('reset-c must be between %.2f and %.2f (or 0 for '
+                               'no reset)' % (TRIMLEARN_C_MIN, TRIMLEARN_C_MAX))
+            # Our own outputs go to zero: the boat drives the run from here.
+            self.throttle = 0.0
+            self.motor_left = 0.0
+            self.motor_right = 0.0
+            self.motor_split = False
+            self.rudder = 0.0
+            msg = self.pb2.BoatMessage()
+            msg.bench.kind = BENCH_KIND[kind]
+            msg.bench.base = base
+            msg.bench.delta = delta
+            msg.bench.reset_c = reset_c
+            if not self._write_locked(msg.SerializeToString()):
+                return False, 'serial write failed'
+            return True, None
+
+    def _handle_bench_status(self, bs):
+        with self._lock:
+            self.bench_status = {
+                'have': True, 'last_rx_monotonic': time.monotonic(),
+                'state': int(bs.state), 'kind': int(bs.kind),
+                'base': float(bs.base), 'samples': int(bs.samples),
+                'file_index': int(bs.file_index),
+                'elapsed_s': float(bs.elapsed_s),
+                'learn_c': float(bs.learn_c),
+                # The BOAT's own answer, not what this tool asked for. If the
+                # two disagree the A/B is void, so it has to be visible.
+                'p_on': bool(bs.p_on),
+            }
+
+    def trigger_record(self):
+        """Fire-and-forget dataset capture (Feature 1): the boat saves a
+        full-quality JPEG + sensor sidecar to SD on its own. There is no ack
+        channel -- success here means the command was sent, not that the capture
+        landed (mirrors dashboard.html's Record button). Not gated on arm: a
+        TrainingLogCommand never touches the drive link, so it can't disturb a
+        calibration sweep either."""
+        with self._lock:
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            if not self._send_training_log_locked():
+                return False, 'serial write failed'
+            return True, None
 
     @staticmethod
     def _with_age(d: dict, stale_s: float) -> dict:
@@ -493,6 +712,9 @@ class BoatLink:
                 'connected': self.connected,
                 'port': self.port,
                 'throttle': self.throttle,
+                'motor_left': self.motor_left,
+                'motor_right': self.motor_right,
+                'motor_split': self.motor_split,
                 'rudder': self.rudder,
                 'winch_speed': self.winch_speed,
                 'winch_command_seq': self.winch_command_seq,
@@ -502,6 +724,12 @@ class BoatLink:
                 'armed_cmd': self.armed_cmd,
                 'force': self.force,
                 'calibrating': self.calibrating,
+                'calibrate': self._with_age(self.calibrate_status, TELEMETRY_STALE_S),
+                'system_status': self._with_age(self.system_status, 5.0),
+                # Sample list deliberately excluded -- the browser polls this
+                # often and the rows belong in the file, not the status blob.
+                'bench': self._with_age(self.bench_status, 5.0),
+                'motor_status': self._with_age(self.motor_status, TELEMETRY_STALE_S),
                 'seq': self.seq,
                 'last_error': self.last_error,
                 'telemetry': self._with_age(self.telemetry, TELEMETRY_STALE_S),
@@ -509,6 +737,55 @@ class BoatLink:
                 # window than telemetry is correct, not a copy/paste of it.
                 'bridge_status': self._with_age(self.bridge_status, 3.0),
             }
+
+    def _handle_system_status(self, st):
+        """Store a SystemStatus (boot / sensor-health report). The boat already
+        sends this ~1Hz over the field link; the tool used to drop MSG_STATUS,
+        which is why 'NO FIX' couldn't be told apart from 'GPS chip not even
+        wired'. gps_ok = the chip is talking to the UART, independent of a
+        satellite fix. Boot flags (camera/tof/imu/mag) don't change after boot."""
+        with self._lock:
+            self.system_status = {
+                'have': True, 'last_rx_monotonic': time.monotonic(),
+                'camera_ok': bool(st.camera_ok), 'tof_a_ok': bool(st.tof_a_ok),
+                'tof_b_ok': bool(st.tof_b_ok), 'imu_ok': bool(st.imu_ok),
+                'mag_ok': bool(st.mag_ok), 'gps_ok': bool(st.gps_ok),
+                'gps_detected_baud': int(st.gps_detected_baud),
+                'gps_baud_confirmed': bool(st.gps_baud_confirmed),
+            }
+
+    def _handle_motor_status(self, ms):
+        """Store a MotorStatus -- the boat's ACTUAL motor state / throttles /
+        winch / servo-rail power, versus what we commanded. state is esc_state_t:
+        0 disarmed, 1 arming, 2 armed. This is the confirmation the tool never
+        had (it only showed the commanded arm) and the real per-motor throttle,
+        handy for a single-ESC spin test."""
+        with self._lock:
+            self.motor_status = {
+                'have': True, 'last_rx_monotonic': time.monotonic(),
+                'state': int(ms.state),
+                'left_throttle': float(ms.left_throttle),
+                'right_throttle': float(ms.right_throttle),
+                'winch_speed': float(ms.winch_speed),
+                'servo_power': bool(ms.servo_power),
+            }
+
+    def _handle_calibrate_status(self, cs):
+        """Store a CalibrateStatus received from the boat. State follows
+        etc_state_t: 0 idle, 1 measure-noise, 2 ramp, 3 settle, 4 DONE,
+        5 ABORTED. DONE/ABORTED are terminal -> the firmware has stopped, so
+        drop our own calibrating flag even though we never sent a stop (the
+        boat reached the end on its own)."""
+        with self._lock:
+            self.calibrate_status = {
+                'have': True, 'last_rx_monotonic': time.monotonic(),
+                'state': cs.state, 'level_index': cs.level_index,
+                'level_throttle': cs.level_throttle, 'trim_diff': cs.trim_diff,
+                'yaw_avg_dps': cs.yaw_avg_dps, 'making_way': cs.making_way,
+                'points_done': cs.points_done,
+            }
+            if cs.state in (4, 5):
+                self.calibrating = False
 
     def _stream_loop(self):
         period = 1.0 / self.send_hz
@@ -524,7 +801,10 @@ class BoatLink:
                         if (self.winch_speed != 0.0 and
                                 time.monotonic() >= self.winch_lease_until):
                             self.winch_speed = 0.0
-                        self._send_motor_locked(self.throttle)
+                        if self.motor_split:
+                            self._send_motor_locked(self.motor_left, self.motor_right)
+                        else:
+                            self._send_motor_locked(self.throttle, self.throttle)
                         self._send_steer_locked(self.rudder)
                         self._send_winch_locked(self.winch_speed)
             next_tick += period
@@ -596,7 +876,8 @@ class BoatLink:
                             f'expected {expect_len}B, got {len(payload)}B (header said {plen}B)')
                 return
             (pitch, roll, heading, gps_valid, lat, lon,
-             speed_mps, course_deg, satellites, hdop) = struct.unpack(FIELD_TELEMETRY_FMT, payload)
+             speed_mps, course_deg, satellites, hdop,
+             yaw_rate) = struct.unpack(FIELD_TELEMETRY_FMT, payload)
             self._diag_counts['ok'] = self._diag_counts.get('ok', 0) + 1
             with self._lock:
                 self.telemetry = {
@@ -605,7 +886,37 @@ class BoatLink:
                     'gps_valid': bool(gps_valid), 'lat': lat, 'lon': lon,
                     'speed_mps': speed_mps, 'course_deg': course_deg,
                     'satellites': satellites, 'hdop': hdop,
+                    'yaw_rate': yaw_rate,
                 }
+            return
+
+        if msg_type == MSG_MOTOR_STATUS:
+            # MotorStatus -- actual arm/throttle/servo state. Same decode shape as
+            # SystemStatus; own branch so the sensor/telemetry paths stay untouched.
+            if len(payload) != plen:
+                return
+            try:
+                msg = self.pb2.BoatMessage()
+                msg.ParseFromString(payload)
+            except Exception:                            # noqa: BLE001
+                return
+            if msg.HasField('motor_status'):
+                self._handle_motor_status(msg.motor_status)
+            return
+
+        if msg_type == MSG_STATUS:
+            # SystemStatus (sensor-health / boot report). It's a BoatMessage too,
+            # just tagged differently -- decode it the same way, in its own branch
+            # so the sensor/telemetry paths below stay untouched.
+            if len(payload) != plen:
+                return
+            try:
+                msg = self.pb2.BoatMessage()
+                msg.ParseFromString(payload)
+            except Exception:                            # noqa: BLE001
+                return
+            if msg.HasField('status'):
+                self._handle_system_status(msg.status)
             return
 
         if msg_type != MSG_SENSOR:
@@ -626,6 +937,17 @@ class BoatLink:
                         f'{type(exc).__name__}: {exc} ({len(payload)}B payload)')
             return
         if not msg.HasField('sensors'):
+            # CalibrateStatus rides the same MSG_SENSOR frames (the P4's
+            # espnow_send_fn tags calibrate_status via its default case). It's
+            # a valid BoatMessage with a different oneof member -- route it, then
+            # fall through to the reject for anything genuinely unexpected. The
+            # sensor path below is deliberately left untouched.
+            if msg.HasField('bench_status'):
+                self._handle_bench_status(msg.bench_status)
+                return
+            if msg.HasField('calibrate_status'):
+                self._handle_calibrate_status(msg.calibrate_status)
+                return
             self._diag('decoded but no sensors field',
                         f'which_oneof={msg.WhichOneof("payload")!r}')
             return
@@ -783,10 +1105,23 @@ PAGE = """<!DOCTYPE html>
     <label class="bench"><input type="checkbox" id="bench">bench (no GPS)</label>
   </div>
   <div id="hint"></div>
-  <div class="row slider-row">
+  <div class="row" style="justify-content:flex-end;margin-bottom:2px;">
+    <label class="bench" style="color:var(--dim);"><input type="checkbox" id="motor-link" checked>Link L+R</label>
+  </div>
+  <div class="row slider-row" id="throttle-row">
     <label>Throttle</label>
     <input type="range" id="throttle" min="-100" max="100" value="0" step="5">
     <span class="val" id="throttle-val">0%</span>
+  </div>
+  <div class="row slider-row" id="motor-left-row" style="display:none;">
+    <label>Left motor</label>
+    <input type="range" id="motor-left" min="-100" max="100" value="0" step="5">
+    <span class="val" id="motor-left-val">0%</span>
+  </div>
+  <div class="row slider-row" id="motor-right-row" style="display:none;">
+    <label>Right motor</label>
+    <input type="range" id="motor-right" min="-100" max="100" value="0" step="5">
+    <span class="val" id="motor-right-val">0%</span>
   </div>
   <div class="row slider-row">
     <label>Rudder</label>
@@ -813,7 +1148,42 @@ PAGE = """<!DOCTYPE html>
     <button id="calibrate-btn" style="flex:1;" title="Learn per-throttle L/R ESC trim from gyro yaw. ARM first; calm water, making way. The boat thrusts itself through a level sweep and saves the trim to NVS on a clean finish. Click again, or STOP / DISARM, to abort.">Calibrate ESC</button>
     <span id="calibrate-status" style="font-size:10px;color:var(--dim);flex:1;text-align:right;overflow-wrap:break-word;">idle</span>
   </div>
+  <div class="row" style="margin-top:6px;">
+    <button id="record-btn" style="flex:1;" title="Trigger one dataset capture (Feature 1): the boat saves a full-quality JPEG + sensor sidecar to SD. Fire-and-forget -- confirms the command was sent, not that the capture landed.">&#9679; Record to SD</button>
+    <span id="record-status" style="font-size:10px;color:var(--dim);flex:1;text-align:right;">&mdash;</span>
+  </div>
   <button id="stop-btn">STOP</button>
+</div>
+
+<div class="card" id="bench-card">
+  <div class="card-title">Throttle mismatch test <span class="pill" id="bench-pill" style="margin-left:6px;">IDLE</span></div>
+  <div class="row slider-row">
+    <label>Throttle %</label>
+    <input type="number" id="bench-throttle" min="1" max="60" step="1" value="20" style="width:56px;">
+    <label style="min-width:auto;margin-left:10px;">Split &#177;%</label>
+    <input type="number" id="bench-delta" min="1" max="30" step="1" value="4" style="width:56px;">
+  </div>
+  <div class="row">
+    <button id="bench-left" title="left stronger / right weaker">LEFT TEST</button>
+    <button id="bench-right" title="right stronger / left weaker">RIGHT TEST</button>
+    <button id="bench-base" title="both equal -- any turn IS the mismatch">BASE TEST</button>
+  </div>
+  <div class="row" style="margin-top:6px;">
+    <label style="min-width:auto;">Restart learner at c</label>
+    <input type="number" id="bench-reset-c" min="0.10" max="0.35" step="0.01"
+           value="0.12" style="width:64px;">
+    <button id="bench-reset" title="set the learner's c ONCE, then run a normal adaptive BASE test">RESET c + BASE</button>
+  </div>
+  <div class="telem-row"><label>Learner c</label><span class="val" id="bench-learn-c">--</span></div>
+  <div class="row" style="margin-top:6px;">
+    <label style="min-width:auto;">Fast P assist</label>
+    <button id="p-assist" title="temporary proportional yaw correction on the motors -- OFF is the control arm">P ASSIST: OFF</button>
+    <span class="pill" id="p-confirm" style="margin-left:8px;">boat: --</span>
+  </div>
+  <div class="telem-row"><label>Run</label><span class="val" id="bench-progress">--</span></div>
+  <div class="telem-row"><label>Saved as</label><span class="val" id="bench-file">--</span></div>
+  <div id="bench-msg" style="font-size:10px;color:var(--warn);">boat records to its own SD card; DISARM stops a run. RESET is one-shot &mdash; ordinary BASE runs keep the learned c.</div>
+</div>
 </div>
 
 <div class="card" id="telemetry-card">
@@ -821,9 +1191,27 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Heading</label><span class="val" id="t-heading">--</span></div>
   <div class="telem-row"><label>Pitch / Roll</label><span class="val" id="t-attitude">--</span></div>
   <div class="telem-row"><label>GPS Fix</label><span class="val" id="t-fix">--</span></div>
+  <div class="telem-row"><label>GPS chip</label><span class="val" id="t-gps-chip">--</span></div>
   <div class="telem-row"><label>Lat / Lon</label><span class="val" id="t-latlon">--</span></div>
   <div class="telem-row"><label>Sats / HDOP</label><span class="val" id="t-sats">--</span></div>
   <div class="telem-row"><label>Speed / Course</label><span class="val" id="t-speed">--</span></div>
+</div>
+
+<div class="card" id="sensors-card">
+  <div class="card-title">Sensors (boot check) <span class="pill" id="sensors-pill" style="margin-left:6px;">NO DATA YET</span></div>
+  <div class="telem-row"><label>Camera</label><span class="val" id="s-camera">--</span></div>
+  <div class="telem-row"><label>ToF A</label><span class="val" id="s-tof-a">--</span></div>
+  <div class="telem-row"><label>ToF B</label><span class="val" id="s-tof-b">--</span></div>
+  <div class="telem-row"><label>IMU</label><span class="val" id="s-imu">--</span></div>
+  <div class="telem-row"><label>Compass</label><span class="val" id="s-mag">--</span></div>
+</div>
+
+<div class="card" id="motorstatus-card">
+  <div class="card-title">Motor (confirmed by boat) <span class="pill" id="mstat-pill" style="margin-left:6px;">NO DATA YET</span></div>
+  <div class="telem-row"><label>Arm state</label><span class="val" id="m-armstate">--</span></div>
+  <div class="telem-row"><label>Throttle L / R</label><span class="val" id="m-throttle">--</span></div>
+  <div class="telem-row"><label>Winch</label><span class="val" id="m-winch">--</span></div>
+  <div class="telem-row"><label>Servo rail</label><span class="val" id="m-servo">--</span></div>
 </div>
 
 <div class="card" id="bridge-card">
@@ -854,6 +1242,10 @@ const $ = id => document.getElementById(id);
 let connected = false;
 let armedCmd = false;
 let servoRailOn = false;
+// Mirrors BenchStatus in boat.proto (see BENCH_KIND_NAME / BENCH_STATE_NAME).
+const BENCH_KIND_NAME = { 0: 'BASE', 1: 'LEFT', 2: 'RIGHT' };
+const BENCH_STATE = { 0: 'IDLE', 1: 'STILL', 2: 'DRIVING', 3: 'COASTING',
+                      4: 'SAVED', 5: 'FAILED' };
 let calibrating = false;
 let winchCommandSeq = 0;
 let winchRenewTimer = null;
@@ -930,15 +1322,49 @@ $('throttle').addEventListener('input', (e) => {
   api('/api/state', 'POST', { throttle: v / 100 });
 });
 
+// Link toggle: checked = one Throttle slider drives both motors; unchecked =
+// splits into independent Left/Right sliders (single-ESC test). On each switch we
+// seed the newly shown slider(s) from the current value and push it, so the
+// motors never jump when you flip the mode.
+function setMotorLink(linked) {
+  $('throttle-row').style.display    = linked ? '' : 'none';
+  $('motor-left-row').style.display  = linked ? 'none' : '';
+  $('motor-right-row').style.display = linked ? 'none' : '';
+  if (linked) {
+    const v = parseInt($('motor-left').value);   // re-link at the left motor's value
+    $('throttle').value = v; $('throttle-val').textContent = v + '%';
+    api('/api/state', 'POST', { throttle: v / 100 });
+  } else {
+    const v = parseInt($('throttle').value);      // split: both start at the throttle value
+    $('motor-left').value = v;  $('motor-left-val').textContent = v + '%';
+    $('motor-right').value = v; $('motor-right-val').textContent = v + '%';
+    api('/api/state', 'POST', { left: v / 100, right: v / 100 });
+  }
+}
+$('motor-link').addEventListener('change', (e) => setMotorLink(e.target.checked));
+
+$('motor-left').addEventListener('input', (e) => {
+  const v = parseInt(e.target.value);
+  $('motor-left-val').textContent = v + '%';
+  api('/api/state', 'POST', { left: v / 100 });
+});
+$('motor-right').addEventListener('input', (e) => {
+  const v = parseInt(e.target.value);
+  $('motor-right-val').textContent = v + '%';
+  api('/api/state', 'POST', { right: v / 100 });
+});
+
 $('rudder').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('rudder-val').textContent = v + '%';
-  // Negated on purpose, matching dashboard.html's own JS boundary exactly:
-  // firmware's steer wire value is +1.0=full-right (STEER_HOME); dashboard.html
-  // lines slider -100 up with that. This tool's slider had no such flip and
-  // was silently the opposite of dashboard.html's -- same slider, same label,
-  // opposite real boat direction. Fixed here, at this UI's own boundary only.
-  api('/api/state', 'POST', { rudder: -v / 100 });
+  // Slider is intuitive: drag RIGHT (+100) -> +1.0 on the wire -> full-right
+  // servo (firmware STEER_HOME = +1.0 = right). This tool and dashboard.html
+  // DELIBERATELY use opposite sliders -- dashboard.html's default sits at its
+  // left end (-100) which it flips to full-right to match its home position;
+  // this tool centres at 0 and maps right->right directly. Both send correct
+  // wire values; do NOT "sync" them by negating one, that just makes this one
+  // steer backwards (regression, reverted).
+  api('/api/state', 'POST', { rudder: v / 100 });
 });
 
 function winchMagnitude() {
@@ -1057,6 +1483,54 @@ $('calibrate-btn').addEventListener('click', async () => {
   await api('/api/calibrate', 'POST', { start, seq: ++winchCommandSeq });
 });
 
+// Dataset capture (Feature 1) -- fire-and-forget, no ack. The boat saves the
+// JPEG + sensor sidecar to SD on its own; this only confirms the command left.
+// Bench throttle-mismatch test. One press records a WHOLE run -- motors off,
+// then the test command, then coasting -- and the file keeps all of it. Once
+// started nothing cuts it short; only STOP or DISARM ends it early.
+async function runBench(kind, resetC) {
+  if (!connected) { $('bench-msg').textContent = 'not connected'; return; }
+  const base = parseInt($('bench-throttle').value) / 100;
+  const delta = parseInt($('bench-delta').value) / 100;
+  $('bench-msg').textContent = '';
+  const r = await api('/api/bench', 'POST',
+                      { kind, base, delta, reset_c: resetC || 0,
+                        seq: ++winchCommandSeq });
+  if (r && !r.ok) $('bench-msg').textContent = r.error || 'refused';
+}
+// The plain buttons send reset_c 0 -- they MUST keep whatever c the learner
+// has reached, or convergence across runs could never be seen.
+$('bench-left').addEventListener('click', () => runBench('left', 0));
+$('bench-right').addEventListener('click', () => runBench('right', 0));
+$('bench-base').addEventListener('click', () => runBench('both', 0));
+// Runtime switch, deliberately not a rebuild: both arms of the A/B must run
+// the same binary. OFF is the control arm and the default.
+var pAssistOn = false;
+$('p-assist').addEventListener('click', async () => {
+  const want = !pAssistOn;
+  const r = await api('/api/assist', 'POST', { p_on: want });
+  if (r && r.ok) {
+    pAssistOn = want;
+    $('p-assist').textContent = 'P ASSIST: ' + (want ? 'ON' : 'OFF');
+    $('p-assist').classList.toggle('up', want);
+  } else if (r) {
+    $('bench-msg').textContent = r.error || 'refused';
+  }
+});
+$('bench-reset').addEventListener('click', () => {
+  var c = parseFloat($('bench-reset-c').value);
+  if (!isFinite(c) || c <= 0) { $('bench-msg').textContent = 'enter a starting c'; return; }
+  runBench('both', c);
+});
+
+$('record-btn').addEventListener('click', async () => {
+  if (!connected) { $('record-status').textContent = 'no link'; return; }
+  $('record-status').textContent = 'sending...';
+  const r = await api('/api/record', 'POST', {});
+  $('record-status').textContent = (r && r.ok) ? 'sent ✓'
+                                               : ('failed: ' + ((r && r.error) || '?'));
+});
+
 function applyStatus(s) {
     if (Number.isInteger(s.winch_command_seq)) {
       winchCommandSeq = Math.max(winchCommandSeq, s.winch_command_seq);
@@ -1071,14 +1545,30 @@ function applyStatus(s) {
     calibrating = !!s.calibrating;
     $('calibrate-btn').textContent = calibrating ? 'Stop Calibration' : 'Calibrate ESC';
     $('calibrate-btn').classList.toggle('disarm', calibrating);
-    // ESP-NOW telemetry is SensorSnapshot-only, so we cannot show the firmware's
-    // live CalibrateStatus here -- only that WE are keeping the sweep alive. The
-    // boat's own serial log has the per-level progress; a finished sweep leaves
-    // the boat stopped (the firmware's start-latch ignores our keepalive until
-    // an explicit Stop). So: watch the boat, and STOP when it settles or drifts.
-    $('calibrate-status').textContent = calibrating
-      ? 'sweeping — watch the boat; STOP when done or if it drifts'
-      : 'idle';
+    // The boat's CalibrateStatus rides the telemetry link, so show its real
+    // state. etc_state_t: 1 measuring, 2 ramp, 3 settling, 4 DONE, 5 aborted.
+    // (If a terminal frame is dropped by ESP-NOW we keep showing the last
+    // progress line; the boat has stopped, so STOP resets it either way.)
+    var cal = s.calibrate;
+    var cel = $('calibrate-status');
+    if (cal && cal.have && !cal.stale) {
+      var st = cal.state;
+      if (st === 4) {
+        cel.textContent = '✓ DONE — ' + cal.points_done + ' points saved';
+      } else if (st === 5) {
+        cel.textContent = '✗ ABORTED — nothing saved';
+      } else {
+        var nm = {1: 'measuring noise', 2: 'ramping', 3: 'settling'};
+        var thr = Math.round((cal.level_throttle || 0) * 100);
+        cel.textContent = (nm[st] || ('state ' + st)) + ' · L' + cal.level_index +
+          ' @' + thr + '% · trim ' + (cal.trim_diff || 0).toFixed(3) +
+          ' · pts ' + cal.points_done + (cal.making_way ? '' : ' · (no way)');
+      }
+    } else if (calibrating) {
+      cel.textContent = 'starting… watch the boat';
+    } else {
+      cel.textContent = 'idle';
+    }
     servoRailOn = s.servo_rail_cut === false;
     updateWinchControls();
     $('seq').textContent = s.seq;
@@ -1108,6 +1598,99 @@ function applyStatus(s) {
     $('t-sats').textContent = t.have ? `${t.satellites} / ${t.hdop.toFixed(1)}` : '--';
     $('t-speed').textContent = (t.have && t.gps_valid)
       ? `${t.speed_mps.toFixed(1)} m/s / ${t.course_deg.toFixed(0)}°` : '--';
+
+    // Sensor-health / boot check (SystemStatus). The boat sends this ~1Hz over
+    // the field link; without it, 'NO FIX' hid whether the GPS chip was even
+    // alive. gps_ok = chip talking to the UART, independent of a satellite lock.
+    const ss = s.system_status;
+    const setOk = (id, v) => {
+      const el = $(id);
+      el.textContent = v ? 'OK' : 'DEAD';
+      el.classList.toggle('warn', !v);
+    };
+    const spill = $('sensors-pill');
+    const chip = $('t-gps-chip');
+    if (!ss || !ss.have) {
+      spill.textContent = 'NO DATA YET';
+      spill.classList.remove('up', 'stale');
+      chip.textContent = '--';
+      chip.classList.remove('warn');
+    } else {
+      spill.textContent = ss.stale ? `STALE ${ss.age_s.toFixed(0)}s` : 'LIVE';
+      spill.classList.toggle('stale', ss.stale);
+      spill.classList.toggle('up', !ss.stale);
+      setOk('s-camera', ss.camera_ok);
+      setOk('s-tof-a', ss.tof_a_ok);
+      setOk('s-tof-b', ss.tof_b_ok);
+      setOk('s-imu', ss.imu_ok);
+      setOk('s-mag', ss.mag_ok);
+      const baud = ss.gps_detected_baud
+        ? ` @${ss.gps_detected_baud}${ss.gps_baud_confirmed ? '' : '?'}` : '';
+      chip.textContent = (ss.gps_ok ? 'talking' : 'DEAD — check wiring') + baud;
+      chip.classList.toggle('warn', !ss.gps_ok);
+    }
+
+    // MotorStatus -- the boat's ACTUAL arm/throttle/servo, vs what we commanded.
+    // state (esc_state_t): 0 disarmed, 1 arming, 2 armed. Compare "ARMED
+    // (confirmed)" here against the arm button's "(commanded)" to see if an arm
+    // actually took (the thing you couldn't tell before).
+    const mst = s.motor_status;
+    const mpill = $('mstat-pill');
+    if (!mst || !mst.have) {
+      mpill.textContent = 'NO DATA YET';
+      mpill.classList.remove('up', 'stale');
+      $('m-armstate').textContent = '--';
+      $('m-throttle').textContent = '--';
+      $('m-winch').textContent = '--';
+      $('m-servo').textContent = '--';
+      $('m-servo').classList.remove('warn');
+    } else {
+      mpill.textContent = mst.stale ? `STALE ${mst.age_s.toFixed(0)}s` : 'LIVE';
+      mpill.classList.toggle('stale', mst.stale);
+      mpill.classList.toggle('up', !mst.stale);
+      const armTxt = mst.state === 2 ? 'ARMED' : (mst.state === 1 ? 'ARMING' : 'DISARMED');
+      $('m-armstate').textContent = armTxt + ' (confirmed)';
+      $('m-throttle').textContent =
+        `${Math.round(mst.left_throttle * 100)}% / ${Math.round(mst.right_throttle * 100)}%`;
+      $('m-winch').textContent = `${Math.round(mst.winch_speed * 100)}%`;
+      const servoEl = $('m-servo');
+      servoEl.textContent = mst.servo_power ? 'ON' : 'OFF';
+      servoEl.classList.toggle('warn', !mst.servo_power);
+    }
+
+    // The BOAT runs the test and writes the file; this just shows its progress
+    // and which file number it saved as. Read the runs with tools/bench_analyze.py.
+    var bn = s.bench;
+    if (bn) {
+      var benchPill = $('bench-pill');
+      var running = bn.have && [1, 2, 3].indexOf(bn.state) !== -1;
+      benchPill.textContent = !bn.have ? 'IDLE'
+        : (BENCH_STATE[bn.state] || ('state ' + bn.state));
+      benchPill.classList.toggle('up', !!running);
+      $('bench-progress').textContent = bn.have
+        ? (BENCH_KIND_NAME[bn.kind] || '?') + '  ' + bn.elapsed_s.toFixed(1)
+          + 's  ' + bn.samples + ' samples'
+        : '--';
+      if (bn.have && bn.file_index) {
+        var pct = Math.round(bn.base * 100);
+        $('bench-file').textContent = 'T' + (pct < 10 ? '0' : '') + pct + '_'
+          + (BENCH_KIND_NAME[bn.kind] || '?').charAt(0) + '_'
+          + (bn.file_index < 10 ? '0' : '') + bn.file_index + '.CSV';
+      } else if (!bn.have) {
+        $('bench-file').textContent = '--';
+      }
+      // What the BOAT reports, next to what we asked for. A mismatch voids
+      // the A/B, so it is shown rather than assumed.
+      if (bn.have) {
+        var bp = !!bn.p_on;
+        $('p-confirm').textContent = 'boat: ' + (bp ? 'ON' : 'OFF');
+        $('p-confirm').classList.toggle('up', bp);
+        $('p-confirm').classList.toggle('warn', bp !== pAssistOn);
+      }
+      $('bench-learn-c').textContent =
+        (bn.have && typeof bn.learn_c === 'number' && bn.learn_c > 0)
+          ? bn.learn_c.toFixed(3) : '--';
+    }
 
     const b = s.bridge_status;
     const bpill = $('bridge-pill');
@@ -1268,7 +1851,8 @@ class Handler(BaseHTTPRequestHandler):
             self.link.disconnect()
             self._json({'ok': True})
         elif self.path == '/api/state':
-            self.link.set_state(throttle=body.get('throttle'), rudder=body.get('rudder'))
+            self.link.set_state(throttle=body.get('throttle'), rudder=body.get('rudder'),
+                                left=body.get('left'), right=body.get('right'))
             self._json({'ok': True})
         elif self.path == '/api/winch':
             command_seq = body.get('seq')
@@ -1326,6 +1910,46 @@ class Handler(BaseHTTPRequestHandler):
             code = 200 if ok else (503 if err in (
                 'serial link is disconnected', 'serial write failed') else 409)
             self._json({'ok': ok, 'error': err}, code)
+        elif self.path == '/api/bench':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            kind = body.get('kind')
+            if not isinstance(kind, str):
+                self._json({'ok': False, 'error': 'kind must be a string'}, 400)
+                return
+            values = {}
+            for label in ('base', 'delta'):
+                val = body.get(label)
+                if (not isinstance(val, (int, float)) or isinstance(val, bool) or
+                        not math.isfinite(val)):
+                    self._json({'ok': False,
+                                'error': '%s must be a finite number' % label}, 400)
+                    return
+                values[label] = val
+            reset_c = body.get('reset_c', 0.0)
+            if (not isinstance(reset_c, (int, float)) or isinstance(reset_c, bool)
+                    or not math.isfinite(reset_c)):
+                self._json({'ok': False,
+                            'error': 'reset_c must be a finite number'}, 400)
+                return
+            ok, err = self.link.send_bench(kind, values['base'], values['delta'],
+                                           command_seq, reset_c)
+            code = 200 if ok else (503 if err in (
+                'serial link is disconnected', 'serial write failed') else 409)
+            self._json({'ok': ok, 'error': err}, code)
+        elif self.path == '/api/assist':
+            p_on = body.get('p_on')
+            if not isinstance(p_on, bool):
+                self._json({'ok': False, 'error': 'p_on must be true or false'}, 400)
+                return
+            ok, err = self.link.send_assist(p_on)
+            self._json({'ok': ok, 'error': err}, 200 if ok else 503)
+        elif self.path == '/api/record':
+            ok, err = self.link.trigger_record()
+            self._json({'ok': ok, 'error': err}, 200 if ok else 503)
         else:
             self.send_response(404)
             self.end_headers()

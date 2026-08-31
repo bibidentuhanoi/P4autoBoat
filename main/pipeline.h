@@ -111,6 +111,22 @@ typedef void (*calibrate_command_handler_fn)(bool start, bool average_into_exist
  */
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
 
+/* Bench throttle-mismatch test: the boat runs the profile and records to its
+ * own SD card, so the link is only used to press the button. */
+/* reset_c > 0 asks the trim learner to restart from that c, ONCE, and only if
+ * the run is actually accepted. 0 leaves the learner untouched, which is what
+ * every ordinary run sends. */
+typedef void (*bench_command_handler_fn)(uint32_t kind, float base, float delta,
+                                         float reset_c);
+void pipeline_register_bench_handler(bench_command_handler_fn handler);
+
+/* Runtime P-assist switch. Runtime so both arms of an A/B run the same
+ * firmware -- a rebuild between arms could pass a build difference off as a
+ * result. */
+typedef void (*assist_command_handler_fn)(bool p_on);
+void pipeline_register_assist_handler(assist_command_handler_fn handler);
+void pipeline_publish_bench_status(const boat_BenchStatus *status);
+
 /**
  * @brief Encode a CalibrateStatus to protobuf and fan out to all transports.
  *        Called from the control task while a calibration sweep runs.

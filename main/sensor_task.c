@@ -691,9 +691,10 @@ void task_sensor_snapshot(void *pvParameters)
              * boat.proto at all on this path). WiFi/WS mode never reaches
              * this branch, so its full-fidelity snapshot is untouched. */
             espnow_telemetry_t tel = {
-                .pitch   = imu.pitch,
-                .roll    = imu.roll,
-                .heading = imu.heading,
+                .pitch    = imu.pitch,
+                .roll     = imu.roll,
+                .heading  = imu.heading,
+                .yaw_rate = imu.yaw_rate,
             };
             if (have_gps) {
                 tel.gps_valid  = gps.valid;

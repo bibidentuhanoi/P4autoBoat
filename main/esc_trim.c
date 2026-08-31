@@ -60,6 +60,29 @@ void esc_trim_apply(float *left, float *right, const EscTrimPoint *pts, uint8_t 
     *right += 0.5f * trim;
 }
 
+void esc_trim_apply_pair(float trim, float *left, float *right)
+{
+    if (!left || !right || !isfinite(trim)) return;
+    if (*left <= 0.0f && *right <= 0.0f) return;   /* stopped stays stopped */
+    *left = clamp01(*left - 0.5f * trim);
+    *right = clamp01(*right + 0.5f * trim);
+}
+
+uint8_t esc_trim_build_proportional(float c, EscTrimPoint *out)
+{
+    if (!out || !isfinite(c) || c == 0.0f) return 0;
+    /* c = 0.5 already means the right motor is commanded 3x the left. Past
+     * that the "small correction" reading breaks down and it is far more
+     * likely a typo than a real boat, so refuse to build it. */
+    if (c > 0.5f) c = 0.5f;
+    if (c < -0.5f) c = -0.5f;
+    out[0].throttle_frac = 0.0f;
+    out[0].trim_diff = 0.0f;
+    out[1].throttle_frac = 1.0f;
+    out[1].trim_diff = 2.0f * c;
+    return 2;
+}
+
 void esc_trim_mix(float throttle, float rudder, const EscTrimPoint *pts,
                   uint8_t count, float *left, float *right)
 {

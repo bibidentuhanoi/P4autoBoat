@@ -60,6 +60,15 @@ PB_BIND(boat_CalibrateCommand, boat_CalibrateCommand, AUTO)
 PB_BIND(boat_CalibrateStatus, boat_CalibrateStatus, AUTO)
 
 
+PB_BIND(boat_AssistCommand, boat_AssistCommand, AUTO)
+
+
+PB_BIND(boat_BenchCommand, boat_BenchCommand, AUTO)
+
+
+PB_BIND(boat_BenchStatus, boat_BenchStatus, AUTO)
+
+
 PB_BIND(boat_BoatMessage, boat_BoatMessage, 4)
 
 

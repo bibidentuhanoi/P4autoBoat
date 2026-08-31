@@ -82,5 +82,38 @@ int main(void)
     assert(fabsf(esc_trim_lookup(pts_single, 1, 0.5f) - (-0.09f)) < 1e-6f);
     assert(fabsf(esc_trim_lookup(pts_single, 1, 1.0f) - (-0.09f)) < 1e-6f);
 
+    /* Sign of the MEASURED trim (2026-08-25 bench sweep: the boat stopped
+     * turning at a 7.55% right-heavy split, so the correction is "right gets
+     * 7.6% more"). esc_trim_mix does left -= t/2, right += t/2, so that is a
+     * POSITIVE 0.152. Getting this backwards drives the boat the wrong way at
+     * twice the strength, which is the runaway the clamp exists to catch. */
+    {
+        EscTrimPoint measured[1] = {
+            { .throttle_frac = 1.0f, .trim_diff = 0.152f },
+        };
+        float l = 0.0f, r = 0.0f;
+        esc_trim_mix(0.40f, 0.0f, measured, 1, &l, &r);
+        assert(r > l);                                   /* RIGHT must get more */
+        assert(fabsf((r - l) - 0.152f) < 1e-4f);         /* by 2 x 7.6% */
+        assert(fabsf(((l + r) * 0.5f) - 0.40f) < 1e-4f); /* total thrust unchanged */
+    }
+
+    /* The motors-off phases of a bench run command (0,0). A trim must NOT
+     * spin one of them up there -- that would corrupt the very baseline the
+     * trim is measured against. */
+    {
+        float l = 0.0f, r = 0.0f;
+        esc_trim_apply_pair(0.152f, &l, &r);
+        assert(l == 0.0f && r == 0.0f);
+
+        l = 0.40f; r = 0.40f;                    /* driving: trim applies */
+        esc_trim_apply_pair(0.152f, &l, &r);
+        assert(r > l && fabsf((r - l) - 0.152f) < 1e-4f);
+
+        l = 0.0f; r = 0.40f;                     /* one side live: still applies */
+        esc_trim_apply_pair(0.152f, &l, &r);
+        assert(fabsf(r - 0.476f) < 1e-4f);
+    }
+
     return 0;
 }

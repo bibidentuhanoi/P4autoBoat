@@ -2,6 +2,9 @@
 #include "arm_sequence.h"
 #include "esc_trim.h"
 #include "esc_trim_cal.h"
+#include "bench_run.h"
+#include "trim_learn.h"
+#include "trim_assist.h"
 #include "file_system.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
@@ -173,6 +176,96 @@ static uint8_t s_esc_trim_count = 0;
  * (stability_sas_tick) so neither fights the calibration routine's probing.
  * Owned by the control task: only calibration_tick writes it. */
 static bool s_calibrating = false;
+/* Bench throttle-mismatch run. s_bench_active mirrors s_calibrating: it tells
+ * the rest of the control cycle that something else owns the ESCs this tick. */
+static bool s_bench_active = false;
+/* On-the-fly trim learner. s_trim_moved lets the drive path know c changed even
+ * when no new pilot command arrived -- the ESC write is otherwise gated on
+ * drive_changed, so a silently-adapting c would never reach the motors. */
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+static trim_learn_t s_trim_learn;
+static trim_learn_cfg_t s_trim_learn_cfg;
+static uint64_t s_trim_last_capture_us = 0;
+#endif
+static bool s_trim_moved = false;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+/* The fast P correction, added on top of the learned c and never stored.
+ * s_p_assist_on is a RUNTIME switch (default off) so the A and B arms of the
+ * experiment run the same firmware -- a rebuild between arms would let a
+ * compiler or config difference masquerade as a result. */
+static trim_assist_t s_trim_assist;
+static trim_assist_cfg_t s_trim_assist_cfg;
+static bool s_p_assist_on = false;
+static float s_p_correction = 0.0f;
+/* Set by the RX task, consumed by the control task. The control task is the
+ * only writer of s_p_assist_on and of everything downstream of it. */
+static bool s_p_assist_req = false;
+static bool s_p_assist_req_pending = false;
+/* Set by the control task on a P transition, printed by the core-1 logger. */
+static bool s_p_log_pending = false;
+#endif
+/* Read by the drive path in BOTH builds; always false when P is compiled out. */
+static bool s_p_moved = false;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+/* Why the learner is not moving, or NULL when it is. Written on the control
+ * task, read by the core-1 logger: a torn read costs one wrong log line and
+ * nothing else, which is far cheaper than a lock on the 10 ms path. */
+static const char *s_trim_why = "starting up";
+static float s_trim_thr = 0.0f;
+#endif
+static bench_t s_bench;
+/* Run profile. Zero-initialising this would make every run finish instantly,
+ * so it is spelled out here. 0.5 s still + 3.0 s driving + 1.0 s coasting. */
+/* Run length is set by the POOL and by COMPARABILITY, never by the learner.
+ *
+ * 3 s, the same as every run recorded before 2026-08-29, so new files can be
+ * held against the ~200 already on file. That comparison is the whole value of
+ * the BASE test and must not be traded away lightly.
+ *
+ * A 10 s BASE run was tried so the learner could converge inside one run. In a
+ * 1.2 m pool that backfires: the hull reaches the wall at a median of 4 s and
+ * bounces for the rest, so 33% of all recorded run time was post-contact,
+ * against 19% for the old 3 s runs. The trim was not less stable -- the
+ * recording just contained twice as much wall.
+ *
+ * The learner does not need a long run anyway: c carries over between runs, so
+ * three short runs integrate exactly like one long one, and short runs are
+ * what the fixed-trim results were validated under.
+ *
+ *   3 s -> 12% post-contact   4 s -> 16%   5 s -> 19%   10 s -> 33%
+ *
+ * And the long run did not even help. The learner keeps MOVING at a steady
+ * ~50% of its maximum rate throughout, but once the hull is bouncing the
+ * disturbance is symmetric, so it steps up as often as down and cancels:
+ *
+ *   first 3 s: 0.0034 of c per second  |  next 7 s: 0.0010 per second
+ *
+ * Three quarters of the progress happens in the first three seconds.
+ *
+ * A LEFT/RIGHT run is deliberately turning throughout and only has to show
+ * which way, so it stays short. */
+#define BENCH_RUN_US_SPLIT 3000000
+#define BENCH_RUN_US_BASE  3000000
+
+static bench_cfg_t s_bench_cfg = {
+    .baseline_us = 500000,
+    .run_us      = BENCH_RUN_US_SPLIT,      /* set per kind in bench_tick */
+    .coast_us    = 1000000,
+    .max_yaw_dps = 200.0f,   /* safety only -- a held boat never gets near this */
+};
+static bool s_bench_start_pending = false;
+/* > 0 asks the learner to restart from that c. Consumed by the single run it
+ * arrived with -- never latched, so an ordinary run that follows cannot
+ * inherit it. */
+static float s_bench_req_reset_c = 0.0f;
+static uint32_t s_bench_req_kind = 0;
+static float s_bench_req_base = 0.0f, s_bench_req_delta = 0.0f;
+static boat_BenchStatus s_bench_status;
+static uint32_t s_bench_status_generation = 0;
+static uint32_t s_bench_file_index = 0;
+/* Set by the control task when a run finishes; the SD write itself is done
+ * by the core-1 diagnostics task via motor_control_bench_flush(). */
+static volatile bool s_bench_save_pending = false;
 
 /* ESC-trim calibration state. The pure state machine (esc_trim_cal) lives in
  * s_cal; s_cal_cfg is loaded once from Kconfig. The two *_pending flags and
@@ -191,6 +284,13 @@ static bool s_cal_start_pending = false;
 static bool s_cal_stop_pending = false;
 static bool s_cal_average = false;
 static bool s_cal_ready = true;   /* start-latch: a start fires only on a clean edge (see calibration_tick) */
+/* True when the boat's current arm was a FORCE arm ("bench / no GPS"). Set on
+ * every arm from decision->force_arm, so while armed it always reflects that
+ * arm (a normal re-arm resets it). Calibration uses it to decide whether to
+ * GPS-gate: force-armed = operator said "no GPS" = skip the making-way gate;
+ * normal-armed = GPS present = keep it. */
+static bool s_force_armed = false;
+static float s_cal_min_speed_cfg = 0.3f;   /* GPS making-way threshold (Kconfig); per-run value derives from this + force-arm */
 static int64_t s_cal_baseline_rx_us = 0;
 static int64_t s_cal_last_rx_us = 0;
 static etc_out_t s_cal_out;   /* this tick's step output (ESC commands + done/abort) */
@@ -480,6 +580,33 @@ static void cal_status_commit(const etc_t *cal, float yaw_avg, bool making_way)
     portEXIT_CRITICAL(&s_status_lock);
 }
 
+static void bench_status_commit(void)
+{
+    boat_BenchStatus st = boat_BenchStatus_init_zero;
+    st.state      = (uint32_t)s_bench.state;
+    st.kind       = (uint32_t)s_bench.kind;
+    st.base       = s_bench.base;
+    st.samples    = s_bench.count;
+    st.file_index = s_bench_file_index;
+    st.elapsed_s  = s_bench.elapsed_s;
+    st.learn_c    = motor_control_trimlearn_c();
+    st.p_on       = motor_control_p_assist_on();
+    portENTER_CRITICAL(&s_status_lock);
+    s_bench_status = st;
+    s_bench_status_generation++;
+    portEXIT_CRITICAL(&s_status_lock);
+}
+
+uint32_t motor_control_get_bench_status(boat_BenchStatus *out)
+{
+    if (!out) return 0;
+    portENTER_CRITICAL(&s_status_lock);
+    uint32_t generation = s_bench_status_generation;
+    *out = s_bench_status;
+    portEXIT_CRITICAL(&s_status_lock);
+    return generation;
+}
+
 uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out)
 {
     if (!out) return 0;
@@ -649,6 +776,38 @@ static void arm_command_handler(bool arm, bool force)
  * wrapper: CalibrateCommand traffic is deliberately invisible to the driving
  * link heartbeat (design doc sec 7a). s_cal_last_rx_us is calibration's own,
  * separate liveness signal. */
+/* Runs in the pipeline RX task. Sets a pending flag only -- the control task
+ * owns every actuator write, same rule as calibrate_command_handler. */
+/* RX task. Records a REQUEST and nothing else.
+ *
+ * Every byte of P state -- the filter, the correction, the enable flag -- is
+ * owned by the control task. Touching it from here would race the 100 Hz loop
+ * mid-mix and could leave the ESCs holding a correction the gate has already
+ * revoked. */
+static void assist_command_handler(bool p_on)
+{
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    portENTER_CRITICAL(&s_arbiter_lock);
+    s_p_assist_req = p_on;
+    s_p_assist_req_pending = true;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+#else
+    (void)p_on;
+#endif
+}
+
+static void bench_command_handler(uint32_t kind, float base, float delta,
+                                  float reset_c)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    s_bench_start_pending = true;
+    s_bench_req_kind = kind;
+    s_bench_req_base = base;
+    s_bench_req_delta = delta;
+    s_bench_req_reset_c = reset_c;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+}
+
 static void calibrate_command_handler(bool start, bool average)
 {
     portENTER_CRITICAL(&s_arbiter_lock);
@@ -795,8 +954,167 @@ static bool control_apply_arm_action(control_decision_t *decision, bool safe_sto
     return false;
 }
 
+/* One learner step per FUSION SAMPLE (50 Hz), not per control tick (100 Hz):
+ * acting every tick would integrate each gyro sample twice. */
+static void trim_learn_tick(const control_decision_t *decision)
+{
+    s_trim_moved = false;
+    s_p_moved = false;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    /* Apply a pending enable/disable HERE, on the control task, before any
+     * gate is evaluated -- so an OFF takes effect on this very tick and the
+     * clean value is remixed in the same cycle. */
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool req_pending = s_p_assist_req_pending;
+    bool req = s_p_assist_req;
+    s_p_assist_req_pending = false;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    if (req_pending && req != s_p_assist_on) {
+        s_p_assist_on = req;
+        if (!req) {                     /* OFF returns to the exact pre-P path */
+            trim_assist_reset(&s_trim_assist);
+            if (s_p_correction != 0.0f) s_p_moved = true;
+            s_p_correction = 0.0f;
+        }
+        /* NOT logged here: one ESP_LOG line is a ~9 ms synchronous UART write
+         * and this is the 10 ms control task. Hand the transition to the
+         * core-1 logger instead. */
+        s_p_log_pending = true;
+    }
+    /* A BASE run commands both motors equal, so it IS a straight-line demand
+     * and any yaw is exactly the error the learner exists to remove: it stays
+     * LIVE, and bench_tick reads its c every tick, so the correction reaches
+     * the jets during the run and the file records it happening.
+     *
+     * A LEFT/RIGHT run is the opposite -- the boat is deliberately turning,
+     * and learning from a commanded turn would poison c with the very
+     * perturbation the test applies. Calibration owns the motors outright. */
+    const bool bench_learning = s_bench_active &&
+                                s_bench.kind == BENCH_KIND_BASE &&
+                                s_bench.state == BENCH_RUN;
+    if (s_calibrating || (s_bench_active && !bench_learning)) {
+        s_trim_why = "bench/cal owns the motors";
+        /* Drop P here too. This return is BEFORE the P block, so without it a
+         * LEFT/RIGHT run or a calibration would keep applying whatever
+         * correction was live when it started -- fighting the very
+         * perturbation the test is applying. */
+        if (s_p_correction != 0.0f) s_p_moved = true;   /* never overwrite:
+                                 * a pending OFF this same tick already set it */
+        trim_assist_reset(&s_trim_assist);
+        s_p_correction = 0.0f;
+        /* Forget when the last sample was. Otherwise the first sample after a
+         * 5 s bench run carries dt = 5 s, and the step is proportional to dt.
+         * trim_learn_update bounds this too; dropping it here is what makes
+         * the gap explicit rather than merely survivable. */
+        s_trim_last_capture_us = 0;
+        return;
+    }
+
+    FusionResult f = {0};
+    fusion_get_result(&f);
+    int64_t age_us = (f.captured_us != 0)
+                   ? (esp_timer_get_time() - (int64_t)f.captured_us) : INT64_MAX;
+    bool healthy = imu_icm_ok() && f.sequence != 0 &&
+                   age_us <= (int64_t)CONFIG_STABILITY_SAS_MAX_AGE_MS * 1000;
+
+    float dt_s = 0.0f;
+    if (s_trim_last_capture_us != 0 && f.captured_us > s_trim_last_capture_us) {
+        dt_s = (float)(f.captured_us - s_trim_last_capture_us) / 1000000.0f;
+    }
+    /* Any rudder demand means the boat is MEANT to be turning. */
+    bool steering = fabsf(decision->rudder) > 0.02f;
+
+    /* A held-up throttle slider on a DISARMED boat is not a measurement: the
+     * jets are dead, the boat is not moving, and every degree the gyro reads is
+     * noise or someone carrying it. Integrating that is a random walk on c.
+     * Reporting throttle 0 freezes the integrator while still letting the yaw
+     * filter track, so it is already settled when the motors do come on. */
+    bool driving = (esc_driver_get_state() == ESC_STATE_ARMED);
+    float thr = driving ? decision->throttle : 0.0f;
+    if (bench_learning) {
+        /* The bench is driving, not the pilot -- whose throttle the tool zeroes
+         * at the button press. Reading that zero would freeze the learner on
+         * the low-throttle gate through the entire run. */
+        thr = driving ? s_bench.base : 0.0f;
+        steering = false;                   /* BASE commands both jets equal */
+    }
+
+    /* RAW gyro, deliberately. Subtracting the run's motors-off baseline was
+     * tried and made it measurably WORSE (dataout/autotrim2, 39 runs). The
+     * baseline does not predict what the gyro does once the motors run:
+     * corr(raw, baseline) = -0.16 over one session and +0.05 over the next,
+     * i.e. nothing. Subtracting an uncorrelated offset removes no bias and
+     * adds a second noise source -- and this one is a step held for a whole
+     * run rather than white noise, the worst possible input to an integrator:
+     *
+     *     sd(raw) 0.40  ->  sd(raw - baseline) 0.92
+     *     c wandered 0.129..0.206  ->  0.114..0.277, repeatedly hitting the
+     *     per-run maximum step of 0.050, twice reaching the clamp.
+     *
+     * What DOES track c is the raw yaw: slope +11 to +20 deg/s per unit c,
+     * r = +0.53..+0.83 across five level-fits. The plant is real and raw is
+     * the signal. Do not reintroduce the subtraction.
+     *
+     * bench_baseline_yaw() is still logged as a diagnostic -- knowing it is
+     * uncorrelated is worth seeing. */
+    const float yaw = f.yaw_rate;
+
+    uint32_t before = s_trim_learn.last_seq;
+    bool fresh_sample = (f.sequence != before);
+    s_trim_moved = trim_learn_update(&s_trim_learn, &s_trim_learn_cfg,
+                                     f.sequence, dt_s, yaw,
+                                     thr, steering, healthy);
+    if (s_trim_learn.last_seq != before) s_trim_last_capture_us = f.captured_us;
+
+    /* --- the fast P correction, on the SAME sample the learner just used ---
+     *
+     * Every gate the learner has, plus the switch and the impact threshold.
+     * A false gate RESETS rather than decays: the correction must not survive
+     * a pause, so that OFF and "gated off" are the same state, and so the A
+     * arm of the experiment is bit-identical to the pre-P firmware. */
+    const float p_prev = s_p_correction;
+    bool p_gate = s_p_assist_on && healthy && driving && !steering &&
+                  (thr >= s_trim_learn_cfg.min_throttle) &&
+                  (fabsf(yaw) <= TRIM_LEARN_REJECT_DPS);
+    if (fresh_sample) {
+        s_p_correction = trim_assist_update(&s_trim_assist, &s_trim_assist_cfg,
+                                            dt_s, yaw, p_gate);
+    } else if (!p_gate) {
+        trim_assist_reset(&s_trim_assist);
+        s_p_correction = 0.0f;
+    }
+    /* A changed correction must reach the ESCs even with no new pilot command,
+     * or P would be visible in the log and absent from the motors. */
+    if (s_p_correction != p_prev) s_p_moved = true;
+
+    s_trim_why = !healthy   ? "gyro stale"
+               : steering   ? "steering"
+               : !driving   ? "disarmed"
+               : s_trim_learn.faulted ? "FAULTED at the clamp"
+               : (thr < s_trim_learn_cfg.min_throttle) ? "throttle too low"
+               : NULL;                      /* NULL == actually learning */
+    s_trim_thr = thr;
+#else
+    (void)decision;
+#endif
+}
+
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+/* The value the mixer actually uses: learned c plus the temporary P
+ * correction, inside the learner's own bounds. The learned c is untouched --
+ * only this sum reaches the mixer, and only the I learner may move c itself.
+ * Both call sites are inside the same #if, so this is too. */
+static float effective_trim_c(float learned_c)
+{
+    return trim_assist_effective_c(learned_c, s_p_correction,
+                                   s_trim_learn_cfg.c_min,
+                                   s_trim_learn_cfg.c_max);
+}
+#endif
+
 static void control_apply_decision(control_decision_t *decision)
 {
+    trim_learn_tick(decision);
     bool changed = false;
     bool explicit_off = decision->servo_power_off;
     /* Arm-gating and the failsafe-zeroing branch below both use general link
@@ -875,7 +1193,7 @@ static void control_apply_decision(control_decision_t *decision)
          * off-centre and corrupt the yaw measurement. An explicit PWR-OFF still
          * cuts the rail (the explicit_off branch above, not this one) and aborts
          * calibration via s_rail_cut. */
-        if (winch_driver_get_power() && !s_calibrating) {
+        if (winch_driver_get_power() && !s_calibrating && !s_bench_active) {
             winch_driver_set_power(false);
             changed = true;
         }
@@ -883,7 +1201,7 @@ static void control_apply_decision(control_decision_t *decision)
         s_manual_right = 0.0f;
         s_manual_rudder = 0.0f;
         heading_assist_reset();
-        if (!control_link_alive() && changed && !s_calibrating) {
+        if (!control_link_alive() && changed && !s_calibrating && !s_bench_active) {
             ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
         }
     }
@@ -895,6 +1213,7 @@ static void control_apply_decision(control_decision_t *decision)
     if (!safe_stop) {
         if (decision->arm || decision->force_arm) {
             s_arm_power_allowed = true;
+            s_force_armed = decision->force_arm;   /* bench/no-GPS arm vs normal arm */
             submit_arm_request(ARM_REQUEST_ARM, decision->force_arm,
                                esp_timer_get_time());
         }
@@ -909,23 +1228,38 @@ static void control_apply_decision(control_decision_t *decision)
             }
         }
 
-        if (decision->drive_changed) {
+        if (decision->drive_changed || s_trim_moved || s_p_moved) {
             float left;
             float right;
             esc_driver_get_throttle(&left, &right);
             float target_left  = decision->left;
             float target_right = decision->right;
-            if (!s_calibrating) {
+            if (!s_calibrating && !s_bench_active) {
+                const EscTrimPoint *pts = s_esc_trim;
+                uint8_t count = s_esc_trim_count;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+                /* The learned trim scales with throttle, so hand the mixer a
+                 * single point holding this cycle's value. Mixer units are
+                 * twice the split (left -= t/2, right += t/2). */
+                EscTrimPoint learned = {
+                    .throttle_frac = 1.0f,
+                    .trim_diff = 2.0f * effective_trim_c(s_trim_learn.c)
+                                     * clampf(decision->throttle, 0.0f, 1.0f),
+                };
+                pts = &learned;
+                count = 1;
+#endif
                 esc_trim_mix(decision->throttle, decision->rudder,
-                             s_esc_trim, s_esc_trim_count,
-                             &target_left, &target_right);
+                             pts, count, &target_left, &target_right);
             }
             if (left != target_left || right != target_right) {
                 esc_driver_set_throttle(target_left, target_right);
                 changed = true;
             }
-            s_manual_left = clampf(decision->left, 0.0f, 1.0f);
-            s_manual_right = clampf(decision->right, 0.0f, 1.0f);
+            if (decision->drive_changed) {   /* only a real command sets these */
+                s_manual_left = clampf(decision->left, 0.0f, 1.0f);
+                s_manual_right = clampf(decision->right, 0.0f, 1.0f);
+            }
         }
 
         if (decision->winch_changed) {
@@ -967,7 +1301,7 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
 #if CONFIG_STABILITY_SAS_ENABLE
     /* Calibration owns the rudder (holds it at 0) and the ESCs while it runs;
      * SAS must not fight it. calibration_tick already ran this cycle. */
-    if (s_calibrating) {
+    if (s_calibrating || s_bench_active) {
         return;
     }
     if (!s_stab_cfg_loaded) {
@@ -1064,13 +1398,14 @@ static void load_cal_cfg(void)
     s_cal_cfg.trim_clamp = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_CLAMP, 0.30f, 0.05f, 1.0f);
     s_cal_cfg.accept_k = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_ACCEPT_K, 3.0f, 0.5f, 10.0f);
     s_cal_cfg.excessive_yaw_dps = (float)CONFIG_STABILITY_TRIMCAL_MAX_YAW_DPS;
-    s_cal_cfg.min_speed_mps = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_MIN_SPEED_MPS, 0.3f, 0.0f, 10.0f);
+    s_cal_min_speed_cfg = parse_cfg_float(CONFIG_STABILITY_TRIMCAL_MIN_SPEED_MPS, 0.3f, 0.0f, 10.0f);
+    s_cal_cfg.min_speed_mps = s_cal_min_speed_cfg;   /* per-run value is set at start from force-arm */
     s_cal_cfg.window_ticks = CONFIG_STABILITY_TRIMCAL_WINDOW_TICKS;
     s_cal_cfg.noise_ticks = CONFIG_STABILITY_TRIMCAL_NOISE_TICKS;
     s_cal_cfg.settle_in_us = (int64_t)CONFIG_STABILITY_TRIMCAL_SETTLE_MS * 1000;
     s_cal_cfg.level_timeout_us = (int64_t)CONFIG_STABILITY_TRIMCAL_LEVEL_TIMEOUT_MS * 1000;
     /* Starting level list -- confirm on the water, config not commitment. */
-    const float levels[] = {0.2f, 0.4f, 0.6f, 0.8f};
+    const float levels[] = {0.05f, 0.10f, 0.20f, 0.30f};
     s_cal_cfg.level_count = (uint8_t)(sizeof(levels) / sizeof(levels[0]));
     for (uint8_t i = 0; i < s_cal_cfg.level_count && i < ESC_TRIM_MAX_POINTS; ++i) {
         s_cal_cfg.levels[i] = levels[i];
@@ -1083,6 +1418,277 @@ static void load_cal_cfg(void)
  * s_calibrating). Non-blocking: one esc_trim_cal_step per tick, no I/O except
  * the NVS write on a clean finish. Owns nothing until a start command lands and
  * the ARMED + link gates hold. See design doc sec 6/7/7a. */
+/* Write the buffered run to the card. 8.3 filenames only
+ * (CONFIG_FATFS_LFN_NONE=y), so the name is "T<pct>_<K>_<NN>.CSV" -- exactly 8
+ * characters before the dot. The WHOLE run is written (baseline, drive and
+ * coast) so which part is useful can be decided later, off the file. */
+static void bench_write_csv(void)
+{
+    const char kc = (s_bench.kind == BENCH_KIND_LEFT) ? 'L'
+                  : (s_bench.kind == BENCH_KIND_RIGHT) ? 'R' : 'B';
+    unsigned pct = (unsigned)(s_bench.base * 100.0f + 0.5f);
+    if (pct > 99u) pct = 99u;
+
+    char name[16];
+    unsigned idx = 0;
+    for (unsigned i = 1; i <= 99u; ++i) {
+        uint8_t probe = 0;
+        size_t got = 0;
+        snprintf(name, sizeof(name), "T%02u_%c_%02u.CSV", pct, kc, i);
+        if (fs_sdcard_read(name, &probe, 1, &got) == ESP_ERR_NOT_FOUND) {
+            idx = i;                        /* first free slot: never overwrite */
+            break;
+        }
+    }
+    if (idx == 0) {
+        ESP_LOGE(TAG, "BENCH,save_failed,no free filename");
+        s_bench.state = BENCH_FAILED;
+        return;
+    }
+    s_bench_file_index = idx;
+
+    /* Each flush is a whole fopen/fwrite/fflush/fclose on FAT, and it takes
+     * the SD lock that the C6 radio shares (one mutex for both slots, in
+     * ESP-IDF's own driver). So the count of flushes -- not the byte total --
+     * is what decides how long the link goes quiet after a run. A 10 s BASE
+     * run is ~48 KB; at 1 KB a flush that is ~48 of them, roughly a second of
+     * silence. 4 KB brings it to ~12, fewer than the old short runs took. */
+    static char chunk[8192];
+    int n = snprintf(chunk, sizeof(chunk), "t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,split,at_cap\n");
+    if (n <= 0 || fs_sdcard_write(name, chunk, (size_t)n) != ESP_OK) {
+        ESP_LOGE(TAG, "BENCH,save_failed,%s", name);
+        s_bench.state = BENCH_FAILED;
+        return;
+    }
+
+    const float base_s = (float)s_bench_cfg.baseline_us / 1000000.0f;
+    const float run_s  = base_s + (float)s_bench_cfg.run_us / 1000000.0f;
+    n = 0;
+    for (uint16_t i = 0; i < s_bench.count; ++i) {
+        if ((size_t)n > sizeof(chunk) - 96u) {      /* flush before it can truncate */
+            (void)fs_sdcard_append(name, chunk, (size_t)n);
+            n = 0;
+        }
+        const bench_sample_t *smp = &s_bench.samples[i];
+        const char *ph = (smp->t_s < base_s) ? "baseline"
+                       : ((smp->t_s < run_s) ? "run" : "coast");
+        int w = snprintf(chunk + n, sizeof(chunk) - (size_t)n,
+                         "%.3f,%s,%.3f,%.3f,%.3f,%.4f,"
+                         "%u,%.3f,%.4f,%.4f,%.4f,%u\n",
+                         (double)smp->t_s, ph, (double)smp->yaw_rate_dps,
+                         (double)smp->left, (double)smp->right, (double)smp->c,
+                         (unsigned)((smp->p_flags & BENCH_P_ON) ? 1u : 0u),
+                         (double)smp->p_yaw,
+                         (double)smp->c_learn,
+                         (double)smp->p_corr,
+                         (double)(0.5f * (smp->right - smp->left)),
+                         (unsigned)((smp->p_flags & BENCH_P_AT_CAP) ? 1u : 0u));
+        if (w < 0 || (size_t)w >= sizeof(chunk) - (size_t)n) break;
+        n += w;
+    }
+    if (n > 0) (void)fs_sdcard_append(name, chunk, (size_t)n);
+
+    ESP_LOGI(TAG, "BENCH,saved,%s,samples=%u%s", name, (unsigned)s_bench.count,
+             s_bench.overflow ? ",OVERFLOW" : "");
+}
+
+/* One bench tick. Mirrors calibration_tick: the control task owns the ESCs,
+ * nothing blocks, and the run is driven by the clock -- a telemetry gap can
+ * never cut the recording short. */
+/* Runs on the core-1 diagnostics task, never on the control loop. Safe because
+ * the control task does not touch the sample buffer once a run has finished,
+ * and a new run is refused while a save is still pending. */
+/* What the BOAT thinks, not what the tool asked for. The A/B is void if the
+ * two ever disagree, so the operator must be able to see the boat's own
+ * answer. */
+bool motor_control_p_assist_on(void)
+{
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    return s_p_assist_on;
+#else
+    return false;
+#endif
+}
+
+float motor_control_trimlearn_c(void)
+{
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    return s_trim_learn.c;
+#else
+    return 0.0f;
+#endif
+}
+
+void motor_control_trimlearn_log(void)
+{
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    /* Core-1 diagnostics only. One ESP_LOG line is ~100 bytes, and the UART
+     * writes it synchronously -- ~9 ms at 115200, which alone would blow the
+     * control task's 10 ms deadline. */
+    static int64_t last_us = 0;
+    static float last_c = -1.0f;
+    static const char *last_why = "";
+    int64_t now = esp_timer_get_time();
+    bool moved = fabsf(s_trim_learn.c - last_c) >= 0.005f;
+    bool changed_why = (s_trim_why != last_why);
+    if (!moved && !changed_why && now - last_us < 5000000) return;
+    last_us = now;
+    last_c = s_trim_learn.c;
+    last_why = s_trim_why;
+
+    if (s_p_log_pending) {
+        s_p_log_pending = false;
+        ESP_LOGW(TAG, "P-ASSIST %s (kp=%.3f tau=%.2f cap=%.3f)",
+                 s_p_assist_on ? "ON" : "OFF",
+                 (double)s_trim_assist_cfg.kp, (double)s_trim_assist_cfg.tau_s,
+                 (double)s_trim_assist_cfg.cap);
+    }
+    if (s_trim_why) {
+        ESP_LOGI(TAG, "TRIMLEARN,hold,c=%.3f,yaw=%+.2f,thr=%.2f,why=%s",
+                 (double)s_trim_learn.c, (double)s_trim_learn.yaw_filt,
+                 (double)s_trim_thr, s_trim_why);
+    } else {
+        ESP_LOGI(TAG, "TRIMLEARN,learn,c=%.3f,yaw=%+.2f,thr=%.2f,split=%.1f%%"
+                      ",zero=%+.2f",
+                 (double)s_trim_learn.c, (double)s_trim_learn.yaw_filt,
+                 (double)s_trim_thr,
+                 (double)(trim_learn_split(&s_trim_learn, s_trim_thr) * 100.0f),
+                 (double)bench_baseline_yaw(&s_bench));
+    }
+#endif
+}
+
+void motor_control_bench_flush(void)
+{
+    if (!s_bench_save_pending) return;
+    bench_write_csv();                      /* sets SAVED or FAILED */
+    s_bench_save_pending = false;
+    bench_status_commit();                  /* only now is the file real */
+}
+
+static void bench_tick(int64_t now_us)
+{
+    portENTER_CRITICAL(&s_arbiter_lock);
+    bool start_req = s_bench_start_pending;
+    s_bench_start_pending = false;
+    uint32_t kind = s_bench_req_kind;
+    float base = s_bench_req_base, delta = s_bench_req_delta;
+    float reset_c = s_bench_req_reset_c;
+    s_bench_req_reset_c = 0.0f;             /* one shot, consumed here */
+    portEXIT_CRITICAL(&s_arbiter_lock);
+
+    if (start_req && !s_bench_active && !s_calibrating) {
+        if (esc_driver_get_state() == ESC_STATE_ARMED && !s_rail_cut &&
+            fs_sdcard_ready() && !s_bench_save_pending) {
+            if (kind > (uint32_t)BENCH_KIND_RIGHT) kind = (uint32_t)BENCH_KIND_BASE;
+            bench_init(&s_bench);
+            s_bench_cfg.run_us = (kind == (uint32_t)BENCH_KIND_BASE)
+                               ? BENCH_RUN_US_BASE : BENCH_RUN_US_SPLIT;
+            if (bench_start(&s_bench, (bench_kind_t)kind, base, delta, now_us)) {
+                s_bench_active = true;
+                s_bench_file_index = 0;
+                /* Inside the accepted branch on purpose: a rejected start must
+                 * leave the learner exactly as it was, or a refused button
+                 * press would silently discard everything it had learned. */
+                if (reset_c > 0.0f) {
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+                    if (trim_learn_reset(&s_trim_learn, &s_trim_learn_cfg,
+                                         reset_c)) {
+                        s_trim_last_capture_us = 0;
+                        trim_assist_reset(&s_trim_assist);
+                        s_p_correction = 0.0f;
+                        ESP_LOGW(TAG, "BENCH,trimlearn_reset,c=%.3f",
+                                 (double)reset_c);
+                    } else {
+                        ESP_LOGW(TAG, "BENCH,trimlearn_reset_REFUSED,c=%.3f,"
+                                      "bounds=%.2f..%.2f", (double)reset_c,
+                                 (double)s_trim_learn_cfg.c_min,
+                                 (double)s_trim_learn_cfg.c_max);
+                    }
+#else
+                    ESP_LOGW(TAG, "BENCH,trimlearn_reset_IGNORED,"
+                                  "learner compiled out");
+#endif
+                }
+                ESP_LOGI(TAG, "BENCH,start,kind=%u,base=%.2f,delta=%.2f",
+                         (unsigned)kind, (double)base, (double)delta);
+            }
+        } else {
+            ESP_LOGW(TAG, "BENCH,start_rejected,armed=%d,rail_cut=%d,sd=%d,saving=%d",
+                     (int)(esc_driver_get_state() == ESC_STATE_ARMED),
+                     (int)s_rail_cut, (int)fs_sdcard_ready(),
+                     (int)s_bench_save_pending);
+        }
+    }
+
+    if (!s_bench_active) return;
+
+    FusionResult fusion = {0};
+    fusion_get_result(&fusion);
+    /* A run must measure the trim the boat is ACTUALLY running, or "press BASE
+     * and see if it goes straight" answers a question about some other trim.
+     * With the learner on that is its current c, read fresh EVERY TICK -- the
+     * learner stays live through a BASE run (trim_learn_tick only bails for
+     * LEFT/RIGHT runs and calibration), so the correction reaches the jets
+     * during the run and the per-sample c column records it moving. */
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    const float bench_trim = 2.0f * effective_trim_c(s_trim_learn.c) * s_bench.base;
+#else
+    const float bench_trim = esc_trim_lookup(s_esc_trim, s_esc_trim_count,
+                                             s_bench.base);
+#endif
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    const bench_assist_t bench_pa = {
+        .yaw_filt   = s_trim_assist.yaw_filt,
+        .correction = s_p_correction,
+        .learned_c  = s_trim_learn.c,
+        .on         = s_p_assist_on,
+        .at_cap     = s_trim_assist.at_cap,
+    };
+    const bench_assist_t *pa = &bench_pa;
+#else
+    const bench_assist_t *pa = NULL;
+#endif
+    bench_out_t o = bench_step(&s_bench, &s_bench_cfg, now_us, fusion.yaw_rate,
+                               esc_driver_get_state() == ESC_STATE_ARMED,
+                               bench_trim, pa);
+
+    if (o.active) {
+        /* Last ESC write of the cycle, overriding control_apply_decision --
+         * the driving link is deliberately idle during a run. Rudder centred.
+         *
+         * The stored trim is applied HERE TOO, exactly as esc_trim_mix would.
+         * Without it a bench run drives the raw, uncorrected motors, so a BASE
+         * run after setting a trim would read unchanged and look like the fix
+         * failed. With it the bench becomes a closed loop: measure, apply,
+         * re-measure, and a corrected boat reads zero. */
+        esc_driver_set_throttle(o.left_cmd, o.right_cmd);
+        if (steer_driver_get() != 0.0f) {
+            steer_driver_set(0.0f);
+        }
+    }
+
+    if (o.finished) {
+        esc_driver_set_throttle(0.0f, 0.0f);
+        /* The SD write is FAR too slow for this 10 ms critical loop (tens of
+         * fopen/fclose on FAT, and the card shares a driver mutex with the C6
+         * radio). Hand it to the core-1 diagnostics task instead. */
+        s_bench_save_pending = true;
+        s_bench_active = false;
+    } else if (o.aborted) {
+        esc_driver_set_throttle(0.0f, 0.0f);
+        s_bench_active = false;
+        ESP_LOGW(TAG, "BENCH,aborted,reason=%s -- nothing saved",
+                 o.reason ? o.reason : "?");
+    }
+
+    /* ~5 Hz, plus always on a terminal state, same as the calibration status. */
+    static uint8_t bench_status_div = 0;
+    if ((++bench_status_div % 20) == 0 || o.aborted) {
+        bench_status_commit();
+    }
+}
+
 static void calibration_tick(int64_t now_us)
 {
     portENTER_CRITICAL(&s_arbiter_lock);
@@ -1121,12 +1727,17 @@ static void calibration_tick(int64_t now_us)
     if (start_req && !s_calibrating && s_cal_ready) {
         if (esc_driver_get_state() == ESC_STATE_ARMED && cal_link_alive && !s_rail_cut) {
             s_cal_cfg.average_into_existing = average;
+            /* Force-armed ("bench / no GPS") -> drop the making-way gate so a
+             * level records on yaw settling alone (operator watches the boat).
+             * Normal-armed (GPS present) -> keep the gate at its Kconfig value. */
+            s_cal_cfg.min_speed_mps = s_force_armed ? 0.0f : s_cal_min_speed_cfg;
             esc_trim_cal_start(&s_cal, &s_cal_cfg);
             s_cal_baseline_rx_us = link_rx_us;   /* any later manual cmd advances past this = abort */
             s_cal_out = (etc_out_t){0};
             s_calibrating = true;
             s_cal_ready = false;                 /* latched until an explicit stop re-arms */
-            ESP_LOGI(TAG, "CAL,start,avg=%d,levels=%u", (int)average, (unsigned)s_cal_cfg.level_count);
+            ESP_LOGI(TAG, "CAL,start,avg=%d,levels=%u,gps_gate=%d",
+                     (int)average, (unsigned)s_cal_cfg.level_count, (int)!s_force_armed);
         } else {
             ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d",
                      (int)(esc_driver_get_state() == ESC_STATE_ARMED), (int)s_rail_cut);
@@ -1149,7 +1760,9 @@ static void calibration_tick(int64_t now_us)
 
     gps_fix_t gps = {0};
     (void)gps_driver_get_fix(&gps);
-    bool making_way = gps.valid && gps.speed_mps >= s_cal_cfg.min_speed_mps;
+    /* force-armed skips the gate (min_speed is 0 for this run), so report making
+     * way; otherwise report the real GPS-based state. */
+    bool making_way = s_force_armed || (gps.valid && gps.speed_mps >= s_cal_cfg.min_speed_mps);
 
     /* Abort (handed to the state machine's manual_override gate) on any of:
      *   - a real manual throttle/winch/steer command accepted since the sweep
@@ -1228,6 +1841,7 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
 
     control_apply_decision(&decision);
     calibration_tick(start_us);
+    bench_tick(start_us);
     stability_sas_tick(decision.steer_raw, start_us);
     status_commit_current(false);
 
@@ -1323,6 +1937,36 @@ esp_err_t motor_control_init(void)
     pipeline_register_servo_power_handler(servo_power_command_handler);
     pipeline_register_steer_raw_handler(steer_raw_command_handler);
     pipeline_register_calibrate_handler(calibrate_command_handler);
+    pipeline_register_bench_handler(bench_command_handler);
+    pipeline_register_assist_handler(assist_command_handler);
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    s_trim_learn_cfg = (trim_learn_cfg_t){
+        /* Same number the static table uses -- the learner starts where the
+         * bench left off and only ever corrects the residual. */
+        .c_init = parse_cfg_float(CONFIG_ESC_TRIM_C, 0.20f, 0.0f, 0.5f),
+        .c_min = 0.10f, .c_max = 0.35f,
+        .deadband_dps = parse_cfg_float(CONFIG_STABILITY_TRIMLEARN_DEADBAND_DPS, 0.5f, 0.05f, 10.0f),
+        .step_per_s = parse_cfg_float(CONFIG_STABILITY_TRIMLEARN_STEP_PER_S, 0.005f, 0.0001f, 0.1f),
+        .yaw_tau_s = 2.0f,
+        .min_throttle = parse_cfg_float(CONFIG_STABILITY_TRIMLEARN_MIN_THROTTLE, 0.15f, 0.0f, 1.0f),
+        .reject_dps = TRIM_LEARN_REJECT_DPS,
+    };
+    s_trim_assist_cfg = (trim_assist_cfg_t){
+        .kp    = parse_cfg_float(CONFIG_STABILITY_PASSIST_KP, 0.020f, 0.0f, 0.20f),
+        .tau_s = parse_cfg_float(CONFIG_STABILITY_PASSIST_TAU_S, 0.50f, 0.02f, 5.0f),
+        .cap   = parse_cfg_float(CONFIG_STABILITY_PASSIST_CAP, 0.030f, 0.0f, 0.20f),
+    };
+    trim_assist_reset(&s_trim_assist);
+    ESP_LOGI(TAG, "P-assist built in (default OFF): kp=%.3f tau=%.2fs cap=%.3f",
+             (double)s_trim_assist_cfg.kp, (double)s_trim_assist_cfg.tau_s,
+             (double)s_trim_assist_cfg.cap);
+    trim_learn_init(&s_trim_learn, &s_trim_learn_cfg);
+    ESP_LOGI(TAG, "TrimLearn ON: c=%.3f deadband=%.2f deg/s step=%.4f/s "
+                  "min_thr=%.2f reject=%.0f deg/s",
+             s_trim_learn_cfg.c_init, s_trim_learn_cfg.deadband_dps,
+             s_trim_learn_cfg.step_per_s, s_trim_learn_cfg.min_throttle,
+             s_trim_learn_cfg.reject_dps);
+#endif
 
     esp_err_t task_error = runtime_task_create(RUNTIME_TASK_ARM_SEQUENCE,
                                                task_arm_sequence, NULL,

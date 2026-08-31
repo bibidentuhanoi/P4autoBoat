@@ -161,6 +161,182 @@ menu "Board Configuration"
             default 1500
             range 1000 2000
 
+        config STABILITY_TRIMLEARN_ENABLE
+            bool "Learn the L/R trim on the fly from the gyro"
+            default y
+            help
+                Continuously adjusts ONE number c, the differential split as a
+                FRACTION of throttle (split = c * throttle), so the correction
+                rescales itself when the throttle changes. Integrator only --
+                direction of drift, never magnitude -- with a deadband, and
+                frozen while steering, at low throttle, disarmed, on a stale
+                gyro, and through a bench run or an ESC calibration.
+
+                It moves the motors on its own, so the bounds matter: c is held
+                to [0.10, 0.35] and may move at most 0.005/s, and touching
+                either bound is treated as a FAULT that latches and stops --
+                wrong sign, blocked jet or bad gyro all land there rather than
+                sitting on the rail pretending to work.
+
+                Starts at ESC_TRIM_C, so switching it off changes nothing until
+                it has learned something. The drift-to-correction SIGN is not a
+                guess: 11 dataset groups on this boat agree that too little
+                trim reads negative yaw and too much reads positive.
+
+                Set to n to run the flashed ESC_TRIM_C fixed.
+
+        config STABILITY_PASSIST_KP
+            string "P-assist: c per deg/s of yaw"
+            default "0.035"
+            depends on STABILITY_TRIMLEARN_ENABLE
+            help
+                A TEMPORARY proportional correction added on top of the learned
+                c. Never stored, never learned, reset the instant its gates stop
+                holding. Switched on at RUNTIME (default off) so the A and B
+                arms of an experiment run the same firmware.
+
+                The measured plant is 16.1 deg/s per unit c, so unity loop gain
+                would be 0.062. 0.035 is ~56% of that.
+
+                0.020 was the first candidate, but simulating the real recorded
+                traces through the measured 1.10 s hull lag showed it reaching
+                only -12% of heading error inside a 3 s run, against a -20% bar.
+                0.035 reaches -24%, with no measurable rise in high-frequency
+                yaw (the hull's own lag filters P's output).
+
+                ROBUST TO THE LAKE. The pool is only the proving ground; at
+                speed the hull is more directionally stable, so the plant gain
+                and lag both change. Swept against the real traces:
+
+                    plant      hull 0.5s  hull 1.1s  hull 2.5s
+                     5.0 deg/s     -13%      -13%       -11%
+                    10.0           -24%      -23%       -20%
+                    16.1 (pool)    -34%      -32%       -29%
+                    25.0           -45%      -44%       -39%
+
+                It helps everywhere and never flips sign. Loop gain stays
+                0.18-0.88, under unity across the whole range, so a P-only loop
+                on a first-order plant cannot oscillate -- and the cap bounds
+                what it can do even if the plant is further off than this.
+
+        config STABILITY_PASSIST_TAU_S
+            string "P-assist: fast yaw filter time constant (s)"
+            default "0.25"
+            depends on STABILITY_TRIMLEARN_ENABLE
+            help
+                Set by the HULL, not by taste. The measured yaw response to a
+                motor step is a 1.10 s time constant with ~0.3 s of dead time
+                (untrimmed T40 runs). A filter faster than the hull chases gyro
+                noise the boat cannot follow: at 0.15 s the correction sits at
+                its cap 30% of the time on noise alone, against 17% at 0.50 s.
+
+                But the POOL caps a run at 3 s, and P's correction only reaches
+                the yaw after the filter plus the 1.10 s hull lag. Simulated on
+                90 real runs, 0.50 s left too little of the run to act in:
+
+                    tau   0.2-2.0s  1.0-3.0s window
+                    0.15     -11%      -21%
+                    0.25     -10%      -21%
+                    0.50      -6%      -19%
+                    1.00      -0%      -14%
+
+                0.25 s buys the response back without measurably raising
+                high-frequency yaw. Below 0.25 s nothing further is gained --
+                the hull cannot follow it.
+
+                On the LAKE this choice barely matters: with continuous running
+                the loop reaches steady state and 0.15 / 0.25 / 0.50 / 1.00 all
+                give -31 to -32%. 0.25 is picked purely so the 3 s POOL test
+                has margin above its bar (-24% vs -20% at 0.50 s). The pool is
+                the proving ground, not the target.
+
+        config STABILITY_PASSIST_CAP
+            string "P-assist: max |correction| in c units"
+            default "0.075"
+            depends on STABILITY_TRIMLEARN_ENABLE
+            help
+                0.075 of c moves each motor by at most 3.0 percentage points at
+                T40 and can cancel about 1.2 deg/s of yaw.
+
+                Chosen as the smallest cap that is NOT limiting: simulated on
+                90 real runs, 0.030 gave -15% (saturated 51% of the time),
+                0.050 gave -21% (28%), and 0.075 gave -24% (9%). Raising it
+                further to 0.100 or removing it entirely still gives -24%, so
+                past 0.075 the cap costs nothing and protects less.
+
+        config STABILITY_TRIMLEARN_DEADBAND_DPS
+            string "TrimLearn: ignore drift below this (deg/s)"
+            default "0.5"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_TRIMLEARN_STEP_PER_S
+            string "TrimLearn: max change in c per second"
+            default "0.005"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_TRIMLEARN_MIN_THROTTLE
+            string "TrimLearn: freeze below this throttle"
+            default "0.15"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config ESC_TRIM_C
+            string "L/R trim as a FRACTION of throttle (the one number)"
+            default "0.17"
+            help
+                split = c * throttle, so left = T*(1-c) and right = T*(1+c).
+                POSITIVE gives the RIGHT motor more.
+
+                This is the whole trim in one dimensionless number, and it is
+                what the bench measured. The split that makes the boat go
+                straight is NOT constant -- 2.3% at T10, 6.5% at T30, 7.0% at
+                T35, 7.5% at T40 -- but split/throttle is: 0.23, 0.22, 0.20,
+                0.19. So one c covers 10-50%.
+
+                A flat trim cannot do that. 0.152 (the T40 answer) was flashed
+                and verified at T30/T40/T45, then read +8.4 deg/s at T10 --
+                over-corrected by 4x because a fixed number does not rescale.
+
+                0.17 +/- 0.035, and that error bar is real -- it is the
+                measurement limit, not a slicing choice.
+
+                Found by bracketing the SIGN FLIP, no line fitted: bin all 63
+                adaptive runs by the c they ran with, and find the pair of bins
+                where median yaw changes sign. Twelve independent slices (five
+                time windows, two sessions, three throttles) give 0.145, 0.155,
+                0.160, 0.162, 0.165, 0.167, 0.168, 0.175, 0.182, 0.195, 0.203,
+                0.212. Median 0.171.
+
+                The two cleanest windows agree closely: 0.5-2.0 s (after
+                spin-up, before the hull reaches the pool wall) gives 0.165 and
+                3.0-10 s gives 0.168.
+
+                Note the band contains both 0.16 and 0.20, so this data cannot
+                tell those apart. It CAN say the answer is near 0.17 and that
+                0.24 and above is measurably too much. Per throttle it is
+                0.162 / 0.203 / 0.145 at T20 / T30 / T40 -- no trend, which is
+                what the one-number model predicts.
+
+                Above ~83% throttle the mixer runs out of headroom (it will not
+                clip the pilot's command to make room for trim), so the trim
+                tapers there. It is untouched over the whole 10-50% range.
+
+                Wins over both ESC_TRIM_DEFAULT and any NVS table.
+                Set "0.0" to fall back to those.
+
+        config ESC_TRIM_DEFAULT
+            string "FLAT fallback trim (only when ESC_TRIM_C is 0)"
+            default "0.152"
+            help
+                esc_trim_mix units: left -= trim/2, right += trim/2, so a
+                POSITIVE value gives the RIGHT motor more.
+
+                0.152 = right +7.6%, measured 2026-08-25 at T40. Correct AT T40
+                and wrong everywhere else -- kept only so the flat behaviour can
+                be reproduced for comparison. Prefer ESC_TRIM_C.
+
+                Used only when ESC_TRIM_C is "0.0". Set "0.0" to fall back to
+                the NVS table.
+
         config ESC_MIN_THR_LEFT_PCT
             int "Left ESC minimum-thrust floor (% throttle where the LEFT jet just starts)"
             default 5
@@ -171,7 +347,7 @@ menu "Board Configuration"
 
         config ESC_MIN_THR_RIGHT_PCT
             int "Right ESC minimum-thrust floor (% throttle where the RIGHT jet just starts)"
-            default 20
+            default 19
             range 0 95
             help
                 Measured right-jet dead-band. Tune each motor in water so equal

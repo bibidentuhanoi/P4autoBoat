@@ -143,6 +143,42 @@ message CalibrateStatus {
   uint32 points_done    = 7;
 }
 
+// Runtime switch for the temporary proportional yaw assist. Runtime, not
+// compile-time, so the A and B arms of an experiment run the SAME firmware --
+// a rebuild between arms would let a build difference look like a result.
+message AssistCommand {
+  bool p_on = 1;
+}
+
+// Bench throttle-mismatch test. The BOAT runs the whole profile and records to
+// its OWN SD card, so a radio dropout cannot spoil the measurement -- the link
+// is only used to press the button. kind: 0 = BASE (both equal, so any turn IS
+// the mismatch), 1 = LEFT stronger, 2 = RIGHT stronger.
+message BenchCommand {
+  uint32 kind  = 1;
+  float  base  = 2;  // both motors at this throttle, 0..1
+  float  delta = 3;  // split added to one side and taken off the other
+  // ONE-SHOT: set the trim learner's c to this before the run, and clear its
+  // filter and any latched fault. Applied only if the run is actually
+  // accepted. 0 (or absent) leaves the learner exactly as it was, which is
+  // what every ordinary BASE run sends -- c must carry over between runs or
+  // convergence can never be observed.
+  float  reset_c = 4;
+}
+
+// No string field on purpose: nanopb strings need a size option, and the file
+// name is fully derivable from kind/base/file_index (T<pct>_<K>_<NN>.CSV).
+message BenchStatus {
+  uint32 state      = 1;  // 0 idle, 1 baseline, 2 run, 3 coast, 4 saved, 5 failed
+  uint32 kind       = 2;
+  float  base       = 3;
+  uint32 samples    = 4;
+  uint32 file_index = 5;
+  float  elapsed_s  = 6;
+  float  learn_c    = 7;  // the trim learner's c right now (0 if compiled out)
+  bool   p_on       = 8;  // the BOAT's own P-assist state, not the tool's
+}
+
 // Envelope — every message on the wire is a BoatMessage
 message BoatMessage {
   oneof payload {
@@ -160,5 +196,8 @@ message BoatMessage {
     TrainingLogCommand training_log = 12;
     CalibrateCommand calibrate  = 13;
     CalibrateStatus calibrate_status = 14;
+    BenchCommand   bench        = 15;
+    BenchStatus    bench_status = 16;
+    AssistCommand  assist       = 17;
   }
 }
