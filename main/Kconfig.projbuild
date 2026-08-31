@@ -591,20 +591,24 @@ menu "Board Configuration"
             default 50
 
         config STEER_PULSE_MIN_US
-            int "Steering Pulse Min (us) — full left"
+            int "Steering Pulse Min (us) — full RIGHT"
             default 1195
             range 500 1500
             help
-                Full-left mechanical stop, found 2026-08-04 by direct probe via
-                the dashboard's raw-pulse calibration box (bypasses this value
+                Mechanical stop, found 2026-08-04 by direct probe via the
+                dashboard's raw-pulse calibration box (bypasses this value
                 entirely, so a wrong number here can't hide the true stop) —
                 walked down from 1000 until the servo hit its real limit. The
                 old 1000 default predates the GPIO34->32 rewiring and was never
-                actually verified against this wiring. Slider +100 maps here
-                (dashboard.html negates the slider at its own JS boundary, so
-                -100 lines up with STEER_HOME/full-right instead -- this text
-                used to say "-100 maps here", true only before that negation
-                existed).
+                actually verified against this wiring.
+
+                This stop is physical FULL RIGHT, sighting from behind the hull
+                toward the bow (measured on the boat 2026-08-31). It was
+                labelled "full left" until then purely because it is the
+                smaller number — nobody had checked it against the hull.
+
+                With CONFIG_STEER_REVERSE on, the canonical +1 ("right") lands
+                here.
 
         config STEER_PULSE_NEUTRAL_US
             int "Steering Pulse Neutral (us) — centered"
@@ -619,23 +623,48 @@ menu "Board Configuration"
                 nudge a few us if straight-ahead drifts.
 
         config STEER_PULSE_MAX_US
-            int "Steering Pulse Max (us) — full right"
+            int "Steering Pulse Max (us) — full LEFT"
             default 1805
             range 1500 2500
             help
                 Calibrated hard limit: at 1805us the servo reaches its mechanical
                 rotation stop (it physically hits something). Do NOT raise past
                 this — anything higher just stalls the servo against the stop.
-                Slider +100 maps here.
+
+                This stop is physical FULL LEFT, sighting from behind the hull
+                toward the bow (measured on the boat 2026-08-31), and it is the
+                power-up position (STEER_HOME = -1). It was labelled "full
+                right" until then purely because it is the larger number.
+
+                With CONFIG_STEER_REVERSE on, the canonical -1 ("left") lands
+                here.
 
         config STEER_REVERSE
             bool "Reverse Rudder Direction"
-            default n
+            default y
             help
-                Flip if the rudders deflect the wrong way for a given command.
-                Both servos share one signal, so they must be mounted to deflect
-                the same way — if only ONE is backwards, mirror it mechanically
-                (flip its horn/linkage); this flag inverts both together.
+                ON for this board, and it is a direction fix, not a preference.
+
+                The canonical convention everywhere above the driver -- proto,
+                arbiter, both UIs -- is:
+
+                    -1 = LEFT      0 = CENTRE      +1 = RIGHT
+
+                sighting from behind the hull toward the bow. The servo runs
+                the other way round: MIN_US 1195 is right and MAX_US 1805 is
+                left, so steer_to_us()'s raw +1 -> MAX would put a "+1 = right"
+                command hard over to LEFT. This flag negates the value on its
+                way into steer_to_us() and lines the two up.
+
+                Turning it off does not restore some older behaviour -- it
+                makes every steering command on the boat point the wrong way.
+                Only change it if the servo, its horn or the linkage is
+                physically re-mounted.
+
+                Both servos share one signal, so they must be mounted to
+                deflect the same way — if only ONE is backwards, mirror it
+                mechanically (flip its horn/linkage); this flag inverts both
+                together.
 
     endmenu
 

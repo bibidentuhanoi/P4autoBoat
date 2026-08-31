@@ -40,14 +40,34 @@ static SemaphoreHandle_t    s_mutex  = NULL;
 static float                s_steer  = 0.0f;
 static bool                 s_inited = false;
 
-/* Confirmed 2026-08-04 against real hardware: the operator's physical resting
- * reference (hand-turned mechanical stop, before every power-up) is full
- * RIGHT — dashboard slider +100, MAX_US, 180 deg in Arduino-angle terms. Prior
- * attempts got this backwards (centered, then -1.0/full-left) because that
- * physical reference was never actually confirmed until now. */
-#define STEER_HOME 1.0f
+/* The operator's physical resting reference (hand-turned mechanical stop,
+ * before every power-up) is the 1805us end-stop. Measured on the boat
+ * 2026-08-31, sighting from BEHIND the hull toward the bow:
+ *
+ *     1805us = full LEFT      1516us = centre      1195us = full RIGHT
+ *
+ * so that stop is full LEFT, and the canonical value for it is -1.
+ *
+ * This #define went from +1 to -1 in the same change that turned
+ * CONFIG_STEER_REVERSE on, and the two cancel: boot_s below flips -1 back to
+ * +1, steer_to_us(+1) is still MAX_US, and the servo still powers up at
+ * 1805us. The physical boot position is UNCHANGED — only the name it is
+ * called by is now the true one.
+ *
+ * Earlier revisions called 1805us "full RIGHT" and set this to +1. That was
+ * never checked against the hull; it was inferred from MAX_US being the
+ * larger number. Everything downstream inherited the error. */
+#define STEER_HOME (-1.0f)
 
-/* Map steer [-1,1] -> pulse us. 0 -> neutral, +1 -> max (right), -1 -> min (left). */
+/* Map steer [-1,1] -> pulse us: 0 -> neutral, +1 -> MAX_US, -1 -> MIN_US.
+ *
+ * This is the RAW pulse mapping and knows nothing about left or right.
+ * CONFIG_STEER_REVERSE is applied by the CALLERS (init/set/reassert), never
+ * here, so this function stays a pure MIN/NEUTRAL/MAX interpolation.
+ *
+ * On this board MAX_US 1805 is physical LEFT and MIN_US 1195 is physical
+ * RIGHT, so with reverse ON a caller's +1 ("right", canonical) arrives here
+ * as -1 and lands on 1195us. That is the whole reason reverse is on. */
 static uint32_t steer_to_us(float s)
 {
     if (s < -1.0f) s = -1.0f;
@@ -112,11 +132,11 @@ esp_err_t steer_driver_init(void)
                                            MCPWM_GEN_ACTION_LOW)),
         TAG, "gen action cmp");
 
-    /* Home to STEER_HOME (full-right) before starting, matching the operator's
-     * confirmed hand-positioned reference — the standard fix for "servo has no
-     * position feedback" (manual positioning to match the boot target), not a
-     * guess. Reuse steer_to_us() so this can never drift from what
-     * steer_driver_set(STEER_HOME) would itself compute. */
+    /* Home to STEER_HOME (full-LEFT, 1805us) before starting, matching the
+     * operator's confirmed hand-positioned reference — the standard fix for
+     * "servo has no position feedback" (manual positioning to match the boot
+     * target), not a guess. Reuse steer_to_us() so this can never drift from
+     * what steer_driver_set(STEER_HOME) would itself compute. */
     s_steer = STEER_HOME;
     float boot_s = STEER_REV ? -s_steer : s_steer;
     uint32_t boot_us = steer_to_us(boot_s);
@@ -126,7 +146,7 @@ esp_err_t steer_driver_init(void)
                         TAG, "timer_start");
 
     s_inited = true;
-    ESP_LOGI(TAG, "steer init OK (rudder=GPIO%d%s %uHz home=%uus full-right, both servos linked)",
+    ESP_LOGI(TAG, "steer init OK (rudder=GPIO%d%s %uHz home=%uus full-left, both servos linked)",
              CONFIG_STEER_PIN, STEER_REV ? " rev" : "",
              (unsigned)CONFIG_STEER_PWM_FREQ_HZ, (unsigned)boot_us);
     return ESP_OK;

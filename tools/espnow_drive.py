@@ -1357,13 +1357,19 @@ $('motor-right').addEventListener('input', (e) => {
 $('rudder').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('rudder-val').textContent = v + '%';
-  // Slider is intuitive: drag RIGHT (+100) -> +1.0 on the wire -> full-right
-  // servo (firmware STEER_HOME = +1.0 = right). This tool and dashboard.html
-  // DELIBERATELY use opposite sliders -- dashboard.html's default sits at its
-  // left end (-100) which it flips to full-right to match its home position;
-  // this tool centres at 0 and maps right->right directly. Both send correct
-  // wire values; do NOT "sync" them by negating one, that just makes this one
-  // steer backwards (regression, reverted).
+  // Slider is intuitive and canonical: drag RIGHT (+100) -> +1.0 on the wire
+  // -> 1195us -> the boat turns RIGHT. -1 = left, 0 = centre, +1 = right,
+  // sighting from behind the hull toward the bow.
+  //
+  // This mapping never changed, but it USED to be wrong on the water: the
+  // driver called 1805us "right" when the boat says it is left, so +1.0 sent
+  // the rudder hard over to the left. CONFIG_STEER_REVERSE fixed that at the
+  // root. dashboard.html dropped its compensating negation in the same change,
+  // so both UIs now send the same value AND move the boat the same way -- they
+  // no longer disagree, and neither should be "synced" by negating one.
+  //
+  // This tool still starts centred at 0; dashboard.html still starts at -100,
+  // which is the 1805us full-left power-up position.
   api('/api/state', 'POST', { rudder: v / 100 });
 });
 

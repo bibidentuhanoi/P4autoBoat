@@ -2017,11 +2017,18 @@ $('winch-speed').addEventListener('input', (e) => {
 // degree of freedom nothing steers with, and a planner only ever wants one value.
 function sendSteerCommand() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;   // boat auto-powers the rail
-  // Negated on purpose: firmware's steer value is +1.0=full-right (STEER_HOME,
-  // the boot position) unchanged — but slider -100 is what the operator wants
-  // lined up with that boot position, so flip sign here at the dashboard
-  // boundary only. steer_driver.c, the proto, and motor_control.c are untouched.
-  const v = -parseInt($('rudder').value) / 100;
+  // Straight through, no sign flip. The canonical convention is -1 = LEFT,
+  // 0 = centre, +1 = RIGHT (sighting from behind the hull toward the bow), and
+  // the driver now honours it via CONFIG_STEER_REVERSE.
+  //
+  // This used to negate. The flip was compensating for steer_driver.c calling
+  // 1805us "full right" when the boat says 1805us is full LEFT, so the fix
+  // moved to the root and the flip came out. The slider's PHYSICAL behaviour is
+  // unchanged — dragging right still turns the boat right, and the default
+  // -100 still lines up with the 1805us boot position — but the value on the
+  // wire is now the true one, which is what makes this UI and
+  // tools/espnow_drive.py finally agree.
+  const v = parseInt($('rudder').value) / 100;
   // Proto keeps left/right for wire compat; both carry the same unified angle.
   ws.send(BoatMessage.encode(BoatMessage.create({ steer: { left: v, right: v } })).finish());
 }
