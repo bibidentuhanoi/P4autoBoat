@@ -245,3 +245,67 @@ bool fs_load_tof_xtalk(const char* key, uint8_t* data, size_t len)
     }
     return false;
 }
+
+static bool esc_trim_blob_valid(const EscTrimNvsBlob *blob)
+{
+    if (!blob || blob->magic_word != ESC_TRIM_NVS_MAGIC ||
+        blob->count > ESC_TRIM_MAX_POINTS) return false;
+    for (uint8_t i = 0; i < blob->count; ++i) {
+        if (!isfinite(blob->points[i].throttle_frac) ||
+            !isfinite(blob->points[i].trim_diff) ||
+            blob->points[i].throttle_frac < 0.0f ||
+            blob->points[i].throttle_frac > 1.0f ||
+            blob->points[i].trim_diff < -1.0f ||
+            blob->points[i].trim_diff > 1.0f) return false;
+    }
+    return true;
+}
+
+bool fs_save_esc_trim(const EscTrimNvsBlob *blob)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("storage", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS open failed for esc_trim save: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (!esc_trim_blob_valid(blob)) {
+        nvs_close(h);
+        ESP_LOGE(TAG, "ESC trim save rejected invalid table");
+        return false;
+    }
+    err = nvs_set_blob(h, "esc_trim", blob, sizeof(*blob));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+        if (err == ESP_OK)
+            ESP_LOGI(TAG, "ESC trim table saved (%u points)", (unsigned)blob->count);
+        else
+            ESP_LOGE(TAG, "ESC trim commit failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "ESC trim save failed: %s", esp_err_to_name(err));
+    }
+    nvs_close(h);
+    return err == ESP_OK;
+}
+
+bool fs_load_esc_trim(EscTrimNvsBlob *blob)
+{
+    memset(blob, 0, sizeof(*blob));   /* safe default if anything below fails */
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("storage", NVS_READONLY, &h);
+    if (err != ESP_OK) return false;
+
+    EscTrimNvsBlob temp;
+    size_t len = sizeof(temp);
+    err = nvs_get_blob(h, "esc_trim", &temp, &len);
+    nvs_close(h);
+
+    if (err != ESP_OK || len != sizeof(temp) || !esc_trim_blob_valid(&temp)) {
+        ESP_LOGI(TAG, "No valid ESC trim table in NVS -- starting with none");
+        return false;
+    }
+    *blob = temp;
+    ESP_LOGI(TAG, "ESC trim table loaded (%u points)", (unsigned)blob->count);
+    return true;
+}

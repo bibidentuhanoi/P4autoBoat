@@ -180,6 +180,8 @@ void control_arbiter_decide(control_arbiter_t *arbiter, int64_t now_us,
     if (!drive->valid || now_us - drive->rx_us >= CONTROL_DRIVE_TIMEOUT_US) {
         out->failsafe = true;
     } else {
+        out->throttle = drive->throttle;
+        out->rudder = drive->rudder;
         out->left = clamp_normalized(drive->throttle + drive->rudder);
         out->right = clamp_normalized(drive->throttle - drive->rudder);
         out->newest_rx_us = drive->rx_us;

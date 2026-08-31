@@ -1,6 +1,8 @@
 #ifndef SENSOR_FUSION_H
 #define SENSOR_FUSION_H
 
+#include <stdint.h>
+
 #include "common.h"
 #include "imu_sample.h"
 
@@ -9,6 +11,9 @@ typedef struct {
     float pitch;
     float roll;
     float heading;
+    float yaw_rate;   /* deg/s about vertical axis, from gyro-Z (mag-independent) */
+    uint32_t sequence; /* published sample sequence; use to detect fusion stalls */
+    uint64_t captured_us; /* IMU sample timestamp this result was derived from */
 } FusionResult;
 
 void fusion_init(CalibrationData* calib_data);

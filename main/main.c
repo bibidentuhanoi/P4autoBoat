@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -33,6 +34,7 @@
 #include "detect_task.h"
 #include "training_log_task.h"
 #include "motor_control.h"
+#include "esc_trim.h"
 #include "transports/espnow_transport.h"
 #include "drivers/sd_card.h"
 #include "runtime_metrics.h"
@@ -181,6 +183,71 @@ void app_main(void) {
         ESP_LOGI(TAG, "Valid calibration found in NVS. Skipping calibration.");
         status_led_set(STATUS_LED_OFF);   // cal-only LED: dark once we're running
     }
+
+    // ESC differential-trim table -- own NVS record ("esc_trim"), entirely
+    // independent of the IMU calibration blob loaded above. Empty table
+    // (count == 0) is always a safe default.
+    EscTrimNvsBlob esc_trim_blob;
+    fs_load_esc_trim(&esc_trim_blob);
+    {
+        /* Priority: proportional c  >  flat hand-measured  >  NVS table.
+         *
+         * A hand-measured trim OVERRIDES whatever calibration is in NVS. The
+         * stored table comes from a sweep that was never confirmed, and it
+         * would otherwise silently outrank a value measured directly on the
+         * bench. The bench measures the RAW motors (esc_trim_mix is skipped
+         * while a run is active), so a bench figure is the true mismatch, not a
+         * residual on top of the table. */
+        float c = strtof(CONFIG_ESC_TRIM_C, NULL);
+        float flat = strtof(CONFIG_ESC_TRIM_DEFAULT, NULL);
+        EscTrimPoint prop[2];
+        uint8_t prop_count = esc_trim_build_proportional(c, prop);
+
+        if (prop_count > 0) {
+            if (esc_trim_blob.count > 0) {
+                ESP_LOGW(TAG, "ESC trim: IGNORING the %u-point table in NVS",
+                         (unsigned)esc_trim_blob.count);
+            }
+            memset(&esc_trim_blob, 0, sizeof(esc_trim_blob));
+            memcpy(esc_trim_blob.points, prop, sizeof(prop));
+            esc_trim_blob.count = prop_count;
+            /* Print what it actually commands at the levels that get bench-run,
+             * so the boot log can be checked against the SD files directly. */
+            ESP_LOGI(TAG, "ESC trim: c=%.3f -- split scales with throttle "
+                          "(left = T*%.2f, right = T*%.2f)",
+                     (double)c, (double)(1.0f - c), (double)(1.0f + c));
+            for (int pct = 10; pct <= 50; pct += 10) {
+                float t = (float)pct / 100.0f;
+                float l = t, r = t;
+                esc_trim_mix(t, 0.0f, esc_trim_blob.points, esc_trim_blob.count,
+                             &l, &r);
+                ESP_LOGI(TAG, "ESC trim:   T%02d -> L %.1f%% / R %.1f%% "
+                              "(split %+.2f%%)",
+                         pct, (double)(l * 100.0f), (double)(r * 100.0f),
+                         (double)((r - l) * 50.0f));
+            }
+        } else if (isfinite(flat) && flat != 0.0f) {
+            if (esc_trim_blob.count > 0) {
+                ESP_LOGW(TAG, "ESC trim: IGNORING the %u-point table in NVS",
+                         (unsigned)esc_trim_blob.count);
+            }
+            memset(&esc_trim_blob, 0, sizeof(esc_trim_blob));
+            esc_trim_blob.points[0].throttle_frac = 1.0f;
+            esc_trim_blob.points[0].trim_diff = flat;
+            esc_trim_blob.count = 1;
+            ESP_LOGW(TAG, "ESC trim: FLAT %.3f (%+.1f%% to the RIGHT motor) at "
+                          "every throttle -- correct only near the throttle it "
+                          "was measured at; prefer ESC_TRIM_C",
+                     (double)flat, (double)(flat * 50.0f));
+        } else if (esc_trim_blob.count > 0) {
+            ESP_LOGI(TAG, "ESC trim: using the %u-point table from NVS "
+                          "(no hand-measured value configured)",
+                     (unsigned)esc_trim_blob.count);
+        } else {
+            ESP_LOGI(TAG, "ESC trim: none -- motors run untrimmed");
+        }
+    }
+    motor_control_set_esc_trim(esc_trim_blob.points, esc_trim_blob.count);
 
     // 8b. Winch servo + servo power. GPIO35 is dual-use with the BOOT button,
     //     so this MUST come after the button read above. Reconfigures GPIO35

@@ -227,6 +227,10 @@ void task_runtime_diagnostics(void *arg)
     static const char *tag = "RTM";
     TickType_t next_report = xTaskGetTickCount();
     uint32_t published_motor_generation = UINT32_MAX;
+    /* 0 = nothing published yet; the control task never emits generation 0. */
+    uint32_t published_calibrate_generation = 0;
+    uint32_t published_bench_generation = 0;
+    unsigned bench_repeats_left = 0;   /* re-sends of the terminal bench status */
 #if (configUSE_TRACE_FACILITY == 1) && (configGENERATE_RUN_TIME_STATS == 1)
     static TaskStatus_t task_status[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
     static uint8_t affinity_masks[RUNTIME_METRICS_SYSTEM_TASK_CAPACITY];
@@ -239,6 +243,37 @@ void task_runtime_diagnostics(void *arg)
         if (periodic_report || motor_generation != published_motor_generation) {
             pipeline_publish_motor_status(&motor_status);
             published_motor_generation = motor_generation;
+        }
+
+        /* ESC-trim calibration progress: publish only on a fresh update (never
+         * periodically -- an idle boat's generation stays put and nothing is
+         * sent). generation 0 = never calibrated this boot. */
+        boat_CalibrateStatus calibrate_status;
+        uint32_t calibrate_generation = motor_control_get_calibrate_status(&calibrate_status);
+        if (calibrate_generation != 0 && calibrate_generation != published_calibrate_generation) {
+            pipeline_publish_calibrate_status(&calibrate_status);
+            published_calibrate_generation = calibrate_generation;
+        }
+
+        /* Bench throttle-mismatch run: same fresh-update-only rule. The file on
+         * the SD card is the real product; this is just so the operator can see
+         * the run progress and which file number it saved as. */
+        motor_control_bench_flush();   /* slow SD write, off the control loop */
+        motor_control_trimlearn_log();  /* logs; must stay off the control loop */
+        boat_BenchStatus bench_status;
+        uint32_t bench_generation = motor_control_get_bench_status(&bench_status);
+        bool bench_terminal = (bench_status.state == 4u || bench_status.state == 5u);
+        if (bench_generation != 0 && bench_generation != published_bench_generation) {
+            published_bench_generation = bench_generation;
+            /* The terminal state is the one the operator actually needs (it
+             * carries the saved file number) and it would otherwise be sent
+             * exactly once -- on a lossy link that single packet going missing
+             * leaves the tool believing the run is still going. Repeat it. */
+            bench_repeats_left = bench_terminal ? 4u : 0u;
+            pipeline_publish_bench_status(&bench_status);
+        } else if (bench_repeats_left > 0u && periodic_report) {
+            --bench_repeats_left;
+            pipeline_publish_bench_status(&bench_status);
         }
 
         if (periodic_report) {

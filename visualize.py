@@ -187,7 +187,7 @@ MSG_BRIDGE_STATUS = 0x13   # S3 self-diagnostics, USB only
 # This viewer has no GPS display, so only pitch/roll/heading are used here;
 # see tools/espnow_drive.py for the full field set if that's ever needed.
 MSG_FIELD_TELEMETRY = 0x08
-FIELD_TELEMETRY_FMT = '<fffBddffBf'
+FIELD_TELEMETRY_FMT = '<fffBddffBff'   # ...B=satellites, f=hdop, f=yaw_rate
 _bridge_prev = {}          # last cumulative bridge counters, for rate deltas
 
 
@@ -308,8 +308,8 @@ def handle_serial_packet(data):
     elif msg_type == MSG_FIELD_TELEMETRY:
         expect_len = struct.calcsize(FIELD_TELEMETRY_FMT)
         if len(payload) == payload_len == expect_len:
-            pitch, roll, heading, _valid, _lat, _lon, _spd, _crs, _sats, _hdop = \
-                struct.unpack(FIELD_TELEMETRY_FMT, payload)
+            (pitch, roll, heading, _valid, _lat, _lon, _spd, _crs,
+             _sats, _hdop, _yaw_rate) = struct.unpack(FIELD_TELEMETRY_FMT, payload)
             with imu_lock:
                 imu_data['pitch']   = pitch
                 imu_data['roll']    = roll

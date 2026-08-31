@@ -26,6 +26,9 @@ typedef struct {
     atomic_uint pitch_bits;
     atomic_uint roll_bits;
     atomic_uint heading_bits;
+    atomic_uint yaw_rate_bits;
+    atomic_uint captured_us_lo;
+    atomic_uint captured_us_hi;
 } fusion_result_slot_t;
 
 typedef struct {
@@ -73,6 +76,9 @@ static void fusion_result_snapshot_init(void)
         atomic_init(&slot->pitch_bits, float_bits(0.0f));
         atomic_init(&slot->roll_bits, float_bits(0.0f));
         atomic_init(&slot->heading_bits, float_bits(0.0f));
+        atomic_init(&slot->yaw_rate_bits, float_bits(0.0f));
+        atomic_init(&slot->captured_us_lo, 0);
+        atomic_init(&slot->captured_us_hi, 0);
     }
     atomic_init(&result_snapshot.published_sequence, 0);
 }
@@ -85,6 +91,11 @@ static void fusion_publish_result(uint32_t sequence, const FusionResult *result)
     atomic_store_explicit(&slot->pitch_bits, float_bits(result->pitch), memory_order_relaxed);
     atomic_store_explicit(&slot->roll_bits, float_bits(result->roll), memory_order_relaxed);
     atomic_store_explicit(&slot->heading_bits, float_bits(result->heading), memory_order_relaxed);
+    atomic_store_explicit(&slot->yaw_rate_bits, float_bits(result->yaw_rate), memory_order_relaxed);
+    atomic_store_explicit(&slot->captured_us_lo,
+                          (uint32_t)(result->captured_us & 0xFFFFFFFFu), memory_order_relaxed);
+    atomic_store_explicit(&slot->captured_us_hi,
+                          (uint32_t)(result->captured_us >> 32), memory_order_relaxed);
     atomic_store_explicit(&slot->version, stable_version, memory_order_release);
     atomic_store_explicit(&result_snapshot.published_sequence, sequence, memory_order_release);
 }
@@ -118,10 +129,16 @@ void fusion_get_result(FusionResult *res)
         unsigned expected_version = sequence << 1U;
         unsigned before = atomic_load_explicit(&slot->version, memory_order_acquire);
         if (before != expected_version) continue;
+        uint64_t captured_us =
+            ((uint64_t)atomic_load_explicit(&slot->captured_us_hi, memory_order_relaxed) << 32) |
+            (uint64_t)atomic_load_explicit(&slot->captured_us_lo, memory_order_relaxed);
         FusionResult candidate = {
             .pitch = bits_float((uint32_t)atomic_load_explicit(&slot->pitch_bits, memory_order_relaxed)),
             .roll = bits_float((uint32_t)atomic_load_explicit(&slot->roll_bits, memory_order_relaxed)),
             .heading = bits_float((uint32_t)atomic_load_explicit(&slot->heading_bits, memory_order_relaxed)),
+            .yaw_rate = bits_float((uint32_t)atomic_load_explicit(&slot->yaw_rate_bits, memory_order_relaxed)),
+            .sequence = sequence,
+            .captured_us = captured_us,
         };
         /* Full reader-side barrier: validate only after this entire result
          * payload was loaded, including on weakly ordered RISC-V cores. */
@@ -197,6 +214,8 @@ void fusion_update_sample(const imu_sample_t *sample)
         .roll = roll - calib->roll_tare,
         .pitch = pitch - calib->pitch_tare,
         .heading = heading,
+        .yaw_rate = gz_rate,
+        .captured_us = sample->captured_us,
     });
 }
 

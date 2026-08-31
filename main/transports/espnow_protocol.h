@@ -95,6 +95,13 @@ typedef struct __attribute__((packed)) {
     float    course_deg;
     uint8_t  satellites;
     float    hdop;
+    /* Gyro-Z turn rate (deg/s), mag-independent -- the signal the bench
+     * throttle-mismatch test reads. Appended last so the offsets of every
+     * field above are unchanged; tools/espnow_drive.py's
+     * FIELD_TELEMETRY_FMT must be extended in the same commit or the frame
+     * is length-rejected (which is the intended loud failure, not silent
+     * corruption). */
+    float    yaw_rate;
 } espnow_telemetry_t;
 
 /* ---------------------------------------------------------------------------

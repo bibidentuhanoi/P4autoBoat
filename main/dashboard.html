@@ -445,6 +445,11 @@
           <div class="motor-bar" id="motor-bar-right"><div class="motor-bar-fill" id="motor-fill-right"></div></div>
         </div>
       </div>
+      <div class="motor-slider-row" style="gap:6px;margin-top:6px;">
+        <button class="btn-pwr" id="calibrate-btn" disabled
+                title="Learn per-throttle L/R ESC trim from gyro yaw so equal throttle stops the boat yawing. Requires ARMED + calm water, making way. The boat thrusts itself through a level sweep; click again (or DISARM / PWR OFF) to stop.">Calibrate ESC</button>
+        <span id="calibrate-status" style="font-size:10px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;">idle</span>
+      </div>
     </div>
   </div>
   <div class="card" id="winch-card">
@@ -493,7 +498,9 @@ message ServoPowerCommand { bool on = 1; }
 message DetectCommand { }
 message TrainingLogCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; bool gps_ok = 9; uint32 gps_detected_baud = 16; bool gps_baud_confirmed = 17; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; } }
+message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
+message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1372,6 +1379,9 @@ function connectWS() {
       if (msg.motorStatus) {
         updateMotorStatus(msg.motorStatus);
       }
+      if (msg.calibrateStatus) {
+        updateCalibrateStatus(msg.calibrateStatus);
+      }
     } catch (e) { console.error('[Proto]', `decode error: ${e.message}`); }
   };
 
@@ -1386,6 +1396,7 @@ function connectWS() {
   ws.onclose = (ev) => {
     const reason = ev.code === 1000 ? 'clean' : ev.code === 1006 ? 'abnormal (no close frame)' : `code ${ev.code}`;
     console.log('[WS]', `closed — ${reason}, reason: "${ev.reason || 'none'}", retry in ${_reconnectDelay}ms`);
+    stopCalibration();   // link gone: drop the keepalive (the boat aborts on its own too)
     ws = null;
     wsConnected = false;
     updateArmEnable();
@@ -1891,6 +1902,8 @@ function updateMotorStatus(ms) {
   motorArmed = (idx === 2);
   servoPower = !!ms.servoPower;
   if (servoPower) railCutByUser = false;   // rail is on ⇒ not cut
+  if (calibrating && !motorArmed) stopCalibration();   // boat disarmed under us
+  updateCalibrateButton();                 // keep enable in sync with armed state
 
   // Arm-refusal feedback: we sent ARM but the boat still reports DISARMED.
   if (idx !== 0) {
@@ -2044,6 +2057,7 @@ $('arm-btn').addEventListener('click', () => {
     flashEl('gps-override-label');
     return;
   }
+  if (motorArmed) stopCalibration();   // disarming must also stop calibration
   _armSentAt = motorArmed ? 0 : Date.now();
   const msg = BoatMessage.create({ armCmd: { arm: !motorArmed, force } });
   const buf = BoatMessage.encode(msg).finish();
@@ -2068,8 +2082,82 @@ $('record-btn').addEventListener('click', () => {
 $('servo-pwr-btn').addEventListener('click', () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   railCutByUser = servoPower;   // currently on ⇒ this click cuts it
+  stopCalibration();            // a rail kill must also stop calibration
   ws.send(BoatMessage.encode(BoatMessage.create({ servoPower: { on: !servoPower } })).finish());
   applyControlEnable();         // reflect immediately, don't wait for the status tick
+});
+
+// ── ESC differential-trim auto-calibration ─────────────────────────────
+// Click Calibrate to start a supervised sweep: the boat thrusts itself through
+// a set of throttle levels and learns the per-level L/R trim that stops it
+// yawing, saving the table to NVS on a clean finish. It runs ONLY while armed +
+// in calm water making way. Click again — or DISARM / PWR OFF, or lose the
+// link — to stop; a partial sweep saves nothing.
+//
+// The firmware gates calibration on its OWN heartbeat (CalibrateCommand), NOT
+// the throttle link, so while calibrating we send a ~1 Hz keepalive. If this
+// dashboard stops (crash / out of range) the boat aborts within ~2 s — the same
+// "lose the operator under thrust ⇒ stop" posture as normal driving. This is an
+// automatic keepalive, NOT a dead-man hold: you click once, not hold.
+const CAL_STATE_NAMES = ['idle', 'measuring noise', 'ramp', 'settling', 'DONE', 'ABORTED'];
+let calibrating = false;
+let _calKeepalive = null;
+
+function sendCalibrate(start) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // average_into_existing is left false: the firmware records FRESH in v1.
+  ws.send(BoatMessage.encode(BoatMessage.create({ calibrate: { start } })).finish());
+}
+
+function startCalibration() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { armHint('not connected to the boat'); return; }
+  if (!motorArmed) { armHint('ARM first — calibration drives the thrusters'); flashEl('arm-btn'); return; }
+  calibrating = true;
+  sendCalibrate(true);
+  if (!_calKeepalive) _calKeepalive = setInterval(() => sendCalibrate(true), 1000);
+  updateCalibrateButton();
+}
+
+function stopCalibration() {
+  if (_calKeepalive) { clearInterval(_calKeepalive); _calKeepalive = null; }
+  if (calibrating) sendCalibrate(false);   // explicit stop; harmless if already stopped
+  calibrating = false;
+  updateCalibrateButton();
+}
+
+function updateCalibrateButton() {
+  const btn = $('calibrate-btn');
+  if (!btn) return;
+  btn.textContent = calibrating ? 'Stop Calibration' : 'Calibrate ESC';
+  btn.classList.toggle('on', calibrating);
+  // Enabled whenever armed + connected; the firmware makes the final call.
+  btn.disabled = !(ws && ws.readyState === WebSocket.OPEN && motorArmed) && !calibrating;
+}
+
+function updateCalibrateStatus(cs) {
+  const el = $('calibrate-status');
+  if (!el) return;
+  const state = CAL_STATE_NAMES[cs.state] || ('state ' + cs.state);
+  if (cs.state === 4) {          // ETC_DONE
+    el.textContent = `DONE — ${cs.pointsDone} points saved`;
+    el.style.color = 'var(--accent)';
+    stopCalibration();           // sweep finished; drop our keepalive
+  } else if (cs.state === 5) {   // ETC_ABORTED
+    el.textContent = 'ABORTED — nothing saved';
+    el.style.color = 'var(--danger)';
+    stopCalibration();
+  } else {
+    const thr = Math.round((cs.levelThrottle || 0) * 100);
+    el.textContent = `${state} L${cs.levelIndex} @${thr}% trim=${(cs.trimDiff || 0).toFixed(3)} `
+                   + `yaw=${(cs.yawAvgDps || 0).toFixed(1)}${cs.makingWay ? ' way' : ' (no way)'} `
+                   + `pts=${cs.pointsDone}`;
+    el.style.color = 'var(--dim)';
+  }
+}
+
+$('calibrate-btn').addEventListener('click', () => {
+  if (calibrating) stopCalibration();
+  else startCalibration();
 });
 
 // If a disabled control is poked, say why. Servos only need a connection now;
