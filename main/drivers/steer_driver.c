@@ -204,6 +204,16 @@ esp_err_t steer_driver_set_raw_us(uint32_t pulse_us)
     return err;
 }
 
+uint32_t steer_driver_get_pulse_us(void)
+{
+    if (!s_inited) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    float s = STEER_REV ? -s_steer : s_steer;
+    uint32_t us = steer_to_us(s);
+    xSemaphoreGive(s_mutex);
+    return us;
+}
+
 float steer_driver_get(void)
 {
     if (!s_mutex) return s_steer;

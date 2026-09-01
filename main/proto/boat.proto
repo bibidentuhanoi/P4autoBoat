@@ -98,6 +98,18 @@ message MotorStatus {
   float  right_throttle = 3;  // current right throttle
   float  winch_speed    = 4;  // current winch speed (-1..1)
   bool   servo_power    = 5;  // servo rail (winch + rudders) actually powered
+  // --- rudder, as COMMANDED by the firmware ---------------------------------
+  // There is no position feedback on this servo. Every field below is what the
+  // boat ASKED the rudder to do, never where the rudder actually is. Anything
+  // displaying or recording them must say so.
+  float  rudder_cmd       = 6;   // normalized, canonical (-1 left .. +1 right)
+  uint32 rudder_pulse_us  = 7;   // the pulse that command maps to
+  bool   rudder_saturated = 8;   // the assisted loop's output cap bound it
+  // --- assisted steering, as the BOAT reports it ----------------------------
+  bool   assist_rudder    = 9;   // the rudder loop is actually running
+  bool   assist_motor_p   = 10;  // the motor P assist is actually running
+  float  yaw_target_dps   = 11;  // physical yaw-rate target the loop is holding
+  float  yaw_filt_dps     = 12;  // the loop's own filtered yaw
 }
 
 message ArmCommand {
@@ -157,6 +169,12 @@ message CalibrateStatus {
 // a rebuild between arms would let a build difference look like a result.
 message AssistCommand {
   bool p_on = 1;
+  // Runtime Assisted Steering (rudder yaw-rate loop). DELIBERATELY a separate
+  // field from p_on: that one is the MOTOR differential-thrust assist, this is
+  // the RUDDER loop, and folding them into one flag would make an experiment
+  // that isolates either of them impossible. The firmware refuses to have both
+  // on at once, but they are still two switches.
+  bool rudder_assist = 2;
 }
 
 // Bench throttle-mismatch test. The BOAT runs the whole profile and records to

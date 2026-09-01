@@ -285,10 +285,24 @@ RUDDER_TEST_DRIVE_S = dict((n, d) for n, d, _t in RUDDER_TEST_PHASES)['drive']
 RUDDER_TEST_MIN_DRIVE_COVERAGE = 0.8    # of the 3 s drive window
 RUDDER_TEST_MIN_DRIVE_FRAMES = 20       # ~20 Hz over 3 s should give ~60
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
+# Assisted Steering: the same 0.5/3.0/1.0 profile, but instead of holding a
+# fixed rudder it hands the boat a yaw-rate TARGET and lets the firmware's
+# rudder loop chase it. Full stick is CONFIG_STABILITY_SAS_RMAX_DPS, which the
+# first pool configuration sets to 2 deg/s -- so stick -1 asks for +2 (left)
+# and stick +1 for -2 (right).
+ASSIST_TEST_TARGET_DPS = 2.0
 RUDDER_TEST_CSV_COLUMNS = (
     't_mono', 'elapsed_s', 'phase', 'yaw_dps', 'heading_deg',
     'cmd_throttle', 'cmd_rudder', 'boat_left', 'boat_right',
     'servo_us', 'telem_age_s', 'gap_s',
+    # --- assisted mode only; blank for a raw run -------------------------
+    'mode',              # 'raw' or 'assisted'
+    'target_dps',        # yaw rate REQUESTED of the firmware loop
+    'yaw_filt_dps',      # the loop's own filtered yaw, as the boat reports it
+    'boat_rudder_cmd',   # firmware-COMMANDED rudder (no position feedback)
+    'boat_rudder_us',    # the pulse that command maps to
+    'boat_saturated',    # the loop's output cap bound it
+    'boat_assist_on',    # the BOAT's own answer, not what we asked for
 )
 
 
@@ -592,6 +606,9 @@ class BoatLink:
         # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
         # the default so a forgotten toggle cannot silently make every run a B.
         self.p_assist_on = False
+        # Assisted Steering (rudder loop). Requested state; the BOAT's own
+        # answer arrives in MotorStatus.assist_rudder and is what gets shown.
+        self.assist_rudder_on = False
         self.bridge_status = self._blank_bridge_status()
         self._diag_counts = {}
         self._stop = threading.Event()
@@ -632,6 +649,9 @@ class BoatLink:
             'have': False, 'last_rx_monotonic': None,
             'state': 0, 'left_throttle': 0.0, 'right_throttle': 0.0,
             'winch_speed': 0.0, 'servo_power': False,
+            'rudder_cmd': 0.0, 'rudder_pulse_us': 0, 'rudder_saturated': False,
+            'assist_rudder': False, 'assist_motor_p': False,
+            'yaw_target_dps': 0.0, 'yaw_filt_dps': 0.0,
         }
 
     @staticmethod
@@ -938,8 +958,28 @@ class BoatLink:
             return False
         return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
 
+    def _send_assist_locked(self, p_on, rudder_assist):
+        """One AssistCommand carrying BOTH switches. Caller holds the lock.
+
+        They are separate fields on purpose -- p_on is the MOTOR
+        differential-thrust assist, rudder_assist is the RUDDER yaw-rate loop --
+        but they ride one message so the boat never sees a moment with both on.
+        The firmware refuses that combination too; this just never asks."""
+        if p_on and rudder_assist:
+            return False, 'motor P assist and Assisted Steering are mutually exclusive'
+        if not self.connected:
+            return False, 'serial link is disconnected'
+        msg = self.pb2.BoatMessage()
+        msg.assist.p_on = bool(p_on)
+        msg.assist.rudder_assist = bool(rudder_assist)
+        if not self._write_locked(msg.SerializeToString()):
+            return False, 'serial write failed'
+        self.p_assist_on = bool(p_on)
+        self.assist_rudder_on = bool(rudder_assist)
+        return True, None
+
     def send_assist(self, p_on):
-        """Turn the temporary P yaw assist on or off, at RUNTIME.
+        """Turn the temporary MOTOR P yaw assist on or off, at RUNTIME.
 
         Runtime and not a rebuild, so both arms of an A/B experiment run the
         same binary -- rebuilding between arms would let a build difference
@@ -950,14 +990,24 @@ class BoatLink:
             # controller under half the recording.
             if self._rudder_test_busy_locked():
                 return False, 'a rudder test is running — wait for it to finish'
-            if not self.connected:
-                return False, 'serial link is disconnected'
-            msg = self.pb2.BoatMessage()
-            msg.assist.p_on = bool(p_on)
-            if not self._write_locked(msg.SerializeToString()):
-                return False, 'serial write failed'
-            self.p_assist_on = bool(p_on)
-            return True, None
+            if p_on and self.assist_rudder_on:
+                return False, ('Assisted Steering is ON — the two assists are '
+                               'mutually exclusive, switch it OFF first')
+            return self._send_assist_locked(bool(p_on), self.assist_rudder_on)
+
+    def send_rudder_assist(self, on):
+        """Assisted Steering (the RUDDER yaw-rate loop) on or off, at RUNTIME.
+
+        Default OFF after every boot: the firmware's boot mode is Raw Manual
+        and nothing here persists a mode."""
+        with self._lock:
+            if self._rudder_test_busy_locked():
+                return False, 'a rudder test is running — wait for it to finish'
+            if on and self.p_assist_on:
+                return False, ('motor P assist is ON — the two assists are '
+                               'mutually exclusive, switch it OFF first')
+            return self._send_assist_locked(self.p_assist_on if not on else False,
+                                            bool(on))
 
     def send_bench(self, kind, base, delta, command_seq, reset_c=0.0):
         """Ask the BOAT to run one bench test and record it to its own SD card.
@@ -1023,7 +1073,7 @@ class BoatLink:
     # self.rudder; the loop already sends those, so nothing here bypasses
     # STOP, DISARM, disconnect or the calibration gate.
 
-    def start_rudder_test(self, sign, command_seq):
+    def start_rudder_test(self, sign, command_seq, assisted=False):
         """Begin the sequence. `sign` is -1 or +1 (the two buttons).
 
         Refuses rather than fixing anything up: it never arms the boat, never
@@ -1062,12 +1112,30 @@ class BoatLink:
                 return False, 'switch P assist OFF first'
             if self.bench_status.get('have') and self.bench_status.get('p_on'):
                 return False, 'the boat reports P assist ON — switch it OFF first'
+            ms = self.motor_status
+            if ms.get('have') and ms.get('assist_motor_p'):
+                return False, ('the boat reports MOTOR P assist ON — the two '
+                               'assists are mutually exclusive, switch it OFF')
+
+            if assisted:
+                # Turn the rudder loop ON before the sequence starts, so the
+                # 0.5 s settle phase is already running the controller at
+                # target zero rather than switching mode mid-run.
+                ok, why = self._send_assist_locked(False, True)
+                if not ok:
+                    return False, why
 
             now = self._now()
-            name, path = self._next_rudder_test_path(sign)
+            name, path = self._next_rudder_test_path(sign, assisted)
             self.rudder_test = {
                 'sign': int(sign),
-                'rudder': float(sign) * RUDDER_TEST_DEFLECTION,
+                'assisted': bool(assisted),
+                # Raw: a fixed deflection. Assisted: FULL stick, which the
+                # firmware turns into +/- SAS_RMAX_DPS of yaw-rate target.
+                'rudder': (float(sign) if assisted
+                           else float(sign) * RUDDER_TEST_DEFLECTION),
+                'target_dps': (-float(sign) * ASSIST_TEST_TARGET_DPS
+                               if assisted else 0.0),
                 't0': now, 'phase': RUDDER_TEST_PHASES[0][0],
                 'rows': [], 'name': name, 'path': str(path),
                 'last_frame_mono': None, 'max_gap_s': 0.0,
@@ -1106,10 +1174,19 @@ class BoatLink:
             return False, 'the boat reports the servo rail is OFF'
         return True, None
 
-    def _next_rudder_test_path(self, sign):
-        """T20 and N80/P80 in the name, first free index -- never overwrite."""
-        tag = ('N' if sign < 0 else 'P') + '%02u' % RUDDER_TEST_PCT
-        base = 'RUD_T%02u_%s' % (int(RUDDER_TEST_THROTTLE * 100 + 0.5), tag)
+    def _next_rudder_test_path(self, sign, assisted=False):
+        """T20 plus the direction, first free index -- never overwrite.
+
+        Raw and assisted runs get DIFFERENT prefixes on purpose: they are not
+        the same experiment and must never be pooled by a glob."""
+        pct = int(RUDDER_TEST_THROTTLE * 100 + 0.5)
+        if assisted:
+            # sign -1 = left stick = POSITIVE yaw target -> L2
+            tag = ('L' if sign < 0 else 'R') + '%g' % ASSIST_TEST_TARGET_DPS
+            base = 'ASST_T%02u_%s' % (pct, tag)
+        else:
+            tag = ('N' if sign < 0 else 'P') + '%02u' % RUDDER_TEST_PCT
+            base = 'RUD_T%02u_%s' % (pct, tag)
         directory = Path(getattr(self, 'rudder_test_dir', RUDDER_TEST_DIR))
         for i in range(1, 1000):
             name = '%s_%02u.csv' % (base, i)
@@ -1151,6 +1228,19 @@ class BoatLink:
             'servo_us': '',
             'telem_age_s': round(now - tel_last, 4) if tel_last else '',
             'gap_s': round(gap, 4),
+            'mode': 'assisted' if rt.get('assisted') else 'raw',
+            # What we ASKED the loop for this instant -- zero outside the drive
+            # phase, matching what the tick actually commands.
+            'target_dps': (rt.get('target_dps', 0.0)
+                           if (rt.get('assisted') and phase
+                               and phase[0] == 'drive') else 0.0),
+            'yaw_filt_dps': ms.get('yaw_filt_dps', '') if ms.get('have') else '',
+            'boat_rudder_cmd': ms.get('rudder_cmd', '') if ms.get('have') else '',
+            'boat_rudder_us': ms.get('rudder_pulse_us', '') if ms.get('have') else '',
+            'boat_saturated': (1 if ms.get('rudder_saturated') else 0)
+                              if ms.get('have') else '',
+            'boat_assist_on': (1 if ms.get('assist_rudder') else 0)
+                              if ms.get('have') else '',
         })
 
     def _rudder_test_tick_locked(self, now):
@@ -1175,7 +1265,14 @@ class BoatLink:
             rt['phase'] = phase[0]
             self.throttle = phase[1]
             self.motor_split = False
-            self.rudder = rt['rudder']
+            if rt.get('assisted'):
+                # Target yaw ZERO outside the drive phase: the settle phase is
+                # the loop holding straight before the motors come on, and the
+                # coast must not keep asking for a turn the jets can no longer
+                # produce -- that would wind the rudder over with no authority.
+                self.rudder = rt['rudder'] if phase[0] == 'drive' else 0.0
+            else:
+                self.rudder = rt['rudder']
             # The stream loop sends these straight after; a write failure there
             # is caught by _stream_loop and routed back here as an abort.
         except Exception as exc:                             # noqa: BLE001
@@ -1205,6 +1302,11 @@ class BoatLink:
         if rt is None:
             return
         self.rudder_test = None
+        # Assisted Steering is switched on FOR the run and off with it, on
+        # every exit including every abort -- leaving the loop live afterwards
+        # would have it quietly steering during ordinary manual driving.
+        if rt.get('assisted') and self.connected:
+            self._send_assist_locked(False, False)
         # Safe state first, unconditionally, before anything that could raise.
         self.throttle = 0.0
         self.motor_left = 0.0
@@ -1398,6 +1500,7 @@ class BoatLink:
                     'frames': len(self.rudder_test['rows']),
                     'name': self.rudder_test['name'],
                 } if self.rudder_test else None),
+                'assist_rudder_on': self.assist_rudder_on,
                 'rudder_test_result': (dict(self.rudder_test_result)
                                        if self.rudder_test_result else None),
                 'motor_status': self._with_age(self.motor_status, TELEMETRY_STALE_S),
@@ -1439,6 +1542,14 @@ class BoatLink:
                 'right_throttle': float(ms.right_throttle),
                 'winch_speed': float(ms.winch_speed),
                 'servo_power': bool(ms.servo_power),
+                # COMMANDED rudder, never measured -- no position feedback.
+                'rudder_cmd': float(ms.rudder_cmd),
+                'rudder_pulse_us': int(ms.rudder_pulse_us),
+                'rudder_saturated': bool(ms.rudder_saturated),
+                'assist_rudder': bool(ms.assist_rudder),
+                'assist_motor_p': bool(ms.assist_motor_p),
+                'yaw_target_dps': float(ms.yaw_target_dps),
+                'yaw_filt_dps': float(ms.yaw_filt_dps),
             }
 
     def _handle_calibrate_status(self, cs):
@@ -1906,6 +2017,17 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Phase</label><span class="val" id="rt-phase">--</span></div>
   <div class="telem-row"><label>Saved as</label><span class="val" id="rt-file">--</span></div>
   <div class="telem-row"><label>Frames</label><span class="val" id="rt-frames">--</span></div>
+  <div class="row" style="margin-top:6px;">
+    <label style="min-width:auto;">Assisted Steering</label>
+    <button id="rt-assist" title="rudder yaw-rate loop -- OFF at every boot; mutually exclusive with motor P assist">ASSIST: OFF</button>
+    <span class="pill" id="rt-assist-confirm" style="margin-left:8px;">boat: --</span>
+  </div>
+  <!-- Assisted runs: same 0.5/3.0/1.0 profile, but the boat's own rudder loop
+       chases a yaw-rate TARGET instead of holding a fixed deflection. -->
+  <div class="row">
+    <button id="rt-al" title="assisted: hold +2 deg/s (left) through a 3 s T20 drive">ASSIST L +2&deg;/s</button>
+    <button id="rt-ar" title="assisted: hold -2 deg/s (right) through a 3 s T20 drive">ASSIST R &minus;2&deg;/s</button>
+  </div>
   <div id="rt-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
 </div>
@@ -2250,7 +2372,8 @@ function setRudderTestLockout(on) {
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
   ['bench-left', 'bench-right', 'bench-base', 'bench-reset', 'p-assist',
-   'rt-minus', 'rt-plus', 'calibrate-btn'].forEach(function (id) {
+   'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
+   'calibrate-btn'].forEach(function (id) {
     const el = $(id);
     if (!el) return;
     el.disabled = on;
@@ -2271,6 +2394,33 @@ async function runRudderTest(sign) {
 }
 $('rt-minus').addEventListener('click', () => runRudderTest(-1));
 $('rt-plus').addEventListener('click', () => runRudderTest(1));
+
+// Assisted runs. sign -1 is LEFT stick, which the firmware turns into a
+// POSITIVE yaw-rate target -- physical left produces positive IMU yaw on this
+// boat (21 recorded runs).
+async function runAssistTest(sign) {
+  if (!connected) { $('rt-msg').textContent = 'not connected'; return; }
+  $('rt-msg').textContent = '';
+  const r = await api('/api/rudder_test', 'POST',
+                      { sign, assisted: true, seq: ++winchCommandSeq });
+  if (r && !r.ok) $('rt-msg').textContent = r.error || 'refused';
+}
+$('rt-al').addEventListener('click', () => runAssistTest(-1));
+$('rt-ar').addEventListener('click', () => runAssistTest(1));
+
+// Runtime mode switch. Raw Manual is the boot mode and stays the default.
+var assistRudderOn = false;
+$('rt-assist').addEventListener('click', async () => {
+  const want = !assistRudderOn;
+  const r = await api('/api/rudder_assist', 'POST', { on: want });
+  if (r && r.ok) {
+    assistRudderOn = want;
+    $('rt-assist').textContent = 'ASSIST: ' + (want ? 'ON' : 'OFF');
+    $('rt-assist').classList.toggle('up', want);
+  } else if (r) {
+    $('rt-msg').textContent = r.error || 'refused';
+  }
+});
 
 // ---- effective split preview -----------------------------------------------
 // Mirror of bench_effective_commands() in this file's Python half, which is the
@@ -2592,6 +2742,16 @@ function applyStatus(s) {
       $('bench-yaw-hdg').textContent = '--';
     }
 
+    // The BOAT's own mode, next to what we asked for. A mismatch voids the
+    // run, so it is shown rather than assumed -- same rule as motor P.
+    const mstA = s.motor_status;
+    if (mstA && mstA.have) {
+      const ba = !!mstA.assist_rudder;
+      $('rt-assist-confirm').textContent = 'boat: ' + (ba ? 'ON' : 'OFF');
+      $('rt-assist-confirm').classList.toggle('up', ba);
+      $('rt-assist-confirm').classList.toggle('warn', ba !== assistRudderOn);
+    }
+
     // ---- rudder test ------------------------------------------------------
     const rt = s.rudder_test, rtr = s.rudder_test_result;
     const rtPill = $('rt-pill');
@@ -2852,9 +3012,20 @@ class Handler(BaseHTTPRequestHandler):
             if sign not in (-1, 1) or isinstance(sign, bool):
                 self._json({'ok': False, 'error': 'sign must be -1 or +1'}, 400)
                 return
+            assisted = body.get('assisted', False)
+            if not isinstance(assisted, bool):
+                self._json({'ok': False, 'error': 'assisted must be a boolean'}, 400)
+                return
             # Returns immediately: the 4.5 s sequence runs on the stream loop,
             # never in this handler.
-            ok, err = self.link.start_rudder_test(sign, command_seq)
+            ok, err = self.link.start_rudder_test(sign, command_seq, assisted)
+            self._json({'ok': ok, 'error': err} if not ok else {'ok': True})
+        elif self.path == '/api/rudder_assist':
+            on = body.get('on')
+            if not isinstance(on, bool):
+                self._json({'ok': False, 'error': 'on must be true or false'}, 400)
+                return
+            ok, err = self.link.send_rudder_assist(on)
             self._json({'ok': ok, 'error': err} if not ok else {'ok': True})
         elif self.path == '/api/bench':
             command_seq = body.get('seq')

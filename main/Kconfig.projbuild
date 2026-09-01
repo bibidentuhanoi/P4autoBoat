@@ -406,8 +406,13 @@ menu "Board Configuration"
                 units. This is only logged while dry-run mode is enabled.
 
         config STABILITY_SAS_ENABLE
-            bool "Enable live rudder yaw-rate stabilizer (actuates the rudder)"
-            default n
+            bool "Build the live rudder yaw-rate stabilizer (Assisted Steering)"
+            default y
+            help
+                Builds the loop in. It is still OFF at boot and every boot --
+                Assisted Steering is a RUNTIME switch (AssistCommand.rudder_assist)
+                and the default mode is Raw Manual. Set n only to compile the
+                whole path out.
             help
                 OFF leaves manual steering unchanged. ON applies the capped
                 yaw-rate loop only while armed, linked, and IMU healthy. It
@@ -415,23 +420,65 @@ menu "Board Configuration"
 
         config STABILITY_SAS_RMAX_DPS
             int "SAS: yaw-rate at full stick (deg/s)"
-            default 45
-            range 5 180
+            default 2
+            range 1 180
+            help
+                Deliberately tiny for the first pool experiment: full stick asks
+                for 2 deg/s, so the assisted L/R tests command exactly +2 and -2.
+                Raise it once the loop is known to hold a rate at all.
+
+                The floor was 5 and silently clamped this to 5 -- Kconfig
+                applies `range` after `default` without a word of warning, which
+                would have made every assisted target 2.5x the intended one.
 
         config STABILITY_SAS_KR
-            string "SAS: rudder per deg/s of rate error"
-            default "0.010"
+            string "SAS: rudder per deg/s of rate error (the P gain)"
+            default "0.05"
+            help
+                First pool configuration. I and D are deliberately absent: this
+                is the first time the loop actually drives the rudder on water,
+                and integral wind-up or derivative noise-gain added before P has
+                been seen to work would make a bad result unattributable.
+
+        config STABILITY_SAS_FF_LEFT
+            string "SAS: feedforward rudder per deg/s for LEFT (positive-yaw) targets"
+            default "0.18"
+            help
+                Directional because the hull is NOT symmetric: the same |0.80|
+                of rudder gives a different rate each way, so one gain would
+                under-drive one direction and over-drive the other.
+
+                0.80 / 4.53 deg/s. NOTE: re-reading dataout/RUD_T20_N80_*.csv
+                gives a 3 s mean nearer 2.3-2.6 deg/s, which would imply ~0.31.
+                The yaw is still growing at the end of every 3 s run and several
+                carry a wall bounce, so no steady-state gain can honestly be
+                read from that data yet -- these are a starting point to be
+                corrected from the first assisted pool run, not a measurement.
+
+        config STABILITY_SAS_FF_RIGHT
+            string "SAS: feedforward rudder per deg/s for RIGHT (negative-yaw) targets"
+            default "0.31"
+            help
+                0.80 / 2.61 deg/s. Same caveat as SAS_FF_LEFT.
+
+        config STABILITY_SAS_SLEW_PER_S
+            string "SAS: max rudder change per second (0 disables)"
+            default "2.0"
+            help
+                The servo cannot step instantly and a step command just slams
+                it; this also stops a filter transient becoming a bang-bang
+                input. 2.0 crosses the full 0.80 cap in 0.4 s.
 
         config STABILITY_SAS_YAW_TAU_S
             string "SAS: yaw-rate low-pass time constant (seconds)"
-            default "0.15"
+            default "0.25"
             help
                 Time constant, not a per-sample blend fraction -- the effective
                 filter stays the same even if the fusion tick rate changes.
 
         config STABILITY_SAS_OUT_CAP
             string "SAS: max rudder authority (0..1)"
-            default "0.50"
+            default "0.80"
 
         config STABILITY_SAS_MAX_AGE_MS
             int "SAS: max fusion-data age before centring the rudder (ms)"

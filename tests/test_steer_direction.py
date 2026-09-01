@@ -225,9 +225,16 @@ class SteerDirectionTest(unittest.TestCase):
         self.assertNotIn('STEER_REV', body,
                          'the reverse leaked into steer_to_us(); the mirror '
                          'and every caller assume it is applied outside')
-        # every caller that drives the servo from a canonical value applies it
-        self.assertEqual(src.count('STEER_REV ? -s_steer : s_steer'), 3,
-                         'init / set / reassert must all apply the reverse')
+        # every caller that maps the canonical value to a pulse applies it:
+        # init, set, reassert, and the pulse getter telemetry reads.
+        self.assertEqual(src.count('STEER_REV ? -s_steer : s_steer'), 4,
+                         'init / set / reassert / get_pulse_us must all apply '
+                         'the reverse')
+        for fn in ('esp_err_t steer_driver_set(float steer)',
+                   'void steer_driver_reassert(void)',
+                   'uint32_t steer_driver_get_pulse_us(void)'):
+            i = src.index(fn)
+            self.assertIn('STEER_REV ? -s_steer : s_steer', src[i:i + 400], fn)
 
     def test_raw_pulse_control_is_untouched_by_any_of_this(self):
         """The calibration escape hatch writes the comparator directly. If the

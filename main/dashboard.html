@@ -501,7 +501,7 @@ message MotorCommand { float throttle = 1; float rudder = 2; float left = 3; flo
 message WinchCommand { float speed = 1; }
 message SteerCommand { float left = 1; float right = 2; }
 message SteerRawCommand { uint32 pulse_us = 1; }
-message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; bool servo_power = 5; }
+message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; bool servo_power = 5; float rudder_cmd = 6; uint32 rudder_pulse_us = 7; bool rudder_saturated = 8; bool assist_rudder = 9; bool assist_motor_p = 10; float yaw_target_dps = 11; float yaw_filt_dps = 12; }
 message ArmCommand { bool arm = 1; bool force = 2; }
 message ServoPowerCommand { bool on = 1; }
 message DetectCommand { }

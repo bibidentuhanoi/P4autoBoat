@@ -206,6 +206,20 @@ static bool s_p_log_pending = false;
 #endif
 /* Read by the drive path in BOTH builds; always false when P is compiled out. */
 static bool s_p_moved = false;
+#if CONFIG_STABILITY_SAS_ENABLE
+/* Assisted Steering: the rudder yaw-rate loop. RUNTIME switch, OFF at every
+ * boot -- the default mode is Raw Manual and nothing persists this. Kept
+ * strictly separate from s_p_assist_on, which is the MOTOR assist. */
+static bool s_assist_rudder_on = false;
+static bool s_assist_rudder_req = false;
+static bool s_assist_rudder_req_pending = false;
+/* Last values the loop commanded, for telemetry. COMMANDED, not measured --
+ * this servo has no position feedback. */
+static float s_assist_rudder_cmd = 0.0f;
+static float s_assist_target_dps = 0.0f;
+static float s_assist_yaw_filt = 0.0f;
+static bool s_assist_saturated = false;
+#endif
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
 /* Why the learner is not moving, or NULL when it is. Written on the control
  * task, read by the core-1 logger: a torn read costs one wrong log line and
@@ -517,7 +531,14 @@ static bool motor_status_equal(const boat_MotorStatus *a, const boat_MotorStatus
            a->left_throttle == b->left_throttle &&
            a->right_throttle == b->right_throttle &&
            a->winch_speed == b->winch_speed &&
-           a->servo_power == b->servo_power;
+           a->servo_power == b->servo_power &&
+           a->rudder_cmd == b->rudder_cmd &&
+           a->rudder_pulse_us == b->rudder_pulse_us &&
+           a->rudder_saturated == b->rudder_saturated &&
+           a->assist_rudder == b->assist_rudder &&
+           a->assist_motor_p == b->assist_motor_p &&
+           a->yaw_target_dps == b->yaw_target_dps &&
+           a->yaw_filt_dps == b->yaw_filt_dps;
 }
 
 static void status_commit_current(bool force)
@@ -527,6 +548,20 @@ static void status_commit_current(bool force)
     esc_driver_get_throttle(&status.left_throttle, &status.right_throttle);
     status.winch_speed = winch_driver_get_speed();
     status.servo_power = winch_driver_get_power();
+    /* COMMANDED rudder, never measured -- this servo has no position feedback.
+     * Read from the driver so it is what actually went out, whichever mode
+     * put it there. */
+    status.rudder_cmd = steer_driver_get();
+    status.rudder_pulse_us = steer_driver_get_pulse_us();
+#if CONFIG_STABILITY_SAS_ENABLE
+    status.assist_rudder = s_assist_rudder_on;
+    status.rudder_saturated = s_assist_saturated;
+    status.yaw_target_dps = s_assist_target_dps;
+    status.yaw_filt_dps = s_assist_yaw_filt;
+#endif
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    status.assist_motor_p = s_p_assist_on;
+#endif
 
     portENTER_CRITICAL(&s_status_lock);
     uint32_t generation = s_status_generation;
@@ -784,16 +819,29 @@ static void arm_command_handler(bool arm, bool force)
  * owned by the control task. Touching it from here would race the 100 Hz loop
  * mid-mix and could leave the ESCs holding a correction the gate has already
  * revoked. */
-static void assist_command_handler(bool p_on)
+static void assist_command_handler(bool p_on, bool rudder_assist)
 {
-#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    /* MUTUALLY EXCLUSIVE for this experiment. The motor P assist perturbs
+     * differential thrust and the rudder loop perturbs the rudder; running
+     * both would leave any result unattributable to either. Resolved HERE, on
+     * the request, so the boat can never hold both -- and resolved in favour
+     * of OFF: a command asking for both is a mistake, and the safe reading of
+     * a mistake is neither. */
+    if (p_on && rudder_assist) {
+        p_on = false;
+        rudder_assist = false;
+    }
     portENTER_CRITICAL(&s_arbiter_lock);
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
     s_p_assist_req = p_on;
     s_p_assist_req_pending = true;
-    portEXIT_CRITICAL(&s_arbiter_lock);
-#else
-    (void)p_on;
 #endif
+#if CONFIG_STABILITY_SAS_ENABLE
+    s_assist_rudder_req = rudder_assist;
+    s_assist_rudder_req_pending = true;
+#endif
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    (void)p_on; (void)rudder_assist;
 }
 
 static void bench_command_handler(uint32_t kind, float base, float delta,
@@ -1331,11 +1379,49 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
     if (!s_stab_cfg_loaded) {
         s_stab_cfg_loaded = true;
         s_stab_cfg.r_max_dps = (float)CONFIG_STABILITY_SAS_RMAX_DPS;
-        s_stab_cfg.k_r = parse_cfg_float(CONFIG_STABILITY_SAS_KR, 0.010f, 0.0f, 1.0f);
-        s_stab_cfg.yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_SAS_YAW_TAU_S, 0.15f, 0.01f, 5.0f);
-        s_stab_cfg.out_cap = parse_cfg_float(CONFIG_STABILITY_SAS_OUT_CAP, 0.50f, 0.0f, 1.0f);
+        s_stab_cfg.k_p = parse_cfg_float(CONFIG_STABILITY_SAS_KR, 0.05f, 0.0f, 1.0f);
+        s_stab_cfg.ff_left = parse_cfg_float(CONFIG_STABILITY_SAS_FF_LEFT, 0.18f, 0.0f, 2.0f);
+        s_stab_cfg.ff_right = parse_cfg_float(CONFIG_STABILITY_SAS_FF_RIGHT, 0.31f, 0.0f, 2.0f);
+        s_stab_cfg.yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_SAS_YAW_TAU_S, 0.25f, 0.01f, 5.0f);
+        s_stab_cfg.out_cap = parse_cfg_float(CONFIG_STABILITY_SAS_OUT_CAP, 0.80f, 0.0f, 1.0f);
+        s_stab_cfg.slew_per_s = parse_cfg_float(CONFIG_STABILITY_SAS_SLEW_PER_S, 2.0f, 0.0f, 20.0f);
         stab_reset(&s_stab_state);
         s_stab_last_tick_us = 0;
+        ESP_LOGI(TAG, "SAS built in (Assisted Steering default OFF): r_max=%.1f "
+                      "kp=%.3f ff_l=%.3f ff_r=%.3f tau=%.2f cap=%.2f slew=%.1f",
+                 (double)s_stab_cfg.r_max_dps, (double)s_stab_cfg.k_p,
+                 (double)s_stab_cfg.ff_left, (double)s_stab_cfg.ff_right,
+                 (double)s_stab_cfg.yaw_tau_s, (double)s_stab_cfg.out_cap,
+                 (double)s_stab_cfg.slew_per_s);
+    }
+
+    /* Apply a pending runtime enable/disable, on THIS task, before any gate is
+     * evaluated -- so an OFF takes effect on this very tick. */
+    portENTER_CRITICAL(&s_arbiter_lock);
+    const bool a_pending = s_assist_rudder_req_pending;
+    const bool a_req = s_assist_rudder_req;
+    s_assist_rudder_req_pending = false;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    if (a_pending && a_req != s_assist_rudder_on) {
+        s_assist_rudder_on = a_req;
+        stab_reset(&s_stab_state);
+        s_stab_last_seq = 0;
+        s_stab_last_tick_us = 0;
+        s_assist_rudder_cmd = 0.0f;
+        s_assist_target_dps = 0.0f;
+        s_assist_yaw_filt = 0.0f;
+        s_assist_saturated = false;
+        /* Leaving Assisted returns the rudder to exactly where Raw Manual says
+         * it should be, rather than wherever the loop had walked it. */
+        if (!s_assist_rudder_on) {
+            steer_driver_set(s_manual_rudder);
+        }
+    }
+
+    /* Raw Manual is the default mode and the boot mode. With the loop off,
+     * control_apply_decision owns the rudder exactly as it always has. */
+    if (!s_assist_rudder_on) {
+        return;
     }
 
     /* Calibration escape hatch: never touch the rudder while the operator is
@@ -1402,9 +1488,15 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
                : clampf((float)(now_us - s_stab_last_tick_us) / 1000000.0f, 0.0f, 0.5f);
     s_stab_last_tick_us = now_us;
 
+    stab_debug_t dbg;
     float rudder = stab_rudder_update(&s_stab_state, &s_stab_cfg,
-                                      dt_s, s_manual_rudder, fusion.yaw_rate);
+                                      dt_s, s_manual_rudder, fusion.yaw_rate,
+                                      &dbg);
     steer_driver_set(rudder);
+    s_assist_rudder_cmd = rudder;
+    s_assist_target_dps = dbg.target_dps;
+    s_assist_yaw_filt = dbg.yaw_filt;
+    s_assist_saturated = dbg.saturated;
 
     if ((++s_stab_log_div % STAB_LOG_DIVIDER) == 0) {
         ESP_LOGI(TAG, "CTRL_SAS,active,yaw=%.1f,rudder=%.2f,dt=%.3f,age_ms=%lld",

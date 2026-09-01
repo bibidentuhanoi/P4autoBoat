@@ -118,6 +118,18 @@ typedef struct _boat_MotorStatus {
     float right_throttle; /* current right throttle */
     float winch_speed; /* current winch speed (-1..1) */
     bool servo_power; /* servo rail (winch + rudders) actually powered */
+    /* --- rudder, as COMMANDED by the firmware ---------------------------------
+ There is no position feedback on this servo. Every field below is what the
+ boat ASKED the rudder to do, never where the rudder actually is. Anything
+ displaying or recording them must say so. */
+    float rudder_cmd; /* normalized, canonical (-1 left .. +1 right) */
+    uint32_t rudder_pulse_us; /* the pulse that command maps to */
+    bool rudder_saturated; /* the assisted loop's output cap bound it */
+    /* --- assisted steering, as the BOAT reports it ---------------------------- */
+    bool assist_rudder; /* the rudder loop is actually running */
+    bool assist_motor_p; /* the motor P assist is actually running */
+    float yaw_target_dps; /* physical yaw-rate target the loop is holding */
+    float yaw_filt_dps; /* the loop's own filtered yaw */
 } boat_MotorStatus;
 
 typedef struct _boat_ArmCommand {
@@ -173,6 +185,12 @@ typedef struct _boat_CalibrateStatus {
  a rebuild between arms would let a build difference look like a result. */
 typedef struct _boat_AssistCommand {
     bool p_on;
+    /* Runtime Assisted Steering (rudder yaw-rate loop). DELIBERATELY a separate
+ field from p_on: that one is the MOTOR differential-thrust assist, this is
+ the RUDDER loop, and folding them into one flag would make an experiment
+ that isolates either of them impossible. The firmware refuses to have both
+ on at once, but they are still two switches. */
+    bool rudder_assist;
 } boat_AssistCommand;
 
 /* Bench throttle-mismatch test. The BOAT runs the whole profile and records to
@@ -246,13 +264,13 @@ extern "C" {
 #define boat_WinchCommand_init_default           {0}
 #define boat_SteerCommand_init_default           {0, 0}
 #define boat_SteerRawCommand_init_default        {0}
-#define boat_MotorStatus_init_default            {0, 0, 0, 0, 0}
+#define boat_MotorStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_default             {0, 0}
 #define boat_ServoPowerCommand_init_default      {0}
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_default       {0, 0}
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
-#define boat_AssistCommand_init_default          {0}
+#define boat_AssistCommand_init_default          {0, 0}
 #define boat_BenchCommand_init_default           {0, 0, 0, 0}
 #define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
@@ -268,13 +286,13 @@ extern "C" {
 #define boat_WinchCommand_init_zero              {0}
 #define boat_SteerCommand_init_zero              {0, 0}
 #define boat_SteerRawCommand_init_zero           {0}
-#define boat_MotorStatus_init_zero               {0, 0, 0, 0, 0}
+#define boat_MotorStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_zero                {0, 0}
 #define boat_ServoPowerCommand_init_zero         {0}
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_zero          {0, 0}
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
-#define boat_AssistCommand_init_zero             {0}
+#define boat_AssistCommand_init_zero             {0, 0}
 #define boat_BenchCommand_init_zero              {0, 0, 0, 0}
 #define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
@@ -326,6 +344,13 @@ extern "C" {
 #define boat_MotorStatus_right_throttle_tag      3
 #define boat_MotorStatus_winch_speed_tag         4
 #define boat_MotorStatus_servo_power_tag         5
+#define boat_MotorStatus_rudder_cmd_tag          6
+#define boat_MotorStatus_rudder_pulse_us_tag     7
+#define boat_MotorStatus_rudder_saturated_tag    8
+#define boat_MotorStatus_assist_rudder_tag       9
+#define boat_MotorStatus_assist_motor_p_tag      10
+#define boat_MotorStatus_yaw_target_dps_tag      11
+#define boat_MotorStatus_yaw_filt_dps_tag        12
 #define boat_ArmCommand_arm_tag                  1
 #define boat_ArmCommand_force_tag                2
 #define boat_ServoPowerCommand_on_tag            1
@@ -350,6 +375,7 @@ extern "C" {
 #define boat_CalibrateStatus_making_way_tag      6
 #define boat_CalibrateStatus_points_done_tag     7
 #define boat_AssistCommand_p_on_tag              1
+#define boat_AssistCommand_rudder_assist_tag     2
 #define boat_BenchCommand_kind_tag               1
 #define boat_BenchCommand_base_tag               2
 #define boat_BenchCommand_delta_tag              3
@@ -482,7 +508,14 @@ X(a, STATIC,   SINGULAR, UINT32,   state,             1) \
 X(a, STATIC,   SINGULAR, FLOAT,    left_throttle,     2) \
 X(a, STATIC,   SINGULAR, FLOAT,    right_throttle,    3) \
 X(a, STATIC,   SINGULAR, FLOAT,    winch_speed,       4) \
-X(a, STATIC,   SINGULAR, BOOL,     servo_power,       5)
+X(a, STATIC,   SINGULAR, BOOL,     servo_power,       5) \
+X(a, STATIC,   SINGULAR, FLOAT,    rudder_cmd,        6) \
+X(a, STATIC,   SINGULAR, UINT32,   rudder_pulse_us,   7) \
+X(a, STATIC,   SINGULAR, BOOL,     rudder_saturated,   8) \
+X(a, STATIC,   SINGULAR, BOOL,     assist_rudder,     9) \
+X(a, STATIC,   SINGULAR, BOOL,     assist_motor_p,   10) \
+X(a, STATIC,   SINGULAR, FLOAT,    yaw_target_dps,   11) \
+X(a, STATIC,   SINGULAR, FLOAT,    yaw_filt_dps,     12)
 #define boat_MotorStatus_CALLBACK NULL
 #define boat_MotorStatus_DEFAULT NULL
 
@@ -530,7 +563,8 @@ X(a, STATIC,   SINGULAR, UINT32,   points_done,       7)
 #define boat_CalibrateStatus_DEFAULT NULL
 
 #define boat_AssistCommand_FIELDLIST(X, a) \
-X(a, STATIC,   SINGULAR, BOOL,     p_on,              1)
+X(a, STATIC,   SINGULAR, BOOL,     p_on,              1) \
+X(a, STATIC,   SINGULAR, BOOL,     rudder_assist,     2)
 #define boat_AssistCommand_CALLBACK NULL
 #define boat_AssistCommand_DEFAULT NULL
 
@@ -642,7 +676,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 /* Maximum encoded size of messages (where known) */
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
 #define boat_ArmCommand_size                     4
-#define boat_AssistCommand_size                  2
+#define boat_AssistCommand_size                  4
 #define boat_BenchCommand_size                   21
 #define boat_BenchStatus_size                    41
 #define boat_BoatMessage_size                    13275
@@ -654,7 +688,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_GpsFix_size                         63
 #define boat_IMUData_size                        20
 #define boat_MotorCommand_size                   20
-#define boat_MotorStatus_size                    23
+#define boat_MotorStatus_size                    50
 #define boat_SensorSnapshot_size                 13272
 #define boat_ServoPowerCommand_size              2
 #define boat_SteerCommand_size                   10

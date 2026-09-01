@@ -53,6 +53,7 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
 
@@ -127,6 +128,7 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 
     def _feed_calibrate(self, **fields):
@@ -241,6 +243,7 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -583,6 +586,7 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -861,6 +865,7 @@ class BenchRunLinkTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link._diag_counts = {}
         self.link.seq = 0
         self.link.last_error = None
@@ -999,6 +1004,7 @@ class FieldTelemetryYawRateTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 
     def test_field_telemetry_decodes_yaw_rate(self):
@@ -1086,6 +1092,7 @@ class BenchLearnerResetTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link._diag_counts = {}
         self.sent = []
         self.link._write_locked = lambda p: (self.sent.append(p), True)[1]
@@ -1189,6 +1196,7 @@ class PAssistControlTest(unittest.TestCase):
         self.link.pb2 = espnow_drive.load_boat_pb2()
         self.link.connected = True
         self.link.rudder_test = None
+        self.link.assist_rudder_on = False
         self.link.p_assist_on = False
         self.sent = []
         self.link._write_locked = lambda p: (self.sent.append(p), True)[1]
@@ -1253,6 +1261,7 @@ class PAssistConfirmTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 
     def feed(self, p_on):

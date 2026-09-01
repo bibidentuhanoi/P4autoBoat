@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -34,6 +36,17 @@ esp_err_t steer_driver_set(float steer);
 
 /** Last commanded rudder angle (safe from any context). */
 float steer_driver_get(void);
+
+/* The pulse width the CURRENT normalized command maps to, in microseconds --
+ * the same value steer_driver_set() last wrote to the comparator, including
+ * CONFIG_STEER_REVERSE. This is the COMMAND, not a position: the servo has no
+ * feedback. Returns 0 before init.
+ *
+ * Deliberately recomputed from the stored command rather than cached from the
+ * write, so it cannot silently disagree with what steer_to_us() would produce
+ * today. A raw-pulse calibration write (steer_driver_set_raw_us) is NOT
+ * reflected here, for the same reason it does not move steer_driver_get(). */
+uint32_t steer_driver_get_pulse_us(void);
 
 /**
  * Defensive re-assertion, NOT a new command: re-clears any hold that may have

@@ -123,7 +123,7 @@ void pipeline_register_bench_handler(bench_command_handler_fn handler);
 /* Runtime P-assist switch. Runtime so both arms of an A/B run the same
  * firmware -- a rebuild between arms could pass a build difference off as a
  * result. */
-typedef void (*assist_command_handler_fn)(bool p_on);
+typedef void (*assist_command_handler_fn)(bool p_on, bool rudder_assist);
 void pipeline_register_assist_handler(assist_command_handler_fn handler);
 void pipeline_publish_bench_status(const boat_BenchStatus *status);
 

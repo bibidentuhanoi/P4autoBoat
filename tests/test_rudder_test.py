@@ -92,6 +92,7 @@ class RudderTestBase(unittest.TestCase):
         link.force = False
         link.calibrating = False
         link.p_assist_on = False
+        link.assist_rudder_on = False
         link.telemetry = T.BoatLink._blank_telemetry()
         link.motor_status = T.BoatLink._blank_motor_status()
         link.bench_status = T.BoatLink._blank_bench_status()
@@ -971,7 +972,7 @@ class UiLockoutTest(unittest.TestCase):
 
     def test_every_locked_out_control_is_also_refused_server_side(self):
         """The point of the whole exercise: disabling is decoration."""
-        self.assertEqual(self.src.count('_rudder_test_busy_locked()'), 6)
+        self.assertEqual(self.src.count('_rudder_test_busy_locked()'), 7)
         for fn in ('def send_bench', 'def set_calibrate', 'def send_assist',
                    'def set_winch', 'def set_state', 'def set_servo_power'):
             i = self.src.index(fn)
@@ -983,6 +984,175 @@ class UiLockoutTest(unittest.TestCase):
             i = self.src.index(fn)
             body = self.src[i:i + 900]
             self.assertNotIn('return False, \'a rudder test is running', body)
+
+
+class AssistedModeTest(RudderTestBase):
+    """Assisted runs hand the boat a yaw-rate TARGET and let its own rudder
+    loop chase it, instead of holding a fixed deflection."""
+
+    def _assisted(self, sign=-1, seq=1):
+        return self.link.start_rudder_test(sign, seq, assisted=True)
+
+    def test_it_turns_the_rudder_loop_on_for_the_run(self):
+        self.assertFalse(self.link.assist_rudder_on)
+        self.assertTrue(self._assisted()[0])
+        self.assertTrue(self.link.assist_rudder_on)
+
+    def test_it_turns_the_loop_off_again_when_the_run_ends(self):
+        """Leaving it live would have the boat quietly steering during
+        ordinary manual driving afterwards."""
+        self._assisted()
+        self._run_to_completion()
+        self.assertFalse(self.link.assist_rudder_on)
+
+    def test_it_turns_the_loop_off_on_an_abort_too(self):
+        self._assisted()
+        self.clock.advance(1.0)
+        self._tick()
+        self.link.stop(self.link.winch_command_seq + 1)
+        self.assertIsNone(self.link.rudder_test)
+        self.assertFalse(self.link.assist_rudder_on)
+
+    def test_left_commands_full_left_stick(self):
+        """Stick -1 is LEFT, which the firmware turns into a POSITIVE yaw
+        target -- physical left produces positive IMU yaw on this boat."""
+        self._assisted(sign=-1)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.assertEqual(self.link.rudder_test['phase'], 'drive')
+        self.assertAlmostEqual(self.link.rudder, -1.0)
+        self.assertAlmostEqual(self.link.rudder_test['target_dps'],
+                               +T.ASSIST_TEST_TARGET_DPS)
+
+    def test_right_commands_full_right_stick(self):
+        self._assisted(sign=+1)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.assertAlmostEqual(self.link.rudder, +1.0)
+        self.assertAlmostEqual(self.link.rudder_test['target_dps'],
+                               -T.ASSIST_TEST_TARGET_DPS)
+
+    def test_the_target_is_zero_outside_the_drive_phase(self):
+        """The settle phase is the loop holding straight before the motors come
+        on, and the coast must not keep asking for a turn the jets can no
+        longer produce -- that would wind the rudder over with no authority."""
+        self._assisted(sign=-1)
+        seen = {}
+        for i in range(120):
+            self.clock.advance(0.05)
+            self._boat_armed(fresh=True)
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+            seen.setdefault(self.link.rudder_test['phase'], set()).add(self.link.rudder)
+        self.assertEqual(seen['rudder_settle'], {0.0})
+        self.assertEqual(seen['coast'], {0.0})
+        self.assertEqual(seen['drive'], {-1.0})
+
+    def test_the_files_are_named_apart_from_the_raw_runs(self):
+        """Different experiments; a glob must never pool them."""
+        self._assisted(sign=-1)
+        self.assertTrue(self.link.rudder_test['name'].startswith('ASST_T20_L2'))
+        self.link.rudder_test = None
+        self.link.winch_command_seq += 1
+        self._assisted(sign=+1, seq=self.link.winch_command_seq + 1)
+        self.assertTrue(self.link.rudder_test['name'].startswith('ASST_T20_R2'))
+        self.link.rudder_test = None
+        self.link.winch_command_seq += 1
+        self.link.start_rudder_test(-1, self.link.winch_command_seq + 1)
+        self.assertTrue(self.link.rudder_test['name'].startswith('RUD_T20_N80'))
+
+    def test_the_rows_carry_the_mode_and_the_boat_reported_loop_state(self):
+        self._assisted(sign=-1)
+        self.clock.advance(1.0)
+        self.link.motor_status = dict(self.link.motor_status,
+                                      rudder_cmd=-0.42, rudder_pulse_us=1700,
+                                      rudder_saturated=True, assist_rudder=True,
+                                      yaw_filt_dps=1.25)
+        self._boat_armed(fresh=True)
+        self.link.motor_status = dict(self.link.motor_status,
+                                      rudder_cmd=-0.42, rudder_pulse_us=1700,
+                                      rudder_saturated=True, assist_rudder=True,
+                                      yaw_filt_dps=1.25)
+        self._tick()
+        self._frame()
+        row = self.link.rudder_test['rows'][-1]
+        self.assertEqual(row['mode'], 'assisted')
+        self.assertAlmostEqual(row['target_dps'], +T.ASSIST_TEST_TARGET_DPS)
+        self.assertAlmostEqual(row['boat_rudder_cmd'], -0.42)
+        self.assertEqual(row['boat_rudder_us'], 1700)
+        self.assertEqual(row['boat_saturated'], 1)
+        self.assertEqual(row['boat_assist_on'], 1)
+        self.assertAlmostEqual(row['yaw_filt_dps'], 1.25)
+
+    def test_a_raw_run_leaves_the_assisted_columns_blank(self):
+        self.link.start_rudder_test(-1, 1)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self._frame()
+        row = self.link.rudder_test['rows'][-1]
+        self.assertEqual(row['mode'], 'raw')
+        self.assertEqual(row['target_dps'], 0.0)
+
+    def test_the_csv_says_the_rudder_is_commanded_not_measured(self):
+        self._assisted()
+        res = self._run_to_completion()
+        rows = read_rudder_csv(res['path'])
+        for col in ('mode', 'target_dps', 'yaw_filt_dps', 'boat_rudder_cmd',
+                    'boat_rudder_us', 'boat_saturated', 'boat_assist_on'):
+            self.assertIn(col, rows[0])
+        head = Path(res['path']).read_text()[:600].lower()
+        self.assertIn('laptop', head)
+
+
+class MutualExclusionTest(RudderTestBase):
+    """Motor P assist and Assisted Steering must never both be on: one
+    perturbs differential thrust and the other the rudder, and a result with
+    both live is attributable to neither."""
+
+    def test_enabling_the_rudder_loop_is_refused_while_motor_p_is_on(self):
+        self.link.p_assist_on = True
+        ok, err = self.link.send_rudder_assist(True)
+        self.assertFalse(ok)
+        self.assertIn('mutually exclusive', err.lower())
+        self.assertFalse(self.link.assist_rudder_on)
+
+    def test_enabling_motor_p_is_refused_while_the_rudder_loop_is_on(self):
+        self.assertTrue(self.link.send_rudder_assist(True)[0])
+        ok, err = self.link.send_assist(True)
+        self.assertFalse(ok)
+        self.assertIn('mutually exclusive', err.lower())
+        self.assertFalse(self.link.p_assist_on)
+
+    def test_the_wire_message_never_carries_both(self):
+        ok, err = self.link._send_assist_locked(True, True)
+        self.assertFalse(ok)
+        self.assertIn('mutually exclusive', err.lower())
+
+    def test_an_assisted_run_is_refused_while_motor_p_is_requested(self):
+        self.link.p_assist_on = True
+        ok, err = self.link.start_rudder_test(-1, 1, assisted=True)
+        self.assertFalse(ok)
+        self.assertIn('p assist', err.lower())
+
+    def test_a_run_is_refused_when_the_BOAT_reports_motor_p_on(self):
+        """Requested-off is not enough: the boat's own answer is what counts."""
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      assist_motor_p=True, state=2,
+                                      servo_power=True,
+                                      last_rx_monotonic=self.clock.t)
+        ok, err = self.link.start_rudder_test(-1, 1, assisted=True)
+        self.assertFalse(ok)
+        self.assertIn('motor p', err.lower())
+
+    def test_turning_the_rudder_loop_on_forces_motor_p_off_on_the_wire(self):
+        self.link.p_assist_on = False
+        self.assertTrue(self.link.send_rudder_assist(True)[0])
+        self.assertTrue(self.link.assist_rudder_on)
+        self.assertFalse(self.link.p_assist_on)
 
 
 class UnchangedBenchBehaviourTest(unittest.TestCase):

@@ -373,7 +373,8 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 
     case boat_BoatMessage_assist_tag:
         if (s_assist_handler) {
-            s_assist_handler(s_rx_msg.payload.assist.p_on);
+            s_assist_handler(s_rx_msg.payload.assist.p_on,
+                             s_rx_msg.payload.assist.rudder_assist);
         }
         break;
 
