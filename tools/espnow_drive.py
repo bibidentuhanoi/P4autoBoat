@@ -253,7 +253,15 @@ BENCH_YAW_MAX_GAP_S = 0.30
 # The sequence drives NOTHING itself. It sets self.throttle / self.rudder and
 # lets the existing 15 Hz stream loop transmit them, so STOP, DISARM,
 # disconnect and the calibration gate all keep working exactly as they did.
-RUDDER_TEST_DEFLECTION = 0.30      # normalized steer, +1 = right (post-2026-08-31)
+# Normalized steer, +1 = right (post-2026-08-31). 0.80 rather than a token
+# nudge: 0.30 produced too little turn to read against the boat's own yaw
+# noise, and the whole point is a deflection big enough to see unambiguously.
+# Not 1.00 -- that parks the servo on its mechanical stop for 4.5 s.
+RUDDER_TEST_DEFLECTION = 0.80
+# Percent form, DERIVED. Everything that shows or names the deflection reads
+# this, so changing the constant above cannot leave a stale "30" in a filename,
+# a button or a status pill -- which it did, in six places, before this existed.
+RUDDER_TEST_PCT = int(round(RUDDER_TEST_DEFLECTION * 100))
 RUDDER_TEST_THROTTLE = 0.20        # linked, both motors -- matches the T20 bench runs
 # (name, duration, commanded throttle). Boundaries are measured from t0, never
 # accumulated per tick, so 15 Hz jitter cannot drift them.
@@ -1010,8 +1018,8 @@ class BoatLink:
         return True, None
 
     def _next_rudder_test_path(self, sign):
-        """T20 and N30/P30 in the name, first free index -- never overwrite."""
-        tag = 'N30' if sign < 0 else 'P30'
+        """T20 and N80/P80 in the name, first free index -- never overwrite."""
+        tag = ('N' if sign < 0 else 'P') + '%02u' % RUDDER_TEST_PCT
         base = 'RUD_T%02u_%s' % (int(RUDDER_TEST_THROTTLE * 100 + 0.5), tag)
         directory = Path(getattr(self, 'rudder_test_dir', RUDDER_TEST_DIR))
         for i in range(1, 1000):
@@ -1118,6 +1126,7 @@ class BoatLink:
         span = (rows[-1]['t_mono'] - rows[0]['t_mono']) if len(rows) >= 2 else 0.0
         result = {
             'name': rt['name'], 'path': rt['path'], 'sign': rt['sign'],
+            'pct': RUDDER_TEST_PCT,
             'frames': len(rows), 'duration_s': round(self._now() - rt['t0'], 3),
             'span_s': round(span, 3), 'max_gap_s': round(rt['max_gap_s'], 3),
             # No frames at all is the worst gap there is, so say so rather than
@@ -1285,6 +1294,7 @@ class BoatLink:
                     'sign': self.rudder_test['sign'],
                     'elapsed_s': round(self._now() - self.rudder_test['t0'], 2),
                     'total_s': RUDDER_TEST_TOTAL_S,
+                    'pct': RUDDER_TEST_PCT,
                     'frames': len(self.rudder_test['rows']),
                     'name': self.rudder_test['name'],
                 } if self.rudder_test else None),
@@ -1790,8 +1800,8 @@ PAGE = """<!DOCTYPE html>
        way the boat physically turns is what this test is FOR, so the buttons
        must not claim a direction nobody has established yet. -->
   <div class="row">
-    <button id="rt-minus" title="hold rudder -0.30 through a 3 s T20 drive">RUDDER &minus;30 TEST</button>
-    <button id="rt-plus" title="hold rudder +0.30 through a 3 s T20 drive">RUDDER +30 TEST</button>
+    <button id="rt-minus" title="hold rudder -0.80 through a 3 s T20 drive">RUDDER &minus;80 TEST</button>
+    <button id="rt-plus" title="hold rudder +0.80 through a 3 s T20 drive">RUDDER +80 TEST</button>
   </div>
   <div class="telem-row"><label>Phase</label><span class="val" id="rt-phase">--</span></div>
   <div class="telem-row"><label>Saved as</label><span class="val" id="rt-file">--</span></div>
@@ -2466,7 +2476,7 @@ function applyStatus(s) {
     const rt = s.rudder_test, rtr = s.rudder_test_result;
     const rtPill = $('rt-pill');
     if (rt && rt.active) {
-      rtPill.textContent = (rt.sign < 0 ? '-30 ' : '+30 ') + rt.phase.toUpperCase();
+      rtPill.textContent = (rt.sign < 0 ? '-' : '+') + rt.pct + ' ' + rt.phase.toUpperCase();
       rtPill.classList.add('up'); rtPill.classList.remove('stale');
       $('rt-phase').textContent =
         rt.phase + '  ' + rt.elapsed_s.toFixed(1) + ' / ' + rt.total_s.toFixed(1) + 's';
@@ -2478,7 +2488,7 @@ function applyStatus(s) {
       rtPill.classList.toggle('stale', !!(rtr && rtr.aborted));
       if (rtr) {
         $('rt-phase').textContent =
-          (rtr.sign < 0 ? '-30' : '+30') + '  ' + rtr.duration_s.toFixed(2) + 's'
+          (rtr.sign < 0 ? '-' : '+') + rtr.pct + '  ' + rtr.duration_s.toFixed(2) + 's'
           + (rtr.aborted ? '  ABORTED: ' + rtr.abort_reason : '');
         $('rt-file').textContent = rtr.name;
         $('rt-frames').textContent =

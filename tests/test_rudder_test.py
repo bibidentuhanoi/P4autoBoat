@@ -578,7 +578,7 @@ class AbortTest(RudderTestBase):
 class CsvFileTest(RudderTestBase):
 
     def test_the_name_identifies_throttle_and_direction(self):
-        for sign, tag in ((-1, 'N30'), (+1, 'P30')):
+        for sign, tag in ((-1, 'N80'), (+1, 'P80')):
             self.setUp()
             self._start(sign=sign)
             name = self.link.rudder_test['name']
@@ -660,6 +660,30 @@ class UnchangedBenchBehaviourTest(unittest.TestCase):
         self.assertIn('value="12"', m.group(0))
         m = re.search(r'<input type="number" id="bench-throttle"[^>]*>', self.src)
         self.assertIn('value="20"', m.group(0))
+
+    def test_the_deflection_is_big_enough_to_read(self):
+        """0.30 produced too little turn to separate from the boat's own yaw
+        noise. Not 1.00 either -- that parks the servo on its stop for 4.5 s."""
+        self.assertGreaterEqual(T.RUDDER_TEST_DEFLECTION, 0.5)
+        self.assertLess(T.RUDDER_TEST_DEFLECTION, 1.0)
+        self.assertEqual(T.RUDDER_TEST_PCT,
+                         round(T.RUDDER_TEST_DEFLECTION * 100))
+
+    def test_every_label_and_filename_follows_the_constant(self):
+        """It was hardcoded in six places before this guard existed: the two
+        filename tags, both button labels and both status pills. Changing the
+        constant must not be able to leave a stale number anywhere."""
+        pct = T.RUDDER_TEST_PCT
+        self.assertIn('RUDDER &minus;%d TEST' % pct, self.src)
+        self.assertIn('RUDDER +%d TEST' % pct, self.src)
+        self.assertIn('hold rudder -0.%d ' % pct, self.src)
+        self.assertIn('hold rudder +0.%d ' % pct, self.src)
+        # the pills read the server's value rather than a literal
+        self.assertIn("rt.pct", self.src)
+        self.assertIn("rtr.pct", self.src)
+        for stale in ('N30', 'P30', "'-30", "'+30", 'minus;30 TEST'):
+            self.assertNotIn(stale, self.src,
+                             'a stale 30 survived: %s' % stale)
 
     def test_no_firmware_proto_or_dashboard_dependency_was_added(self):
         """The sequence is built entirely from commands the boat already
