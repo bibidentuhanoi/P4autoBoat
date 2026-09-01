@@ -1188,6 +1188,7 @@ class PAssistControlTest(unittest.TestCase):
         self.link._lock = threading.Lock()
         self.link.pb2 = espnow_drive.load_boat_pb2()
         self.link.connected = True
+        self.link.rudder_test = None
         self.link.p_assist_on = False
         self.sent = []
         self.link._write_locked = lambda p: (self.sent.append(p), True)[1]

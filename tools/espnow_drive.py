@@ -278,12 +278,63 @@ RUDDER_TEST_STATUS_MAX_AGE_S = TELEMETRY_STALE_S
 # A hole longer than this in the received frames means the recording cannot
 # describe the turn. Same reasoning (and value) as the bench summary.
 RUDDER_TEST_MAX_GAP_S = BENCH_YAW_MAX_GAP_S
+# The DRIVE phase is the measurement; the settle and coast phases are context.
+# So coverage is judged on the drive window alone -- a run with plenty of
+# frames that happen to land in the coast phase has recorded nothing useful.
+RUDDER_TEST_DRIVE_S = dict((n, d) for n, d, _t in RUDDER_TEST_PHASES)['drive']
+RUDDER_TEST_MIN_DRIVE_COVERAGE = 0.8    # of the 3 s drive window
+RUDDER_TEST_MIN_DRIVE_FRAMES = 20       # ~20 Hz over 3 s should give ~60
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 RUDDER_TEST_CSV_COLUMNS = (
     't_mono', 'elapsed_s', 'phase', 'yaw_dps', 'heading_deg',
     'cmd_throttle', 'cmd_rudder', 'boat_left', 'boat_right',
     'servo_us', 'telem_age_s', 'gap_s',
 )
+
+
+def rudder_test_drive_coverage(rows):
+    """How well the caught frames actually cover the DRIVE window.
+
+    Frame count alone is not coverage. Sixty frames crammed into the last
+    second, or a recording that only started 1.2 s in, both look healthy by
+    count and describe most of the turn not at all. So this measures where the
+    frames sit relative to the 0.5 .. 3.5 s drive window:
+
+      drive_frames      how many landed inside it
+      drive_first_delay how long after the window opened the first one arrived
+      drive_tail_gap    how long before it closed the last one arrived
+      drive_span        first to last, inside the window
+      drive_max_gap     worst hole between consecutive frames -- INCLUDING the
+                        lead-in and tail, because a hole at either edge hides
+                        exactly as much of the turn as one in the middle
+    """
+    start = RUDDER_TEST_PHASES[0][1]            # drive opens after the settle
+    end = start + RUDDER_TEST_DRIVE_S
+    inside = [r for r in rows if start <= r['elapsed_s'] < end]
+    out = {
+        'drive_frames': len(inside),
+        'drive_first_delay_s': round(RUDDER_TEST_DRIVE_S, 3),
+        'drive_tail_gap_s': round(RUDDER_TEST_DRIVE_S, 3),
+        'drive_span_s': 0.0,
+        'drive_max_gap_s': round(RUDDER_TEST_DRIVE_S, 3),
+        'drive_incomplete': True,
+    }
+    if not inside:
+        return out
+    first, last = inside[0]['elapsed_s'], inside[-1]['elapsed_s']
+    out['drive_first_delay_s'] = round(first - start, 3)
+    out['drive_tail_gap_s'] = round(end - last, 3)
+    out['drive_span_s'] = round(last - first, 3)
+    gaps = [inside[i]['elapsed_s'] - inside[i - 1]['elapsed_s']
+            for i in range(1, len(inside))]
+    worst = max(gaps) if gaps else 0.0
+    worst = max(worst, out['drive_first_delay_s'], out['drive_tail_gap_s'])
+    out['drive_max_gap_s'] = round(worst, 3)
+    out['drive_incomplete'] = (
+        out['drive_frames'] < RUDDER_TEST_MIN_DRIVE_FRAMES
+        or out['drive_span_s'] < RUDDER_TEST_DRIVE_S * RUDDER_TEST_MIN_DRIVE_COVERAGE
+        or worst > RUDDER_TEST_MAX_GAP_S)
+    return out
 
 
 def rudder_test_phase_at(elapsed):
@@ -722,6 +773,16 @@ class BoatLink:
 
     def set_state(self, throttle=None, rudder=None, left=None, right=None):
         with self._lock:
+            # Touching a stick mid-run means the operator wants control back.
+            # Abort, and DISCARD the value they sent rather than applying it:
+            # the abort has already forced throttle 0 / rudder centred, and
+            # letting a half-pushed slider through would immediately undo that.
+            # The next command after the abort is theirs to make deliberately.
+            if self._rudder_test_busy_locked() and (
+                    throttle is not None or rudder is not None
+                    or left is not None or right is not None):
+                self._abort_rudder_test_locked('manual control input')
+                return
             if throttle is not None:
                 self.throttle = clamp(float(throttle), -1.0, 1.0)
                 self.motor_split = False          # linked: throttle drives both
@@ -741,6 +802,8 @@ class BoatLink:
             if command_seq <= self.winch_command_seq:
                 return False, 'stale command sequence'
             self.winch_command_seq = command_seq
+            if self._rudder_test_busy_locked():
+                return False, 'a rudder test is running — wait for it to finish'
             if not self.connected:
                 self.winch_speed = 0.0
                 self.winch_lease_until = 0.0
@@ -765,6 +828,10 @@ class BoatLink:
             if command_seq <= self.winch_command_seq:
                 return False, 'stale command sequence'
             self.winch_command_seq = command_seq
+            # Servo power OFF drops the rail the rudder needs to hold its
+            # deflection, so it ends the run rather than racing it.
+            if self._rudder_test_busy_locked():
+                self._abort_rudder_test_locked('servo power changed')
             if not self.connected:
                 self.winch_speed = 0.0
                 self.winch_lease_until = 0.0
@@ -823,6 +890,8 @@ class BoatLink:
             if command_seq <= self.winch_command_seq:
                 return False, 'stale command sequence'
             self.winch_command_seq = command_seq
+            if start and self._rudder_test_busy_locked():
+                return False, 'a rudder test is running — wait for it to finish'
             if not self.connected:
                 return False, 'serial link is disconnected'
             if start and not self.armed_cmd:
@@ -877,6 +946,10 @@ class BoatLink:
         pass for a result. OFF returns the boat to exactly the pre-P path: the
         firmware drops the correction rather than letting it decay."""
         with self._lock:
+            # P perturbs the motors. Changing it mid-run would put a different
+            # controller under half the recording.
+            if self._rudder_test_busy_locked():
+                return False, 'a rudder test is running — wait for it to finish'
             if not self.connected:
                 return False, 'serial link is disconnected'
             msg = self.pb2.BoatMessage()
@@ -903,6 +976,8 @@ class BoatLink:
             if command_seq <= self.winch_command_seq:
                 return False, 'stale command sequence'
             self.winch_command_seq = command_seq
+            if self._rudder_test_busy_locked():
+                return False, 'a rudder test is running — wait for it to finish'
             if kind not in BENCH_KIND:
                 return False, 'unknown run type'
             if not self.connected:
@@ -1005,6 +1080,15 @@ class BoatLink:
             self.rudder = self.rudder_test['rudder']
             return True, None
 
+    def _rudder_test_busy_locked(self):
+        """Server-side interlock, not a UI convenience.
+
+        The page greys these controls out while a run is going, but disabled
+        buttons are decoration: a stale tab, a second browser, a curl, or the
+        keyboard shortcuts all reach the HTTP API directly. The refusal has to
+        live here, where every one of those paths converges."""
+        return self.rudder_test is not None
+
     def _boat_armed_and_fresh_locked(self, now):
         """(ok, why). The BOAT's own confirmation, not what we commanded."""
         ms = self.motor_status
@@ -1015,6 +1099,11 @@ class BoatLink:
             return False, 'boat status is stale — not safe to drive blind'
         if int(ms.get('state', 0)) != 2:
             return False, 'the boat does not report itself armed'
+        # The rudder is a SERVO. Without the rail powered it does not hold a
+        # deflection, so a run without this is throttle applied to a rudder
+        # that may be drifting anywhere -- worse than no test.
+        if not ms.get('servo_power'):
+            return False, 'the boat reports the servo rail is OFF'
         return True, None
 
     def _next_rudder_test_path(self, sign):
@@ -1124,6 +1213,7 @@ class BoatLink:
         self.rudder = 0.0
         rows = rt['rows']
         span = (rows[-1]['t_mono'] - rows[0]['t_mono']) if len(rows) >= 2 else 0.0
+        drive = rudder_test_drive_coverage(rows)
         result = {
             'name': rt['name'], 'path': rt['path'], 'sign': rt['sign'],
             'pct': RUDDER_TEST_PCT,
@@ -1135,6 +1225,10 @@ class BoatLink:
             'aborted': bool(aborted),
             'abort_reason': reason if aborted else None,
         }
+        result.update(drive)
+        # An aborted run cut the drive phase short, so it can never be
+        # complete however good the frames it did catch look.
+        result['incomplete'] = bool(aborted) or drive['drive_incomplete']
         self.rudder_test_result = result
         self._rudder_test_write = (rt, result)
 
@@ -1164,6 +1258,12 @@ class BoatLink:
                             result['max_gap_s'],
                             (' ABORTED=' + str(result['abort_reason']))
                             if result['aborted'] else ''))
+                fh.write('# drive_frames=%d first_delay_s=%.3f tail_gap_s=%.3f '
+                         'span_s=%.3f max_gap_s=%.3f%s\n'
+                         % (result['drive_frames'], result['drive_first_delay_s'],
+                            result['drive_tail_gap_s'], result['drive_span_s'],
+                            result['drive_max_gap_s'],
+                            ' INCOMPLETE' if result['incomplete'] else ''))
                 w = csv.DictWriter(fh, fieldnames=list(RUDDER_TEST_CSV_COLUMNS))
                 w.writeheader()
                 for row in rt['rows']:
@@ -2142,6 +2242,26 @@ $('bench-base').addEventListener('click', () => runBench('both', 0));
 // The 4.5 s sequence runs on the server's own command loop; this call returns
 // at once and progress arrives through the normal status poll. Nothing here
 // sleeps or holds the page.
+// Purely visual. Every one of these is ALSO refused server-side while a run
+// is going -- a disabled button is decoration, and a stale tab, a second
+// browser or a curl all reach the HTTP API without ever seeing it.
+var _rtLockedOut = null;
+function setRudderTestLockout(on) {
+  if (_rtLockedOut === on) return;      // don't fight the user every poll
+  _rtLockedOut = on;
+  ['bench-left', 'bench-right', 'bench-base', 'bench-reset', 'p-assist',
+   'rt-minus', 'rt-plus', 'calibrate-btn'].forEach(function (id) {
+    const el = $(id);
+    if (!el) return;
+    el.disabled = on;
+    // Cosmetic, and guarded: this runs inside the status renderer, so a throw
+    // here would take the whole UI update down with it -- for a greyed-out
+    // button. The disabled flag above is the part that matters, and the real
+    // refusal is server-side regardless.
+    if (el.style) el.style.opacity = on ? '0.4' : '';
+  });
+}
+
 async function runRudderTest(sign) {
   if (!connected) { $('rt-msg').textContent = 'not connected'; return; }
   $('rt-msg').textContent = '';
@@ -2482,7 +2602,9 @@ function applyStatus(s) {
         rt.phase + '  ' + rt.elapsed_s.toFixed(1) + ' / ' + rt.total_s.toFixed(1) + 's';
       $('rt-file').textContent = rt.name;
       $('rt-frames').textContent = rt.frames + ' collecting...';
+      setRudderTestLockout(true);
     } else {
+      setRudderTestLockout(false);
       rtPill.textContent = rtr ? (rtr.aborted ? 'ABORTED' : 'DONE') : 'IDLE';
       rtPill.classList.remove('up');
       rtPill.classList.toggle('stale', !!(rtr && rtr.aborted));
@@ -2492,8 +2614,12 @@ function applyStatus(s) {
           + (rtr.aborted ? '  ABORTED: ' + rtr.abort_reason : '');
         $('rt-file').textContent = rtr.name;
         $('rt-frames').textContent =
-          rtr.frames + (rtr.gap ? '  GAP ' + rtr.max_gap_s.toFixed(2) + 's' : '');
-        $('rt-frames').classList.toggle('warn', !!rtr.gap);
+          rtr.frames + ' (' + rtr.drive_frames + ' in drive)'
+          + '  first +' + rtr.drive_first_delay_s.toFixed(2) + 's'
+          + '  tail ' + rtr.drive_tail_gap_s.toFixed(2) + 's'
+          + '  maxgap ' + rtr.drive_max_gap_s.toFixed(2) + 's'
+          + (rtr.incomplete ? '  INCOMPLETE' : '');
+        $('rt-frames').classList.toggle('warn', !!(rtr.incomplete || rtr.gap));
         if (rtr.write_error) $('rt-msg').textContent = rtr.write_error;
       }
     }

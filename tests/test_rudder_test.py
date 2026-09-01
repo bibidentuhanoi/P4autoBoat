@@ -121,10 +121,10 @@ class RudderTestBase(unittest.TestCase):
 
     # ---- fixtures ------------------------------------------------------
 
-    def _boat_armed(self, fresh=True, state=2):
+    def _boat_armed(self, fresh=True, state=2, servo_power=True):
         self.link.motor_status = dict(
             self.link.motor_status, have=True, state=state,
-            left_throttle=0.18, right_throttle=0.22,
+            left_throttle=0.18, right_throttle=0.22, servo_power=servo_power,
             last_rx_monotonic=self.clock.t if fresh else self.clock.t - 60.0)
 
     def _start(self, sign=-1, seq=1):
@@ -628,6 +628,361 @@ class CsvFileTest(RudderTestBase):
         res = self._run_to_completion()
         rows = read_rudder_csv(res['path'])
         self.assertTrue(all(r['servo_us'] == '' for r in rows))
+
+
+class ServoPowerGateTest(RudderTestBase):
+    """The rudder is a SERVO. With the rail unpowered it does not hold a
+    deflection, so a run without it is throttle applied to a rudder that may be
+    drifting anywhere -- worse than no test, because it still produces a file."""
+
+    def test_it_refuses_to_start_with_the_rail_off(self):
+        self._boat_armed(fresh=True, servo_power=False)
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertIn('servo rail', err.lower())
+
+    def test_the_rail_going_off_mid_run_aborts(self):
+        self._start()
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True, servo_power=False)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.throttle, 0.0)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.link._flush_rudder_test_write()
+        self.assertTrue(self.link.rudder_test_result['aborted'])
+        self.assertIn('servo rail',
+                      self.link.rudder_test_result['abort_reason'].lower())
+
+    def test_status_going_stale_also_loses_the_rail_confirmation(self):
+        """Freshness and rail state are one gate: a stale 'powered' is not
+        evidence the rail is still up."""
+        self._start()
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=False, servo_power=True)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.rudder, 0.0)
+
+
+class ServerSideInterlockTest(RudderTestBase):
+    """Refusals live on the SERVER. The page greys these out, but a stale tab,
+    a second browser or a curl reaches the HTTP API without seeing that."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self._start()[0])
+        self._seq = self.link.winch_command_seq
+
+    def _next(self):
+        self._seq += 1
+        return self._seq
+
+    def test_bench_start_is_refused(self):
+        ok, err = self.link.send_bench('both', 0.2, 0.12, self._next())
+        self.assertFalse(ok)
+        self.assertIn('rudder test', err.lower())
+        self.assertIsNotNone(self.link.rudder_test)   # and does NOT abort it
+
+    def test_calibration_start_is_refused(self):
+        ok, err = self.link.set_calibrate(True, self._next())
+        self.assertFalse(ok)
+        self.assertIn('rudder test', err.lower())
+        self.assertIsNotNone(self.link.rudder_test)
+
+    def test_a_p_assist_change_is_refused(self):
+        ok, err = self.link.send_assist(True)
+        self.assertFalse(ok)
+        self.assertIn('rudder test', err.lower())
+        self.assertFalse(self.link.p_assist_on)
+
+    def test_winch_is_refused(self):
+        ok, err = self.link.set_winch(0.5, self._next())
+        self.assertFalse(ok)
+        self.assertIn('rudder test', err.lower())
+        self.assertEqual(self.link.winch_speed, 0.0)
+
+    def test_a_second_rudder_test_is_refused(self):
+        ok, err = self.link.start_rudder_test(1, self._next())
+        self.assertFalse(ok)
+        self.assertIn('already', err.lower())
+
+    def test_the_refusals_do_not_disturb_the_running_test(self):
+        """Refused means refused -- not 'quietly ends the run'."""
+        phase_before = self.link.rudder_test['phase']
+        self.link.send_bench('both', 0.2, 0.12, self._next())
+        self.link.set_calibrate(True, self._next())
+        self.link.send_assist(True)
+        self.link.set_winch(0.5, self._next())
+        self.assertIsNotNone(self.link.rudder_test)
+        self.assertEqual(self.link.rudder_test['phase'], phase_before)
+        self.assertEqual(self.link.rudder, -T.RUDDER_TEST_DEFLECTION)
+
+    def test_stop_disarm_and_disconnect_stay_active(self):
+        """These must NEVER be interlocked -- they are the way out."""
+        self.link.stop(self._next())
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.throttle, 0.0)
+        self.assertEqual(self.link.rudder, 0.0)
+
+
+class ManualOverrideTest(RudderTestBase):
+    """Touching a stick means the operator wants control back."""
+
+    def setUp(self):
+        super().setUp()
+        self.assertTrue(self._start()[0])
+        self.clock.advance(1.0)
+        self._tick()
+
+    def _assert_aborted_and_safe(self):
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.throttle, 0.0)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertEqual(self.link.motor_left, 0.0)
+        self.assertEqual(self.link.motor_right, 0.0)
+        self.link._flush_rudder_test_write()
+        self.assertTrue(self.link.rudder_test_result['aborted'])
+        self.assertIn('manual',
+                      self.link.rudder_test_result['abort_reason'].lower())
+
+    def test_a_throttle_input_aborts_and_the_value_is_discarded(self):
+        """Discarded, not applied: the abort has already forced throttle 0, and
+        letting the half-pushed slider through would immediately undo that."""
+        self.link.set_state(throttle=0.6)
+        self._assert_aborted_and_safe()
+
+    def test_a_rudder_input_aborts_and_is_discarded(self):
+        self.link.set_state(rudder=0.9)
+        self._assert_aborted_and_safe()
+
+    def test_a_per_motor_input_aborts_and_is_discarded(self):
+        self.link.set_state(left=0.5)
+        self._assert_aborted_and_safe()
+
+    def test_a_zero_input_still_aborts(self):
+        """Releasing a stick is just as much 'I want control back'."""
+        self.link.set_state(throttle=0.0)
+        self._assert_aborted_and_safe()
+
+    def test_manual_control_works_normally_once_the_run_has_ended(self):
+        self.link.set_state(throttle=0.6)          # aborts
+        self.link.set_state(throttle=0.6)          # now it applies
+        self.assertAlmostEqual(self.link.throttle, 0.6)
+
+    def test_servo_power_off_aborts_the_run(self):
+        self.link.set_servo_power(False, self.link.winch_command_seq + 1)
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.link._flush_rudder_test_write()
+        self.assertTrue(self.link.rudder_test_result['aborted'])
+
+
+class DriveCoverageTest(unittest.TestCase):
+    """Frame COUNT is not coverage. Sixty frames crammed into the last second,
+    or a recording that only starts 1.2 s in, both look healthy by count and
+    describe most of the turn not at all."""
+
+    @staticmethod
+    def _rows(times):
+        return [{'elapsed_s': t} for t in times]
+
+    def _clean(self, hz=20.0):
+        step = 1.0 / hz
+        n = int(T.RUDDER_TEST_DRIVE_S / step)
+        return self._rows([0.5 + i * step for i in range(n)])
+
+    def test_a_clean_drive_is_complete(self):
+        c = T.rudder_test_drive_coverage(self._clean())
+        self.assertFalse(c['drive_incomplete'])
+        self.assertGreaterEqual(c['drive_frames'], T.RUDDER_TEST_MIN_DRIVE_FRAMES)
+        self.assertAlmostEqual(c['drive_first_delay_s'], 0.0, places=3)
+        self.assertLessEqual(c['drive_tail_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertLessEqual(c['drive_max_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+
+    def test_only_frames_inside_the_drive_window_are_counted(self):
+        """Settle- and coast-phase frames are context, not measurement."""
+        rows = self._rows([0.0, 0.2, 0.4] + [4.0, 4.2]) + self._clean()
+        rows.sort(key=lambda r: r['elapsed_s'])
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertEqual(c['drive_frames'], len(self._clean()))
+
+    def test_a_late_start_is_incomplete_even_with_many_frames(self):
+        rows = self._rows([1.9 + i * 0.02 for i in range(70)])   # dense, late
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertGreaterEqual(c['drive_frames'], T.RUDDER_TEST_MIN_DRIVE_FRAMES)
+        self.assertGreater(c['drive_first_delay_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertTrue(c['drive_incomplete'])
+
+    def test_an_early_stop_is_incomplete(self):
+        rows = self._rows([0.5 + i * 0.02 for i in range(70)])   # dense, early
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertGreater(c['drive_tail_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertTrue(c['drive_incomplete'])
+
+    def test_a_hole_in_the_middle_is_incomplete(self):
+        rows = self._rows([0.5 + i * 0.05 for i in range(15)]
+                          + [2.0 + i * 0.05 for i in range(28)])
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertGreater(c['drive_max_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertTrue(c['drive_incomplete'])
+
+    def test_the_gap_limit_is_three_tenths_of_a_second(self):
+        self.assertAlmostEqual(T.RUDDER_TEST_MAX_GAP_S, 0.30, places=6)
+
+    def test_the_coverage_thresholds_are_pinned(self):
+        """These decide whether a run counts as data, so a quiet loosening
+        would silently turn thin recordings into confident ones. Nothing else
+        catches it: relaxing either still leaves the maths self-consistent."""
+        self.assertEqual(T.RUDDER_TEST_MIN_DRIVE_FRAMES, 20)
+        self.assertAlmostEqual(T.RUDDER_TEST_MIN_DRIVE_COVERAGE, 0.8, places=6)
+        self.assertAlmostEqual(T.RUDDER_TEST_DRIVE_S, 3.0, places=6)
+
+    def test_too_few_frames_ALONE_is_enough_to_be_incomplete(self):
+        """Isolates the frame count: 19 frames spanning the whole 3 s window
+        with 0.16 s gaps. Span, lead-in and tail are all fine, so only the
+        count can fail it."""
+        rows = self._rows([0.5 + i * (2.95 / 18.0) for i in range(19)])
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertEqual(c['drive_frames'], 19)
+        self.assertLess(c['drive_frames'], T.RUDDER_TEST_MIN_DRIVE_FRAMES)
+        self.assertGreaterEqual(
+            c['drive_span_s'], T.RUDDER_TEST_DRIVE_S * T.RUDDER_TEST_MIN_DRIVE_COVERAGE)
+        self.assertLessEqual(c['drive_max_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertTrue(c['drive_incomplete'],
+                        '19 frames across a 3 s turn is too thin to trust')
+
+    def test_a_gap_just_over_the_limit_trips_it(self):
+        rows = self._rows([0.5 + i * 0.05 for i in range(20)]
+                          + [1.81 + i * 0.05 for i in range(34)])
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertTrue(c['drive_incomplete'])
+
+    def test_a_late_start_ALONE_is_enough_to_be_incomplete(self):
+        """Isolates the first-frame delay. Span and frame count are both fine
+        here -- 2.6 s of the 3 s window, 53 frames, 0.05 s gaps -- so only the
+        0.4 s lead-in can fail it. The earlier late-start test also failed on
+        span, which let a mutation that ignored the lead-in survive."""
+        rows = self._rows([0.9 + i * 0.05 for i in range(53)])   # 0.90 .. 3.50
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertGreaterEqual(c['drive_frames'], T.RUDDER_TEST_MIN_DRIVE_FRAMES)
+        self.assertGreaterEqual(
+            c['drive_span_s'], T.RUDDER_TEST_DRIVE_S * T.RUDDER_TEST_MIN_DRIVE_COVERAGE)
+        self.assertAlmostEqual(c['drive_first_delay_s'], 0.4, places=3)
+        self.assertLessEqual(c['drive_tail_gap_s'], T.RUDDER_TEST_MAX_GAP_S)
+        self.assertTrue(c['drive_incomplete'],
+                        'a 0.4 s lead-in hides the start of the turn')
+
+    def test_a_tail_gap_ALONE_is_enough_to_be_incomplete(self):
+        """Mirror image: the recording stops 0.4 s before the drive window
+        closes, with span and count otherwise fine."""
+        rows = self._rows([0.5 + i * 0.05 for i in range(53)])   # 0.50 .. 3.10
+        c = T.rudder_test_drive_coverage(rows)
+        self.assertGreaterEqual(c['drive_frames'], T.RUDDER_TEST_MIN_DRIVE_FRAMES)
+        self.assertGreaterEqual(
+            c['drive_span_s'], T.RUDDER_TEST_DRIVE_S * T.RUDDER_TEST_MIN_DRIVE_COVERAGE)
+        self.assertAlmostEqual(c['drive_first_delay_s'], 0.0, places=3)
+        self.assertAlmostEqual(c['drive_tail_gap_s'], 0.4, places=3)
+        self.assertTrue(c['drive_incomplete'],
+                        'a 0.4 s tail hides the end of the turn')
+
+    def test_no_frames_at_all_is_incomplete(self):
+        c = T.rudder_test_drive_coverage([])
+        self.assertEqual(c['drive_frames'], 0)
+        self.assertTrue(c['drive_incomplete'])
+
+
+class ResultIncompleteTest(RudderTestBase):
+
+    def test_a_clean_run_is_marked_complete(self):
+        res = self._run_to_completion(frame_every=1)   # ~15 Hz
+        self.assertFalse(res['aborted'])
+        self.assertFalse(res['incomplete'])
+        self.assertGreater(res['drive_frames'], 0)
+
+    def test_a_sparse_run_is_marked_incomplete(self):
+        res = self._run_to_completion(frame_every=20)  # ~0.75 Hz
+        self.assertTrue(res['incomplete'])
+
+    def test_an_aborted_run_is_always_incomplete(self):
+        self._start()
+        self.clock.advance(1.0)
+        self._tick()
+        self._frame()
+        self.link.stop(self.link.winch_command_seq + 1)
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        self.assertTrue(res['aborted'])
+        self.assertTrue(res['incomplete'])
+
+    def test_an_abort_during_COAST_is_still_incomplete(self):
+        """The sharp case: the drive phase ran to completion with dense frames,
+        so the coverage numbers alone look perfect -- and the run was still cut
+        short. An aborted run is not a completed test, and must not print as
+        one. The earlier abort test aborted mid-drive, where coverage failed
+        anyway, which let a mutation dropping the abort term survive."""
+        self._start()
+        t0 = self.clock.t
+        for i in range(1, 73):                      # through settle + all of drive
+            self.clock.t = t0 + i * 0.05
+            self._boat_armed(fresh=True)
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+            self._frame()
+        self.assertIsNotNone(self.link.rudder_test)
+        self.assertEqual(self.link.rudder_test['phase'], 'coast')
+
+        # Coverage of the DRIVE window is genuinely good at this point...
+        cov = T.rudder_test_drive_coverage(self.link.rudder_test['rows'])
+        self.assertFalse(cov['drive_incomplete'])
+
+        self.link.stop(self.link.winch_command_seq + 1)
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        self.assertTrue(res['aborted'])
+        self.assertFalse(res['drive_incomplete'])   # ...the drive data is fine
+        self.assertTrue(res['incomplete'],          # ...and it is STILL not a
+                        'an aborted run must never report as complete')
+
+    def test_the_csv_records_the_coverage_verdict(self):
+        res = self._run_to_completion(frame_every=20)
+        head = Path(res['path']).read_text()[:900]
+        self.assertIn('drive_frames=', head)
+        self.assertIn('first_delay_s=', head)
+        self.assertIn('tail_gap_s=', head)
+        self.assertIn('INCOMPLETE', head)
+
+
+class UiLockoutTest(unittest.TestCase):
+    """Cosmetic only -- and the tests say so, so nobody later mistakes the
+    greyed-out buttons for the safety mechanism."""
+
+    def setUp(self):
+        self.src = TOOL.read_text()
+
+    def test_the_conflicting_controls_are_greyed_out_while_running(self):
+        self.assertIn('function setRudderTestLockout(on)', self.src)
+        for control in ('bench-left', 'bench-right', 'bench-base', 'bench-reset',
+                        'p-assist', 'rt-minus', 'rt-plus', 'calibrate-btn'):
+            self.assertIn("'%s'" % control, self.src)
+        self.assertIn('setRudderTestLockout(true)', self.src)
+        self.assertIn('setRudderTestLockout(false)', self.src)
+
+    def test_every_locked_out_control_is_also_refused_server_side(self):
+        """The point of the whole exercise: disabling is decoration."""
+        self.assertEqual(self.src.count('_rudder_test_busy_locked()'), 6)
+        for fn in ('def send_bench', 'def set_calibrate', 'def send_assist',
+                   'def set_winch', 'def set_state', 'def set_servo_power'):
+            i = self.src.index(fn)
+            self.assertIn('_rudder_test_busy_locked()', self.src[i:i + 1500],
+                          '%s has no server-side interlock' % fn)
+
+    def test_stop_and_disarm_are_never_interlocked(self):
+        for fn in ('def stop(', 'def arm('):
+            i = self.src.index(fn)
+            body = self.src[i:i + 900]
+            self.assertNotIn('return False, \'a rudder test is running', body)
 
 
 class UnchangedBenchBehaviourTest(unittest.TestCase):
