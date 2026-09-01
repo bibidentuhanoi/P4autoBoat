@@ -1108,6 +1108,168 @@ class AssistedModeTest(RudderTestBase):
         self.assertIn('laptop', head)
 
 
+class AssistedSafetyOrderingTest(RudderTestBase):
+    """Four defects found in independent review. Each is a real hazard, not a
+    tidiness issue, so each gets a test that fails on the old behaviour."""
+
+    def setUp(self):
+        super().setUp()
+        # Decode every AssistCommand / SteerCommand / MotorCommand this test
+        # writes, in order, so the SEQUENCE can be asserted -- not just the
+        # final state, which looks identical either way round.
+        self.sent = []
+        pb2 = self.link.pb2
+
+        def record(payload):
+            msg = pb2.BoatMessage()
+            try:
+                msg.ParseFromString(payload)
+            except Exception:                      # noqa: BLE001
+                return self.write_ok
+            which = msg.WhichOneof('payload')
+            if which == 'assist':
+                self.sent.append(('assist', msg.assist.p_on,
+                                  msg.assist.rudder_assist))
+            elif which == 'steer':
+                self.sent.append(('steer', round(msg.steer.left, 4)))
+            elif which == 'motor':
+                self.sent.append(('motor', round(msg.motor.left, 4),
+                                  round(msg.motor.right, 4)))
+            return self.write_ok
+        self.link._write_locked = record
+
+    # ---- 2. the settle phase must hold ZERO stick -----------------------
+
+    def test_an_assisted_run_does_not_command_full_stick_before_the_first_tick(self):
+        """start_rudder_test used to assign the drive-phase stick immediately,
+        so the controller saw a 2 deg/s target through the whole settle phase
+        -- which is neither the profile nor what gets recorded."""
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertEqual(self.link.throttle, 0.0)
+
+    def test_the_stick_stays_zero_for_the_whole_settle_phase(self):
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        t0 = self.clock.t
+        for i in range(1, 25):                      # 0.05 .. 1.20 s
+            self.clock.t = t0 + i * 0.05
+            self._boat_armed(fresh=True)
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+            if self.link.rudder_test['phase'] == 'rudder_settle':
+                self.assertEqual(self.link.rudder, 0.0)
+
+    def test_a_raw_run_still_commands_its_deflection_immediately(self):
+        """Unchanged behaviour: for a raw run, holding the deflection IS what
+        the settle phase is for."""
+        self.assertTrue(self.link.start_rudder_test(-1, 1)[0])
+        self.assertAlmostEqual(self.link.rudder, -T.RUDDER_TEST_DEFLECTION)
+
+    # ---- 3. zero and SEND before leaving Assisted mode ------------------
+
+    def _indices(self, kind):
+        return [i for i, m in enumerate(self.sent) if m[0] == kind]
+
+    def test_zero_steering_is_sent_before_assisted_mode_is_switched_off(self):
+        """In Assisted mode self.rudder is a yaw-RATE demand: +/-1.0 means
+        +/-2 deg/s. The instant the loop is off, that same +/-1.0 is a RAW
+        steering command -- full rudder, hard over. Disabling first left a
+        one-tick window of exactly that on every abort."""
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.assertAlmostEqual(self.link.rudder, -1.0)   # full stick, drive phase
+
+        self.sent.clear()
+        self.link.stop(self.link.winch_command_seq + 1)
+
+        zero_steer = [i for i, m in enumerate(self.sent)
+                      if m[0] == 'steer' and m[1] == 0.0]
+        assist_off = [i for i, m in enumerate(self.sent)
+                      if m[0] == 'assist' and m[1] is False and m[2] is False]
+        self.assertTrue(zero_steer, 'no zero steer was sent at all')
+        self.assertTrue(assist_off, 'assisted mode was never switched off')
+        self.assertLess(min(zero_steer), min(assist_off),
+                        'assisted mode was disabled while a full-scale rate '
+                        'demand was still the standing steering command')
+
+    def test_zero_throttle_is_also_sent_before_the_mode_change(self):
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.sent.clear()
+        self.link.stop(self.link.winch_command_seq + 1)
+        zero_motor = [i for i, m in enumerate(self.sent)
+                      if m[0] == 'motor' and m[1] == 0.0 and m[2] == 0.0]
+        assist_off = [i for i, m in enumerate(self.sent) if m[0] == 'assist']
+        self.assertTrue(zero_motor)
+        self.assertLess(min(zero_motor), min(assist_off))
+
+    def test_the_ordering_holds_on_every_abort_route(self):
+        for name, fire in (
+                ('disarm', lambda: self.link.arm(False, False)),
+                ('disconnect', lambda: self.link.disconnect()),
+                ('manual input', lambda: self.link.set_state(throttle=0.5)),
+        ):
+            self.setUp()
+            self.link.start_rudder_test(-1, 1, assisted=True)
+            self.clock.advance(1.0)
+            self._boat_armed(fresh=True)
+            self._tick()
+            self.sent.clear()
+            fire()
+            zero_steer = [i for i, m in enumerate(self.sent)
+                          if m[0] == 'steer' and m[1] == 0.0]
+            assist_off = [i for i, m in enumerate(self.sent) if m[0] == 'assist']
+            self.assertTrue(zero_steer, '%s sent no zero steer' % name)
+            if assist_off:
+                self.assertLess(min(zero_steer), min(assist_off),
+                                '%s disabled assist before zeroing' % name)
+            self.assertEqual(self.link.rudder, 0.0, name)
+            self.assertEqual(self.link.throttle, 0.0, name)
+
+    def test_a_completed_run_zeroes_before_the_mode_change_too(self):
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        while self.link.rudder_test is not None:
+            self.clock.advance(1.0 / 15.0)
+            self._boat_armed(fresh=True)
+            self.sent.clear()
+            self._tick()
+        zero_steer = [i for i, m in enumerate(self.sent)
+                      if m[0] == 'steer' and m[1] == 0.0]
+        assist_off = [i for i, m in enumerate(self.sent) if m[0] == 'assist']
+        self.assertTrue(zero_steer)
+        self.assertTrue(assist_off)
+        self.assertLess(min(zero_steer), min(assist_off))
+
+    # ---- 4. both targets, side by side ----------------------------------
+
+    def test_the_row_carries_the_requested_AND_the_boat_reported_target(self):
+        """They should agree -- and when they do not, that IS the finding, so
+        neither may stand in for the other."""
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self.link.motor_status = dict(self.link.motor_status,
+                                      yaw_target_dps=1.75, assist_rudder=True)
+        self._tick()
+        self._frame()
+        row = self.link.rudder_test['rows'][-1]
+        self.assertAlmostEqual(row['target_dps'], +T.ASSIST_TEST_TARGET_DPS)
+        self.assertAlmostEqual(row['boat_target_dps'], 1.75)
+        self.assertNotEqual(row['target_dps'], row['boat_target_dps'])
+
+    def test_both_target_columns_reach_the_csv(self):
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        res = self._run_to_completion()
+        rows = read_rudder_csv(res['path'])
+        self.assertIn('target_dps', rows[0])
+        self.assertIn('boat_target_dps', rows[0])
+
+
 class MutualExclusionTest(RudderTestBase):
     """Motor P assist and Assisted Steering must never both be on: one
     perturbs differential thrust and the other the rudder, and a result with

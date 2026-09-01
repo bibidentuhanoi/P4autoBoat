@@ -303,6 +303,7 @@ RUDDER_TEST_CSV_COLUMNS = (
     'boat_rudder_us',    # the pulse that command maps to
     'boat_saturated',    # the loop's output cap bound it
     'boat_assist_on',    # the BOAT's own answer, not what we asked for
+    'boat_target_dps',   # the target the BOAT says its loop is holding
 )
 
 
@@ -1141,11 +1142,18 @@ class BoatLink:
                 'last_frame_mono': None, 'max_gap_s': 0.0,
             }
             self.rudder_test_result = None
-            # Command the rudder immediately rather than waiting up to 67 ms
-            # for the next tick: the settle phase is only 0.5 s long.
             self.throttle = 0.0
             self.motor_split = False
-            self.rudder = self.rudder_test['rudder']
+            # RAW: command the deflection immediately rather than waiting up to
+            # 67 ms for the next tick -- the settle phase is only 0.5 s and
+            # holding the deflection IS what it is for.
+            #
+            # ASSISTED: the settle phase is the loop holding STRAIGHT before
+            # the motors come on, so the stick starts at zero and the tick
+            # raises it when the drive phase opens. Assigning full stick here
+            # handed the controller a 2 deg/s target for the whole settle
+            # phase, which is not the profile and not what gets recorded.
+            self.rudder = 0.0 if assisted else self.rudder_test['rudder']
             return True, None
 
     def _rudder_test_busy_locked(self):
@@ -1241,6 +1249,11 @@ class BoatLink:
                               if ms.get('have') else '',
             'boat_assist_on': (1 if ms.get('assist_rudder') else 0)
                               if ms.get('have') else '',
+            # Both targets, side by side. `target_dps` is what this laptop
+            # asked for; this is what the boat says its loop is actually
+            # holding. They should agree -- and when they do not, that IS the
+            # finding, so neither may stand in for the other.
+            'boat_target_dps': ms.get('yaw_target_dps', '') if ms.get('have') else '',
         })
 
     def _rudder_test_tick_locked(self, now):
@@ -1302,17 +1315,28 @@ class BoatLink:
         if rt is None:
             return
         self.rudder_test = None
-        # Assisted Steering is switched on FOR the run and off with it, on
-        # every exit including every abort -- leaving the loop live afterwards
-        # would have it quietly steering during ordinary manual driving.
-        if rt.get('assisted') and self.connected:
-            self._send_assist_locked(False, False)
-        # Safe state first, unconditionally, before anything that could raise.
+        # ORDER MATTERS. Zero the commands, PUSH them, and only then leave
+        # Assisted mode.
+        #
+        # In Assisted mode self.rudder is a yaw-RATE demand: +/-1.0 means
+        # "+/-2 deg/s", and the firmware's loop turns it into a few tenths of
+        # rudder. The instant the loop is switched off that same +/-1.0 is read
+        # as a RAW steering command -- full rudder, hard over. Disabling first
+        # and zeroing after leaves a window of exactly that, one stream-loop
+        # tick wide, on every abort.
         self.throttle = 0.0
         self.motor_left = 0.0
         self.motor_right = 0.0
         self.motor_split = False
         self.rudder = 0.0
+        if self.connected:
+            self._send_motor_locked(0.0, 0.0)
+            self._send_steer_locked(0.0)
+        # Now it is safe: whatever mode the boat is in, it has been told zero.
+        # Switched off on EVERY exit including every abort -- leaving the loop
+        # live would have it quietly steering during ordinary manual driving.
+        if rt.get('assisted') and self.connected:
+            self._send_assist_locked(False, False)
         rows = rt['rows']
         span = (rows[-1]['t_mono'] - rows[0]['t_mono']) if len(rows) >= 2 else 0.0
         drive = rudder_test_drive_coverage(rows)

@@ -279,6 +279,86 @@ static void reset_clears_the_slew_memory_too(void)
     assert(!s.initialized);
 }
 
+static void enabling_the_loop_commands_nothing_on_the_first_sample(void)
+{
+    /* The bug this guards: with the snap sample allowed to emit, switching
+     * Assisted Steering on delivered the whole feedforward (-0.46 / +0.72) as
+     * one step, bypassing the slew limit exactly when it matters most. */
+    const stab_cfg_t cfg = pool_cfg();
+    stab_state_t s;
+    stab_debug_t d;
+
+    stab_reset(&s);
+    float first = stab_rudder_update(&s, &cfg, 0.0f, -1.0f, 0.0f, &d);
+    assert(first == 0.0f);
+    assert(s.rudder == 0.0f);
+    /* ...but the loop is still correctly informed: the terms are computed and
+     * reported, only the OUTPUT is withheld. */
+    assert(NEAR(d.ff_term, -0.36f));
+
+    /* The next real tick ramps from zero, bounded by slew_per_s * dt. */
+    float second = stab_rudder_update(&s, &cfg, 0.02f, -1.0f, 0.0f, &d);
+    assert(fabsf(second) <= 0.04f + 1e-6f);
+    assert(second < 0.0f);
+    printf("  enable: first sample %+.3f, then ramps %+.3f\n",
+           (double)first, (double)second);
+}
+
+static void the_enable_sample_commands_nothing_even_with_slew_disabled(void)
+{
+    /* Isolates the snap branch. With the limiter ON, dt=0 gives step=0 and the
+     * slew clamp alone would hold the output at zero -- so the enabled case
+     * cannot tell the two mechanisms apart. Turn the limiter off and only the
+     * explicit snap guard is left to stop the full feedforward going out as
+     * the first command after enable. */
+    stab_cfg_t cfg = pool_cfg();
+    cfg.slew_per_s = 0.0f;
+    stab_state_t s;
+    stab_debug_t d;
+    stab_reset(&s);
+    float first = stab_rudder_update(&s, &cfg, 0.0f, +1.0f, 0.0f, &d);
+    assert(first == 0.0f);
+    assert(NEAR(d.ff_term, +0.62f));   /* computed, just not commanded */
+    /* and with no limiter the NEXT sample may take the whole value */
+    float second = stab_rudder_update(&s, &cfg, 0.02f, +1.0f, 0.0f, &d);
+    assert(second > 0.5f);
+}
+
+static void the_ramp_from_enable_takes_the_expected_time(void)
+{
+    /* -0.36 at 2.0/s is ~0.18 s of ramp, not an instant step. */
+    const stab_cfg_t cfg = pool_cfg();
+    stab_state_t s;
+    stab_reset(&s);
+    stab_rudder_update(&s, &cfg, 0.0f, -1.0f, 0.0f, NULL);
+    int ticks = 0;
+    float out = 0.0f;
+    for (; ticks < 200; ++ticks) {
+        float prev = out;
+        out = stab_rudder_update(&s, &cfg, 0.02f, -1.0f, 0.0f, NULL);
+        assert(fabsf(out - prev) <= 0.04f + 1e-6f);   /* every step bounded */
+        if (fabsf(out - (-0.46f)) < 1e-3f) break;
+    }
+    assert(ticks >= 10);      /* at least ~0.2 s, never one step */
+    printf("  ramp to -0.460 took %d ticks (%.2f s)\n", ticks, ticks * 0.02);
+}
+
+static void a_reset_mid_run_also_re_ramps(void)
+{
+    /* A centring fault does not know where the servo physically is, so
+     * resuming must start from zero rather than resume mid-deflection. */
+    const stab_cfg_t cfg = pool_cfg();
+    stab_state_t s;
+    stab_reset(&s);
+    stab_rudder_update(&s, &cfg, 0.0f, -1.0f, 0.0f, NULL);
+    for (int i = 0; i < 100; ++i) stab_rudder_update(&s, &cfg, 0.02f, -1.0f, 0.0f, NULL);
+    assert(fabsf(s.rudder) > 0.3f);
+    stab_reset(&s);
+    assert(stab_rudder_update(&s, &cfg, 0.0f, -1.0f, 0.0f, NULL) == 0.0f);
+    float next = stab_rudder_update(&s, &cfg, 0.02f, -1.0f, 0.0f, NULL);
+    assert(fabsf(next) <= 0.04f + 1e-6f);
+}
+
 static void the_filter_snaps_on_the_first_sample(void)
 {
     const stab_cfg_t cfg = pool_cfg();
@@ -316,6 +396,10 @@ int main(void)
     a_zero_slew_config_disables_the_limiter();
     a_nonfinite_input_centres_and_resets();
     reset_clears_the_slew_memory_too();
+    enabling_the_loop_commands_nothing_on_the_first_sample();
+    the_enable_sample_commands_nothing_even_with_slew_disabled();
+    the_ramp_from_enable_takes_the_expected_time();
+    a_reset_mid_run_also_re_ramps();
     the_filter_snaps_on_the_first_sample();
     zero_stick_and_zero_yaw_commands_nothing();
     printf("test_stability_control: OK\n");

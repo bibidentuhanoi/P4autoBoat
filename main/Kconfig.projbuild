@@ -410,13 +410,14 @@ menu "Board Configuration"
             default y
             help
                 Builds the loop in. It is still OFF at boot and every boot --
-                Assisted Steering is a RUNTIME switch (AssistCommand.rudder_assist)
-                and the default mode is Raw Manual. Set n only to compile the
-                whole path out.
-            help
-                OFF leaves manual steering unchanged. ON applies the capped
-                yaw-rate loop only while armed, linked, and IMU healthy. It
-                controls the rudder only; ESC commands remain manual.
+                Assisted Steering is a RUNTIME switch
+                (AssistCommand.rudder_assist) and the default mode is Raw
+                Manual. Set n only to compile the whole path out.
+
+                With the mode OFF, manual steering is unchanged. With it ON the
+                capped yaw-rate loop runs only while armed, linked and the IMU
+                is healthy, and it controls the RUDDER only -- ESC commands
+                stay manual.
 
         config STABILITY_SAS_RMAX_DPS
             int "SAS: yaw-rate at full stick (deg/s)"

@@ -43,7 +43,10 @@ float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
         return 0.0f;
     }
 
-    if (!state->initialized || dt_s <= 0.0f) {
+    /* Captured BEFORE the snap sets it: a snap sample has no real timestep, so
+     * it can neither filter nor slew, and must not emit a command. */
+    const bool snap = (!state->initialized || dt_s <= 0.0f);
+    if (snap) {
         state->yaw_filt = yaw_rate_dps;   /* snap on first sample / non-positive dt */
         state->initialized = true;
     } else {
@@ -75,11 +78,21 @@ float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
 
     /* Slew AFTER the cap, so the limiter walks toward the value that will
      * actually be commanded rather than chasing one the cap is about to
-     * discard. dt_s <= 0 is the post-reset snap: let it take the value
-     * outright, or the very first command would be limited against a stale
-     * previous output. */
+     * discard. */
     bool slewed = false;
-    if (cfg->slew_per_s > 0.0f && state->initialized && dt_s > 0.0f) {
+    if (snap) {
+        /* The enable/reset sample commands NOTHING. Without this the very
+         * first output after switching Assisted Steering on is the full
+         * feedforward -- -0.46 left, +0.72 right -- delivered as a single step
+         * to a servo that cannot move that fast, and the slew limit the
+         * configuration promises is bypassed exactly when it matters most.
+         *
+         * The yaw filter still snaps (above), so nothing is lost: the loop
+         * starts correctly informed and simply waits for the next fresh IMU
+         * tick, which brings a real positive dt to ramp against. At 50 Hz that
+         * is 20 ms, and the ramp then obeys slew_per_s * dt like any other. */
+        out = 0.0f;
+    } else if (cfg->slew_per_s > 0.0f) {
         const float step = cfg->slew_per_s * dt_s;
         const float delta = out - state->rudder;
         if (delta > step) {
