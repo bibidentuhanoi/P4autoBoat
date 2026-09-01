@@ -50,6 +50,9 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         # stands in for __init__ and has to carry whatever status() reads.
         self.link.bench_yaw_samples = []
         self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link.seq = 0
         self.link.last_error = None
 
@@ -119,6 +122,11 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
         self.link.telemetry = espnow_drive.BoatLink._blank_telemetry()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link._diag_counts = {}
 
     def _feed_calibrate(self, **fields):
@@ -230,6 +238,9 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         # stands in for __init__ and has to carry whatever status() reads.
         self.link.bench_yaw_samples = []
         self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -569,6 +580,9 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         # stands in for __init__ and has to carry whatever status() reads.
         self.link.bench_yaw_samples = []
         self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -842,6 +856,11 @@ class BenchRunLinkTest(unittest.TestCase):
         self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
         self.link.telemetry = espnow_drive.BoatLink._blank_telemetry()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link._diag_counts = {}
         self.link.seq = 0
         self.link.last_error = None
@@ -975,6 +994,11 @@ class FieldTelemetryYawRateTest(unittest.TestCase):
         self.link.pb2 = espnow_drive.load_boat_pb2()
         self.link.telemetry = espnow_drive.BoatLink._blank_telemetry()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link._diag_counts = {}
 
     def test_field_telemetry_decodes_yaw_rate(self):
@@ -1057,6 +1081,11 @@ class BenchLearnerResetTest(unittest.TestCase):
         self.link.calibrating = False
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
         self.link.telemetry = espnow_drive.BoatLink._blank_telemetry()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link._diag_counts = {}
         self.sent = []
         self.link._write_locked = lambda p: (self.sent.append(p), True)[1]
@@ -1218,6 +1247,11 @@ class PAssistConfirmTest(unittest.TestCase):
         self.link.pb2 = espnow_drive.load_boat_pb2()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
         self.link.telemetry = espnow_drive.BoatLink._blank_telemetry()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+        self.link.rudder_test = None
+        self.link.rudder_test_result = None
+        self.link._rudder_test_write = None
         self.link._diag_counts = {}
 
     def feed(self, p_on):

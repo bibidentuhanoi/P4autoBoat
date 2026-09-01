@@ -84,6 +84,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # This script lives in tools/, but proto/boat_pb2.py is a repo-root package --
 # running it as `python tools/espnow_drive.py` (the documented usage) puts
@@ -240,6 +241,53 @@ BENCH_YAW_MIN_COVERAGE = 0.6
 # quietly interpolated straight across the missing two thirds. At ~20 Hz this
 # is about six consecutive dropped frames.
 BENCH_YAW_MAX_GAP_S = 0.30
+
+
+# ---- automatic rudder test --------------------------------------------------
+# A laptop-driven turn: hold a known rudder deflection at a known throttle for a
+# known time and record what the gyro says, so the installed IMU's yaw sign can
+# be pinned to a physical direction. Purely a tool feature -- the boat has no
+# idea this exists, which is why the recording is over-the-air and lossy rather
+# than the boat's own 100 Hz SD file.
+#
+# The sequence drives NOTHING itself. It sets self.throttle / self.rudder and
+# lets the existing 15 Hz stream loop transmit them, so STOP, DISARM,
+# disconnect and the calibration gate all keep working exactly as they did.
+RUDDER_TEST_DEFLECTION = 0.30      # normalized steer, +1 = right (post-2026-08-31)
+RUDDER_TEST_THROTTLE = 0.20        # linked, both motors -- matches the T20 bench runs
+# (name, duration, commanded throttle). Boundaries are measured from t0, never
+# accumulated per tick, so 15 Hz jitter cannot drift them.
+RUDDER_TEST_PHASES = (
+    ('rudder_settle', 0.5, 0.0),   # rudder over, motors off: let the servo arrive
+    ('drive',         3.0, RUDDER_TEST_THROTTLE),
+    ('coast',         1.0, 0.0),   # motors off, rudder still over: residual yaw
+)
+RUDDER_TEST_TOTAL_S = sum(d for _n, d, _t in RUDDER_TEST_PHASES)
+# The boat's MotorStatus must be this fresh to count as confirmation. This IS a
+# liveness question -- "is the boat still telling us it is armed" -- so it
+# reuses the general telemetry limit rather than the tighter bench gap.
+RUDDER_TEST_STATUS_MAX_AGE_S = TELEMETRY_STALE_S
+# A hole longer than this in the received frames means the recording cannot
+# describe the turn. Same reasoning (and value) as the bench summary.
+RUDDER_TEST_MAX_GAP_S = BENCH_YAW_MAX_GAP_S
+RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
+RUDDER_TEST_CSV_COLUMNS = (
+    't_mono', 'elapsed_s', 'phase', 'yaw_dps', 'heading_deg',
+    'cmd_throttle', 'cmd_rudder', 'boat_left', 'boat_right',
+    'servo_us', 'telem_age_s', 'gap_s',
+)
+
+
+def rudder_test_phase_at(elapsed):
+    """(phase name, commanded throttle) at `elapsed` seconds, or None when the
+    sequence is over. Computed from the elapsed time rather than a running
+    counter so a missed or late tick cannot shift a boundary."""
+    edge = 0.0
+    for name, dur, thr in RUDDER_TEST_PHASES:
+        edge += dur
+        if elapsed < edge:
+            return name, thr
+    return None
 
 
 # ---- what the motors ACTUALLY get -------------------------------------------
@@ -474,6 +522,14 @@ class BoatLink:
         # the boat's 100 Hz SD CSV is the authoritative record.
         self.bench_yaw_samples = []
         self.bench_yaw = None
+        # Automatic rudder test: one shared state machine, ticked by the 15 Hz
+        # stream loop. `_now` is injectable so the tests can drive the 4.5 s
+        # sequence on a fake clock instead of actually sleeping through it.
+        self._now = time.monotonic
+        self.rudder_test = None
+        self.rudder_test_result = None
+        self._rudder_test_write = None
+        self.rudder_test_dir = RUDDER_TEST_DIR
         # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
         # the default so a forgotten toggle cannot silently make every run a B.
         self.p_assist_on = False
@@ -639,6 +695,7 @@ class BoatLink:
         with self._lock:
             if not self.connected:
                 return
+            self._abort_rudder_test_locked('serial link disconnected')
             self.winch_command_seq += 1
             self.throttle = 0.0
             self.motor_left = 0.0
@@ -734,6 +791,7 @@ class BoatLink:
             self.winch_lease_until = 0.0
             was_calibrating = self.calibrating
             self.calibrating = False          # STOP is also a calibration kill
+            self._abort_rudder_test_locked('STOP pressed')
             if not self.connected:
                 return False, 'serial link is disconnected'
             writes_ok = (
@@ -781,6 +839,8 @@ class BoatLink:
         with self._lock:
             self.armed_cmd = bool(do_arm)
             self.force = bool(force)
+            if not do_arm:
+                self._abort_rudder_test_locked('disarmed')
             # NOTE: disarming is also how a boat-side bench run is stopped --
             # the boat's own bench_step aborts the moment it sees !armed.
             if not do_arm and self.calibrating:   # disarm must stop calibration
@@ -872,6 +932,237 @@ class BoatLink:
             if not self._write_locked(msg.SerializeToString()):
                 return False, 'serial write failed'
             return True, None
+
+    # ---- automatic rudder test ------------------------------------------
+    #
+    # One shared non-blocking state machine, ticked from _stream_loop at the
+    # existing 15 Hz under the existing lock. It only sets self.throttle and
+    # self.rudder; the loop already sends those, so nothing here bypasses
+    # STOP, DISARM, disconnect or the calibration gate.
+
+    def start_rudder_test(self, sign, command_seq):
+        """Begin the sequence. `sign` is -1 or +1 (the two buttons).
+
+        Refuses rather than fixing anything up: it never arms the boat, never
+        zeroes a throttle the operator is holding, and never turns P off. Each
+        of those is a decision the operator has to make knowingly, and quietly
+        doing it for them is how a "test" ends up measuring something else."""
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            self.winch_command_seq = command_seq
+            if sign not in (-1, 1) or isinstance(sign, bool):
+                return False, 'direction must be -1 or +1'
+            if self.rudder_test is not None:
+                return False, 'a rudder test is already running'
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            if self.calibrating:
+                return False, 'calibration is running — stop it first'
+            if self._bench_running_locked():
+                return False, 'a bench run is going — wait for it to finish'
+            # The sequence owns the throttle for the next 4.5 s. Taking it over
+            # from a held stick would yank the boat to zero and then to 0.20,
+            # which is not the test that gets recorded.
+            if (self.throttle != 0.0 or self.motor_left != 0.0
+                    or self.motor_right != 0.0):
+                return False, 'set the throttle to zero first'
+            if not self.armed_cmd:
+                return False, 'ARM first — the rudder test spins the thrusters'
+            ok, why = self._boat_armed_and_fresh_locked(self._now())
+            if not ok:
+                return False, why
+            # P perturbs the motors mid-turn, which is exactly what this run
+            # must not contain. Both the request AND the boat's own answer,
+            # because the two can disagree and only the boat's is real.
+            if self.p_assist_on:
+                return False, 'switch P assist OFF first'
+            if self.bench_status.get('have') and self.bench_status.get('p_on'):
+                return False, 'the boat reports P assist ON — switch it OFF first'
+
+            now = self._now()
+            name, path = self._next_rudder_test_path(sign)
+            self.rudder_test = {
+                'sign': int(sign),
+                'rudder': float(sign) * RUDDER_TEST_DEFLECTION,
+                't0': now, 'phase': RUDDER_TEST_PHASES[0][0],
+                'rows': [], 'name': name, 'path': str(path),
+                'last_frame_mono': None, 'max_gap_s': 0.0,
+            }
+            self.rudder_test_result = None
+            # Command the rudder immediately rather than waiting up to 67 ms
+            # for the next tick: the settle phase is only 0.5 s long.
+            self.throttle = 0.0
+            self.motor_split = False
+            self.rudder = self.rudder_test['rudder']
+            return True, None
+
+    def _boat_armed_and_fresh_locked(self, now):
+        """(ok, why). The BOAT's own confirmation, not what we commanded."""
+        ms = self.motor_status
+        if not ms.get('have'):
+            return False, 'no MotorStatus from the boat yet — wait a moment'
+        last = ms.get('last_rx_monotonic')
+        if last is None or (now - last) > RUDDER_TEST_STATUS_MAX_AGE_S:
+            return False, 'boat status is stale — not safe to drive blind'
+        if int(ms.get('state', 0)) != 2:
+            return False, 'the boat does not report itself armed'
+        return True, None
+
+    def _next_rudder_test_path(self, sign):
+        """T20 and N30/P30 in the name, first free index -- never overwrite."""
+        tag = 'N30' if sign < 0 else 'P30'
+        base = 'RUD_T%02u_%s' % (int(RUDDER_TEST_THROTTLE * 100 + 0.5), tag)
+        directory = Path(getattr(self, 'rudder_test_dir', RUDDER_TEST_DIR))
+        for i in range(1, 1000):
+            name = '%s_%02u.csv' % (base, i)
+            path = directory / name
+            if not path.exists():
+                return name, path
+        return base + '_overflow.csv', directory / (base + '_overflow.csv')
+
+    def _collect_rudder_test_row_locked(self, yaw_rate, heading, now=None):
+        """One row per RECEIVED TELEMETRY FRAME. Called from the decode paths,
+        never from status(): rows keyed to UI polls would multiply with the
+        browser's refresh rate and make the integrated angle meaningless."""
+        rt = self.rudder_test
+        if rt is None:
+            return
+        now = self._now() if now is None else now
+        elapsed = now - rt['t0']
+        phase = rudder_test_phase_at(elapsed)
+        gap = 0.0 if rt['last_frame_mono'] is None else (now - rt['last_frame_mono'])
+        if rt['last_frame_mono'] is not None and gap > rt['max_gap_s']:
+            rt['max_gap_s'] = gap
+        rt['last_frame_mono'] = now
+        ms = self.motor_status
+        tel_last = self.telemetry.get('last_rx_monotonic')
+        rt['rows'].append({
+            't_mono': round(now, 4),
+            'elapsed_s': round(elapsed, 4),
+            'phase': phase[0] if phase else 'done',
+            'yaw_dps': yaw_rate,
+            'heading_deg': heading,
+            'cmd_throttle': self.throttle,
+            'cmd_rudder': self.rudder,
+            'boat_left': ms.get('left_throttle') if ms.get('have') else '',
+            'boat_right': ms.get('right_throttle') if ms.get('have') else '',
+            # MotorStatus carries state/throttles/winch/servo_power and NO
+            # rudder position or pulse. The column exists so the schema is
+            # stable if the firmware ever adds one -- filling it with the
+            # COMMAND would pass an intention off as a measurement.
+            'servo_us': '',
+            'telem_age_s': round(now - tel_last, 4) if tel_last else '',
+            'gap_s': round(gap, 4),
+        })
+
+    def _rudder_test_tick_locked(self, now):
+        """Advance the sequence. Caller holds the lock. Never blocks."""
+        rt = self.rudder_test
+        if rt is None:
+            return
+        try:
+            if not self.connected:
+                return self._abort_rudder_test_locked('serial link disconnected')
+            if not self.armed_cmd:
+                return self._abort_rudder_test_locked('disarmed')
+            if self.calibrating:
+                return self._abort_rudder_test_locked('calibration started')
+            ok, why = self._boat_armed_and_fresh_locked(now)
+            if not ok:
+                return self._abort_rudder_test_locked(why)
+
+            phase = rudder_test_phase_at(now - rt['t0'])
+            if phase is None:
+                return self._finish_rudder_test_locked(aborted=False, reason=None)
+            rt['phase'] = phase[0]
+            self.throttle = phase[1]
+            self.motor_split = False
+            self.rudder = rt['rudder']
+            # The stream loop sends these straight after; a write failure there
+            # is caught by _stream_loop and routed back here as an abort.
+        except Exception as exc:                             # noqa: BLE001
+            self._abort_rudder_test_locked(
+                '%s: %s' % (type(exc).__name__, exc))
+
+    def _rudder_test_after_send_locked(self, sent_ok):
+        """Called by the stream loop with the result of this tick's writes.
+
+        A rudder test that cannot reach the boat is not a test -- and worse,
+        the boat is holding a deflection nobody can now change. End it rather
+        than keep recording rows against commands that never landed."""
+        if not sent_ok:
+            self._abort_rudder_test_locked('serial write failed')
+
+    def _abort_rudder_test_locked(self, reason):
+        if self.rudder_test is None:
+            return
+        self._finish_rudder_test_locked(aborted=True, reason=reason)
+
+    def _finish_rudder_test_locked(self, aborted, reason):
+        """Stop the boat, centre the rudder, hand the CSV off to be written.
+
+        The write happens OUTSIDE the lock (see _flush_rudder_test_write) so a
+        few milliseconds of file I/O never sits inside the 15 Hz command loop."""
+        rt = self.rudder_test
+        if rt is None:
+            return
+        self.rudder_test = None
+        # Safe state first, unconditionally, before anything that could raise.
+        self.throttle = 0.0
+        self.motor_left = 0.0
+        self.motor_right = 0.0
+        self.motor_split = False
+        self.rudder = 0.0
+        rows = rt['rows']
+        span = (rows[-1]['t_mono'] - rows[0]['t_mono']) if len(rows) >= 2 else 0.0
+        result = {
+            'name': rt['name'], 'path': rt['path'], 'sign': rt['sign'],
+            'frames': len(rows), 'duration_s': round(self._now() - rt['t0'], 3),
+            'span_s': round(span, 3), 'max_gap_s': round(rt['max_gap_s'], 3),
+            # No frames at all is the worst gap there is, so say so rather than
+            # reporting a tidy 0.0 for a recording that captured nothing.
+            'gap': (not rows) or rt['max_gap_s'] > RUDDER_TEST_MAX_GAP_S,
+            'aborted': bool(aborted),
+            'abort_reason': reason if aborted else None,
+        }
+        self.rudder_test_result = result
+        self._rudder_test_write = (rt, result)
+
+    def _flush_rudder_test_write(self):
+        """Write the pending CSV. Called from _stream_loop with the lock NOT
+        held, and directly by tests."""
+        pending = self._rudder_test_write
+        if pending is None:
+            return
+        self._rudder_test_write = None
+        rt, result = pending
+        try:
+            directory = Path(getattr(self, 'rudder_test_dir', RUDDER_TEST_DIR))
+            directory.mkdir(parents=True, exist_ok=True)
+            with open(result['path'], 'w', newline='') as fh:
+                # Provenance first, so nobody can mistake this for the boat's
+                # own 100 Hz SD recording of a bench run.
+                fh.write('# laptop/radio-observed rudder test -- recorded by '
+                         'tools/espnow_drive.py from ESP-NOW telemetry frames, '
+                         'NOT the boat SD card\n')
+                fh.write('# throttle=%.2f rudder=%+.2f phases=%s\n'
+                         % (RUDDER_TEST_THROTTLE, rt['rudder'],
+                            '/'.join('%s:%.1fs' % (n, d)
+                                     for n, d, _t in RUDDER_TEST_PHASES)))
+                fh.write('# frames=%d duration_s=%.3f max_gap_s=%.3f%s\n'
+                         % (result['frames'], result['duration_s'],
+                            result['max_gap_s'],
+                            (' ABORTED=' + str(result['abort_reason']))
+                            if result['aborted'] else ''))
+                w = csv.DictWriter(fh, fieldnames=list(RUDDER_TEST_CSV_COLUMNS))
+                w.writeheader()
+                for row in rt['rows']:
+                    w.writerow(row)
+        except OSError as exc:
+            result['write_error'] = '%s: %s' % (type(exc).__name__, exc)
+            print('[rudder-test] could not write %s: %s'
+                  % (result['path'], exc), file=sys.stderr, flush=True)
 
     def _collect_bench_yaw_locked(self, yaw_rate, heading):
         """One telemetry frame, kept only if the boat says it is DRIVING.
@@ -986,6 +1277,19 @@ class BoatLink:
                 # the way live telemetry does.
                 'bench_yaw': dict(self.bench_yaw) if self.bench_yaw else None,
                 'bench_yaw_live': len(self.bench_yaw_samples),
+                # Read-only view of the rudder test. status() is hit by every
+                # browser poll, so it must never touch rudder_test['rows'].
+                'rudder_test': ({
+                    'active': True,
+                    'phase': self.rudder_test['phase'],
+                    'sign': self.rudder_test['sign'],
+                    'elapsed_s': round(self._now() - self.rudder_test['t0'], 2),
+                    'total_s': RUDDER_TEST_TOTAL_S,
+                    'frames': len(self.rudder_test['rows']),
+                    'name': self.rudder_test['name'],
+                } if self.rudder_test else None),
+                'rudder_test_result': (dict(self.rudder_test_result)
+                                       if self.rudder_test_result else None),
                 'motor_status': self._with_age(self.motor_status, TELEMETRY_STALE_S),
                 'seq': self.seq,
                 'last_error': self.last_error,
@@ -1049,6 +1353,10 @@ class BoatLink:
         next_tick = time.monotonic()
         while not self._stop.is_set():
             with self._lock:
+                # Before the sends: the sequence only sets throttle/rudder and
+                # the block below transmits them, so it inherits every existing
+                # safety path instead of opening a second command route.
+                self._rudder_test_tick_locked(time.monotonic())
                 if self.connected:
                     if self.calibrating:
                         # Firmware owns the actuators; send ONLY the keepalive.
@@ -1059,11 +1367,15 @@ class BoatLink:
                                 time.monotonic() >= self.winch_lease_until):
                             self.winch_speed = 0.0
                         if self.motor_split:
-                            self._send_motor_locked(self.motor_left, self.motor_right)
+                            ok = self._send_motor_locked(self.motor_left, self.motor_right)
                         else:
-                            self._send_motor_locked(self.throttle, self.throttle)
-                        self._send_steer_locked(self.rudder)
-                        self._send_winch_locked(self.winch_speed)
+                            ok = self._send_motor_locked(self.throttle, self.throttle)
+                        ok = self._send_steer_locked(self.rudder) and ok
+                        ok = self._send_winch_locked(self.winch_speed) and ok
+                        self._rudder_test_after_send_locked(ok)
+            # File I/O deliberately outside the lock -- a few ms of CSV write
+            # must never sit inside the 15 Hz command loop's critical section.
+            self._flush_rudder_test_write()
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -1146,6 +1458,7 @@ class BoatLink:
                     'yaw_rate': yaw_rate,
                 }
                 self._collect_bench_yaw_locked(yaw_rate, heading)
+                self._collect_rudder_test_row_locked(yaw_rate, heading)
             return
 
         if msg_type == MSG_MOTOR_STATUS:
@@ -1227,6 +1540,7 @@ class BoatLink:
                 'satellites': s.gps.satellites, 'hdop': s.gps.hdop,
             }
             self._collect_bench_yaw_locked(s.imu.yaw_rate, s.imu.heading)
+            self._collect_rudder_test_row_locked(s.imu.yaw_rate, s.imu.heading)
 
     def _read_loop(self):
         """Telemetry downlink: same serial connection as the command uplink,
@@ -1257,6 +1571,7 @@ class BoatLink:
 
     def shutdown(self):
         self.disconnect()
+        self._flush_rudder_test_write()   # the abort above may have queued one
         self._stop.set()
 
 
@@ -1466,6 +1781,23 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Samples</label><span class="val" id="bench-yaw-n">--</span></div>
   <div id="bench-yaw-note" style="font-size:10px;color:var(--dim);">UI-observed / approximate &mdash; the boat's SD CSV is authoritative.</div>
   <div id="bench-msg" style="font-size:10px;color:var(--warn);">boat records to its own SD card; DISARM stops a run. RESET is one-shot &mdash; ordinary BASE runs keep the learned c.</div>
+</div>
+
+<div class="card" id="rudder-test-card">
+  <div class="card-title">Rudder test <span class="pill" id="rt-pill" style="margin-left:6px;">IDLE</span></div>
+  <!-- Fixed sequence: rudder over for 0.5s, then T20 for exactly 3.0s, then
+       1.0s of coast still held over, then centre. Named by SIGN only -- which
+       way the boat physically turns is what this test is FOR, so the buttons
+       must not claim a direction nobody has established yet. -->
+  <div class="row">
+    <button id="rt-minus" title="hold rudder -0.30 through a 3 s T20 drive">RUDDER &minus;30 TEST</button>
+    <button id="rt-plus" title="hold rudder +0.30 through a 3 s T20 drive">RUDDER +30 TEST</button>
+  </div>
+  <div class="telem-row"><label>Phase</label><span class="val" id="rt-phase">--</span></div>
+  <div class="telem-row"><label>Saved as</label><span class="val" id="rt-file">--</span></div>
+  <div class="telem-row"><label>Frames</label><span class="val" id="rt-frames">--</span></div>
+  <div id="rt-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
+  <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
 </div>
 </div>
 
@@ -1797,6 +2129,19 @@ $('bench-left').addEventListener('click', () => runBench('left', 0));
 $('bench-right').addEventListener('click', () => runBench('right', 0));
 $('bench-base').addEventListener('click', () => runBench('both', 0));
 
+// The 4.5 s sequence runs on the server's own command loop; this call returns
+// at once and progress arrives through the normal status poll. Nothing here
+// sleeps or holds the page.
+async function runRudderTest(sign) {
+  if (!connected) { $('rt-msg').textContent = 'not connected'; return; }
+  $('rt-msg').textContent = '';
+  const r = await api('/api/rudder_test', 'POST',
+                      { sign, seq: ++winchCommandSeq });
+  if (r && !r.ok) $('rt-msg').textContent = r.error || 'refused';
+}
+$('rt-minus').addEventListener('click', () => runRudderTest(-1));
+$('rt-plus').addEventListener('click', () => runRudderTest(1));
+
 // ---- effective split preview -----------------------------------------------
 // Mirror of bench_effective_commands() in this file's Python half, which is the
 // tested reference. The boat applies trim = 2*c*base on top of the commanded
@@ -2117,6 +2462,32 @@ function applyStatus(s) {
       $('bench-yaw-hdg').textContent = '--';
     }
 
+    // ---- rudder test ------------------------------------------------------
+    const rt = s.rudder_test, rtr = s.rudder_test_result;
+    const rtPill = $('rt-pill');
+    if (rt && rt.active) {
+      rtPill.textContent = (rt.sign < 0 ? '-30 ' : '+30 ') + rt.phase.toUpperCase();
+      rtPill.classList.add('up'); rtPill.classList.remove('stale');
+      $('rt-phase').textContent =
+        rt.phase + '  ' + rt.elapsed_s.toFixed(1) + ' / ' + rt.total_s.toFixed(1) + 's';
+      $('rt-file').textContent = rt.name;
+      $('rt-frames').textContent = rt.frames + ' collecting...';
+    } else {
+      rtPill.textContent = rtr ? (rtr.aborted ? 'ABORTED' : 'DONE') : 'IDLE';
+      rtPill.classList.remove('up');
+      rtPill.classList.toggle('stale', !!(rtr && rtr.aborted));
+      if (rtr) {
+        $('rt-phase').textContent =
+          (rtr.sign < 0 ? '-30' : '+30') + '  ' + rtr.duration_s.toFixed(2) + 's'
+          + (rtr.aborted ? '  ABORTED: ' + rtr.abort_reason : '');
+        $('rt-file').textContent = rtr.name;
+        $('rt-frames').textContent =
+          rtr.frames + (rtr.gap ? '  GAP ' + rtr.max_gap_s.toFixed(2) + 's' : '');
+        $('rt-frames').classList.toggle('warn', !!rtr.gap);
+        if (rtr.write_error) $('rt-msg').textContent = rtr.write_error;
+      }
+    }
+
     const b = s.bridge_status;
     const bpill = $('bridge-pill');
     if (!b.have) {
@@ -2335,6 +2706,20 @@ class Handler(BaseHTTPRequestHandler):
             code = 200 if ok else (503 if err in (
                 'serial link is disconnected', 'serial write failed') else 409)
             self._json({'ok': ok, 'error': err}, code)
+        elif self.path == '/api/rudder_test':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            sign = body.get('sign')
+            if sign not in (-1, 1) or isinstance(sign, bool):
+                self._json({'ok': False, 'error': 'sign must be -1 or +1'}, 400)
+                return
+            # Returns immediately: the 4.5 s sequence runs on the stream loop,
+            # never in this handler.
+            ok, err = self.link.start_rudder_test(sign, command_seq)
+            self._json({'ok': ok, 'error': err} if not ok else {'ok': True})
         elif self.path == '/api/bench':
             command_seq = body.get('seq')
             if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
