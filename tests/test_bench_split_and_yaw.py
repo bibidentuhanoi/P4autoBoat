@@ -312,6 +312,178 @@ class YawSummaryTest(unittest.TestCase):
         self.assertFalse(s['stale'])
 
 
+class SummaryValidityTest(unittest.TestCase):
+    """Three ways a summary could look trustworthy while being wrong."""
+
+    @staticmethod
+    def _run(rates, hz=20.0, t0=100.0):
+        dt = 1.0 / hz
+        return [(t0 + i * dt, r, None) for i, r in enumerate(rates)]
+
+    # ---- 1. an aborted run is never "complete" --------------------------
+
+    def test_an_aborted_run_is_incomplete_however_clean_the_frames_look(self):
+        """The frames here are perfect -- 60 of them, evenly spaced, covering
+        the whole window. Without the abort flag this summary would print as a
+        finished run, for a run the boat cut short and saved nothing for."""
+        clean = self._run([-8.0] * 60)
+        ok = T.summarize_yaw(clean)
+        self.assertFalse(ok['incomplete'])
+        self.assertFalse(ok['aborted'])
+
+        killed = T.summarize_yaw(clean, aborted=True)
+        self.assertTrue(killed['aborted'])
+        self.assertTrue(killed['incomplete'],
+                        'an aborted run must never report as complete')
+
+    def test_abort_wins_over_every_other_quality_check(self):
+        for rates in ([-8.0] * 60, [-8.0] * 3, []):
+            s = T.summarize_yaw(self._run(rates), aborted=True)
+            self.assertTrue(s['incomplete'])
+            self.assertTrue(s['aborted'])
+
+    def test_the_numbers_are_still_computed_for_an_aborted_run(self):
+        """Flagged, not suppressed -- a partial turn is still worth eyeballing
+        as long as it is clearly labelled."""
+        s = T.summarize_yaw(self._run([-8.0] * 60), aborted=True)
+        self.assertTrue(s['have'])
+        self.assertAlmostEqual(s['mean_yaw_dps'], -8.0, places=6)
+
+    # ---- 2. mean is time-weighted, not a sample average ------------------
+
+    def test_mean_is_the_integrated_angle_over_the_span(self):
+        """Uneven sampling is the whole point. Two frames close together then
+        one far away: an arithmetic mean counts each frame equally regardless
+        of how long it stood for, and lands somewhere the boat never was."""
+        samples = [(0.0, 0.0, None), (0.1, 0.0, None), (2.0, 10.0, None)]
+        s = T.summarize_yaw(samples)
+        arithmetic = (0.0 + 0.0 + 10.0) / 3.0          # 3.333...
+        self.assertAlmostEqual(s['yaw_angle_deg'], 9.5, places=6)
+        self.assertAlmostEqual(s['span_s'], 2.0, places=6)
+        self.assertAlmostEqual(s['mean_yaw_dps'], 4.75, places=6)
+        self.assertNotAlmostEqual(s['mean_yaw_dps'], arithmetic, places=3)
+
+    def test_a_dense_burst_does_not_drag_the_mean(self):
+        """21 frames across the first half, 2 across the second. The sample
+        average leans hard toward the densely-sampled half; the time-weighted
+        mean does not."""
+        dense = [(i * 0.05, 10.0, None) for i in range(21)]      # 0.00 .. 1.00
+        sparse = [(1.5, -10.0, None), (2.0, -10.0, None)]
+        s = T.summarize_yaw(dense + sparse)
+        arithmetic = (21 * 10.0 + 2 * -10.0) / 23.0              # +8.26
+        self.assertAlmostEqual(s['mean_yaw_dps'], 2.5, places=6)
+        self.assertLess(s['mean_yaw_dps'], arithmetic)
+
+    def test_mean_times_span_reproduces_the_angle(self):
+        """The identity that makes the mean meaningful at all."""
+        for samples in ([(0.0, 0.0, None), (0.1, 0.0, None), (2.0, 10.0, None)],
+                        self._run([-8.0] * 60),
+                        self._run([3.0, -7.0, 11.0, -2.0] * 15)):
+            s = T.summarize_yaw(samples)
+            self.assertAlmostEqual(s['mean_yaw_dps'] * s['span_s'],
+                                   s['yaw_angle_deg'], places=6)
+
+    def test_a_single_sample_falls_back_to_that_sample(self):
+        """No span to divide by; the one reading is the only answer there is."""
+        s = T.summarize_yaw([(0.0, -6.0, None)])
+        self.assertEqual(s['n'], 1)
+        self.assertAlmostEqual(s['mean_yaw_dps'], -6.0)
+        self.assertTrue(s['incomplete'])
+
+    def test_duplicate_timestamps_do_not_divide_by_zero(self):
+        s = T.summarize_yaw([(5.0, -6.0, None), (5.0, -4.0, None)])
+        self.assertTrue(math.isfinite(s['mean_yaw_dps']))
+        self.assertEqual(s['span_s'], 0.0)
+
+    # ---- 3. a bench-specific gap threshold -------------------------------
+
+    def test_the_gap_threshold_is_bench_specific_not_the_liveness_limit(self):
+        self.assertLessEqual(T.BENCH_YAW_MAX_GAP_S, 0.30)
+        self.assertGreaterEqual(T.BENCH_YAW_MAX_GAP_S, 0.25)
+        self.assertLess(T.BENCH_YAW_MAX_GAP_S, T.TELEMETRY_STALE_S,
+                        'the bench gap limit must be tighter than the general '
+                        'telemetry liveness limit')
+
+    def test_a_half_second_hole_is_flagged(self):
+        """The regression: 0.5 s is well under the 2 s liveness limit, so the
+        old threshold called this clean. It is ten missed frames in the middle
+        of a three-second turn, and the integrator interpolates straight
+        across it."""
+        first = [(i * 0.05, -8.0, None) for i in range(30)]       # .. 1.45
+        second = [(1.95 + i * 0.05, -8.0, None) for i in range(30)]
+        s = T.summarize_yaw(first + second)
+        self.assertGreater(s['max_gap_s'], T.BENCH_YAW_MAX_GAP_S)
+        self.assertLess(s['max_gap_s'], T.TELEMETRY_STALE_S)
+        self.assertTrue(s['stale'], 'a 0.5 s hole must be flagged')
+        self.assertTrue(s['incomplete'])
+
+    def test_normal_jitter_is_not_flagged(self):
+        """~20 Hz with the odd dropped frame stays clean, or the flag means
+        nothing."""
+        ts, t = [], 0.0
+        for i in range(60):
+            ts.append((t, -8.0, None))
+            t += 0.10 if i % 10 == 0 else 0.05   # one dropped frame each 10
+        s = T.summarize_yaw(ts)
+        self.assertLessEqual(s['max_gap_s'], T.BENCH_YAW_MAX_GAP_S)
+        self.assertFalse(s['stale'])
+        self.assertFalse(s['incomplete'])
+
+
+class AbortTransitionTest(unittest.TestCase):
+    """The RUN -> terminal transition is what decides aborted, so drive it."""
+
+    class _Bs:
+        def __init__(self, state):
+            self.state, self.kind, self.base = state, 1, 0.20
+            self.samples, self.file_index, self.elapsed_s = 0, 0, 0.0
+            self.learn_c, self.p_on = 0.17, False
+
+    def setUp(self):
+        self.link = T.BoatLink.__new__(T.BoatLink)
+        self.link._lock = __import__('threading').RLock()
+        self.link.bench_status = T.BoatLink._blank_bench_status()
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
+
+    def _drive_then(self, end_state, n=60):
+        self.link._handle_bench_status(self._Bs(T.BENCH_STATE_RUN))
+        t0 = 500.0
+        self.link.bench_yaw_samples = [(t0 + i * 0.05, -8.0, None)
+                                       for i in range(n)]
+        self.link._handle_bench_status(self._Bs(end_state))
+        return self.link.bench_yaw
+
+    def test_run_to_coast_is_a_clean_finish(self):
+        s = self._drive_then(T.BENCH_STATE_COAST)
+        self.assertFalse(s['aborted'])
+        self.assertFalse(s['incomplete'])
+
+    def test_run_straight_to_saved_is_also_clean(self):
+        """A lost COAST packet must not read as an abort."""
+        s = self._drive_then(T.BENCH_STATE_SAVED)
+        self.assertFalse(s['aborted'])
+        self.assertFalse(s['incomplete'])
+
+    def test_run_to_failed_is_aborted_and_incomplete(self):
+        s = self._drive_then(T.BENCH_STATE_FAILED)
+        self.assertTrue(s['aborted'])
+        self.assertTrue(s['incomplete'])
+        self.assertEqual(s['end_state'], T.BENCH_STATE_FAILED)
+
+    def test_run_back_to_idle_is_aborted_too(self):
+        s = self._drive_then(0)
+        self.assertTrue(s['aborted'])
+        self.assertTrue(s['incomplete'])
+
+    def test_a_new_run_clears_the_previous_summary(self):
+        self._drive_then(T.BENCH_STATE_FAILED)
+        self.assertIsNotNone(self.link.bench_yaw)
+        self.link._handle_bench_status(self._Bs(T.BENCH_STATE_RUN))
+        self.assertIsNone(self.link.bench_yaw)
+        self.assertEqual(self.link.bench_yaw_samples, [])
+
+
 class CollectionGatingTest(unittest.TestCase):
     """Samples are kept only while the BOAT says it is in the drive phase."""
 
@@ -459,6 +631,37 @@ class JsMirrorTest(unittest.TestCase):
     def test_the_preview_uses_the_boats_real_c_not_a_constant(self):
         self.assertIn('benchLearnC = bn.learn_c;', self.src)
         self.assertIn('refreshBenchPreview();', self.src)
+
+    def test_an_assumed_c_is_labelled_assumed(self):
+        """Every number on that row -- both differentials AND the warning
+        threshold -- scales with c. The flashed 0.17 is a guess: the learner
+        moves c while driving, so by the time a button is pressed it may be
+        anywhere in [0.10, 0.35]. A guess must not be presented as a reading."""
+        self.assertIn('var benchLearnCFromBoat = false;', self.src)
+        self.assertIn('ASSUMED', self.src)
+        self.assertIn("benchLearnCFromBoat = true;", self.src)
+        self.assertIn('id="bench-c-src"', self.src)
+
+    def test_assumed_and_reported_are_visually_distinguished(self):
+        m = re.search(r"cEl\.textContent = benchLearnCFromBoat(.*?);",
+                      self.src, re.S)
+        self.assertIsNotNone(m, 'the assumed/reported branch is missing')
+        branch = m.group(1)
+        self.assertIn("(boat)", branch)
+        self.assertIn('ASSUMED', branch)
+        # not just different words -- a different colour too
+        self.assertIn("cEl.classList.toggle('warn', !benchLearnCFromBoat);",
+                      self.src)
+
+    def test_the_flag_flips_only_on_a_real_bench_status(self):
+        """It must be set where BenchStatus is consumed, not at page load."""
+        i = self.src.index('benchLearnCFromBoat = true;')
+        window = self.src[max(0, i - 400):i]
+        self.assertIn('bn.learn_c', window)
+
+    def test_the_aborted_run_is_called_out_in_the_summary(self):
+        self.assertIn("by.aborted ? '  ABORTED' : ''", self.src)
+        self.assertIn('Run ABORTED before the drive phase finished', self.src)
 
     def test_the_preview_updates_as_the_operator_types(self):
         self.assertIn("$('bench-throttle').addEventListener('input', refreshBenchPreview);",

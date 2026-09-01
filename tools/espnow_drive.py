@@ -207,6 +207,13 @@ BENCH_RUNNING_STALE_S = 3.0
 # 0 idle, 1 baseline, 2 run, 3 coast, 4 saved, 5 failed). Named because the
 # yaw summary is delimited by it and a bare 2 in that test reads as nothing.
 BENCH_STATE_RUN = 2
+# The only two states a completed drive phase can hand off to: the clock runs
+# out into the motors-off coast, which then saves. Any other exit from RUN is
+# the boat aborting (bench_step's disarm / excessive-yaw fail paths), and it
+# saves nothing.
+BENCH_STATE_COAST = 3
+BENCH_STATE_SAVED = 4
+BENCH_STATE_FAILED = 5
 
 # The learner's clamp, mirrored from motor_control.c (.c_min / .c_max). A value
 # outside this is refused by the boat, so refuse it here too rather than send a
@@ -223,6 +230,16 @@ BENCH_DRIVE_S = 3.0
 BENCH_YAW_MIN_SAMPLES = 12
 # Fraction of the drive phase the caught samples must span to count as complete.
 BENCH_YAW_MIN_COVERAGE = 0.6
+# Longest hole in the caught frames that still leaves a 3 s run describable.
+#
+# Deliberately NOT TELEMETRY_STALE_S. That one is a LIVENESS test -- "is the
+# boat still talking to us" -- and 2 s of it is a generous margin for a
+# readout that only has to stop showing a frozen number. Here the question is
+# a different one: can these samples describe a 3 s turn? A 2 s hole leaves
+# one third of the run and would still pass, while the integrated angle
+# quietly interpolated straight across the missing two thirds. At ~20 Hz this
+# is about six consecutive dropped frames.
+BENCH_YAW_MAX_GAP_S = 0.30
 
 
 # ---- what the motors ACTUALLY get -------------------------------------------
@@ -321,17 +338,23 @@ def wrap_deg(delta):
     return ((float(delta) + 180.0) % 360.0) - 180.0
 
 
-def summarize_yaw(samples):
+def summarize_yaw(samples, aborted=False):
     """samples: list of (t_monotonic, yaw_rate_dps, heading_deg | None).
 
     Gyro yaw is the primary measurement. Heading change is accumulated from
     CONSECUTIVE wrapped deltas rather than first-vs-last, so a run that turns
-    through more than 180 deg still adds up correctly."""
+    through more than 180 deg still adds up correctly.
+
+    `aborted` marks a run the boat did not carry to completion (disarm, an
+    excessive-yaw trip). Such a run is ALWAYS incomplete no matter how clean
+    the frames look: the drive phase was cut short, so the samples describe
+    part of a turn while the boat saved nothing to compare against."""
     out = {
         'have': False, 'n': 0, 'span_s': 0.0,
         'mean_yaw_dps': 0.0, 'peak_yaw_dps': 0.0, 'yaw_angle_deg': 0.0,
         'heading_change_deg': 0.0, 'heading_ok': False,
         'stale': False, 'incomplete': True, 'max_gap_s': 0.0,
+        'aborted': bool(aborted),
     }
     usable = [s for s in samples
               if isinstance(s[1], (int, float)) and not isinstance(s[1], bool)
@@ -342,16 +365,18 @@ def summarize_yaw(samples):
     out['have'] = True
 
     rates = [s[1] for s in usable]
-    out['mean_yaw_dps'] = sum(rates) / len(rates)
     # Signed peak: the largest EXCURSION, keeping its direction. max(abs) would
     # throw away the one thing this whole readout exists to establish.
     out['peak_yaw_dps'] = max(rates, key=abs)
+    # Fallback only: with a single sample there is no span to divide by, and
+    # that one reading is the only answer available.
+    out['mean_yaw_dps'] = sum(rates) / len(rates)
 
     if len(usable) >= 2:
         out['span_s'] = usable[-1][0] - usable[0][0]
         gaps = [usable[i][0] - usable[i - 1][0] for i in range(1, len(usable))]
         out['max_gap_s'] = max(gaps) if gaps else 0.0
-        out['stale'] = out['max_gap_s'] > TELEMETRY_STALE_S
+        out['stale'] = out['max_gap_s'] > BENCH_YAW_MAX_GAP_S
         # Trapezoidal: the rate is a continuous signal sampled unevenly, so
         # rectangles would bias whichever end happened to be sampled denser.
         angle = 0.0
@@ -362,6 +387,16 @@ def summarize_yaw(samples):
             angle += 0.5 * (usable[i][1] + usable[i - 1][1]) * dt
         out['yaw_angle_deg'] = angle
 
+        # TIME-weighted, not a sample average. Frames arrive unevenly -- a
+        # burst then a hole -- and an arithmetic mean counts each frame equally
+        # regardless of how long it stood for, so a dense burst during one part
+        # of the turn drags the answer toward that part. Dividing the
+        # integrated angle by the span it was integrated over is the mean rate
+        # that actually produced the observed turn, and keeps
+        # mean * span == angle exactly.
+        if out['span_s'] > 0.0:
+            out['mean_yaw_dps'] = out['yaw_angle_deg'] / out['span_s']
+
         headings = [s[2] for s in usable
                     if isinstance(s[2], (int, float)) and not isinstance(s[2], bool)
                     and math.isfinite(s[2])]
@@ -371,7 +406,8 @@ def summarize_yaw(samples):
                 wrap_deg(headings[i] - headings[i - 1])
                 for i in range(1, len(headings)))
 
-    out['incomplete'] = (out['n'] < BENCH_YAW_MIN_SAMPLES
+    out['incomplete'] = (out['aborted']
+                         or out['n'] < BENCH_YAW_MIN_SAMPLES
                          or out['span_s'] < BENCH_DRIVE_S * BENCH_YAW_MIN_COVERAGE
                          or out['stale'])
     return out
@@ -879,9 +915,21 @@ class BoatLink:
                 self.bench_yaw_samples = []          # a new run: start clean
                 self.bench_yaw = None
             elif was_driving and not now_driving:
-                self.bench_yaw = summarize_yaw(self.bench_yaw_samples)
+                # A run only ends cleanly by running out the clock, which takes
+                # it RUN -> COAST -> SAVED. Anything else leaving the drive
+                # phase means the boat cut it short (disarm, excessive-yaw
+                # trip) and saved NOTHING, so the frames we caught describe
+                # part of a turn with no file to check them against. Treat that
+                # as aborted even when the samples themselves look clean --
+                # a tidy-looking summary of a run that never happened is the
+                # worst possible output here.
+                aborted = int(bs.state) not in (BENCH_STATE_COAST,
+                                                BENCH_STATE_SAVED)
+                self.bench_yaw = summarize_yaw(self.bench_yaw_samples,
+                                               aborted=aborted)
                 self.bench_yaw['kind'] = self.bench_status['kind']
                 self.bench_yaw['base'] = self.bench_status['base']
+                self.bench_yaw['end_state'] = int(bs.state)
 
     def trigger_record(self):
         """Fire-and-forget dataset capture (Feature 1): the boat saves a
@@ -1385,6 +1433,7 @@ PAGE = """<!DOCTYPE html>
        runs. Shown rather than hidden: the asymmetry is the thing being
        measured, not a bug to paper over. -->
   <div class="telem-row"><label>Effective L / R</label><span class="val" id="bench-eff">--</span></div>
+  <div class="telem-row"><label>Trim used</label><span class="val" id="bench-c-src">--</span></div>
   <div id="bench-warn" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div class="row">
     <!-- Named for the MOTOR, not a turn direction: which way the boat
@@ -1777,9 +1826,13 @@ function benchEffective(kind, base, delta, c) {
 }
 function sgn2(v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }
 
-// Current learner c, as the BOAT reports it. Falls back to the flashed default
-// only so the preview is not blank before the first BenchStatus arrives.
+// Current learner c. Until a BenchStatus arrives this is the FLASHED DEFAULT,
+// not the boat's actual value -- the learner moves c while driving, so by the
+// time you press a button it may be anywhere in [0.10, 0.35]. The preview is
+// still worth showing (it is the right shape, and it warns), but it must not
+// look like a measurement, so it is marked assumed until the boat speaks.
 var benchLearnC = 0.17;
+var benchLearnCFromBoat = false;
 function refreshBenchPreview() {
   const base = parseInt($('bench-throttle').value) / 100;
   const delta = parseInt($('bench-delta').value) / 100;
@@ -1791,6 +1844,15 @@ function refreshBenchPreview() {
     + ' (' + sgn2(L.differential * 100) + ')   '
     + 'R-str ' + (R.left * 100).toFixed(1) + '/' + (R.right * 100).toFixed(1)
     + ' (' + sgn2(R.differential * 100) + ')';
+  // Say which c this was computed from, and make an assumed one look assumed.
+  // Everything on this row -- both differentials and the warning threshold --
+  // scales with c, so a stale 0.17 against a learner that has walked to 0.24
+  // is a different prediction entirely.
+  var cEl = $('bench-c-src');
+  cEl.textContent = benchLearnCFromBoat
+    ? ('c = ' + benchLearnC.toFixed(3) + ' (boat)')
+    : ('c = ' + benchLearnC.toFixed(3) + ' ASSUMED — no BenchStatus yet');
+  cEl.classList.toggle('warn', !benchLearnCFromBoat);
   // Same threshold as bench_split_warning(): delta == c*base is exact cancellation.
   const cancel = Math.abs(benchLearnC) * base;
   let warn = '';
@@ -2018,8 +2080,9 @@ function applyStatus(s) {
       // and during a run is what the jets are actually going to get -- not the
       // flashed default the page started with.
       if (bn.have && typeof bn.learn_c === 'number' && bn.learn_c > 0
-          && bn.learn_c !== benchLearnC) {
+          && (bn.learn_c !== benchLearnC || !benchLearnCFromBoat)) {
         benchLearnC = bn.learn_c;
+        benchLearnCFromBoat = true;   // no longer a guess
         refreshBenchPreview();
       }
     }
@@ -2034,15 +2097,19 @@ function applyStatus(s) {
         by.heading_ok ? (sgn2(by.heading_change_deg) + ' °') : '--';
       $('bench-yaw-n').textContent =
         by.n + ' over ' + by.span_s.toFixed(1) + 's'
-        + (by.stale ? '  GAPPY (' + by.max_gap_s.toFixed(1) + 's)' : '')
+        + (by.aborted ? '  ABORTED' : '')
+        + (by.stale ? '  GAPPY (' + by.max_gap_s.toFixed(2) + 's)' : '')
         + (by.incomplete ? '  INCOMPLETE' : '');
       // Loud when the sample set does not actually cover the run: a confident
       // -8.3 deg/s from four frames is worse than no number at all.
       $('bench-yaw-n').classList.toggle('warn', !!(by.incomplete || by.stale));
-      $('bench-yaw-note').textContent = (by.incomplete || by.stale)
-        ? 'UI-observed / approximate, and this one is patchy — read the '
-          + "boat's SD CSV, which is authoritative."
-        : "UI-observed / approximate — the boat's SD CSV is authoritative.";
+      $('bench-yaw-note').textContent = by.aborted
+        ? 'Run ABORTED before the drive phase finished — the boat saved no '
+          + 'file. These numbers describe part of a turn; discard them.'
+        : ((by.incomplete || by.stale)
+            ? 'UI-observed / approximate, and this one is patchy — read the '
+              + "boat's SD CSV, which is authoritative."
+            : "UI-observed / approximate — the boat's SD CSV is authoritative.");
     } else if (typeof s.bench_yaw_live === 'number' && s.bench_yaw_live > 0) {
       $('bench-yaw-n').textContent = s.bench_yaw_live + ' collecting…';
       $('bench-yaw-rate').textContent = '--';
