@@ -203,12 +203,178 @@ BENCH_STATE_NAME = {0: 'idle', 1: 'still', 2: 'driving', 3: 'coasting',
 # still be running -- most likely the terminal SAVED packet was lost over the
 # air. Without this the tool latches on 'driving' and refuses every later run.
 BENCH_RUNNING_STALE_S = 3.0
+# BenchStatus.state == 2 is the drive phase (motor_control.c / bench_run.c:
+# 0 idle, 1 baseline, 2 run, 3 coast, 4 saved, 5 failed). Named because the
+# yaw summary is delimited by it and a bare 2 in that test reads as nothing.
+BENCH_STATE_RUN = 2
 
 # The learner's clamp, mirrored from motor_control.c (.c_min / .c_max). A value
 # outside this is refused by the boat, so refuse it here too rather than send a
 # command that will be silently dropped.
 TRIMLEARN_C_MIN = 0.10
 TRIMLEARN_C_MAX = 0.35
+
+# Length of the boat's drive phase, mirrored from motor_control.c
+# (BENCH_RUN_US_SPLIT / BENCH_RUN_US_BASE, both 3000000). Only used to judge
+# whether the yaw telemetry we happened to catch covers the whole run.
+BENCH_DRIVE_S = 3.0
+# The boat publishes telemetry at roughly 20 Hz, so a 3 s drive phase should
+# yield ~60 frames. Below this the summary is too thin to mean anything.
+BENCH_YAW_MIN_SAMPLES = 12
+# Fraction of the drive phase the caught samples must span to count as complete.
+BENCH_YAW_MIN_COVERAGE = 0.6
+
+
+# ---- what the motors ACTUALLY get -------------------------------------------
+# The boat applies the learned trim on top of the commanded split, for every
+# run kind (bench_run.c: bench_commands() then esc_trim_apply_pair(), with
+# trim = 2 * c * base from motor_control.c's bench_tick). That is deliberate --
+# these runs are meant to measure the boat in its real operating condition,
+# autotrim included -- but it means the nominal +/-delta is NOT what the jets
+# see, and the two directions are NOT symmetric:
+#
+#     LEFT  differential = 2 * (c*base - delta)     <- zero at delta == c*base,
+#                                                      REVERSED below it
+#     RIGHT differential = 2 * (c*base + delta)     <- always amplified
+#
+# This function is the reference implementation; the browser mirrors it for the
+# live preview. Nothing here changes the boat -- it only shows the operator what
+# the boat is already going to do.
+def bench_effective_commands(kind, base, delta, c):
+    """Predict the (left, right) a bench run will really command.
+
+    kind: 'both' | 'left' | 'right'. Returns a dict with the nominal pair, the
+    trimmed pair actually sent, and both differentials (right - left, signed).
+    Mirrors bench_commands() + esc_trim_apply_pair() exactly, clamps included."""
+    base = clamp(float(base), 0.0, 1.0)
+    delta = clamp(float(delta), 0.0, 1.0)
+    c = float(c)
+    if not math.isfinite(c):
+        c = 0.0
+
+    if kind == 'left':
+        nl, nr = base + delta, base - delta
+    elif kind == 'right':
+        nl, nr = base - delta, base + delta
+    else:
+        nl = nr = base
+    # The jets are unidirectional: bench_commands() clamps before the trim.
+    nl, nr = clamp(nl, 0.0, 1.0), clamp(nr, 0.0, 1.0)
+
+    trim = 2.0 * c * base
+    if nl <= 0.0 and nr <= 0.0:
+        left, right = nl, nr          # esc_trim_apply_pair: stopped stays stopped
+    else:
+        left = clamp(nl - 0.5 * trim, 0.0, 1.0)
+        right = clamp(nr + 0.5 * trim, 0.0, 1.0)
+
+    return {
+        'nominal_left': nl, 'nominal_right': nr,
+        'nominal_differential': nr - nl,
+        'left': left, 'right': right,
+        'differential': right - left,
+        'trim': trim,
+    }
+
+
+def bench_split_cancel_delta(base, c):
+    """The delta at which the trim exactly cancels a LEFT run: delta == c*base.
+    Below it the LEFT run turns the boat the SAME way a RIGHT run does."""
+    return abs(float(c)) * clamp(float(base), 0.0, 1.0)
+
+
+def bench_split_warning(base, delta, c):
+    """None when the chosen split is clearly stronger than the trim, otherwise
+    a plain-English warning.
+
+    This does NOT make the two directions symmetric and must not be described
+    as doing so -- RIGHT is always the stronger of the two. It only keeps the
+    LEFT run pointing the way its name says."""
+    cancel = bench_split_cancel_delta(base, c)
+    delta = clamp(float(delta), 0.0, 1.0)
+    if cancel <= 0.0:
+        return None
+    if delta < cancel:
+        return ('LEFT MOTOR STRONGER will drive the boat the SAME way as RIGHT: '
+                'trim %.1f%% exceeds the %.1f%% split, so the nominal left run '
+                'is reversed. Use more than %.1f%%.'
+                % (cancel * 100.0, delta * 100.0, cancel * 100.0))
+    if delta < 2.0 * cancel:
+        return ('split %.1f%% is close to the %.1f%% the trim cancels -- the '
+                'LEFT run will be weak and the two directions very lopsided. '
+                'Above %.1f%% is clearer.'
+                % (delta * 100.0, cancel * 100.0, 2.0 * cancel * 100.0))
+    return None
+
+
+# ---- UI-observed yaw summary ------------------------------------------------
+# Computed from the telemetry frames this tool happened to receive while the
+# boat reported itself in the drive phase. The boat's own SD CSV is sampled at
+# 100 Hz and is the authoritative record; this is a lossy over-the-air view,
+# good for "which way did it turn, and roughly how hard".
+def wrap_deg(delta):
+    """Signed shortest angular difference, in [-180, +180).
+
+    Exactly 180 comes back as -180: a half turn is genuinely ambiguous in sign,
+    and this is the conventional resolution. It never arises in practice here,
+    because the deltas being wrapped are between CONSECUTIVE ~20 Hz frames."""
+    return ((float(delta) + 180.0) % 360.0) - 180.0
+
+
+def summarize_yaw(samples):
+    """samples: list of (t_monotonic, yaw_rate_dps, heading_deg | None).
+
+    Gyro yaw is the primary measurement. Heading change is accumulated from
+    CONSECUTIVE wrapped deltas rather than first-vs-last, so a run that turns
+    through more than 180 deg still adds up correctly."""
+    out = {
+        'have': False, 'n': 0, 'span_s': 0.0,
+        'mean_yaw_dps': 0.0, 'peak_yaw_dps': 0.0, 'yaw_angle_deg': 0.0,
+        'heading_change_deg': 0.0, 'heading_ok': False,
+        'stale': False, 'incomplete': True, 'max_gap_s': 0.0,
+    }
+    usable = [s for s in samples
+              if isinstance(s[1], (int, float)) and not isinstance(s[1], bool)
+              and math.isfinite(s[1])]
+    out['n'] = len(usable)
+    if not usable:
+        return out
+    out['have'] = True
+
+    rates = [s[1] for s in usable]
+    out['mean_yaw_dps'] = sum(rates) / len(rates)
+    # Signed peak: the largest EXCURSION, keeping its direction. max(abs) would
+    # throw away the one thing this whole readout exists to establish.
+    out['peak_yaw_dps'] = max(rates, key=abs)
+
+    if len(usable) >= 2:
+        out['span_s'] = usable[-1][0] - usable[0][0]
+        gaps = [usable[i][0] - usable[i - 1][0] for i in range(1, len(usable))]
+        out['max_gap_s'] = max(gaps) if gaps else 0.0
+        out['stale'] = out['max_gap_s'] > TELEMETRY_STALE_S
+        # Trapezoidal: the rate is a continuous signal sampled unevenly, so
+        # rectangles would bias whichever end happened to be sampled denser.
+        angle = 0.0
+        for i in range(1, len(usable)):
+            dt = usable[i][0] - usable[i - 1][0]
+            if dt <= 0.0:
+                continue
+            angle += 0.5 * (usable[i][1] + usable[i - 1][1]) * dt
+        out['yaw_angle_deg'] = angle
+
+        headings = [s[2] for s in usable
+                    if isinstance(s[2], (int, float)) and not isinstance(s[2], bool)
+                    and math.isfinite(s[2])]
+        if len(headings) >= 2:
+            out['heading_ok'] = True
+            out['heading_change_deg'] = sum(
+                wrap_deg(headings[i] - headings[i - 1])
+                for i in range(1, len(headings)))
+
+    out['incomplete'] = (out['n'] < BENCH_YAW_MIN_SAMPLES
+                         or out['span_s'] < BENCH_DRIVE_S * BENCH_YAW_MIN_COVERAGE
+                         or out['stale'])
+    return out
 
 
 def load_boat_pb2():
@@ -267,6 +433,11 @@ class BoatLink:
         self.system_status = self._blank_system_status()
         self.motor_status = self._blank_motor_status()
         self.bench_status = self._blank_bench_status()
+        # Yaw telemetry caught while the boat reported itself driving, and the
+        # summary derived from it once the phase ends. UI-observed and lossy --
+        # the boat's 100 Hz SD CSV is the authoritative record.
+        self.bench_yaw_samples = []
+        self.bench_yaw = None
         # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
         # the default so a forgotten toggle cannot silently make every run a B.
         self.p_assist_on = False
@@ -666,8 +837,29 @@ class BoatLink:
                 return False, 'serial write failed'
             return True, None
 
+    def _collect_bench_yaw_locked(self, yaw_rate, heading):
+        """One telemetry frame, kept only if the boat says it is DRIVING.
+
+        Caller already holds self._lock -- both decode paths assign
+        self.telemetry inside it, and this has to see the same bench state they
+        were decoded against.
+
+        Bounded: a run is 3 s of ~20 Hz telemetry (~60 frames), so a cap well
+        above that costs nothing and stops a stuck 'driving' state (a lost
+        terminal packet, say) growing this without limit for the whole
+        session."""
+        if not self.bench_status.get('have'):
+            return
+        if self.bench_status.get('state') != BENCH_STATE_RUN:
+            return
+        if len(self.bench_yaw_samples) >= 4000:
+            return
+        self.bench_yaw_samples.append((time.monotonic(), yaw_rate, heading))
+
     def _handle_bench_status(self, bs):
         with self._lock:
+            was_driving = (self.bench_status.get('have')
+                           and self.bench_status.get('state') == BENCH_STATE_RUN)
             self.bench_status = {
                 'have': True, 'last_rx_monotonic': time.monotonic(),
                 'state': int(bs.state), 'kind': int(bs.kind),
@@ -679,6 +871,17 @@ class BoatLink:
                 # two disagree the A/B is void, so it has to be visible.
                 'p_on': bool(bs.p_on),
             }
+            now_driving = (int(bs.state) == BENCH_STATE_RUN)
+            # Collect only across the DRIVE phase. The boat's own state is what
+            # delimits it -- guessing from elapsed_s would drift, and the
+            # motors-off baseline/coast readings are not part of the turn.
+            if now_driving and not was_driving:
+                self.bench_yaw_samples = []          # a new run: start clean
+                self.bench_yaw = None
+            elif was_driving and not now_driving:
+                self.bench_yaw = summarize_yaw(self.bench_yaw_samples)
+                self.bench_yaw['kind'] = self.bench_status['kind']
+                self.bench_yaw['base'] = self.bench_status['base']
 
     def trigger_record(self):
         """Fire-and-forget dataset capture (Feature 1): the boat saves a
@@ -729,6 +932,12 @@ class BoatLink:
                 # Sample list deliberately excluded -- the browser polls this
                 # often and the rows belong in the file, not the status blob.
                 'bench': self._with_age(self.bench_status, 5.0),
+                # UI-observed yaw summary for the last completed drive phase.
+                # None until one finishes. Deliberately NOT age-stamped: it
+                # describes a run that is already over, so it does not go stale
+                # the way live telemetry does.
+                'bench_yaw': dict(self.bench_yaw) if self.bench_yaw else None,
+                'bench_yaw_live': len(self.bench_yaw_samples),
                 'motor_status': self._with_age(self.motor_status, TELEMETRY_STALE_S),
                 'seq': self.seq,
                 'last_error': self.last_error,
@@ -888,6 +1097,7 @@ class BoatLink:
                     'satellites': satellites, 'hdop': hdop,
                     'yaw_rate': yaw_rate,
                 }
+                self._collect_bench_yaw_locked(yaw_rate, heading)
             return
 
         if msg_type == MSG_MOTOR_STATUS:
@@ -968,6 +1178,7 @@ class BoatLink:
                 'speed_mps': s.gps.speed_mps, 'course_deg': s.gps.course_deg,
                 'satellites': s.gps.satellites, 'hdop': s.gps.hdop,
             }
+            self._collect_bench_yaw_locked(s.imu.yaw_rate, s.imu.heading)
 
     def _read_loop(self):
         """Telemetry downlink: same serial connection as the command uplink,
@@ -1167,11 +1378,20 @@ PAGE = """<!DOCTYPE html>
     <label>Throttle %</label>
     <input type="number" id="bench-throttle" min="1" max="60" step="1" value="20" style="width:56px;">
     <label style="min-width:auto;margin-left:10px;">Split &#177;%</label>
-    <input type="number" id="bench-delta" min="1" max="30" step="1" value="4" style="width:56px;">
+    <input type="number" id="bench-delta" min="1" max="30" step="1" value="12" style="width:56px;">
   </div>
+  <!-- What the jets ACTUALLY get. The boat applies the learned trim on top of
+       the commanded split for every kind, so the nominal +/-delta is not what
+       runs. Shown rather than hidden: the asymmetry is the thing being
+       measured, not a bug to paper over. -->
+  <div class="telem-row"><label>Effective L / R</label><span class="val" id="bench-eff">--</span></div>
+  <div id="bench-warn" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div class="row">
-    <button id="bench-left" title="left stronger / right weaker">LEFT TEST</button>
-    <button id="bench-right" title="right stronger / left weaker">RIGHT TEST</button>
+    <!-- Named for the MOTOR, not a turn direction: which way the boat
+         physically swings has not been measured yet, and these runs are how we
+         measure it. Do not rename to LEFT TURN / RIGHT TURN until it has. -->
+    <button id="bench-left" title="port jet commanded stronger, starboard weaker (before trim)">LEFT MOTOR STRONGER</button>
+    <button id="bench-right" title="starboard jet commanded stronger, port weaker (before trim)">RIGHT MOTOR STRONGER</button>
     <button id="bench-base" title="both equal -- any turn IS the mismatch">BASE TEST</button>
   </div>
   <div class="row" style="margin-top:6px;">
@@ -1188,6 +1408,14 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div class="telem-row"><label>Run</label><span class="val" id="bench-progress">--</span></div>
   <div class="telem-row"><label>Saved as</label><span class="val" id="bench-file">--</span></div>
+  <!-- Derived from the telemetry frames THIS TOOL caught during the 3 s drive
+       phase (~20 Hz over the air). The boat samples at 100 Hz to its SD card
+       and that file is authoritative; this is a quick "which way, how hard". -->
+  <div class="telem-row" style="margin-top:6px;"><label>Yaw mean / peak</label><span class="val" id="bench-yaw-rate">--</span></div>
+  <div class="telem-row"><label>Yaw angle</label><span class="val" id="bench-yaw-angle">--</span></div>
+  <div class="telem-row"><label>Heading &#916;</label><span class="val" id="bench-yaw-hdg">--</span></div>
+  <div class="telem-row"><label>Samples</label><span class="val" id="bench-yaw-n">--</span></div>
+  <div id="bench-yaw-note" style="font-size:10px;color:var(--dim);">UI-observed / approximate &mdash; the boat's SD CSV is authoritative.</div>
   <div id="bench-msg" style="font-size:10px;color:var(--warn);">boat records to its own SD card; DISARM stops a run. RESET is one-shot &mdash; ordinary BASE runs keep the learned c.</div>
 </div>
 </div>
@@ -1519,6 +1747,69 @@ async function runBench(kind, resetC) {
 $('bench-left').addEventListener('click', () => runBench('left', 0));
 $('bench-right').addEventListener('click', () => runBench('right', 0));
 $('bench-base').addEventListener('click', () => runBench('both', 0));
+
+// ---- effective split preview -----------------------------------------------
+// Mirror of bench_effective_commands() in this file's Python half, which is the
+// tested reference. The boat applies trim = 2*c*base on top of the commanded
+// split (bench_run.c), so:
+//     LEFT  differential = 2*(c*base - delta)   zero at delta == c*base,
+//                                               REVERSED below it
+//     RIGHT differential = 2*(c*base + delta)   always amplified
+// Raising the split does NOT make the two directions symmetric -- RIGHT stays
+// the stronger one. It only keeps LEFT pointing the way its name says.
+function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+function benchEffective(kind, base, delta, c) {
+  base = clamp01(base); delta = clamp01(delta);
+  if (!isFinite(c)) c = 0;
+  let nl, nr;
+  if (kind === 'left')       { nl = base + delta; nr = base - delta; }
+  else if (kind === 'right') { nl = base - delta; nr = base + delta; }
+  else                       { nl = base;         nr = base; }
+  nl = clamp01(nl); nr = clamp01(nr);
+  const trim = 2 * c * base;
+  let left = nl, right = nr;
+  if (!(nl <= 0 && nr <= 0)) {
+    left = clamp01(nl - 0.5 * trim);
+    right = clamp01(nr + 0.5 * trim);
+  }
+  return { left, right, differential: right - left,
+           nominalDifferential: nr - nl, trim };
+}
+function sgn2(v) { return (v >= 0 ? '+' : '') + v.toFixed(2); }
+
+// Current learner c, as the BOAT reports it. Falls back to the flashed default
+// only so the preview is not blank before the first BenchStatus arrives.
+var benchLearnC = 0.17;
+function refreshBenchPreview() {
+  const base = parseInt($('bench-throttle').value) / 100;
+  const delta = parseInt($('bench-delta').value) / 100;
+  if (!isFinite(base) || !isFinite(delta)) { $('bench-eff').textContent = '--'; return; }
+  const L = benchEffective('left', base, delta, benchLearnC);
+  const R = benchEffective('right', base, delta, benchLearnC);
+  $('bench-eff').textContent =
+    'L-str ' + (L.left * 100).toFixed(1) + '/' + (L.right * 100).toFixed(1)
+    + ' (' + sgn2(L.differential * 100) + ')   '
+    + 'R-str ' + (R.left * 100).toFixed(1) + '/' + (R.right * 100).toFixed(1)
+    + ' (' + sgn2(R.differential * 100) + ')';
+  // Same threshold as bench_split_warning(): delta == c*base is exact cancellation.
+  const cancel = Math.abs(benchLearnC) * base;
+  let warn = '';
+  if (cancel > 0 && delta < cancel) {
+    warn = 'LEFT MOTOR STRONGER will drive the boat the SAME way as RIGHT: trim '
+         + (cancel * 100).toFixed(1) + '% exceeds the ' + (delta * 100).toFixed(1)
+         + '% split, so the nominal left run is reversed. Use more than '
+         + (cancel * 100).toFixed(1) + '%.';
+  } else if (cancel > 0 && delta < 2 * cancel) {
+    warn = 'split ' + (delta * 100).toFixed(1) + '% is close to the '
+         + (cancel * 100).toFixed(1) + '% the trim cancels -- the LEFT run will be '
+         + 'weak and the two directions very lopsided. Above '
+         + (2 * cancel * 100).toFixed(1) + '% is clearer.';
+  }
+  $('bench-warn').textContent = warn;
+}
+$('bench-throttle').addEventListener('input', refreshBenchPreview);
+$('bench-delta').addEventListener('input', refreshBenchPreview);
+refreshBenchPreview();
 // Runtime switch, deliberately not a rebuild: both arms of the A/B must run
 // the same binary. OFF is the control arm and the default.
 var pAssistOn = false;
@@ -1723,6 +2014,40 @@ function applyStatus(s) {
       $('bench-learn-c').textContent =
         (bn.have && typeof bn.learn_c === 'number' && bn.learn_c > 0)
           ? bn.learn_c.toFixed(3) : '--';
+      // Feed the boat's REAL c back into the preview, so what is shown before
+      // and during a run is what the jets are actually going to get -- not the
+      // flashed default the page started with.
+      if (bn.have && typeof bn.learn_c === 'number' && bn.learn_c > 0
+          && bn.learn_c !== benchLearnC) {
+        benchLearnC = bn.learn_c;
+        refreshBenchPreview();
+      }
+    }
+
+    // ---- UI-observed yaw summary of the last completed drive phase ----------
+    const by = s.bench_yaw;
+    if (by && by.have) {
+      $('bench-yaw-rate').textContent =
+        sgn2(by.mean_yaw_dps) + ' / ' + sgn2(by.peak_yaw_dps) + ' °/s';
+      $('bench-yaw-angle').textContent = sgn2(by.yaw_angle_deg) + ' °';
+      $('bench-yaw-hdg').textContent =
+        by.heading_ok ? (sgn2(by.heading_change_deg) + ' °') : '--';
+      $('bench-yaw-n').textContent =
+        by.n + ' over ' + by.span_s.toFixed(1) + 's'
+        + (by.stale ? '  GAPPY (' + by.max_gap_s.toFixed(1) + 's)' : '')
+        + (by.incomplete ? '  INCOMPLETE' : '');
+      // Loud when the sample set does not actually cover the run: a confident
+      // -8.3 deg/s from four frames is worse than no number at all.
+      $('bench-yaw-n').classList.toggle('warn', !!(by.incomplete || by.stale));
+      $('bench-yaw-note').textContent = (by.incomplete || by.stale)
+        ? 'UI-observed / approximate, and this one is patchy — read the '
+          + "boat's SD CSV, which is authoritative."
+        : "UI-observed / approximate — the boat's SD CSV is authoritative.";
+    } else if (typeof s.bench_yaw_live === 'number' && s.bench_yaw_live > 0) {
+      $('bench-yaw-n').textContent = s.bench_yaw_live + ' collecting…';
+      $('bench-yaw-rate').textContent = '--';
+      $('bench-yaw-angle').textContent = '--';
+      $('bench-yaw-hdg').textContent = '--';
     }
 
     const b = s.bridge_status;

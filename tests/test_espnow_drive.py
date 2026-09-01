@@ -45,6 +45,11 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         self.link.system_status = espnow_drive.BoatLink._blank_system_status()
         self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
+        # UI-observed yaw summary state. Set here for the same reason every
+        # other field is: this fixture builds the link with __new__, so it
+        # stands in for __init__ and has to carry whatever status() reads.
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
         self.link.seq = 0
         self.link.last_error = None
 
@@ -220,6 +225,11 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.system_status = espnow_drive.BoatLink._blank_system_status()
         self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
+        # UI-observed yaw summary state. Set here for the same reason every
+        # other field is: this fixture builds the link with __new__, so it
+        # stands in for __init__ and has to carry whatever status() reads.
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -554,6 +564,11 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         self.link.system_status = espnow_drive.BoatLink._blank_system_status()
         self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
         self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
+        # UI-observed yaw summary state. Set here for the same reason every
+        # other field is: this fixture builds the link with __new__, so it
+        # stands in for __init__ and has to carry whatever status() reads.
+        self.link.bench_yaw_samples = []
+        self.link.bench_yaw = None
         self.link.seq = 0
         self.link.last_error = None
         self.sent = []
@@ -792,8 +807,11 @@ class BenchRunPageTest(unittest.TestCase):
                    'bench-throttle', 'bench-delta'):
             self.assertIn('id="%s"' % el, espnow_drive.PAGE)
         self.assertIn('/api/bench', espnow_drive.PAGE)
-        self.assertIn('LEFT TEST', espnow_drive.PAGE)
-        self.assertIn('RIGHT TEST', espnow_drive.PAGE)
+        # Named for the MOTOR, not a turn direction -- which way the boat
+        # physically swings has not been measured, and these runs are how it
+        # gets measured. See tests/test_bench_split_and_yaw.py.
+        self.assertIn('LEFT MOTOR STRONGER', espnow_drive.PAGE)
+        self.assertIn('RIGHT MOTOR STRONGER', espnow_drive.PAGE)
         self.assertIn('BASE TEST', espnow_drive.PAGE)
 
 
