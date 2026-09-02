@@ -1986,7 +1986,30 @@ function updateMotorBar(side, value) {
   fill.style.background = 'var(--green)';
 }
 
+// THE MOTOR HEARTBEAT. The firmware zeroes the boat after
+// CONTROL_LINK_TIMEOUT_US of silence, which is the whole failsafe on this
+// path -- the browser is the sender, so if it dies the commands simply stop.
+//
+// That makes the stream a HOLD, not an event: while a non-zero command stands
+// it has to keep going out. Stopping it on slider RELEASE meant letting go at
+// 40% killed the stream, the firmware timed out 400 ms later, and the motors
+// cut while the slider still read 40%.
 let _motorSendTimer = null;
+function motorCommandIsZero() {
+  return parseInt($('motor-left').value) === 0 &&
+         parseInt($('motor-right').value) === 0;
+}
+function startMotorHeartbeat() {
+  if (!_motorSendTimer) _motorSendTimer = setInterval(sendMotorCommand, 100);
+}
+function stopMotorHeartbeat() {
+  if (_motorSendTimer) { clearInterval(_motorSendTimer); _motorSendTimer = null; }
+}
+function syncMotorHeartbeat() {
+  // Runs while zero: nothing is being commanded, so the firmware timeout is
+  // the correct outcome and there is nothing to hold.
+  if (motorCommandIsZero()) stopMotorHeartbeat(); else startMotorHeartbeat();
+}
 function sendMotorCommand() {
   if (!ws || ws.readyState !== WebSocket.OPEN || !motorArmed) return;
   const left  = parseInt($('motor-left').value) / 100;
@@ -2000,19 +2023,20 @@ function sendMotorCommand() {
   $(id).addEventListener('input', e => {
     const lbl = id === 'motor-left' ? 'motor-left-val' : 'motor-right-val';
     $(lbl).textContent = e.target.value + '%';
-    if (!_motorSendTimer) {
-      _motorSendTimer = setInterval(sendMotorCommand, 100);
-    }
+    syncMotorHeartbeat();
   });
   $(id).addEventListener('change', () => {
+    // RELEASE. Send at once, then keep holding if the command is non-zero --
+    // releasing the slider is not the same as asking the boat to stop.
     sendMotorCommand();
-    if (_motorSendTimer) { clearInterval(_motorSendTimer); _motorSendTimer = null; }
+    syncMotorHeartbeat();
   });
   $(id).addEventListener('dblclick', () => {
     $(id).value = 0;
     const lbl = id === 'motor-left' ? 'motor-left-val' : 'motor-right-val';
     $(lbl).textContent = '0%';
     sendMotorCommand();
+    syncMotorHeartbeat();     // back to zero: nothing left to hold
   });
 });
 

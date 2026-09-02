@@ -1071,6 +1071,19 @@ class BoatLink:
                 self._transmit_zeros_locked()
             return self.session_id
 
+    def release_control_session(self):
+        """Give up control deliberately: zero, transmit, drop the session.
+
+        Distinct from stop() because that also aborts a calibration, and a tab
+        being hidden must not do that. Distinct from letting the lease expire
+        because this is immediate and unambiguous."""
+        with self._lock:
+            self._zero_controls_locked()
+            if self.connected:
+                self._transmit_zeros_locked()
+            self.session_id = None
+            self.session_seq = 0
+
     def _zero_controls_locked(self):
         """Every actuator this process commands, to zero, in one step. Not a
         loop over endpoints: a partial stop is the failure mode this exists to
@@ -1112,23 +1125,35 @@ class BoatLink:
         otherwise leave the boat holding a value nobody is asking for any
         more."""
         with self._lock:
+            # The CODE matters as much as the message. Two of these mean the
+            # session is gone and the browser must acquire a new one; two mean
+            # this single request was not applied and the session is perfectly
+            # healthy. Conflating them made a reordered response or a
+            # mid-transition assist-OFF tear down a working session and stop
+            # the boat for no reason.
             if self.session_id is None:
-                return False, 'no control session — reload the page'
+                return False, ('no control session — reload the page',
+                               'no_session')
             if session_id != self.session_id:
                 # Includes the post-STOP case: STOP drops the session, so a
                 # request already in flight when it landed cannot restore
                 # anything.
-                return False, 'not the active control session'
+                return False, ('not the active control session', 'wrong_session')
             if not isinstance(seq, int) or seq <= self.session_seq:
-                return False, 'stale command sequence'
+                # Out-of-order arrival, not a dead session. Refuse the REQUEST
+                # and keep the session: heartbeats are sent continuously and
+                # the next in-order one lands in under 100 ms.
+                return False, ('stale command sequence', 'stale_seq')
             self.session_seq = seq
             self.session_last_hb = self._now()
             self.lease_expired_at = None
             if self._assist_off_pending_locked():
                 # Assisted mode may still be ON aboard, where these values mean
-                # something entirely different. Refuse rather than guess.
+                # something entirely different. Refuse rather than guess -- but
+                # the session is fine and the lease has just been refreshed, so
+                # the boat is held rather than dropped.
                 return False, ('waiting for the boat to confirm Assisted '
-                               'Steering OFF')
+                               'Steering OFF', 'assist_off_pending')
             self._apply_state_locked(throttle, rudder, left, right)
             return True, None
 
@@ -2643,38 +2668,76 @@ async function openSession() {
     // Taking control starts from a stopped boat; mirror that locally so the
     // first heartbeat cannot re-assert a stale slider position.
     ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
-    if (hbTimer) clearInterval(hbTimer);
+    stopHeartbeat();
+    hbInFlight = false;
     hbTimer = setInterval(sendHeartbeat, Math.round(1000 / (r.heartbeat_hz || 12)));
   }
   return r;
 }
 
+// SERIALIZED and COALESCED. Two heartbeats in flight at once can be answered
+// out of order, and the loser is then judged against a sequence the winner has
+// already advanced -- a self-inflicted stale_seq storm. Only one request is
+// ever outstanding; anything asked for while it is in flight collapses into a
+// single follow-up carrying the LATEST state, which is what full-state
+// heartbeats make safe to do.
+var hbInFlight = false, hbPending = false;
+
 async function sendHeartbeat() {
   if (!connected || !sessionId) return;
-  const r = await api('/api/state', 'POST', {
-    session_id: sessionId, seq: ++ctrlSeq,
-    throttle: ctrl.throttle, rudder: ctrl.rudder,
-    left: ctrl.left, right: ctrl.right });
-  if (r && !r.ok) {
-    // Superseded by another tab, or dropped by STOP. Stop pretending to drive.
-    sessionId = null;
-    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  if (hbInFlight) { hbPending = true; return; }
+  hbInFlight = true;
+  try {
+    const r = await api('/api/state', 'POST', {
+      session_id: sessionId, seq: ++ctrlSeq,
+      throttle: ctrl.throttle, rudder: ctrl.rudder,
+      left: ctrl.left, right: ctrl.right });
+    if (r && !r.ok) {
+      // ONLY a dead session tears this down. stale_seq means one request
+      // arrived out of order, and assist_off_pending means the boat is
+      // mid-transition -- in both cases the session is healthy and the lease
+      // was refreshed, so dropping it would stop the boat for no reason.
+      if (r.code === 'no_session' || r.code === 'wrong_session') {
+        stopHeartbeat();
+        sessionId = null;
+      }
+    }
+  } finally {
+    hbInFlight = false;
+    if (hbPending) { hbPending = false; sendHeartbeat(); }
   }
 }
 
-// The browser going away must stop the stream. pagehide covers tab close,
-// navigation and mobile backgrounding; the lease covers everything it misses
-// (crash, network death, a laptop lid closing).
-window.addEventListener('pagehide', () => {
+function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-  navigator.sendBeacon('/api/stop',
-    new Blob([JSON.stringify({ seq: ++winchCommandSeq })],
-             { type: 'application/json' }));
-});
+  hbPending = false;
+}
+
+// Going away must both stop the stream AND give up the session, so nothing can
+// resume against a browser that is no longer watching.
+//
+// /api/release rather than /api/stop: a hidden tab must not abort a running
+// calibration, which STOP does. The lease still covers everything neither
+// event catches -- a crash, the network dying, a laptop lid closing.
+function releaseControl(beacon) {
+  stopHeartbeat();
+  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+  sessionId = null;
+  const body = new Blob(['{}'], { type: 'application/json' });
+  if (beacon && navigator.sendBeacon) navigator.sendBeacon('/api/release', body);
+  else api('/api/release', 'POST', {});
+}
+
+window.addEventListener('pagehide', () => releaseControl(true));
+
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-  else if (!document.hidden && sessionId && !hbTimer) {
-    hbTimer = setInterval(sendHeartbeat, 80);
+  if (document.hidden) {
+    releaseControl(true);
+  } else if (connected) {
+    // Coming back takes a FRESH session, starting at zero. Resuming the old
+    // one would restore whatever the sliders happen to show, and the operator
+    // did not ask for that by switching tabs back.
+    openSession();
   }
 });
 
@@ -2790,6 +2853,11 @@ $('stop-btn').addEventListener('click', async () => {
   $('throttle').value = 0; $('throttle-val').textContent = '0%';
   $('rudder').value = 0; $('rudder-val').textContent = '0%';
   await api('/api/stop', 'POST', { seq: ++winchCommandSeq });
+  // STOP drops the session server-side; mirror it so the UI does not keep
+  // heartbeating a session that no longer exists. ARM re-acquires one.
+  stopHeartbeat();
+  sessionId = null;
+  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
 });
 
 $('arm-btn').addEventListener('click', async () => {
@@ -2799,7 +2867,23 @@ $('arm-btn').addEventListener('click', async () => {
   $('hint').textContent = (nextArm && !force)
     ? 'sent without "bench (no GPS)" -- boat will refuse this if it has no GPS lock'
     : '';
-  await api('/api/arm', 'POST', { arm: nextArm, force });
+  if (nextArm) {
+    // STOP and DISARM both drop the session by design, so ARM has to acquire a
+    // fresh one -- otherwise the boat arms with nothing able to drive it, and
+    // the first slider move is refused as 'no_session'. A new session also
+    // starts at ZERO, which is exactly what ARM requires: the server refuses
+    // to arm against a held control.
+    if (!sessionId) await openSession();
+    else { ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 }; await sendHeartbeat(); }
+  }
+  const r = await api('/api/arm', 'POST', { arm: nextArm, force });
+  if (r && !r.ok) $('hint').textContent = r.error || 'refused';
+  if (!nextArm) {
+    // DISARM dropped the session server-side; stop pretending to hold one.
+    stopHeartbeat();
+    sessionId = null;
+    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+  }
 });
 
 $('calibrate-btn').addEventListener('click', async () => {
@@ -3426,6 +3510,13 @@ class Handler(BaseHTTPRequestHandler):
                         'session_id': self.link.open_control_session(),
                         'heartbeat_hz': CONTROL_HEARTBEAT_HZ,
                         'lease_s': CONTROL_LEASE_S})
+        elif self.path == '/api/release':
+            # The browser is going away (hidden, navigating, closing). Zero the
+            # controls and drop the session, but WITHOUT STOP's other effects:
+            # STOP also kills a running calibration, and merely switching tabs
+            # must not abort one.
+            self.link.release_control_session()
+            self._json({'ok': True})
         elif self.path == '/api/state':
             # The browser's full-state heartbeat. Carries the session id and a
             # monotonic seq, so a delayed request cannot apply out of order and
@@ -3434,8 +3525,11 @@ class Handler(BaseHTTPRequestHandler):
                 body.get('session_id'), body.get('seq'),
                 throttle=body.get('throttle'), rudder=body.get('rudder'),
                 left=body.get('left'), right=body.get('right'))
-            self._json({'ok': ok} if ok else {'ok': False, 'error': err},
-                       200 if ok else 409)
+            if ok:
+                self._json({'ok': True})
+            else:
+                message, code = err
+                self._json({'ok': False, 'error': message, 'code': code}, 409)
         elif self.path == '/api/winch':
             command_seq = body.get('seq')
             if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or

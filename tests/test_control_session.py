@@ -195,8 +195,13 @@ class SessionBasicsTest(SessionBase):
         self.assertTrue(self.link.control_heartbeat(s, 5, throttle=0.4)[0])
         ok, err = self.link.control_heartbeat(s, 4, throttle=0.0)
         self.assertFalse(ok)
-        self.assertIn('stale', err.lower())
+        message, code = err
+        self.assertEqual(code, 'stale_seq')
         self.assertAlmostEqual(self.link.throttle, 0.4)
+        # ...and the SESSION survives: an out-of-order arrival is not a dead
+        # session, and tearing one down over it stops the boat for no reason.
+        self.assertEqual(self.link.session_id, s)
+        self.assertTrue(self.link.control_heartbeat(s, 6, throttle=0.3)[0])
 
     def test_the_heartbeat_carries_full_state_not_deltas(self):
         """A dropped delta would leave the boat holding a value nobody is
@@ -405,8 +410,13 @@ class AssistOffAcknowledgedTest(SessionBase):
         self.link.send_rudder_assist(False)
         ok, err = self.link.control_heartbeat(s, 1, throttle=0.4, rudder=0.5)
         self.assertFalse(ok)
-        self.assertIn('assisted', err.lower())
+        message, code = err
+        self.assertEqual(code, 'assist_off_pending')
+        self.assertIn('assisted', message.lower())
         self._assert_stopped()
+        # The session survives and the lease was refreshed -- the boat is HELD
+        # through the transition, not dropped.
+        self.assertEqual(self.link.session_id, s)
 
     def test_a_matching_confirmation_clears_it_and_restores_control(self):
         s = self._open()
