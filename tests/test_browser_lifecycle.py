@@ -443,3 +443,204 @@ class DashboardSliderReleaseTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ThrottleReachesTheWireTest(BrowserHttpTest):
+    """The full-state heartbeat vs. the linked/unlinked motor mode.
+
+    THE BUG. motor_split was INFERRED from which fields a request carried:
+    `{throttle: x}` meant linked, `{left: x, right: y}` meant per-motor. That
+    worked while the page sent one-shot deltas. A full-state heartbeat always
+    carries all four, so `left`/`right` were always present, motor_split was
+    permanently True, and the stream sent motor_left/motor_right -- both zero
+    -- while the operator's throttle sat in a field nothing read.
+
+    The throttle was accepted, acknowledged, stored, and never transmitted.
+
+    So the mode is now EXPLICIT in the heartbeat. Inferring intent from field
+    presence cannot survive a protocol where every field is always present.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import time as _t
+        self.link._stop = threading.Event()
+        self.link.send_hz = 50
+        self.wire = []
+
+        def w(payload):
+            m = self.link.pb2.BoatMessage()
+            m.ParseFromString(payload)
+            k = m.WhichOneof('payload')
+            if k == 'motor':
+                self.wire.append(('motor', round(m.motor.left, 3),
+                                  round(m.motor.right, 3)))
+            elif k == 'steer':
+                self.wire.append(('steer', round(m.steer.left, 3)))
+            return True
+        self.link._write_locked = w
+        self.stream = threading.Thread(target=self.link._stream_loop, daemon=True)
+        self.stream.start()
+        self._t = _t
+
+    def tearDown(self):
+        self.link._stop.set()
+        self.stream.join(timeout=2.0)
+        super().tearDown()
+
+    def _wire_after(self, kind, seconds=0.15):
+        self.wire.clear()
+        self._t.sleep(seconds)
+        return [x for x in self.wire if x[0] == kind]
+
+    def test_the_throttle_slider_actually_reaches_the_boat(self):
+        """THE regression. Everything upstream said yes and nothing moved."""
+        sid = self.open_session()
+        code, _ = self.hb(sid, 1, throttle=0.40, rudder=0.0,
+                          left=0, right=0, split=False)
+        self.assertEqual(code, 200)
+        self.assertFalse(self.link.motor_split,
+                         'a linked-throttle heartbeat put the boat in '
+                         'per-motor mode, so the throttle is never read')
+        got = self._wire_after('motor')
+        self.assertTrue(got, 'no motor command reached the wire at all')
+        self.assertAlmostEqual(got[0][1], 0.40, places=2,
+                               msg='throttle 0.40 went out as %r' % (got[0],))
+        self.assertAlmostEqual(got[0][2], 0.40, places=2)
+
+    def test_per_motor_sliders_still_reach_the_boat(self):
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0, rudder=0.0, left=0.30, right=0.10,
+                split=True)
+        self.assertTrue(self.link.motor_split)
+        got = self._wire_after('motor')
+        self.assertTrue(got)
+        self.assertAlmostEqual(got[0][1], 0.30, places=2)
+        self.assertAlmostEqual(got[0][2], 0.10, places=2)
+
+    def test_the_rudder_slider_reaches_the_boat(self):
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0.0, rudder=0.50, left=0, right=0, split=False)
+        got = self._wire_after('steer')
+        self.assertTrue(got)
+        self.assertAlmostEqual(got[0][1], 0.50, places=2)
+
+    def test_switching_back_to_linked_leaves_per_motor_mode(self):
+        """The mode has to be able to change BACK, or the first per-motor drag
+        of a session strands the throttle for good."""
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0, rudder=0, left=0.3, right=0.1, split=True)
+        self.assertTrue(self.link.motor_split)
+        self.hb(sid, 2, throttle=0.25, rudder=0, left=0, right=0, split=False)
+        self.assertFalse(self.link.motor_split)
+        got = self._wire_after('motor')
+        self.assertAlmostEqual(got[0][1], 0.25, places=2)
+
+    def test_the_page_sends_the_mode_explicitly(self):
+        src = TOOL.read_text()
+        m = re.search(r'const r = await api\(./api/state., .POST., \{(.*?)\}\);',
+                      src, re.S)
+        self.assertIsNotNone(m, 'the heartbeat body moved')
+        self.assertIn('split:', m.group(1),
+                      'the heartbeat does not carry the motor mode, so the '
+                      'server has to guess it from field presence -- which a '
+                      'full-state heartbeat makes impossible')
+
+
+class HeartbeatDoesNotAbortARunningTestTest(BrowserHttpTest):
+    """THE second presence-based inference the full-state heartbeat destroyed.
+
+    The manual-override abort fired whenever a state request carried ANY
+    control field. That read correctly while the page sent one-shot deltas --
+    a field arriving meant the operator had moved something. A full-state
+    heartbeat carries all of them, 12 times a second, so the first keepalive
+    after a run started aborted it within 83 ms.
+
+    Reported as "it drive but abort mid running", and again as the rudder test
+    breaking once the session watchdog made heartbeats reliable. Same cause
+    both times.
+    """
+
+    def _start_run(self):
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            last_rx_monotonic=self.link._now())
+        self.link.armed_cmd = True
+        ok, err = self.link.start_rudder_test(-1, 1)
+        self.assertTrue(ok, err)
+
+    def test_repeated_identical_heartbeats_do_not_abort_a_run(self):
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0, rudder=0, left=0, right=0, split=False)
+        self._start_run()
+        for seq in range(2, 20):          # ~1.5 s of keepalives at 12 Hz
+            self.hb(sid, seq, throttle=0, rudder=0, left=0, right=0,
+                    split=False)
+        self.assertIsNotNone(self.link.rudder_test,
+                             'the keepalive stream aborted the run')
+
+    def test_the_operator_actually_moving_a_stick_still_aborts(self):
+        """The safety property must survive the fix."""
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0, rudder=0, left=0, right=0, split=False)
+        self._start_run()
+        self.hb(sid, 2, throttle=0, rudder=0, left=0, right=0, split=False)
+        self.assertIsNotNone(self.link.rudder_test)
+        self.hb(sid, 3, throttle=0.30, rudder=0, left=0, right=0, split=False)
+        self.assertIsNone(self.link.rudder_test,
+                          'a real stick movement no longer aborts the run')
+
+    def test_a_rudder_movement_aborts_too(self):
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0, rudder=0, left=0, right=0, split=False)
+        self._start_run()
+        self.hb(sid, 2, throttle=0, rudder=-0.4, left=0, right=0, split=False)
+        self.assertIsNone(self.link.rudder_test)
+
+
+class AssistOffCannotStrandTheOperatorTest(BrowserHttpTest):
+    """An unconfirmed assisted-OFF held manual control FOREVER.
+
+    The block required MotorStatus to echo the exact request id. Firmware that
+    predates the field, or one lost reply, meant it never matched -- and every
+    heartbeat was refused from then on, so throttle AND rudder were both dead
+    with no way back short of restarting the tool.
+    """
+
+    def test_a_status_saying_not_assisted_releases_the_block(self):
+        """Whatever request id it carries. The question is what mode the boat
+        is in NOW, not whether it answered this particular request."""
+        sid = self.open_session()
+        self.link.assist_rudder_on = True
+        self.link.send_rudder_assist(False)
+        self.assertEqual(self.hb(sid, 1, throttle=0.3, split=False)[0], 409)
+
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, assist_rudder=False,
+            assist_request_id=0,              # an id that will never match
+            last_rx_monotonic=self.link._now())
+        code, _ = self.hb(sid, 2, throttle=0.3, rudder=0, left=0, right=0,
+                          split=False)
+        self.assertEqual(code, 200, 'still blocked by a boat that says it is '
+                                    'not assisted')
+        self.assertAlmostEqual(self.link.throttle, 0.3)
+
+    def test_a_silent_boat_does_not_block_forever(self):
+        sid = self.open_session()
+        self.link.assist_rudder_on = True
+        self.link.send_rudder_assist(False)
+        self.assertEqual(self.hb(sid, 1, throttle=0.3, split=False)[0], 409)
+
+        self.link._assist_off_started -= (D.ASSIST_OFF_BLOCK_MAX_S + 0.1)
+        code, _ = self.hb(sid, 2, throttle=0.3, rudder=0, left=0, right=0,
+                          split=False)
+        self.assertEqual(code, 200, 'a silent boat locked the operator out')
+
+    def test_the_block_still_holds_while_the_boat_says_it_IS_assisted(self):
+        sid = self.open_session()
+        self.link.assist_rudder_on = True
+        self.link.send_rudder_assist(False)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, assist_rudder=True,
+            assist_request_id=0, last_rx_monotonic=self.link._now())
+        self.assertEqual(self.hb(sid, 1, throttle=0.3, split=False)[0], 409)

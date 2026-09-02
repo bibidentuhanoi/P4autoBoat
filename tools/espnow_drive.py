@@ -328,6 +328,10 @@ CONTROL_HEARTBEAT_HZ = 12          # browser -> here; inside the lease with marg
 CONTROL_LEASE_S = 0.30             # ~3.6 missed heartbeats
 # How often an unconfirmed Assisted-OFF is re-sent.
 ASSIST_OFF_RETRY_S = 0.25
+# How long manual control may be held while an assisted-OFF goes unconfirmed
+# AND no status is available to answer the question another way. A bound, not a
+# preference: an unbounded hold is a lockout the operator cannot escape.
+ASSIST_OFF_BLOCK_MAX_S = 3.0
 
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 # Assisted Steering: the same 0.5/3.0/1.0 profile, but instead of holding a
@@ -675,6 +679,10 @@ class BoatLink:
         # operator believes they have manual control.
         self._assist_off_req_id = None
         self._assist_off_next_retry = 0.0
+        self._assist_off_started = 0.0
+        # The previous heartbeat's control values, so a repeated one can be
+        # told from the operator actually moving something.
+        self._last_hb_state = None
         self.lease_expired_at = None     # for the UI: why the boat went quiet
         self.assist_request_id = 0
         # 0 means "not yet seeded"; the first request picks a random start so
@@ -864,28 +872,46 @@ class BoatLink:
             self._close_locked()
 
     def _apply_state_locked(self, throttle=None, rudder=None,
-                            left=None, right=None):
+                            left=None, right=None, split=None,
+                            operator_moved=True):
         # Touching a stick mid-run means the operator wants control back.
         # Abort, and DISCARD the value they sent rather than applying it:
         # the abort has already forced throttle 0 / rudder centred, and
         # letting a half-pushed slider through would immediately undo that.
         # The next command after the abort is theirs to make deliberately.
-        if self._rudder_test_busy_locked() and (
+        #
+        # `operator_moved` is what makes that judgement possible. It used to be
+        # inferred from a field simply BEING PRESENT, which held while the page
+        # sent one-shot deltas -- but a full-state heartbeat carries every field
+        # every time, at 12 Hz, so the presence test fired on the first keepalive
+        # after a run started and aborted it within 83 ms. A repeated identical
+        # value is not the operator touching anything.
+        if self._rudder_test_busy_locked() and operator_moved and (
                 throttle is not None or rudder is not None
                 or left is not None or right is not None):
             self._abort_rudder_test_locked('manual control input')
             return
         if throttle is not None:
             self.throttle = clamp(float(throttle), -1.0, 1.0)
-            self.motor_split = False          # linked: throttle drives both
+            if split is None:
+                self.motor_split = False      # linked: throttle drives both
         if left is not None:
             self.motor_left = clamp(float(left), -1.0, 1.0)
-            self.motor_split = True           # unlinked: independent per-motor
+            if split is None:
+                self.motor_split = True       # unlinked: independent per-motor
         if right is not None:
             self.motor_right = clamp(float(right), -1.0, 1.0)
-            self.motor_split = True
+            if split is None:
+                self.motor_split = True
         if rudder is not None:
             self.rudder = clamp(float(rudder), -1.0, 1.0)
+        if split is not None:
+            # EXPLICIT wins. Inferring the mode from which fields arrived cannot
+            # work once every field always arrives: `left`/`right` were present
+            # in every heartbeat, so the boat sat permanently in per-motor mode
+            # and the operator's throttle -- accepted, stored and acknowledged
+            # -- was read by nothing.
+            self.motor_split = bool(split)
 
     def set_state(self, throttle=None, rudder=None, left=None, right=None):
         """Direct control entry, no session. Retained for the automated tests
@@ -1067,6 +1093,10 @@ class BoatLink:
             self.session_seq = 0
             self.session_last_hb = self._now()
             self.lease_expired_at = None
+            # Seed it with the zeroed state this session starts from, so the
+            # page's first heartbeat is recognised as "unchanged" rather than
+            # as the operator grabbing a control.
+            self._last_hb_state = (0.0, 0.0, 0.0, 0.0, False)
             if self.connected:
                 self._transmit_zeros_locked()
             return self.session_id
@@ -1117,7 +1147,7 @@ class BoatLink:
                 and (now - self.session_last_hb) <= CONTROL_LEASE_S)
 
     def control_heartbeat(self, session_id, seq, throttle=None, rudder=None,
-                          left=None, right=None):
+                          left=None, right=None, split=None):
         """The browser's full-state heartbeat: 'I am alive, and this is every
         control value I intend'.
 
@@ -1154,7 +1184,15 @@ class BoatLink:
                 # the boat is held rather than dropped.
                 return False, ('waiting for the boat to confirm Assisted '
                                'Steering OFF', 'assist_off_pending')
-            self._apply_state_locked(throttle, rudder, left, right)
+            # Did the OPERATOR move something, or is this the same values
+            # again? At 12 Hz most heartbeats are the latter, and treating
+            # every one as fresh input aborted running rudder tests instantly.
+            state = (throttle, rudder, left, right, split)
+            moved = (self._last_hb_state is not None
+                     and state != self._last_hb_state)
+            self._last_hb_state = state
+            self._apply_state_locked(throttle, rudder, left, right, split,
+                                     operator_moved=moved)
             return True, None
 
     def _assist_off_pending_locked(self):
@@ -1164,7 +1202,22 @@ class BoatLink:
         This blocks ordinary manual control, because until the boat confirms,
         the mode its rudder is in is unknown -- and a stick value means a
         yaw RATE in one mode and a rudder ANGLE in the other."""
-        return self._assist_off_req_id is not None
+        if self._assist_off_req_id is None:
+            return False
+        ms = self.motor_status
+        # The question manual control actually depends on is "is the boat in
+        # assisted mode RIGHT NOW" -- not "did it acknowledge my particular
+        # request". A status saying assist_rudder is false answers it whatever
+        # request id it carries, and demanding the id match meant a boat that
+        # never echoes one (firmware that predates the field, or a single lost
+        # reply) locked manual control out PERMANENTLY, with no way back short
+        # of restarting this tool.
+        if ms.get('have') and not ms.get('assist_rudder'):
+            return False
+        # No usable status at all: hold briefly, then let the operator drive
+        # rather than strand them. The retry keeps running either way, and the
+        # firmware clears assist itself on link loss or disarm.
+        return (self._now() - self._assist_off_started) < ASSIST_OFF_BLOCK_MAX_S
 
     def _assist_off_tick_locked(self, now):
         """Retry the OFF until MotorStatus confirms it, using the SAME request
@@ -1237,6 +1290,7 @@ class BoatLink:
             # Track it until confirmed; _assist_off_tick_locked retries with
             # this same id and clears it on the matching acknowledgement.
             self._assist_off_req_id = req_id
+            self._assist_off_started = self._now()
             self._assist_off_next_retry = self._now() + ASSIST_OFF_RETRY_S
         else:
             self._assist_off_req_id = None
@@ -2626,7 +2680,8 @@ $('connect-btn').addEventListener('click', async () => {
 $('throttle').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('throttle-val').textContent = v + '%';
-  ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0; sendHeartbeat();
+  ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0;
+  ctrl.split = false; sendHeartbeat();
 });
 
 // Link toggle: checked = one Throttle slider drives both motors; unchecked =
@@ -2640,12 +2695,14 @@ function setMotorLink(linked) {
   if (linked) {
     const v = parseInt($('motor-left').value);   // re-link at the left motor's value
     $('throttle').value = v; $('throttle-val').textContent = v + '%';
-    ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0; sendHeartbeat();
+    ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0;
+  ctrl.split = false; sendHeartbeat();
   } else {
     const v = parseInt($('throttle').value);      // split: both start at the throttle value
     $('motor-left').value = v;  $('motor-left-val').textContent = v + '%';
     $('motor-right').value = v; $('motor-right-val').textContent = v + '%';
-    ctrl.left = v / 100; ctrl.right = v / 100; ctrl.throttle = 0; sendHeartbeat();
+    ctrl.left = v / 100; ctrl.right = v / 100; ctrl.throttle = 0;
+    ctrl.split = true; sendHeartbeat();
   }
 }
 $('motor-link').addEventListener('change', (e) => setMotorLink(e.target.checked));
@@ -2653,12 +2710,12 @@ $('motor-link').addEventListener('change', (e) => setMotorLink(e.target.checked)
 $('motor-left').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('motor-left-val').textContent = v + '%';
-  ctrl.left = v / 100; ctrl.throttle = 0; sendHeartbeat();
+  ctrl.left = v / 100; ctrl.throttle = 0; ctrl.split = true; sendHeartbeat();
 });
 $('motor-right').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('motor-right-val').textContent = v + '%';
-  ctrl.right = v / 100; ctrl.throttle = 0; sendHeartbeat();
+  ctrl.right = v / 100; ctrl.throttle = 0; ctrl.split = true; sendHeartbeat();
 });
 
 // ---- control session + heartbeat -------------------------------------------
@@ -2666,7 +2723,11 @@ $('motor-right').addEventListener('input', (e) => {
 // holding 40% throttle" from "the tab closed 20 seconds ago" unless we keep
 // saying we are here. Miss the lease and the boat is zeroed.
 var sessionId = null, ctrlSeq = 0, hbTimer = null;
-var ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+// `split` is the MOTOR MODE, sent explicitly. false = the linked throttle
+// drives both; true = independent left/right. The server used to infer it from
+// which fields a request carried, which a full-state heartbeat makes
+// impossible -- every field is always present.
+var ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
 
 async function openSession() {
   const r = await api('/api/session', 'POST', {});
@@ -2675,7 +2736,7 @@ async function openSession() {
     ctrlSeq = 0;
     // Taking control starts from a stopped boat; mirror that locally so the
     // first heartbeat cannot re-assert a stale slider position.
-    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
     stopHeartbeat();
     hbInFlight = false;
     hbTimer = setInterval(sendHeartbeat, Math.round(1000 / (r.heartbeat_hz || 12)));
@@ -2717,7 +2778,7 @@ async function sendHeartbeat() {
     const r = await api('/api/state', 'POST', {
       session_id: sessionId, seq: ++ctrlSeq,
       throttle: ctrl.throttle, rudder: ctrl.rudder,
-      left: ctrl.left, right: ctrl.right });
+      left: ctrl.left, right: ctrl.right, split: ctrl.split });
     if (r && !r.ok) {
       // ONLY a dead session tears this down. stale_seq means one request
       // arrived out of order, and assist_off_pending means the boat is
@@ -2750,7 +2811,7 @@ function stopHeartbeat() {
 // event catches -- a crash, the network dying, a laptop lid closing.
 function releaseControl(beacon) {
   stopHeartbeat();
-  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
   sessionId = null;
   const body = new Blob(['{}'], { type: 'application/json' });
   if (beacon && navigator.sendBeacon) navigator.sendBeacon('/api/release', body);
@@ -2886,7 +2947,7 @@ $('stop-btn').addEventListener('click', async () => {
   // heartbeating a session that no longer exists. ARM re-acquires one.
   stopHeartbeat();
   sessionId = null;
-  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
 });
 
 $('arm-btn').addEventListener('click', async () => {
@@ -2903,7 +2964,7 @@ $('arm-btn').addEventListener('click', async () => {
     // starts at ZERO, which is exactly what ARM requires: the server refuses
     // to arm against a held control.
     if (!sessionId) await openSession();
-    else { ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 }; await sendHeartbeat(); }
+    else { ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false }; await sendHeartbeat(); }
   }
   const r = await api('/api/arm', 'POST', { arm: nextArm, force });
   if (r && !r.ok) $('hint').textContent = r.error || 'refused';
@@ -2911,7 +2972,7 @@ $('arm-btn').addEventListener('click', async () => {
     // DISARM dropped the session server-side; stop pretending to hold one.
     stopHeartbeat();
     sessionId = null;
-    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
   }
 });
 
@@ -3553,7 +3614,8 @@ class Handler(BaseHTTPRequestHandler):
             ok, err = self.link.control_heartbeat(
                 body.get('session_id'), body.get('seq'),
                 throttle=body.get('throttle'), rudder=body.get('rudder'),
-                left=body.get('left'), right=body.get('right'))
+                left=body.get('left'), right=body.get('right'),
+                split=body.get('split'))
             if ok:
                 self._json({'ok': True})
             else:
