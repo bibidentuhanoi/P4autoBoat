@@ -103,6 +103,32 @@ class YawRateProtoTest(unittest.TestCase):
         c = (ROOT / 'main' / 'proto' / 'boat.pb.c').read_text()
         self.assertIn('boat_IMUData', c)
 
+    def test_the_embedded_schema_is_generated_not_mirrored_by_hand(self):
+        """The hand-mirroring is gone. protobuf.js silently drops fields it
+        does not declare, so a copy maintained by hand loses data with no error
+        anywhere -- and every proto change needed a manual step nothing
+        enforced. This runs the generator in --check mode: a proto edit without
+        a regenerate fails here rather than on the water."""
+        import subprocess
+        r = subprocess.run(
+            [sys.executable, str(ROOT / 'tools' / 'gen_dashboard_schema.py'),
+             '--check'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0,
+                         'dashboard schema is out of date:\n' + r.stderr)
+        dash = (ROOT / 'main' / 'dashboard.html').read_text()
+        self.assertIn('GENERATED FROM main/proto/boat.proto', dash)
+
+    def test_every_proto_message_reaches_the_dashboard_schema(self):
+        """Not just the ones somebody remembered."""
+        proto = (ROOT / 'main' / 'proto' / 'boat.proto').read_text()
+        dash = (ROOT / 'main' / 'dashboard.html').read_text()
+        i = dash.index('const protoSchema = `')
+        block = dash[i:dash.index('`;', i)]
+        for name in re.findall(r'^message (\w+)', proto, re.M):
+            self.assertIn('message %s ' % name, block,
+                          '%s is missing from the embedded schema; '
+                          'protobuf.js would drop it silently' % name)
+
     def test_the_dashboard_schema_matches_boat_proto(self):
         """The parity trap: protobuf.js drops undeclared fields SILENTLY. The
         embedded schema must carry the same field number and type."""

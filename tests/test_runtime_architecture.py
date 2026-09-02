@@ -243,6 +243,7 @@ HARNESS = r"""
 #define ESP_ERR_NOT_FOUND 0x105
 #endif
 #include <assert.h>
+#include <stdio.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -616,6 +617,49 @@ int main(void) {
     steer_handler(&(boat_SteerCommand){.left = 0.2f});
     run_one_control_cycle();
     assert(servo_power && close_enough(steer_value, 0.2f));
+
+    /* ---- DYNAMIC PROOF: MotorStatus rate under active trim/P ------------
+     *
+     * The trim learner and the motor P assist move left/right throttle on
+     * every fresh fusion sample -- ~50 Hz -- while status_commit_current runs
+     * at the 100 Hz control rate. Treating that as "publish now" put
+     * MotorStatus on the air at the fusion rate, which is what starved it.
+     *
+     * Measured here rather than asserted from the source: drive the real
+     * status_commit_current through one simulated second of exactly that
+     * motion and COUNT the generations it produces. */
+    {
+        uint32_t gen_before = 0, publishes = 0;
+        boat_MotorStatus probe;
+        gen_before = motor_control_get_status(&probe);
+        int64_t t0 = now_us;
+        for (int i = 0; i < 100; ++i) {          /* 100 control ticks = 1 s */
+            now_us = t0 + (int64_t)i * 10000;    /* 10 ms apart */
+            /* A boat that is actually being DRIVEN: keep the control link
+             * alive, or safe_stop fires at 400 ms and freezes every value,
+             * which measures a stopped boat instead of a working one. */
+            /* On a FUSION tick (~50 Hz) the trim learner nudges the split and
+             * the drive block rewrites both ESCs. Modelled as a moving
+             * commanded throttle, which is what that motion looks like where
+             * MotorStatus reads it. Between those, the value holds. */
+            float thr = 0.20f + ((i % 2) == 0 ? 0.0001f * (float)i : 0.0f);
+            motor_handler(&(boat_MotorCommand){.throttle = thr});
+            motor_control_notify_link_rx(now_us);
+            run_one_control_cycle();
+            uint32_t g = motor_control_get_status(&probe);
+            if (g != gen_before) { publishes++; gen_before = g; }
+        }
+        /* 10 Hz budget, +1 for the boundary tick. Anything near 50 means the
+         * continuous split is not being rate-limited. */
+        if (publishes > 11 || publishes < 8) {
+            fprintf(stderr, "MOTORSTATUS_RATE=%u per second\n",
+                    (unsigned)publishes);
+        }
+        assert(publishes <= 11);
+        /* ...and it must not have gone silent either: the assisted CSV samples
+         * these against ~20 Hz telemetry. */
+        assert(publishes >= 8);
+    }
 
     boat_MotorStatus status;
     uint32_t generation = motor_control_get_status(&status);
@@ -1298,13 +1342,21 @@ def test_motorstatus_does_not_publish_at_the_control_rate():
         assert fast not in disc, (
             "%s is back in the immediate-publish comparison -- MotorStatus "
             "will flood the radio again" % fast)
-    for slow in ("state", "left_throttle", "right_throttle", "winch_speed",
-                 "servo_power", "assist_rudder", "assist_motor_p"):
+    for slow in ("state", "winch_speed", "servo_power", "assist_rudder",
+                 "assist_motor_p", "assist_request_id"):
         assert slow in disc, "%s must still publish immediately" % slow
 
     cont = _function_body(src, "static bool motor_status_continuous_equal(")
-    for fast in ("rudder_cmd", "yaw_target_dps", "yaw_filt_dps"):
-        assert fast in cont
+    # left/right belong here, not above: the trim learner and the motor P
+    # assist move them on every fresh fusion sample (~50 Hz), so treating a
+    # change as "publish now" is the flood this split exists to stop.
+    for fast in ("left_throttle", "right_throttle", "rudder_cmd",
+                 "yaw_target_dps", "yaw_filt_dps"):
+        assert fast in cont, "%s must be rate-limited, not immediate" % fast
+    for fast in ("left_throttle", "right_throttle"):
+        assert fast not in disc, (
+            "%s is in the immediate-publish set; the trim learner moves it at "
+            "the fusion rate and MotorStatus will flood again" % fast)
 
     # ...and the continuous path must actually be rate-limited.
     commit = _function_body(src, "static void status_commit_current(bool force)")

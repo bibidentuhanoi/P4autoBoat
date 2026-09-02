@@ -160,8 +160,12 @@ class SteerDirectionTest(unittest.TestCase):
         self.assertNotIn('-parseInt', expr)
 
     def test_python_tool_sends_the_slider_straight_through(self):
+        """The slider now feeds the control heartbeat rather than posting a
+        one-off state, but the MAPPING is what this pins: v / 100, no sign
+        flip."""
         src = (ROOT / 'tools' / 'espnow_drive.py').read_text()
-        self.assertIn("api('/api/state', 'POST', { rudder: v / 100 });", src)
+        self.assertIn('ctrl.rudder = v / 100;', src)
+        self.assertNotIn('ctrl.rudder = -v / 100', src)
         self.assertNotIn("rudder: -v / 100", src)
 
     def test_both_uis_produce_the_same_truth_table(self):

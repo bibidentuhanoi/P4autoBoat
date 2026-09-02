@@ -552,8 +552,11 @@ static bool motor_status_discrete_equal(const boat_MotorStatus *a,
                                         const boat_MotorStatus *b)
 {
     return a->state == b->state &&
-           a->left_throttle == b->left_throttle &&
-           a->right_throttle == b->right_throttle &&
+           /* left/right are NOT here. The trim learner and the motor P assist
+            * move them continuously -- every fresh fusion sample, ~50 Hz --
+            * so treating a change as "publish now" put MotorStatus back on the
+            * air at the fusion rate, which is the flood this split exists to
+            * stop. They are continuous quantities and belong below. */
            a->winch_speed == b->winch_speed &&
            a->servo_power == b->servo_power &&
            a->assist_rudder == b->assist_rudder &&
@@ -579,7 +582,9 @@ static bool motor_status_discrete_equal(const boat_MotorStatus *a,
 static bool motor_status_continuous_equal(const boat_MotorStatus *a,
                                           const boat_MotorStatus *b)
 {
-    return a->rudder_cmd == b->rudder_cmd &&
+    return a->left_throttle == b->left_throttle &&
+           a->right_throttle == b->right_throttle &&
+           a->rudder_cmd == b->rudder_cmd &&
            a->rudder_pulse_us == b->rudder_pulse_us &&
            a->rudder_saturated == b->rudder_saturated &&
            a->yaw_target_dps == b->yaw_target_dps &&
@@ -1333,6 +1338,25 @@ static void control_apply_decision(control_decision_t *decision)
         heading_assist_reset();
     } else if (safe_stop) {
         s_arm_power_allowed = false;
+#if CONFIG_STABILITY_SAS_ENABLE
+        /* Leaving Assisted Steering on through a link loss or a disarm would
+         * have the boat still steering itself the moment anything came back,
+         * against an operator who has every reason to believe control is
+         * manual. The ground station also asks for OFF and retries until
+         * acknowledged; this is the half that does not depend on the ground
+         * station being alive to ask. */
+        if (s_assist_rudder_on) {
+            s_assist_rudder_on = false;
+            stab_reset(&s_stab_state);
+            s_stab_last_seq = 0;
+            s_stab_last_tick_us = 0;
+            s_assist_rudder_cmd = 0.0f;
+            s_assist_target_dps = 0.0f;
+            s_assist_yaw_filt = 0.0f;
+            s_assist_saturated = false;
+            ESP_LOGW(TAG, "CTRL_SAS,assist_cleared_by_failsafe");
+        }
+#endif
         float left;
         float right;
         esc_driver_get_throttle(&left, &right);
@@ -1455,7 +1479,18 @@ static void control_apply_decision(control_decision_t *decision)
         }
     }
 
-    status_commit_current(changed);
+    /* NOT status_commit_current(changed). `changed` is true for any actuator
+     * write this cycle -- including the ESC write the trim learner and the
+     * motor P assist trigger on every fresh fusion sample via s_trim_moved /
+     * s_p_moved. Forcing on that bypassed the continuous rate limit entirely
+     * and put MotorStatus back on the air at ~50 Hz, which is the flood the
+     * discrete/continuous split exists to stop.
+     *
+     * Urgency belongs to the FIELD, not to "something moved": the discrete
+     * comparison already publishes an arm, mode or rail change immediately,
+     * and continuous control values are rate-limited. That is strictly more
+     * precise than a blanket flag. */
+    status_commit_current(false);
 }
 
 static void stability_sas_tick(bool steer_raw, int64_t now_us)

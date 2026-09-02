@@ -489,11 +489,16 @@ const DEG2RAD = Math.PI / 180;
 // changes, change THIS STRING in the same commit.
 // ═══════════════════════════════════════════════════════════════
 const protoSchema = `
+// GENERATED FROM main/proto/boat.proto BY tools/gen_dashboard_schema.py.
+// Do not edit by hand: protobuf.js silently drops fields it does not know, so
+// a hand-mirrored copy loses data with no error anywhere. Regenerate instead.
 syntax = "proto3";
 package boat;
 message IMUData { float pitch = 1; float roll = 2; float heading = 3; float yaw_rate = 4; }
 message ToFGrid { bool valid = 1; repeated int32 distances = 2; repeated uint32 sigma = 3; repeated uint32 target_status = 4; repeated uint32 nb_target_detected = 5; }
 message Detection { int32 category = 1; float score = 2; int32 x1 = 3; int32 y1 = 4; int32 x2 = 5; int32 y2 = 6; }
+message DetectCommand { }
+message TrainingLogCommand { }
 message GpsFix { bool valid = 1; double latitude = 2; double longitude = 3; float altitude_m = 4; float speed_mps = 5; float course_deg = 6; uint32 fix_quality = 7; uint32 satellites = 8; float hdop = 9; uint64 utc_ms = 10; }
 message GpsCoordinate { double latitude = 1; double longitude = 2; }
 message SensorSnapshot { uint64 timestamp_us = 1; IMUData imu = 2; ToFGrid tof_a = 3; ToFGrid tof_b = 4; repeated Detection detections = 5; GpsFix gps = 6; }
@@ -505,12 +510,13 @@ message SteerRateCommand { float target_dps = 1; }
 message MotorStatus { uint32 state = 1; float left_throttle = 2; float right_throttle = 3; float winch_speed = 4; bool servo_power = 5; float rudder_cmd = 6; uint32 rudder_pulse_us = 7; bool rudder_saturated = 8; bool assist_rudder = 9; bool assist_motor_p = 10; float yaw_target_dps = 11; float yaw_filt_dps = 12; uint32 assist_request_id = 13; }
 message ArmCommand { bool arm = 1; bool force = 2; }
 message ServoPowerCommand { bool on = 1; }
-message DetectCommand { }
-message TrainingLogCommand { }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; bool gps_ok = 9; uint32 gps_detected_baud = 16; bool gps_baud_confirmed = 17; }
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; } }
+message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
+message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; }
+message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; BenchCommand bench = 15; BenchStatus bench_status = 16; AssistCommand assist = 17; SteerRateCommand steer_rate = 18; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');

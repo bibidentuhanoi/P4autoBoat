@@ -53,6 +53,19 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
@@ -128,6 +141,19 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 
@@ -243,6 +269,19 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
@@ -586,6 +625,19 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link.seq = 0
         self.link.last_error = None
@@ -865,6 +917,19 @@ class BenchRunLinkTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link._diag_counts = {}
         self.link.seq = 0
@@ -1004,6 +1069,19 @@ class FieldTelemetryYawRateTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 
@@ -1092,6 +1170,19 @@ class BenchLearnerResetTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link._diag_counts = {}
         self.sent = []
@@ -1198,6 +1289,10 @@ class PAssistControlTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.assist_rudder_on = False
         self.link.p_assist_on = False
+        self.link._now = espnow_drive.time.monotonic
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        self.link._assist_req_seq = 0
         self.sent = []
         self.link._write_locked = lambda p: (self.sent.append(p), True)[1]
 
@@ -1261,6 +1356,19 @@ class PAssistConfirmTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link._now = espnow_drive.time.monotonic
+        self.link.session_id = None
+        self.link.session_seq = 0
+        self.link.session_last_hb = 0.0
+        self.link.lease_expired_at = None
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        # A live control session, as a real browser holds. Without it the
+        # drive lease correctly refuses to stream non-zero commands, which is
+        # the point of the lease -- but these fixtures are standing in for a
+        # browser that IS there.
+        self.link.session_id = 'test-session'
+        self.link.session_last_hb = float('inf')
         self.link.assist_rudder_on = False
         self.link._diag_counts = {}
 

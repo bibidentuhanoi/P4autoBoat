@@ -308,6 +308,27 @@ RUDDER_TEST_DRIVE_CONFIRM_S = 1.5
 # assist_rudder is in MotorStatus's immediate-publish set, so a healthy boat
 # acknowledges within one radio round trip; 2 s is many times that.
 RUDDER_TEST_ASSIST_ACK_S = 2.0
+
+# ---- the single active browser control session -----------------------------
+#
+# This process STREAMS ON THE BROWSER'S BEHALF. That is the whole hazard: close
+# the tab at 40% throttle and Python carries on transmitting 40% forever,
+# because the boat's own link failsafe sees a perfectly healthy stream. The
+# browser dying has to be detectable HERE, and the only way is for the browser
+# to keep saying it is alive.
+#
+# (dashboard.html has no such problem and needs no such lease: the browser IS
+# the sender there, so if it dies the commands stop and the firmware's own
+# CONTROL_LINK_TIMEOUT_US failsafe zeroes the boat. Adding a ground-station
+# lease to a path with no intermediary would guard nothing.)
+#
+# One session at a time. A reload supersedes the old one, so a stale tab cannot
+# keep driving alongside a fresh one.
+CONTROL_HEARTBEAT_HZ = 12          # browser -> here; inside the lease with margin
+CONTROL_LEASE_S = 0.30             # ~3.6 missed heartbeats
+# How often an unconfirmed Assisted-OFF is re-sent.
+ASSIST_OFF_RETRY_S = 0.25
+
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 # Assisted Steering: the same 0.5/3.0/1.0 profile, but instead of holding a
 # fixed rudder it hands the boat a yaw-rate TARGET and lets the firmware's
@@ -644,6 +665,17 @@ class BoatLink:
         # a stale "assisted is on" processed after a new request would satisfy
         # a time-based check and authorise a rate demand the boat is not in a
         # mode to receive.
+        # The one session allowed to command motion. Everything else may still
+        # read status and press STOP.
+        self.session_id = None
+        self.session_seq = 0
+        self.session_last_hb = 0.0
+        # Assisted-OFF is a transition that must be ACKNOWLEDGED, not merely
+        # sent: an unacknowledged OFF leaves the boat steering itself while the
+        # operator believes they have manual control.
+        self._assist_off_req_id = None
+        self._assist_off_next_retry = 0.0
+        self.lease_expired_at = None     # for the UI: why the boat went quiet
         self.assist_request_id = 0
         # 0 means "not yet seeded"; the first request picks a random start so
         # a restart cannot reuse the previous session's ids.
@@ -831,29 +863,36 @@ class BoatLink:
                 self.armed_cmd = False
             self._close_locked()
 
+    def _apply_state_locked(self, throttle=None, rudder=None,
+                            left=None, right=None):
+        # Touching a stick mid-run means the operator wants control back.
+        # Abort, and DISCARD the value they sent rather than applying it:
+        # the abort has already forced throttle 0 / rudder centred, and
+        # letting a half-pushed slider through would immediately undo that.
+        # The next command after the abort is theirs to make deliberately.
+        if self._rudder_test_busy_locked() and (
+                throttle is not None or rudder is not None
+                or left is not None or right is not None):
+            self._abort_rudder_test_locked('manual control input')
+            return
+        if throttle is not None:
+            self.throttle = clamp(float(throttle), -1.0, 1.0)
+            self.motor_split = False          # linked: throttle drives both
+        if left is not None:
+            self.motor_left = clamp(float(left), -1.0, 1.0)
+            self.motor_split = True           # unlinked: independent per-motor
+        if right is not None:
+            self.motor_right = clamp(float(right), -1.0, 1.0)
+            self.motor_split = True
+        if rudder is not None:
+            self.rudder = clamp(float(rudder), -1.0, 1.0)
+
     def set_state(self, throttle=None, rudder=None, left=None, right=None):
+        """Direct control entry, no session. Retained for the automated tests
+        and the rudder-test abort path, which run inside this process and are
+        not a browser. Browser input goes through control_heartbeat()."""
         with self._lock:
-            # Touching a stick mid-run means the operator wants control back.
-            # Abort, and DISCARD the value they sent rather than applying it:
-            # the abort has already forced throttle 0 / rudder centred, and
-            # letting a half-pushed slider through would immediately undo that.
-            # The next command after the abort is theirs to make deliberately.
-            if self._rudder_test_busy_locked() and (
-                    throttle is not None or rudder is not None
-                    or left is not None or right is not None):
-                self._abort_rudder_test_locked('manual control input')
-                return
-            if throttle is not None:
-                self.throttle = clamp(float(throttle), -1.0, 1.0)
-                self.motor_split = False          # linked: throttle drives both
-            if left is not None:
-                self.motor_left = clamp(float(left), -1.0, 1.0)
-                self.motor_split = True           # unlinked: independent per-motor
-            if right is not None:
-                self.motor_right = clamp(float(right), -1.0, 1.0)
-                self.motor_split = True
-            if rudder is not None:
-                self.rudder = clamp(float(rudder), -1.0, 1.0)
+            self._apply_state_locked(throttle, rudder, left, right)
 
     def set_winch(self, speed: float, command_seq: int):
         """Set winch speed and transmit immediately; the stream loop repeats
@@ -914,16 +953,17 @@ class BoatLink:
         matches the firmware's own link-loss failsafe, which centres/zeroes
         but leaves the ARM decision to an explicit command."""
         with self._lock:
-            if command_seq <= self.winch_command_seq:
-                return False, 'stale command sequence'
-            self.winch_command_seq = command_seq
-            self.throttle = 0.0
-            self.motor_left = 0.0
-            self.motor_right = 0.0
-            self.motor_split = False
-            self.rudder = 0.0
-            self.winch_speed = 0.0
-            self.winch_lease_until = 0.0
+            # NEVER rejected as stale. A stop that arrives out of order is
+            # still a stop, and refusing it because a sequence number looks old
+            # is the one refusal that can leave the boat running.
+            if command_seq > self.winch_command_seq:
+                self.winch_command_seq = command_seq
+            # Drop the session. Any /api/state already in flight when this
+            # landed now belongs to a session that no longer exists, so it
+            # cannot restore the throttle a moment after the stop.
+            self.session_id = None
+            self.session_seq = 0
+            self._zero_controls_locked()
             was_calibrating = self.calibrating
             self.calibrating = False          # STOP is also a calibration kill
             self._abort_rudder_test_locked('STOP pressed')
@@ -974,10 +1014,22 @@ class BoatLink:
 
     def arm(self, do_arm: bool, force: bool):
         with self._lock:
+            if not do_arm:
+                # Zero and TRANSMIT before the disarm packet, so the boat is
+                # already being told nothing even if the disarm itself is lost.
+                # The stream then keeps repeating those zeros: a lost disarm
+                # degrades to a stopped boat rather than a running one.
+                self._abort_rudder_test_locked('disarmed')
+                self._zero_controls_locked()
+                self._transmit_zeros_locked()
+                self.session_id = None
+            else:
+                # Arming spins thrusters. Refuse unless every control is at
+                # zero, so it can never start against a held stick.
+                if self._anything_commanded_locked():
+                    return False, 'set every control to zero before arming'
             self.armed_cmd = bool(do_arm)
             self.force = bool(force)
-            if not do_arm:
-                self._abort_rudder_test_locked('disarmed')
             # NOTE: disarming is also how a boat-side bench run is stopped --
             # the boat's own bench_step aborts the moment it sees !armed.
             if not do_arm and self.calibrating:   # disarm must stop calibration
@@ -986,6 +1038,7 @@ class BoatLink:
                     self._send_calibrate_locked(False)
             if self.connected:
                 self._send_arm_locked(self.armed_cmd, self.force)
+            return True, None
 
     def _bench_running_locked(self):
         """True only for a run we have HEARD FROM recently. The boat publishes
@@ -997,6 +1050,119 @@ class BoatLink:
         if last is None:
             return False
         return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
+
+    # ---- control session ------------------------------------------------
+
+    def open_control_session(self):
+        """Claim control. Supersedes any existing session, and starts from a
+        stopped boat: taking over must never inherit somebody else's throttle.
+
+        Random id, not a counter, for the same reason the assist request id is
+        random -- a reload must not be able to reuse the previous session's
+        identity and have delayed requests from it accepted."""
+        with self._lock:
+            self._zero_controls_locked()
+            self.session_id = '%08x%08x' % (random.getrandbits(32),
+                                            random.getrandbits(32))
+            self.session_seq = 0
+            self.session_last_hb = self._now()
+            self.lease_expired_at = None
+            if self.connected:
+                self._transmit_zeros_locked()
+            return self.session_id
+
+    def _zero_controls_locked(self):
+        """Every actuator this process commands, to zero, in one step. Not a
+        loop over endpoints: a partial stop is the failure mode this exists to
+        prevent."""
+        self.throttle = 0.0
+        self.motor_left = 0.0
+        self.motor_right = 0.0
+        self.motor_split = False
+        self.rudder = 0.0
+        self.winch_speed = 0.0
+        self.winch_lease_until = 0.0
+
+    def _transmit_zeros_locked(self):
+        """Put those zeros on the wire NOW rather than waiting up to a stream
+        tick. Best-effort: a failed write still leaves the local state zeroed,
+        so the next tick keeps trying."""
+        if not self.connected:
+            return
+        self._send_motor_locked(0.0, 0.0)
+        self._send_steer_locked(0.0)
+        self._send_winch_locked(0.0)
+
+    def _anything_commanded_locked(self):
+        return (self.throttle != 0.0 or self.motor_left != 0.0
+                or self.motor_right != 0.0 or self.rudder != 0.0
+                or self.winch_speed != 0.0)
+
+    def _drive_lease_ok_locked(self, now):
+        """May this process stream NON-ZERO commands right now?"""
+        return (self.session_id is not None
+                and (now - self.session_last_hb) <= CONTROL_LEASE_S)
+
+    def control_heartbeat(self, session_id, seq, throttle=None, rudder=None,
+                          left=None, right=None):
+        """The browser's full-state heartbeat: 'I am alive, and this is every
+        control value I intend'.
+
+        Full state rather than deltas on purpose -- a dropped delta would
+        otherwise leave the boat holding a value nobody is asking for any
+        more."""
+        with self._lock:
+            if self.session_id is None:
+                return False, 'no control session — reload the page'
+            if session_id != self.session_id:
+                # Includes the post-STOP case: STOP drops the session, so a
+                # request already in flight when it landed cannot restore
+                # anything.
+                return False, 'not the active control session'
+            if not isinstance(seq, int) or seq <= self.session_seq:
+                return False, 'stale command sequence'
+            self.session_seq = seq
+            self.session_last_hb = self._now()
+            self.lease_expired_at = None
+            if self._assist_off_pending_locked():
+                # Assisted mode may still be ON aboard, where these values mean
+                # something entirely different. Refuse rather than guess.
+                return False, ('waiting for the boat to confirm Assisted '
+                               'Steering OFF')
+            self._apply_state_locked(throttle, rudder, left, right)
+            return True, None
+
+    def _assist_off_pending_locked(self):
+        """True while we have asked for Assisted Steering OFF and the boat has
+        not yet confirmed it.
+
+        This blocks ordinary manual control, because until the boat confirms,
+        the mode its rudder is in is unknown -- and a stick value means a
+        yaw RATE in one mode and a rudder ANGLE in the other."""
+        return self._assist_off_req_id is not None
+
+    def _assist_off_tick_locked(self, now):
+        """Retry the OFF until MotorStatus confirms it, using the SAME request
+        id throughout so a late confirmation of an earlier attempt still
+        counts. A single unacknowledged OFF would leave the boat steering
+        itself while the operator believed they had manual control."""
+        req = self._assist_off_req_id
+        if req is None:
+            return
+        ms = self.motor_status
+        if (ms.get('have') and not ms.get('assist_rudder')
+                and ms.get('assist_request_id') == req):
+            self._assist_off_req_id = None
+            self._assist_off_next_retry = 0.0
+            self.assist_rudder_on = False
+            return
+        if now >= self._assist_off_next_retry and self.connected:
+            self._assist_off_next_retry = now + ASSIST_OFF_RETRY_S
+            msg = self.pb2.BoatMessage()
+            msg.assist.p_on = bool(self.p_assist_on)
+            msg.assist.rudder_assist = False
+            msg.assist.request_id = req
+            self._write_locked(msg.SerializeToString())
 
     def _next_assist_request_id(self):
         """Unique within a session AND across restarts, never 0.
@@ -1042,6 +1208,13 @@ class BoatLink:
         if not self.connected:
             return False, 'serial link is disconnected'
         req_id = self._next_assist_request_id()
+        if not rudder_assist:
+            # Track it until confirmed; _assist_off_tick_locked retries with
+            # this same id and clears it on the matching acknowledgement.
+            self._assist_off_req_id = req_id
+            self._assist_off_next_retry = self._now() + ASSIST_OFF_RETRY_S
+        else:
+            self._assist_off_req_id = None
         msg = self.pb2.BoatMessage()
         msg.assist.p_on = bool(p_on)
         msg.assist.rudder_assist = bool(rudder_assist)
@@ -1805,7 +1978,21 @@ class BoatLink:
                 # Before the sends: the sequence only sets throttle/rudder and
                 # the block below transmits them, so it inherits every existing
                 # safety path instead of opening a second command route.
-                self._rudder_test_tick_locked(time.monotonic())
+                now_mono = time.monotonic()
+                self._assist_off_tick_locked(now_mono)
+                self._rudder_test_tick_locked(now_mono)
+                # THE LEASE. A rudder test drives itself and is not browser
+                # input, so it keeps its own authority; anything else must be
+                # backed by a live browser saying so.
+                if (self.rudder_test is None
+                        and not self._drive_lease_ok_locked(now_mono)
+                        and self._anything_commanded_locked()):
+                    if self.lease_expired_at is None:
+                        self.lease_expired_at = now_mono
+                        print('[lease] browser heartbeat lost — zeroing',
+                              flush=True)
+                    self._zero_controls_locked()
+                    self._transmit_zeros_locked()
                 if self.connected:
                     if self.calibrating:
                         # Firmware owns the actuators; send ONLY the keepalive.
@@ -2392,6 +2579,7 @@ $('connect-btn').addEventListener('click', async () => {
   const port = $('port-select').value;
   if (!port) return;
   const res = await api('/api/connect', 'POST', { port });
+  if (res && res.ok) await openSession();   // claim control for THIS tab
   if (res.ok) {
     winchDir = 0;
     setConnectedUI(true, port);
@@ -2405,7 +2593,7 @@ $('connect-btn').addEventListener('click', async () => {
 $('throttle').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('throttle-val').textContent = v + '%';
-  api('/api/state', 'POST', { throttle: v / 100 });
+  ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0; sendHeartbeat();
 });
 
 // Link toggle: checked = one Throttle slider drives both motors; unchecked =
@@ -2419,12 +2607,12 @@ function setMotorLink(linked) {
   if (linked) {
     const v = parseInt($('motor-left').value);   // re-link at the left motor's value
     $('throttle').value = v; $('throttle-val').textContent = v + '%';
-    api('/api/state', 'POST', { throttle: v / 100 });
+    ctrl.throttle = v / 100; ctrl.left = 0; ctrl.right = 0; sendHeartbeat();
   } else {
     const v = parseInt($('throttle').value);      // split: both start at the throttle value
     $('motor-left').value = v;  $('motor-left-val').textContent = v + '%';
     $('motor-right').value = v; $('motor-right-val').textContent = v + '%';
-    api('/api/state', 'POST', { left: v / 100, right: v / 100 });
+    ctrl.left = v / 100; ctrl.right = v / 100; ctrl.throttle = 0; sendHeartbeat();
   }
 }
 $('motor-link').addEventListener('change', (e) => setMotorLink(e.target.checked));
@@ -2432,12 +2620,62 @@ $('motor-link').addEventListener('change', (e) => setMotorLink(e.target.checked)
 $('motor-left').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('motor-left-val').textContent = v + '%';
-  api('/api/state', 'POST', { left: v / 100 });
+  ctrl.left = v / 100; ctrl.throttle = 0; sendHeartbeat();
 });
 $('motor-right').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
   $('motor-right-val').textContent = v + '%';
-  api('/api/state', 'POST', { right: v / 100 });
+  ctrl.right = v / 100; ctrl.throttle = 0; sendHeartbeat();
+});
+
+// ---- control session + heartbeat -------------------------------------------
+// This process streams on our behalf, so it cannot tell "the operator is
+// holding 40% throttle" from "the tab closed 20 seconds ago" unless we keep
+// saying we are here. Miss the lease and the boat is zeroed.
+var sessionId = null, ctrlSeq = 0, hbTimer = null;
+var ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+
+async function openSession() {
+  const r = await api('/api/session', 'POST', {});
+  if (r && r.ok) {
+    sessionId = r.session_id;
+    ctrlSeq = 0;
+    // Taking control starts from a stopped boat; mirror that locally so the
+    // first heartbeat cannot re-assert a stale slider position.
+    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0 };
+    if (hbTimer) clearInterval(hbTimer);
+    hbTimer = setInterval(sendHeartbeat, Math.round(1000 / (r.heartbeat_hz || 12)));
+  }
+  return r;
+}
+
+async function sendHeartbeat() {
+  if (!connected || !sessionId) return;
+  const r = await api('/api/state', 'POST', {
+    session_id: sessionId, seq: ++ctrlSeq,
+    throttle: ctrl.throttle, rudder: ctrl.rudder,
+    left: ctrl.left, right: ctrl.right });
+  if (r && !r.ok) {
+    // Superseded by another tab, or dropped by STOP. Stop pretending to drive.
+    sessionId = null;
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  }
+}
+
+// The browser going away must stop the stream. pagehide covers tab close,
+// navigation and mobile backgrounding; the lease covers everything it misses
+// (crash, network death, a laptop lid closing).
+window.addEventListener('pagehide', () => {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  navigator.sendBeacon('/api/stop',
+    new Blob([JSON.stringify({ seq: ++winchCommandSeq })],
+             { type: 'application/json' }));
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  else if (!document.hidden && sessionId && !hbTimer) {
+    hbTimer = setInterval(sendHeartbeat, 80);
+  }
 });
 
 $('rudder').addEventListener('input', (e) => {
@@ -2456,7 +2694,8 @@ $('rudder').addEventListener('input', (e) => {
   //
   // This tool still starts centred at 0; dashboard.html still starts at -100,
   // which is the 1805us full-left power-up position.
-  api('/api/state', 'POST', { rudder: v / 100 });
+  ctrl.rudder = v / 100;
+  sendHeartbeat();          // immediate, then the timer keeps the lease alive
 });
 
 function winchMagnitude() {
@@ -3180,10 +3419,23 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/disconnect':
             self.link.disconnect()
             self._json({'ok': True})
+        elif self.path == '/api/session':
+            # Claim control. Supersedes any existing session and starts from a
+            # stopped boat.
+            self._json({'ok': True,
+                        'session_id': self.link.open_control_session(),
+                        'heartbeat_hz': CONTROL_HEARTBEAT_HZ,
+                        'lease_s': CONTROL_LEASE_S})
         elif self.path == '/api/state':
-            self.link.set_state(throttle=body.get('throttle'), rudder=body.get('rudder'),
-                                left=body.get('left'), right=body.get('right'))
-            self._json({'ok': True})
+            # The browser's full-state heartbeat. Carries the session id and a
+            # monotonic seq, so a delayed request cannot apply out of order and
+            # one from a superseded session cannot apply at all.
+            ok, err = self.link.control_heartbeat(
+                body.get('session_id'), body.get('seq'),
+                throttle=body.get('throttle'), rudder=body.get('rudder'),
+                left=body.get('left'), right=body.get('right'))
+            self._json({'ok': ok} if ok else {'ok': False, 'error': err},
+                       200 if ok else 409)
         elif self.path == '/api/winch':
             command_seq = body.get('seq')
             if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
@@ -3224,8 +3476,10 @@ class Handler(BaseHTTPRequestHandler):
                 'serial link is disconnected', 'serial write failed') else 409)
             self._json({'ok': ok, 'error': err}, code)
         elif self.path == '/api/arm':
-            self.link.arm(bool(body.get('arm')), bool(body.get('force')))
-            self._json({'ok': True})
+            ok, err = self.link.arm(bool(body.get('arm')),
+                                    bool(body.get('force')))
+            self._json({'ok': ok} if ok else {'ok': False, 'error': err},
+                       200 if ok else 409)
         elif self.path == '/api/calibrate':
             command_seq = body.get('seq')
             if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
