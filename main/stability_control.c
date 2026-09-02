@@ -26,6 +26,21 @@ float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
                          float dt_s, float steer_cmd_norm, float yaw_rate_dps,
                          stab_debug_t *dbg)
 {
+    if (!state || !cfg) return 0.0f;
+    if (!isfinite(steer_cmd_norm)) {
+        stab_reset(state);
+        if (dbg) { const stab_debug_t z = {0}; *dbg = z; }
+        return 0.0f;
+    }
+    return stab_rudder_update_dps(state, cfg, dt_s,
+                                  stab_target_dps(cfg, steer_cmd_norm),
+                                  yaw_rate_dps, dbg);
+}
+
+float stab_rudder_update_dps(stab_state_t *state, const stab_cfg_t *cfg,
+                             float dt_s, float target_dps, float yaw_rate_dps,
+                             stab_debug_t *dbg)
+{
     if (dbg) {
         const stab_debug_t zero = {0};
         *dbg = zero;
@@ -38,7 +53,7 @@ float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
      * servo. yaw_rate_dps can go bad from a corrupted sensor read;
      * steer_cmd_norm from a malformed network float -- neither is defended
      * upstream, so this pure function is the one place that must catch both. */
-    if (!isfinite(yaw_rate_dps) || !isfinite(steer_cmd_norm) || !isfinite(dt_s)) {
+    if (!isfinite(yaw_rate_dps) || !isfinite(target_dps) || !isfinite(dt_s)) {
         stab_reset(state);
         return 0.0f;
     }
@@ -57,7 +72,7 @@ float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
         state->yaw_filt += alpha * (yaw_rate_dps - state->yaw_filt);
     }
 
-    const float target = stab_target_dps(cfg, steer_cmd_norm);
+    const float target = target_dps;
     const float error = target - state->yaw_filt;
 
     /* Feedforward picked by the direction of the TARGET, not of the error: the

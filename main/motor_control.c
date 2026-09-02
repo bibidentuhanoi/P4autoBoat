@@ -218,6 +218,23 @@ static bool s_assist_rudder_req = false;
 static bool s_assist_rudder_req_pending = false;
 /* Last values the loop commanded, for telemetry. COMMANDED, not measured --
  * this servo has no position feedback. */
+static uint32_t s_assist_rudder_req_id = 0;
+/* The request the CONTROL TASK has applied -- echoed to the ground station so
+ * an acknowledgement can be correlated with the command that caused it.
+ * Arrival time cannot do that: it records when the ground station processed a
+ * packet, so a stale "assisted is on" processed after a new request would
+ * satisfy a time-based check and authorise a rate demand the boat is not
+ * ready for. */
+static uint32_t s_assist_applied_id = 0;
+/* Yaw-rate demand from SteerRateCommand, and when it arrived. Honoured only
+ * while Assisted Steering is on AND it is fresh; otherwise the loop falls back
+ * to the pilot's stick. */
+static float s_assist_rate_dps = 0.0f;
+static int64_t s_assist_rate_rx_us = 0;
+/* A rate demand older than this is not a demand any more. Matches the drive
+ * link timeout: the same silence that zeroes the throttle must not leave the
+ * boat turning. */
+#define ASSIST_RATE_TIMEOUT_US CONTROL_LINK_TIMEOUT_US
 static float s_assist_rudder_cmd = 0.0f;
 static float s_assist_target_dps = 0.0f;
 static float s_assist_yaw_filt = 0.0f;
@@ -540,7 +557,11 @@ static bool motor_status_discrete_equal(const boat_MotorStatus *a,
            a->winch_speed == b->winch_speed &&
            a->servo_power == b->servo_power &&
            a->assist_rudder == b->assist_rudder &&
-           a->assist_motor_p == b->assist_motor_p;
+           a->assist_motor_p == b->assist_motor_p &&
+           /* The acknowledgement itself -- it must go out at once, or the
+            * ground station waits out its timeout on a boat that already
+            * applied the change. */
+           a->assist_request_id == b->assist_request_id;
 }
 
 /* CONTINUOUS control values, which move on essentially every 100 Hz cycle once
@@ -586,6 +607,7 @@ static void status_commit_current(bool force)
     status.rudder_saturated = s_assist_saturated;
     status.yaw_target_dps = s_assist_target_dps;
     status.yaw_filt_dps = s_assist_yaw_filt;
+    status.assist_request_id = s_assist_applied_id;
 #endif
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
     status.assist_motor_p = s_p_assist_on;
@@ -870,7 +892,23 @@ static void arm_command_handler(bool arm, bool force)
  * owned by the control task. Touching it from here would race the 100 Hz loop
  * mid-mix and could leave the ESCs holding a correction the gate has already
  * revoked. */
-static void assist_command_handler(bool p_on, bool rudder_assist)
+static void steer_rate_command_handler(float target_dps)
+{
+#if CONFIG_STABILITY_SAS_ENABLE
+    /* RX task: record only. The control task owns everything downstream, and
+     * it ignores this outright unless Assisted Steering is actually on -- so a
+     * rate demand can never reach the rudder as an angle. */
+    portENTER_CRITICAL(&s_arbiter_lock);
+    s_assist_rate_dps = isfinite(target_dps) ? target_dps : 0.0f;
+    s_assist_rate_rx_us = esp_timer_get_time();
+    portEXIT_CRITICAL(&s_arbiter_lock);
+#else
+    (void)target_dps;
+#endif
+}
+
+static void assist_command_handler(bool p_on, bool rudder_assist,
+                                   uint32_t request_id)
 {
     /* MUTUALLY EXCLUSIVE for this experiment. The motor P assist perturbs
      * differential thrust and the rudder loop perturbs the rudder; running
@@ -889,10 +927,11 @@ static void assist_command_handler(bool p_on, bool rudder_assist)
 #endif
 #if CONFIG_STABILITY_SAS_ENABLE
     s_assist_rudder_req = rudder_assist;
+    s_assist_rudder_req_id = request_id;
     s_assist_rudder_req_pending = true;
 #endif
     portEXIT_CRITICAL(&s_arbiter_lock);
-    (void)p_on; (void)rudder_assist;
+    (void)p_on; (void)rudder_assist; (void)request_id;
 }
 
 static void bench_command_handler(uint32_t kind, float base, float delta,
@@ -1451,8 +1490,14 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
     portENTER_CRITICAL(&s_arbiter_lock);
     const bool a_pending = s_assist_rudder_req_pending;
     const bool a_req = s_assist_rudder_req;
+    const uint32_t a_id = s_assist_rudder_req_id;
     s_assist_rudder_req_pending = false;
     portEXIT_CRITICAL(&s_arbiter_lock);
+    if (a_pending) {
+        /* Echo the id even when the mode is unchanged: a repeated request is
+         * still a request, and the ground station is waiting for THIS one. */
+        s_assist_applied_id = a_id;
+    }
     if (a_pending && a_req != s_assist_rudder_on) {
         s_assist_rudder_on = a_req;
         stab_reset(&s_stab_state);
@@ -1539,10 +1584,25 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
                : clampf((float)(now_us - s_stab_last_tick_us) / 1000000.0f, 0.0f, 0.5f);
     s_stab_last_tick_us = now_us;
 
+    /* An explicit SteerRateCommand wins over the stick while it is fresh. It
+     * is a rate in deg/s, so it goes straight to the loop -- there is no
+     * conversion in which it could be mistaken for a rudder angle. Stale, and
+     * the stick takes over again; Assisted off, and this whole function has
+     * already returned. */
+    portENTER_CRITICAL(&s_arbiter_lock);
+    const float rate_dps = s_assist_rate_dps;
+    const int64_t rate_rx = s_assist_rate_rx_us;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    const bool rate_live = (rate_rx != 0) &&
+                           ((now_us - rate_rx) < ASSIST_RATE_TIMEOUT_US);
+    const float target_dps = rate_live
+                           ? rate_dps
+                           : stab_target_dps(&s_stab_cfg, s_manual_rudder);
+
     stab_debug_t dbg;
-    float rudder = stab_rudder_update(&s_stab_state, &s_stab_cfg,
-                                      dt_s, s_manual_rudder, fusion.yaw_rate,
-                                      &dbg);
+    float rudder = stab_rudder_update_dps(&s_stab_state, &s_stab_cfg,
+                                          dt_s, target_dps, fusion.yaw_rate,
+                                          &dbg);
     steer_driver_set(rudder);
     s_assist_rudder_cmd = rudder;
     s_assist_target_dps = dbg.target_dps;
@@ -2106,6 +2166,7 @@ esp_err_t motor_control_init(void)
     pipeline_register_calibrate_handler(calibrate_command_handler);
     pipeline_register_bench_handler(bench_command_handler);
     pipeline_register_assist_handler(assist_command_handler);
+    pipeline_register_steer_rate_handler(steer_rate_command_handler);
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
     s_trim_learn_cfg = (trim_learn_cfg_t){
         /* Same number the static table uses -- the learner starts where the

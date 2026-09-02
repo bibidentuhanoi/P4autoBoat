@@ -638,6 +638,13 @@ class BoatLink:
         # Assisted Steering (rudder loop). Requested state; the BOAT's own
         # answer arrives in MotorStatus.assist_rudder and is what gets shown.
         self.assist_rudder_on = False
+        # Correlates an acknowledgement with the request that caused it. Time
+        # of arrival cannot: it records when THIS process handled a packet, so
+        # a stale "assisted is on" processed after a new request would satisfy
+        # a time-based check and authorise a rate demand the boat is not in a
+        # mode to receive.
+        self.assist_request_id = 0
+        self._assist_req_seq = 0
         self.bridge_status = self._blank_bridge_status()
         self._diag_counts = {}
         self._stop = threading.Event()
@@ -681,6 +688,7 @@ class BoatLink:
             'rudder_cmd': 0.0, 'rudder_pulse_us': 0, 'rudder_saturated': False,
             'assist_rudder': False, 'assist_motor_p': False,
             'yaw_target_dps': 0.0, 'yaw_filt_dps': 0.0,
+            'assist_request_id': 0,
         }
 
     @staticmethod
@@ -987,6 +995,20 @@ class BoatLink:
             return False
         return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
 
+    def _next_assist_request_id(self):
+        """Monotonic, never 0. 0 is the boat's power-on value, so treating it
+        as a real id would make a boat that has never applied anything look
+        like it had just acknowledged us."""
+        self._assist_req_seq = getattr(self, '_assist_req_seq', 0) + 1
+        return self._assist_req_seq
+
+    def _send_steer_rate_locked(self, target_dps):
+        """Yaw-rate demand, deg/s. Its own message on purpose -- see the
+        SteerRateCommand comment in boat.proto. Caller holds the lock."""
+        msg = self.pb2.BoatMessage()
+        msg.steer_rate.target_dps = float(target_dps)
+        return self._write_locked(msg.SerializeToString())
+
     def _send_assist_locked(self, p_on, rudder_assist):
         """One AssistCommand carrying BOTH switches. Caller holds the lock.
 
@@ -998,13 +1020,16 @@ class BoatLink:
             return False, 'motor P assist and Assisted Steering are mutually exclusive'
         if not self.connected:
             return False, 'serial link is disconnected'
+        req_id = self._next_assist_request_id()
         msg = self.pb2.BoatMessage()
         msg.assist.p_on = bool(p_on)
         msg.assist.rudder_assist = bool(rudder_assist)
+        msg.assist.request_id = req_id
         if not self._write_locked(msg.SerializeToString()):
             return False, 'serial write failed'
         self.p_assist_on = bool(p_on)
         self.assist_rudder_on = bool(rudder_assist)
+        self.assist_request_id = req_id
         return True, None
 
     def send_assist(self, p_on):
@@ -1173,6 +1198,8 @@ class BoatLink:
                 'phase': ('awaiting_assist' if assisted
                           else RUDDER_TEST_PHASES[0][0]),
                 'assist_sent_at': now if assisted else None,
+                'assist_request_id': self.assist_request_id if assisted else 0,
+                'rate_dps': 0.0,
                 'ack_deadline': ack_deadline,
                 'rows': [], 'name': name, 'path': str(path),
                 'last_frame_mono': None, 'max_gap_s': 0.0,
@@ -1280,9 +1307,8 @@ class BoatLink:
             'mode': 'assisted' if rt.get('assisted') else 'raw',
             # What we ASKED the loop for this instant -- zero outside the drive
             # phase, matching what the tick actually commands.
-            'target_dps': (rt.get('target_dps', 0.0)
-                           if (rt.get('assisted') and phase
-                               and phase[0] == 'drive') else 0.0),
+            # What the tick last put on the wire, not what the phase implies.
+            'target_dps': rt.get('rate_dps', 0.0),
             'yaw_filt_dps': ms.get('yaw_filt_dps', '') if ms.get('have') else '',
             'boat_rudder_cmd': ms.get('rudder_cmd', '') if ms.get('have') else '',
             'boat_rudder_us': ms.get('rudder_pulse_us', '') if ms.get('have') else '',
@@ -1325,12 +1351,20 @@ class BoatLink:
             # boat's own assist_rudder makes it safe.
             if rt.get('assisted'):
                 ms = self.motor_status
-                last = ms.get('last_rx_monotonic')
-                # The confirmation must have ARRIVED after we asked, or a
-                # leftover status from a previous run could satisfy it.
+                # Correlated by ID, never by arrival time. last_rx_monotonic
+                # records when THIS process handled a packet, so a stale
+                # assist_rudder=true processed after the request satisfies a
+                # time comparison while describing a mode the boat has since
+                # left -- reproduced with acknowledgements disabled, where it
+                # started the profile and put -1.0 on the wire.
+                #
+                # The boat echoes AssistCommand.request_id only once its
+                # control task has applied the change, so a matching id is
+                # proof about this request and nothing else.
                 confirmed = (ms.get('have') and ms.get('assist_rudder')
-                             and last is not None
-                             and last >= rt['assist_sent_at'])
+                             and rt['assist_request_id'] != 0
+                             and ms.get('assist_request_id')
+                                 == rt['assist_request_id'])
                 if rt['t0'] is None:
                     if confirmed:
                         rt['t0'] = now          # profile starts here, not before
@@ -1405,15 +1439,21 @@ class BoatLink:
                 # the loop holding straight before the motors come on, and the
                 # coast must not keep asking for a turn the jets can no longer
                 # produce -- that would wind the rudder over with no authority.
-                # `confirmed` is re-asserted here deliberately. The gate
-                # above already returns unless the boat is in Assisted mode, so
-                # this cannot fire today -- it is here so that the ONE
-                # assignment capable of putting +/-1 on the wire carries the
-                # condition that makes +/-1 mean 2 deg/s rather than FULL
-                # RUDDER. Any future edit that reorders the gate must defeat
-                # this too.
-                self.rudder = (rt['rudder']
-                               if (phase[0] == 'drive' and confirmed) else 0.0)
+                # THE RAW STICK STAYS AT ZERO FOR THE WHOLE ASSISTED RUN.
+                #
+                # The demand goes out as a SteerRateCommand -- deg/s, its own
+                # message, routed by the firmware to the yaw-rate loop and
+                # nowhere else. So there is no longer a value in flight that
+                # could be reinterpreted as a rudder angle: lose the mode
+                # mid-run, drop a packet, get the ordering wrong, and the worst
+                # case is a centred rudder rather than one hard over.
+                #
+                # This replaces the old scheme, where the same SteerCommand
+                # value meant "+2 deg/s" with the loop on and "full left
+                # rudder" with it off.
+                self.rudder = 0.0
+                rt['rate_dps'] = (rt['target_dps']
+                                  if (phase[0] == 'drive' and confirmed) else 0.0)
             else:
                 self.rudder = rt['rudder']
             # The stream loop sends these straight after; a write failure there
@@ -1459,9 +1499,12 @@ class BoatLink:
         self.motor_right = 0.0
         self.motor_split = False
         self.rudder = 0.0
+        rt['rate_dps'] = 0.0
         if self.connected:
             self._send_motor_locked(0.0, 0.0)
             self._send_steer_locked(0.0)
+            if rt.get('assisted'):
+                self._send_steer_rate_locked(0.0)
         # Now it is safe: whatever mode the boat is in, it has been told zero.
         # Switched off on EVERY exit including every abort -- leaving the loop
         # live would have it quietly steering during ordinary manual driving.
@@ -1713,6 +1756,7 @@ class BoatLink:
                 'assist_motor_p': bool(ms.assist_motor_p),
                 'yaw_target_dps': float(ms.yaw_target_dps),
                 'yaw_filt_dps': float(ms.yaw_filt_dps),
+                'assist_request_id': int(ms.assist_request_id),
             }
 
     def _handle_calibrate_status(self, cs):
@@ -1755,6 +1799,13 @@ class BoatLink:
                         else:
                             ok = self._send_motor_locked(self.throttle, self.throttle)
                         ok = self._send_steer_locked(self.rudder) and ok
+                        # Only while an assisted run is live: the firmware
+                        # ignores it otherwise, but there is no reason to put
+                        # it on the air at all.
+                        if self.rudder_test is not None and \
+                                self.rudder_test.get('assisted'):
+                            ok = self._send_steer_rate_locked(
+                                self.rudder_test.get('rate_dps', 0.0)) and ok
                         ok = self._send_winch_locked(self.winch_speed) and ok
                         self._rudder_test_after_send_locked(ok)
             # File I/O deliberately outside the lock -- a few ms of CSV write

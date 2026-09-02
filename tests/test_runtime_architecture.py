@@ -187,14 +187,16 @@ typedef struct { float throttle; float rudder; float left; float right; } boat_M
 typedef struct { float speed; } boat_WinchCommand;
 typedef struct { float left; float right; } boat_SteerCommand;
 typedef struct { uint32_t pulse_us; } boat_SteerRawCommand;
-typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; } boat_MotorStatus;
-#define boat_MotorStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; } boat_MotorStatus;
+#define boat_MotorStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 #define boat_CalibrateStatus_init_zero {0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
 #define boat_BenchStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
-typedef struct { bool p_on; bool rudder_assist; } boat_AssistCommand;
+typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
+typedef struct { float target_dps; } boat_SteerRateCommand;
+#define boat_BoatMessage_steer_rate_tag 18
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
 typedef void (*arm_command_handler_fn)(bool, bool);
 typedef void (*winch_command_handler_fn)(const boat_WinchCommand *);
@@ -203,7 +205,9 @@ typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
 typedef void (*calibrate_command_handler_fn)(bool, bool);
 typedef void (*bench_command_handler_fn)(uint32_t, float, float, float);
-typedef void (*assist_command_handler_fn)(bool, bool);
+typedef void (*assist_command_handler_fn)(bool, bool, uint32_t);
+typedef void (*steer_rate_command_handler_fn)(float);
+void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn handler);
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
 void pipeline_register_arm_handler(arm_command_handler_fn handler);
 void pipeline_register_winch_handler(winch_command_handler_fn handler);
@@ -327,6 +331,8 @@ void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn fn) { raw_
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn fn) { calibrate_handler = fn; }
 void pipeline_register_bench_handler(bench_command_handler_fn fn) { bench_handler = fn; }
 void pipeline_register_assist_handler(assist_command_handler_fn fn) { assist_handler = fn; }
+static steer_rate_command_handler_fn steer_rate_handler_cb;
+void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn fn) { steer_rate_handler_cb = fn; }
 void pipeline_publish_motor_status(const boat_MotorStatus *status) { (void)status; ++transport_publishes; }
 bool pipeline_recent_command(int64_t max_age_us) { (void)max_age_us; return true; }
 bool fs_save_esc_trim(const EscTrimNvsBlob *blob) { (void)blob; return true; }
@@ -696,12 +702,14 @@ typedef struct { float left; float right; } boat_SteerCommand;
 typedef struct { uint32_t pulse_us; } boat_SteerRawCommand;
 typedef struct { bool arm; bool force; } boat_ArmCommand;
 typedef struct { bool on; } boat_ServoPowerCommand;
-typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; } boat_MotorStatus;
+typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; } boat_MotorStatus;
 typedef struct { bool start; bool average_into_existing; } boat_CalibrateCommand;
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
 typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
-typedef struct { bool p_on; bool rudder_assist; } boat_AssistCommand;
+typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
+typedef struct { float target_dps; } boat_SteerRateCommand;
+#define boat_BoatMessage_steer_rate_tag 18
 typedef struct {
     int which_payload;
     union {
@@ -712,6 +720,7 @@ typedef struct {
         boat_WinchCommand winch;
         boat_SteerCommand steer;
         boat_SteerRawCommand steer_raw;
+        boat_SteerRateCommand steer_rate;
         boat_ArmCommand arm_cmd;
         boat_ServoPowerCommand servo_power;
         boat_CalibrateCommand calibrate;
@@ -751,7 +760,9 @@ typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
 typedef void (*calibrate_command_handler_fn)(bool, bool);
 typedef void (*bench_command_handler_fn)(uint32_t, float, float, float);
-typedef void (*assist_command_handler_fn)(bool, bool);
+typedef void (*assist_command_handler_fn)(bool, bool, uint32_t);
+typedef void (*steer_rate_command_handler_fn)(float);
+void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn handler);
 esp_err_t pipeline_init(void);
 esp_err_t pipeline_register_transport(transport_send_fn send, void *ctx);
 void pipeline_register_motor_handler(motor_command_handler_fn handler);
@@ -852,7 +863,8 @@ static void raw_handler(const boat_SteerRawCommand *command) { (void)command; ++
 static void calibrate_handler(bool start, bool average) { (void)start; (void)average; ++calibrate_calls; }
 static void bench_handler(uint32_t kind, float base, float delta, float reset_c)
 { (void)kind; (void)base; (void)delta; (void)reset_c; }
-static void assist_handler(bool p_on, bool ra) { (void)p_on; (void)ra; }
+static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }
+static void steer_rate_handler(float d) { (void)d; }
 
 int main(void) {
     const uint8_t input[] = {0};
@@ -866,6 +878,7 @@ int main(void) {
     pipeline_register_calibrate_handler(calibrate_handler);
     pipeline_register_bench_handler(bench_handler);
     pipeline_register_assist_handler(assist_handler);
+    pipeline_register_steer_rate_handler(steer_rate_handler);
 
     decoded_tag = boat_BoatMessage_detect_tag;
     pipeline_handle_incoming(input, sizeof(input));
@@ -926,11 +939,13 @@ void vTaskDelay(TickType_t ticks);
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
-typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; } boat_MotorStatus;
+typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; } boat_MotorStatus;
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
 typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
-typedef struct { bool p_on; bool rudder_assist; } boat_AssistCommand;
+typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
+typedef struct { float target_dps; } boat_SteerRateCommand;
+#define boat_BoatMessage_steer_rate_tag 18
 uint32_t motor_control_get_status(boat_MotorStatus *out);
 uint32_t motor_control_get_calibrate_status(boat_CalibrateStatus *out);
 uint32_t motor_control_get_bench_status(boat_BenchStatus *out);
@@ -1599,7 +1614,7 @@ def test_turning_p_off_returns_exactly_to_the_pre_p_path():
     # control task, or a command can land mid-mix and leave the ESCs holding a
     # correction the gate has already revoked.
     h = _function_body(src,
-                       "static void assist_command_handler(bool p_on, bool rudder_assist)")
+                       "static void assist_command_handler(bool p_on, bool rudder_assist,")
     assert "s_p_assist_req_pending = true;" in h
     for forbidden in ("trim_assist_reset", "s_p_correction", "s_p_moved"):
         assert forbidden not in h, (

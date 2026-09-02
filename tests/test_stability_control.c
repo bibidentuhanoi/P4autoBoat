@@ -379,6 +379,39 @@ static void zero_stick_and_zero_yaw_commands_nothing(void)
     assert(NEAR(d.p_term, 0.0f));
 }
 
+static void the_direct_target_entry_matches_the_stick_one(void)
+{
+    /* stab_rudder_update() is stab_rudder_update_dps() with the stick
+     * conversion in front; an assisted run feeds a rate straight in, so the
+     * two must not diverge. */
+    const stab_cfg_t cfg = pool_cfg();
+    stab_state_t a, b;
+    stab_debug_t da, db;
+    stab_reset(&a); stab_reset(&b);
+    for (int i = 0; i < 50; ++i) {
+        float dt = (i == 0) ? 0.0f : 0.02f;
+        float ra = stab_rudder_update(&a, &cfg, dt, -1.0f, 1.0f, &da);
+        float rb = stab_rudder_update_dps(&b, &cfg, dt, +2.0f, 1.0f, &db);
+        assert(NEAR(ra, rb));
+        assert(NEAR(da.target_dps, db.target_dps));
+    }
+    printf("  direct-target entry agrees with the stick entry\n");
+}
+
+static void a_direct_target_needs_no_stick_conversion(void)
+{
+    /* The point of the separate message: a rate goes in as a rate. Half the
+     * full-stick rate must produce half the feedforward, with no reference to
+     * r_max_dps at the call site. */
+    const stab_cfg_t cfg = pool_cfg();
+    stab_state_t s;
+    stab_debug_t d;
+    stab_reset(&s);
+    stab_rudder_update_dps(&s, &cfg, 0.0f, +1.0f, 0.0f, &d);
+    assert(NEAR(d.target_dps, +1.0f));
+    assert(NEAR(d.ff_term, -0.18f));      /* 0.18 x 1.0 */
+}
+
 int main(void)
 {
     left_stick_requests_positive_yaw_and_gives_left_rudder();
@@ -400,6 +433,8 @@ int main(void)
     the_enable_sample_commands_nothing_even_with_slew_disabled();
     the_ramp_from_enable_takes_the_expected_time();
     a_reset_mid_run_also_re_ramps();
+    the_direct_target_entry_matches_the_stick_one();
+    a_direct_target_needs_no_stick_conversion();
     the_filter_snaps_on_the_first_sample();
     zero_stick_and_zero_yaw_commands_nothing();
     printf("test_stability_control: OK\n");

@@ -93,3 +93,12 @@ float stab_target_dps(const stab_cfg_t *cfg, float steer_cmd_norm);
 float stab_rudder_update(stab_state_t *state, const stab_cfg_t *cfg,
                          float dt_s, float steer_cmd_norm, float yaw_rate_dps,
                          stab_debug_t *dbg);
+
+/* Same loop, given the physical yaw-rate target DIRECTLY in deg/s rather than
+ * as a stick position. This is what an explicit SteerRateCommand feeds: a rate
+ * is what the controller actually wants, and passing one avoids a round trip
+ * through a stick value that means something else entirely when the loop is
+ * off. stab_rudder_update() is this with the stick conversion in front. */
+float stab_rudder_update_dps(stab_state_t *state, const stab_cfg_t *cfg,
+                             float dt_s, float target_dps, float yaw_rate_dps,
+                             stab_debug_t *dbg);

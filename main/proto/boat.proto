@@ -92,6 +92,23 @@ message SteerRawCommand {
   uint32 pulse_us = 1;
 }
 
+// Yaw-RATE demand for Assisted Steering, in deg/s.
+//
+// A SEPARATE message from SteerCommand, deliberately. Those two carry
+// different physical quantities -- a rate in deg/s and a rudder angle -- and
+// overloading one field for both meant the same -1.0 was "+2 deg/s" with the
+// loop on and "FULL LEFT RUDDER" with it off. Any confusion about the mode
+// therefore threw the rudder to its stop.
+//
+// With a message of its own there is no value that can be reinterpreted: the
+// firmware routes this to the yaw-rate loop and NOWHERE else, and ignores it
+// outright when Assisted Steering is off. An automated assisted run can then
+// hold SteerCommand at zero the whole time, so even losing the mode mid-run
+// leaves the rudder centred rather than hard over.
+message SteerRateCommand {
+  float target_dps = 1;
+}
+
 message MotorStatus {
   uint32 state          = 1;  // motor state enum
   float  left_throttle  = 2;  // current left throttle
@@ -110,6 +127,10 @@ message MotorStatus {
   bool   assist_motor_p   = 10;  // the motor P assist is actually running
   float  yaw_target_dps   = 11;  // physical yaw-rate target the loop is holding
   float  yaw_filt_dps     = 12;  // the loop's own filtered yaw
+  // The AssistCommand.request_id the control task has APPLIED. Not the one it
+  // has merely received: the RX task only queues a request, and echoing at
+  // receipt would acknowledge a mode the boat is not yet in.
+  uint32 assist_request_id = 13;
 }
 
 message ArmCommand {
@@ -169,6 +190,14 @@ message CalibrateStatus {
 // a rebuild between arms would let a build difference look like a result.
 message AssistCommand {
   bool p_on = 1;
+  // Correlates the acknowledgement with THIS request. Wall-clock arrival time
+  // cannot do that job: last-received timestamps record when the GROUND
+  // STATION processed a packet, not when the boat sent it, so a stale
+  // assist_rudder=true that happens to be processed after a new request
+  // satisfies a time-based check and falsely authorises a rate demand.
+  // Echoed back in MotorStatus.assist_request_id, and only once the CONTROL
+  // TASK has actually applied the change.
+  uint32 request_id = 3;
   // Runtime Assisted Steering (rudder yaw-rate loop). DELIBERATELY a separate
   // field from p_on: that one is the MOTOR differential-thrust assist, this is
   // the RUDDER loop, and folding them into one flag would make an experiment
@@ -226,5 +255,6 @@ message BoatMessage {
     BenchCommand   bench        = 15;
     BenchStatus    bench_status = 16;
     AssistCommand  assist       = 17;
+    SteerRateCommand steer_rate = 18;
   }
 }

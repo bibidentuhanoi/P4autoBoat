@@ -132,6 +132,7 @@ class RudderTestBase(unittest.TestCase):
                         link.motor_status, have=True,
                         assist_rudder=bool(msg.assist.rudder_assist),
                         assist_motor_p=bool(msg.assist.p_on),
+                        assist_request_id=int(msg.assist.request_id),
                         last_rx_monotonic=self.clock.t)
             return self.write_ok
         link._write_locked = _write
@@ -1050,8 +1051,8 @@ class AssistedModeTest(RudderTestBase):
         self._boat_armed(fresh=True)
         self._tick()
         self.assertEqual(self.link.rudder_test['phase'], 'drive')
-        self.assertAlmostEqual(self.link.rudder, -1.0)
-        self.assertAlmostEqual(self.link.rudder_test['target_dps'],
+        self.assertEqual(self.link.rudder, 0.0)   # raw channel stays zero
+        self.assertAlmostEqual(self.link.rudder_test['rate_dps'],
                                +T.ASSIST_TEST_TARGET_DPS)
 
     def test_right_commands_full_right_stick(self):
@@ -1060,8 +1061,8 @@ class AssistedModeTest(RudderTestBase):
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
-        self.assertAlmostEqual(self.link.rudder, +1.0)
-        self.assertAlmostEqual(self.link.rudder_test['target_dps'],
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertAlmostEqual(self.link.rudder_test['rate_dps'],
                                -T.ASSIST_TEST_TARGET_DPS)
 
     def test_the_target_is_zero_outside_the_drive_phase(self):
@@ -1080,7 +1081,7 @@ class AssistedModeTest(RudderTestBase):
             seen.setdefault(self.link.rudder_test['phase'], set()).add(self.link.rudder)
         self.assertEqual(seen['rudder_settle'], {0.0})
         self.assertEqual(seen['coast'], {0.0})
-        self.assertEqual(seen['drive'], {-1.0})
+        self.assertEqual(seen['drive'], {0.0})   # demand rides its own message
 
     def test_the_files_are_named_apart_from_the_raw_runs(self):
         """Different experiments; a glob must never pool them."""
@@ -1170,9 +1171,13 @@ class AssistedSafetyOrderingTest(RudderTestBase):
                         self.link.motor_status, have=True,
                         assist_rudder=bool(msg.assist.rudder_assist),
                         assist_motor_p=bool(msg.assist.p_on),
+                        assist_request_id=int(msg.assist.request_id),
                         last_rx_monotonic=self.clock.t)
             elif which == 'steer':
                 self.sent.append(('steer', round(msg.steer.left, 4)))
+            elif which == 'steer_rate':
+                self.sent.append(('steer_rate',
+                                  round(msg.steer_rate.target_dps, 4)))
             elif which == 'motor':
                 self.sent.append(('motor', round(msg.motor.left, 4),
                                   round(msg.motor.right, 4)))
@@ -1223,7 +1228,11 @@ class AssistedSafetyOrderingTest(RudderTestBase):
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
-        self.assertAlmostEqual(self.link.rudder, -1.0)   # full stick, drive phase
+        # The raw channel is zero throughout an assisted run; the demand is a
+        # SteerRateCommand. What matters here is the ORDERING of the messages.
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertAlmostEqual(self.link.rudder_test['rate_dps'],
+                               +T.ASSIST_TEST_TARGET_DPS)
 
         self.sent.clear()
         self.link.stop(self.link.winch_command_seq + 1)
@@ -1274,6 +1283,24 @@ class AssistedSafetyOrderingTest(RudderTestBase):
                                 '%s disabled assist before zeroing' % name)
             self.assertEqual(self.link.rudder, 0.0, name)
             self.assertEqual(self.link.throttle, 0.0, name)
+
+    def test_a_zero_rate_demand_is_sent_before_the_mode_change(self):
+        """The rate rides its own message, so it needs its own zeroing on the
+        way out -- and before Assisted mode goes away, for the same reason the
+        steering does."""
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
+        self.clock.advance(1.0)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.sent.clear()
+        self.link.stop(self.link.winch_command_seq + 1)
+        zero_rate = [i for i, m in enumerate(self.sent)
+                     if m[0] == 'steer_rate' and m[1] == 0.0]
+        assist_off = [i for i, m in enumerate(self.sent) if m[0] == 'assist']
+        self.assertTrue(zero_rate, 'no zero rate demand was sent on exit')
+        if assist_off:
+            self.assertLess(min(zero_rate), min(assist_off))
 
     def test_a_completed_run_zeroes_before_the_mode_change_too(self):
         self.link.start_rudder_test(-1, 1, assisted=True)
@@ -1498,10 +1525,18 @@ class AssistAcknowledgementTest(RudderTestBase):
     assist_rudder makes +/-1 safe to send."""
 
     def _sticks(self):
+        """Every RAW steering value the run put on the wire. Under the
+        separate-message design this must be {0.0} always -- the demand
+        travels as a SteerRateCommand instead."""
         return {round(s, 3) for s in self._stick_trace}
+
+    def _rates(self):
+        """Every yaw-RATE demand, in deg/s."""
+        return {round(s, 3) for s in self._rate_trace}
 
     def _run(self, ticks=60, ack=True, drop_at=None):
         self._stick_trace = []
+        self._rate_trace = []
         self.boat_acks_assist = ack
         ok, err = self.link.start_rudder_test(-1, 1, assisted=True)
         self.assertTrue(ok, err)
@@ -1520,16 +1555,29 @@ class AssistAcknowledgementTest(RudderTestBase):
                                                   last_rx_monotonic=self.clock.t)
             self._tick()
             self._stick_trace.append(self.link.rudder)
+            self._rate_trace.append(
+                (self.link.rudder_test or {}).get('rate_dps', 0.0))
             if self.link.rudder_test is None:
                 break
 
     # ---- the invariant ---------------------------------------------------
 
-    def test_full_stick_is_never_sent_before_the_boat_confirms(self):
+    def test_no_rate_demand_goes_out_before_the_boat_confirms(self):
         self._run(ticks=80, ack=False)
+        self.assertEqual(self._rates(), {0.0},
+                         'a rate demand went out before the boat confirmed the '
+                         'mode that gives it meaning')
+
+    def test_the_raw_stick_is_zero_for_the_ENTIRE_assisted_run(self):
+        """The structural fix. The demand is a SteerRateCommand -- its own
+        message, routed by the firmware to the yaw-rate loop and nowhere else --
+        so no value in flight can be reinterpreted as a rudder angle. Lose the
+        mode, drop a packet, get the ordering wrong: the worst case is a
+        centred rudder, not one hard over."""
+        self._run(ticks=120, ack=True)
         self.assertEqual(self._sticks(), {0.0},
-                         'a rate demand went out while the boat was in raw '
-                         'mode -- that is full rudder, hard over')
+                         'the raw steering channel carried a non-zero value '
+                         'during an assisted run')
 
     def test_the_throttle_also_stays_at_zero_before_confirmation(self):
         self.boat_acks_assist = False
@@ -1557,18 +1605,19 @@ class AssistAcknowledgementTest(RudderTestBase):
         # now the boat confirms
         self.boat_acks_assist = True
         self.clock.advance(0.1)
-        self.link.motor_status = dict(self.link.motor_status, have=True,
-                                      assist_rudder=True, state=2,
-                                      servo_power=True,
-                                      last_rx_monotonic=self.clock.t)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, assist_rudder=True, state=2,
+            servo_power=True,
+            assist_request_id=self.link.rudder_test['assist_request_id'],
+            last_rx_monotonic=self.clock.t)
         self._tick()
         self.assertIsNotNone(self.link.rudder_test['t0'])
         self.assertEqual(self.link.rudder_test['phase'], 'rudder_settle')
 
-    def test_a_confirmed_run_does_command_full_stick(self):
+    def test_a_confirmed_run_does_command_the_rate(self):
         """The gate must not be so strict that it never lets a good run go."""
-        self._run(ticks=80, ack=True)
-        self.assertIn(-1.0, self._sticks())
+        self._run(ticks=120, ack=True)
+        self.assertIn(+T.ASSIST_TEST_TARGET_DPS, self._rates())
 
     # ---- staleness of the confirmation ----------------------------------
 
@@ -1585,6 +1634,101 @@ class AssistAcknowledgementTest(RudderTestBase):
         self._tick()
         self.assertIsNone(self.link.rudder_test['t0'],
                           'a stale confirmation started the profile')
+
+    def test_a_stale_true_processed_AFTER_the_request_does_not_authorize(self):
+        """THE REPRODUCTION. last_rx_monotonic records when THIS process
+        handled a packet, not when the boat sent it. So a MotorStatus carrying
+        assist_rudder=true that describes an EARLIER mode -- and is processed
+        after the new request -- passes any time-based check. With
+        acknowledgements otherwise disabled it started the profile and put a
+        full-scale demand on the wire.
+
+        The id is what makes it safe: that old packet echoes an old
+        request_id, so it cannot answer for this request no matter when it is
+        processed."""
+        self.boat_acks_assist = False
+        # A previous run left the boat in assisted mode under request id 1.
+        self.link._send_assist_locked(False, True)
+        stale_id = self.link.assist_request_id
+        self.link._send_assist_locked(False, False)      # ...then turned it off
+
+        self.clock.advance(0.5)
+        ok, err = self.link.start_rudder_test(-1, 1, assisted=True)
+        self.assertTrue(ok, err)
+        new_id = self.link.rudder_test['assist_request_id']
+        self.assertNotEqual(new_id, stale_id)
+
+        # NOW the stale packet lands -- arriving, by wall clock, after the
+        # request. Time says yes; the id says no.
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            assist_rudder=True,               # the stale claim
+            assist_request_id=stale_id,       # but answering the OLD request
+            last_rx_monotonic=self.clock.t)   # processed AFTER we asked
+
+        for i in range(1, 20):
+            self.clock.advance(0.05)
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+            self.assertIsNone(self.link.rudder_test['t0'],
+                              'a stale acknowledgement started the profile')
+            self.assertEqual(self.link.rudder, 0.0)
+            self.assertEqual(self.link.rudder_test.get('rate_dps', 0.0), 0.0,
+                             'a stale acknowledgement authorised a rate demand')
+
+    def test_the_matching_id_does_authorize(self):
+        """The mirror: the same packet with the CURRENT id is accepted, so the
+        check is discriminating rather than simply always refusing."""
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            assist_rudder=True,
+            assist_request_id=self.link.rudder_test['assist_request_id'],
+            last_rx_monotonic=self.clock.t)
+        self._tick()
+        self.assertIsNotNone(self.link.rudder_test['t0'])
+
+    def test_a_zero_request_id_never_authorizes(self):
+        """0 is the boat's power-on value. Accepting it would let a boat that
+        has applied nothing look like it had just acknowledged us."""
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            assist_rudder=True, assist_request_id=0,
+            last_rx_monotonic=self.clock.t)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test['t0'])
+
+    def test_a_zero_id_on_BOTH_sides_still_does_not_authorize(self):
+        """Reaches the `!= 0` guard directly. Matching-on-equality alone would
+        accept 0 == 0 -- a boat that has applied nothing agreeing with a
+        request we never managed to stamp. Only this guard rejects it."""
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.link.rudder_test['assist_request_id'] = 0      # never stamped
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            assist_rudder=True, assist_request_id=0,        # boat's power-on value
+            last_rx_monotonic=self.clock.t)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test['t0'],
+                          '0 == 0 authorised a rate demand')
+        self.assertEqual(self.link.rudder_test.get('rate_dps', 0.0), 0.0)
+
+    def test_request_ids_are_unique_across_requests(self):
+        seen = set()
+        for _ in range(5):
+            self.link._send_assist_locked(False, True)
+            self.assertNotIn(self.link.assist_request_id, seen)
+            self.assertNotEqual(self.link.assist_request_id, 0)
+            seen.add(self.link.assist_request_id)
 
     # ---- timeout ---------------------------------------------------------
 
@@ -1614,9 +1758,10 @@ class AssistAcknowledgementTest(RudderTestBase):
         self.assertEqual(self.link.rudder, 0.0)
         self.assertEqual(self.link.throttle, 0.0)
 
-    def test_no_full_stick_survives_the_drop(self):
+    def test_no_demand_survives_the_drop(self):
         self._run(ticks=80, ack=True, drop_at=1.2)
         self.assertEqual(self.link.rudder, 0.0)
+        self.assertEqual((self.link.rudder_test or {}).get('rate_dps', 0.0), 0.0)
 
     # ---- raw runs are untouched -----------------------------------------
 

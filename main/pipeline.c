@@ -42,6 +42,7 @@ static steer_raw_command_handler_fn s_steer_raw_handler = NULL;
 static calibrate_command_handler_fn s_calibrate_handler = NULL;
 static bench_command_handler_fn s_bench_handler = NULL;
 static assist_command_handler_fn s_assist_handler = NULL;
+static steer_rate_command_handler_fn s_steer_rate_handler = NULL;
 
 /* ---- Shared protobuf envelopes ----
  * boat_BoatMessage is a ~7KB union (SensorSnapshot member holds the 256-entry
@@ -122,6 +123,7 @@ esp_err_t pipeline_init(void)
     s_calibrate_handler = NULL;
     s_bench_handler = NULL;
     s_assist_handler = NULL;
+    s_steer_rate_handler = NULL;
     if (!s_msg_mutex) {
         s_msg_mutex = xSemaphoreCreateMutex();
         if (!s_msg_mutex) {
@@ -185,6 +187,11 @@ void pipeline_register_servo_power_handler(servo_power_handler_fn handler)
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler)
 {
     s_steer_raw_handler = handler;
+}
+
+void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn handler)
+{
+    s_steer_rate_handler = handler;
 }
 
 void pipeline_register_assist_handler(assist_command_handler_fn handler)
@@ -374,7 +381,16 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
     case boat_BoatMessage_assist_tag:
         if (s_assist_handler) {
             s_assist_handler(s_rx_msg.payload.assist.p_on,
-                             s_rx_msg.payload.assist.rudder_assist);
+                             s_rx_msg.payload.assist.rudder_assist,
+                             s_rx_msg.payload.assist.request_id);
+        }
+        break;
+
+    case boat_BoatMessage_steer_rate_tag:
+        /* Routed ONLY to the yaw-rate loop. It never touches the raw rudder
+         * path, so no value carried here can become a rudder angle. */
+        if (s_steer_rate_handler) {
+            s_steer_rate_handler(s_rx_msg.payload.steer_rate.target_dps);
         }
         break;
 
