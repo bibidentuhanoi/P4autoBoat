@@ -1347,6 +1347,28 @@ class NotDrivingTest(RudderTestBase):
             self._tick()
         self.assertIsNotNone(self.link.rudder_test)
 
+    def test_a_stale_status_never_produces_a_not_driving_verdict(self):
+        """The 2026-09-02 case: the boat WAS driving, but MotorStatus had
+        stopped arriving, so the cached value read 0.0. Blaming the arm state
+        from a frozen packet sends the operator after the wrong fault -- the
+        staleness gate is what should speak, and it names itself."""
+        self.assertTrue(self._start()[0])
+        t0 = self.clock.t
+        # One fresh status showing not-yet-driving, then silence.
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      state=2, servo_power=True,
+                                      left_throttle=0.0, right_throttle=0.0,
+                                      last_rx_monotonic=t0)
+        for i in range(1, 120):
+            self.clock.t = t0 + i * 0.05
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+        self.link._flush_rudder_test_write()
+        reason = self.link.rudder_test_result['abort_reason'].lower()
+        self.assertIn('stale', reason)
+        self.assertNotIn('not driving', reason)
+
     def test_the_settle_and_coast_phases_are_not_checked(self):
         """They command zero throttle, so a zero report is correct there."""
         self.assertTrue(self._start()[0])

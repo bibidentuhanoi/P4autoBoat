@@ -1313,15 +1313,32 @@ class BoatLink:
             # cause. Catch it directly and say so.
             if phase[0] == 'drive' and phase[1] > 0.0:
                 ms = self.motor_status
+                # ONLY judge this on a FRESH status. A frozen one says nothing
+                # about what the boat is doing -- and saying "not driving,
+                # check ARM" from a stale packet is worse than saying nothing,
+                # because it sends the operator after the wrong fault. On
+                # 2026-09-02 the boat drove correctly while MotorStatus had
+                # stopped arriving; this check would have blamed the arm state.
+                if rt.get('drive_started') is None:
+                    rt['drive_started'] = now
+                last = ms.get('last_rx_monotonic')
                 driving = ms.get('have') and (
                     abs(ms.get('left_throttle', 0.0)) > 0.01
                     or abs(ms.get('right_throttle', 0.0)) > 0.01)
                 if driving:
                     rt['drive_confirmed'] = True
                 elif not rt.get('drive_confirmed'):
-                    if rt.get('drive_started') is None:
-                        rt['drive_started'] = now
-                    elif (now - rt['drive_started']) > RUDDER_TEST_DRIVE_CONFIRM_S:
+                    # Judge ONLY on a status that arrived after the boat had
+                    # time to spin up. A status from before that -- or a frozen
+                    # one -- says nothing about whether it is driving NOW, and
+                    # blaming the arm state from it sends the operator after
+                    # the wrong fault. On 2026-09-02 the boat drove correctly
+                    # while MotorStatus had stopped arriving 0.16 s into the
+                    # drive phase; this rule leaves that case to the staleness
+                    # gate, which names itself honestly.
+                    informed = (last is not None and
+                                last >= rt['drive_started'] + RUDDER_TEST_DRIVE_CONFIRM_S)
+                    if informed:
                         return self._abort_rudder_test_locked(
                             'boat is not driving — commanded %.2f, boat reports '
                             '%.2f/%.2f (check ARM)'

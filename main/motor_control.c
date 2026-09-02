@@ -158,6 +158,9 @@ static QueueHandle_t s_arm_request_queue = NULL;
 static QueueHandle_t s_arm_action_queue = NULL;
 
 static boat_MotorStatus s_status_buffers[2];
+/* When the fast control values last went out; 0 = never. Guarded by
+ * s_status_lock, same as the buffers. */
+static int64_t s_status_continuous_us = 0;
 static uint32_t s_status_generation;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uintptr_t s_status_reader_task;
@@ -525,21 +528,44 @@ static void heading_assist_dry_run_tick(void)
 #endif
 }
 
-static bool motor_status_equal(const boat_MotorStatus *a, const boat_MotorStatus *b)
+/* DISCRETE state: arm, throttle, winch, rail, and the two assist mode flags.
+ * These change rarely and matter immediately, so any difference publishes at
+ * once -- an operator must see an arm or mode change without waiting. */
+static bool motor_status_discrete_equal(const boat_MotorStatus *a,
+                                        const boat_MotorStatus *b)
 {
     return a->state == b->state &&
            a->left_throttle == b->left_throttle &&
            a->right_throttle == b->right_throttle &&
            a->winch_speed == b->winch_speed &&
            a->servo_power == b->servo_power &&
-           a->rudder_cmd == b->rudder_cmd &&
+           a->assist_rudder == b->assist_rudder &&
+           a->assist_motor_p == b->assist_motor_p;
+}
+
+/* CONTINUOUS control values, which move on essentially every 100 Hz cycle once
+ * the assisted loop is live. Treating a change in these as "publish now" put
+ * MotorStatus on the air at 100 Hz over a link carrying ~20 Hz of telemetry;
+ * it congested, MotorStatus was what got dropped, and the rudder-test
+ * staleness gate then killed both assisted runs on 2026-09-02 while the boat
+ * was in fact driving perfectly well.
+ *
+ * They still need better than the 1 Hz periodic -- the assisted CSV records
+ * them per telemetry frame -- so they publish on their own bounded schedule
+ * instead. */
+static bool motor_status_continuous_equal(const boat_MotorStatus *a,
+                                          const boat_MotorStatus *b)
+{
+    return a->rudder_cmd == b->rudder_cmd &&
            a->rudder_pulse_us == b->rudder_pulse_us &&
            a->rudder_saturated == b->rudder_saturated &&
-           a->assist_rudder == b->assist_rudder &&
-           a->assist_motor_p == b->assist_motor_p &&
            a->yaw_target_dps == b->yaw_target_dps &&
            a->yaw_filt_dps == b->yaw_filt_dps;
 }
+
+/* 10 Hz. Comfortably finer than the ~20 Hz telemetry the CSV samples against,
+ * and a tenth of the flood. */
+#define MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US 100000
 
 static void status_commit_current(bool force)
 {
@@ -565,9 +591,27 @@ static void status_commit_current(bool force)
 
     portENTER_CRITICAL(&s_status_lock);
     uint32_t generation = s_status_generation;
-    if (!force && motor_status_equal(&status, &s_status_buffers[generation & 1U])) {
-        portEXIT_CRITICAL(&s_status_lock);
-        return;
+    const boat_MotorStatus *prev = &s_status_buffers[generation & 1U];
+    if (!force) {
+        const bool discrete_same = motor_status_discrete_equal(&status, prev);
+        const bool continuous_same = motor_status_continuous_equal(&status, prev);
+        if (discrete_same && continuous_same) {
+            portEXIT_CRITICAL(&s_status_lock);
+            return;                       /* nothing moved at all */
+        }
+        if (discrete_same) {
+            /* Only the fast control values moved. Rate-limit those, or the
+             * assisted loop publishes at the 100 Hz control rate. */
+            const int64_t now = esp_timer_get_time();
+            if (s_status_continuous_us != 0 &&
+                (now - s_status_continuous_us) < MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US) {
+                portEXIT_CRITICAL(&s_status_lock);
+                return;
+            }
+            s_status_continuous_us = now;
+        }
+        /* A discrete change always publishes immediately, and resets the
+         * window so the next continuous update is measured from here. */
     }
 
     uint32_t next = generation + 1U;
