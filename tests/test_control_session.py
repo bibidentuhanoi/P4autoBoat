@@ -93,6 +93,10 @@ class SessionBase(unittest.TestCase):
         link.rudder_test = None
         link.rudder_test_result = None
         link._rudder_test_write = None
+        link.bench_run = None
+        link._bench_write = None
+        link.bench_csv_name = None
+        link.bench_dir = Path('/tmp')
         link.rudder_test_dir = Path('/tmp')
         link.seq = 0
         link.last_error = None

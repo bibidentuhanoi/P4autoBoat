@@ -340,6 +340,22 @@ RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 # first pool configuration sets to 2 deg/s -- so stick -1 asks for +2 (left)
 # and stick +1 for -2 (right).
 ASSIST_TEST_TARGET_DPS = 2.0
+# A BASE/bench run, as this laptop saw it over the radio. The boat writes its
+# own 100 Hz file to SD and that stays authoritative; this is what the link
+# actually delivered, and when the two disagree THAT is the finding -- so
+# neither may stand in for the other.
+BENCH_CSV_COLUMNS = (
+    't_mono', 'elapsed_s', 'yaw_dps', 'heading_deg',
+    # What the motors were really doing. Yaw alone cannot tell a trim result
+    # from a run the boat refused -- the same gap that made the 2026-09-02
+    # rudder runs undiagnosable until boat_state/boat_servo_power were added.
+    'boat_left', 'boat_right', 'boat_state', 'boat_servo_power',
+    'bench_state', 'bench_elapsed_s', 'bench_samples',
+    'learn_c',           # the trim learner's c, as the BOAT reports it
+    'boat_p_on',         # the boat's own P-assist state; a mismatch voids an A/B
+    'telem_age_s', 'gap_s',
+)
+
 RUDDER_TEST_CSV_COLUMNS = (
     't_mono', 'elapsed_s', 'phase', 'yaw_dps', 'heading_deg',
     'cmd_throttle', 'cmd_rudder', 'boat_left', 'boat_right',
@@ -514,6 +530,12 @@ def wrap_deg(delta):
     return ((float(delta) + 180.0) % 360.0) - 180.0
 
 
+def _r3(v):
+    """Round for a header line. None/'' pass through so a missing value stays
+    visibly missing rather than becoming a plausible 0.0."""
+    return v if not isinstance(v, float) else round(v, 3)
+
+
 def summarize_yaw(samples, aborted=False):
     """samples: list of (t_monotonic, yaw_rate_dps, heading_deg | None).
 
@@ -650,6 +672,12 @@ class BoatLink:
         # the boat's 100 Hz SD CSV is the authoritative record.
         self.bench_yaw_samples = []
         self.bench_yaw = None
+        # ...and the same run, recorded in full to a CSV on THIS computer.
+        # Independent of the boat's SD file, which stays authoritative.
+        self.bench_run = None            # rows of the run currently driving
+        self.bench_csv_name = None       # last file written, for the UI
+        self._bench_write = None         # queued CSV, flushed outside the lock
+        self.bench_dir = RUDDER_TEST_DIR
         # Automatic rudder test: one shared state machine, ticked by the 15 Hz
         # stream loop. `_now` is injectable so the tests can drive the 4.5 s
         # sequence on a fake clock instead of actually sleeping through it.
@@ -1811,6 +1839,92 @@ class BoatLink:
         self.rudder_test_result = result
         self._rudder_test_write = (rt, result)
 
+    # ---- BASE/bench run recording ---------------------------------------
+
+    def _bench_csv_path(self, kind, base):
+        """BASE / LEFT / RIGHT get DIFFERENT prefixes, for the same reason raw
+        and assisted rudder runs do: they are not the same experiment and must
+        never be pooled by a glob."""
+        name = BENCH_KIND_NAME.get(int(kind), 'BENCH%d' % int(kind))
+        stem = '%s_T%02u' % (name, int(base * 100 + 0.5))
+        directory = Path(getattr(self, 'bench_dir', RUDDER_TEST_DIR))
+        for i in range(1, 1000):
+            path = directory / ('%s_%02u.csv' % (stem, i))
+            if not path.exists():
+                return path
+        return directory / (stem + '_overflow.csv')
+
+    def _queue_bench_write_locked(self, aborted, end_state, file_index):
+        """Hand the finished run to the stream loop to write. The write itself
+        happens outside the lock, like the rudder test's, so a slow or full
+        filesystem cannot stall the command stream."""
+        run = self.bench_run
+        self.bench_run = None
+        if run is None or not run['rows']:
+            return              # a run that never drove has nothing to record
+        self._bench_write = (run, {
+            'aborted': bool(aborted),
+            'end_state': int(end_state),
+            'file_index': int(file_index),
+            'summary': self.bench_yaw,
+            'path': self._bench_csv_path(run['kind'], run['base']),
+        })
+
+    def _flush_bench_write(self):
+        """Called from _stream_loop with the lock NOT held, and by tests."""
+        pending = self._bench_write
+        if pending is None:
+            return
+        self._bench_write = None
+        run, result = pending
+        s = result['summary'] or {}
+        head = [
+            # Provenance first. It must be impossible to mistake this for the
+            # boat's own 100 Hz SD recording of the same run.
+            'laptop/radio-observed BASE run -- recorded by '
+            'tools/espnow_drive.py from ESP-NOW telemetry frames, '
+            'NOT the boat SD card',
+            'kind=%s throttle=%.2f boat_sd_file_index=%d  '
+            '(that index is the authoritative file on the boat)'
+            % (BENCH_KIND_NAME.get(run['kind'], run['kind']), run['base'],
+               result['file_index']),
+            'frames=%d mean_yaw_dps=%s peak_yaw_dps=%s span_s=%s max_gap_s=%s'
+            % (len(run['rows']), _r3(s.get('mean_yaw_dps')),
+               _r3(s.get('peak_yaw_dps')), _r3(s.get('span_s')),
+               _r3(s.get('max_gap_s'))),
+        ]
+        if result['aborted']:
+            # A tidy-looking summary of a run that never happened is the worst
+            # possible output, so this is loud and first-class.
+            head.append('ABORTED end_state=%s (%s) -- the boat cut this run '
+                        'short and saved NOTHING to SD; these frames describe '
+                        'part of a turn with no file to check them against'
+                        % (result['end_state'],
+                           BENCH_STATE_NAME.get(result['end_state'], '?')))
+        err = self._write_csv(result['path'], head, BENCH_CSV_COLUMNS,
+                              run['rows'], 'bench')
+        self.bench_csv_name = (('write failed: ' + err) if err
+                               else Path(result['path']).name)
+
+    def _write_csv(self, path, header_lines, columns, rows, label):
+        """Shared by the rudder-test and BASE-run writers: create the
+        directory, write '# ' provenance lines, then the rows -- and never let
+        a filesystem error take down the control stream."""
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w', newline='') as fh:
+                for line in header_lines:
+                    fh.write('# %s\n' % line)
+                w = csv.DictWriter(fh, fieldnames=list(columns))
+                w.writeheader()
+                for row in rows:
+                    w.writerow(row)
+            return None
+        except OSError as exc:
+            print('[%s] could not write %s: %s' % (label, path, exc),
+                  file=sys.stderr, flush=True)
+            return '%s: %s' % (type(exc).__name__, exc)
+
     def _flush_rudder_test_write(self):
         """Write the pending CSV. Called from _stream_loop with the lock NOT
         held, and directly by tests."""
@@ -1819,38 +1933,31 @@ class BoatLink:
             return
         self._rudder_test_write = None
         rt, result = pending
-        try:
-            directory = Path(getattr(self, 'rudder_test_dir', RUDDER_TEST_DIR))
-            directory.mkdir(parents=True, exist_ok=True)
-            with open(result['path'], 'w', newline='') as fh:
-                # Provenance first, so nobody can mistake this for the boat's
-                # own 100 Hz SD recording of a bench run.
-                fh.write('# laptop/radio-observed rudder test -- recorded by '
-                         'tools/espnow_drive.py from ESP-NOW telemetry frames, '
-                         'NOT the boat SD card\n')
-                fh.write('# throttle=%.2f rudder=%+.2f phases=%s\n'
-                         % (RUDDER_TEST_THROTTLE, rt['rudder'],
-                            '/'.join('%s:%.1fs' % (n, d)
-                                     for n, d, _t in RUDDER_TEST_PHASES)))
-                fh.write('# frames=%d duration_s=%.3f max_gap_s=%.3f%s\n'
-                         % (result['frames'], result['duration_s'],
-                            result['max_gap_s'],
-                            (' ABORTED=' + str(result['abort_reason']))
-                            if result['aborted'] else ''))
-                fh.write('# drive_frames=%d first_delay_s=%.3f tail_gap_s=%.3f '
-                         'span_s=%.3f max_gap_s=%.3f%s\n'
-                         % (result['drive_frames'], result['drive_first_delay_s'],
-                            result['drive_tail_gap_s'], result['drive_span_s'],
-                            result['drive_max_gap_s'],
-                            ' INCOMPLETE' if result['incomplete'] else ''))
-                w = csv.DictWriter(fh, fieldnames=list(RUDDER_TEST_CSV_COLUMNS))
-                w.writeheader()
-                for row in rt['rows']:
-                    w.writerow(row)
-        except OSError as exc:
-            result['write_error'] = '%s: %s' % (type(exc).__name__, exc)
-            print('[rudder-test] could not write %s: %s'
-                  % (result['path'], exc), file=sys.stderr, flush=True)
+        # Provenance first, so nobody can mistake this for the boat's own
+        # 100 Hz SD recording of a bench run.
+        head = [
+            'laptop/radio-observed rudder test -- recorded by '
+            'tools/espnow_drive.py from ESP-NOW telemetry frames, '
+            'NOT the boat SD card',
+            'throttle=%.2f rudder=%+.2f phases=%s'
+            % (RUDDER_TEST_THROTTLE, rt['rudder'],
+               '/'.join('%s:%.1fs' % (n, d)
+                        for n, d, _t in RUDDER_TEST_PHASES)),
+            'frames=%d duration_s=%.3f max_gap_s=%.3f%s'
+            % (result['frames'], result['duration_s'], result['max_gap_s'],
+               (' ABORTED=' + str(result['abort_reason']))
+               if result['aborted'] else ''),
+            'drive_frames=%d first_delay_s=%.3f tail_gap_s=%.3f '
+            'span_s=%.3f max_gap_s=%.3f%s'
+            % (result['drive_frames'], result['drive_first_delay_s'],
+               result['drive_tail_gap_s'], result['drive_span_s'],
+               result['drive_max_gap_s'],
+               ' INCOMPLETE' if result['incomplete'] else ''),
+        ]
+        err = self._write_csv(result['path'], head, RUDDER_TEST_CSV_COLUMNS,
+                              rt['rows'], 'rudder-test')
+        if err:
+            result['write_error'] = err
 
     def _collect_bench_yaw_locked(self, yaw_rate, heading):
         """One telemetry frame, kept only if the boat says it is DRIVING.
@@ -1869,7 +1976,39 @@ class BoatLink:
             return
         if len(self.bench_yaw_samples) >= 4000:
             return
-        self.bench_yaw_samples.append((time.monotonic(), yaw_rate, heading))
+        now = self._now()
+        self.bench_yaw_samples.append((now, yaw_rate, heading))
+
+        # ...and the same frame, in full, for the CSV. Same cap and the same
+        # RUN-only gate, so the file and the on-screen summary can never
+        # describe different sets of frames.
+        run = self.bench_run
+        if run is None:
+            return
+        bs, ms = self.bench_status, self.motor_status
+        tel_last = self.telemetry.get('last_rx_monotonic')
+        gap = (now - run['last_t']) if run['last_t'] is not None else 0.0
+        run['last_t'] = now
+        run['rows'].append({
+            't_mono': round(now, 4),
+            'elapsed_s': round(now - run['t0'], 4),
+            'yaw_dps': round(yaw_rate, 4),
+            'heading_deg': ('' if heading is None else round(heading, 3)),
+            'boat_left': ms.get('left_throttle', '') if ms.get('have') else '',
+            'boat_right': ms.get('right_throttle', '') if ms.get('have') else '',
+            'boat_state': ms.get('state', '') if ms.get('have') else '',
+            'boat_servo_power': (1 if ms.get('servo_power') else 0)
+                                if ms.get('have') else '',
+            'bench_state': bs.get('state', ''),
+            'bench_elapsed_s': round(bs.get('elapsed_s', 0.0), 4),
+            'bench_samples': bs.get('samples', ''),
+            # float32 off the wire: round, or every row carries six digits
+            # of noise that look like precision and are not.
+            'learn_c': round(bs.get('learn_c', 0.0), 6),
+            'boat_p_on': 1 if bs.get('p_on') else 0,
+            'telem_age_s': round(now - tel_last, 4) if tel_last else '',
+            'gap_s': round(gap, 4),
+        })
 
     def _handle_bench_status(self, bs):
         with self._lock:
@@ -1893,6 +2032,14 @@ class BoatLink:
             if now_driving and not was_driving:
                 self.bench_yaw_samples = []          # a new run: start clean
                 self.bench_yaw = None
+                # The boat's own RUN edge opens the recording, for the same
+                # reason it delimits the summary: guessing the phase from
+                # elapsed_s would drift, and the motors-off baseline and coast
+                # are not part of the turn.
+                self.bench_run = {
+                    't0': self._now(), 'last_t': None, 'rows': [],
+                    'kind': int(bs.kind), 'base': float(bs.base),
+                }
             elif was_driving and not now_driving:
                 # A run only ends cleanly by running out the clock, which takes
                 # it RUN -> COAST -> SAVED. Anything else leaving the drive
@@ -1909,6 +2056,8 @@ class BoatLink:
                 self.bench_yaw['kind'] = self.bench_status['kind']
                 self.bench_yaw['base'] = self.bench_status['base']
                 self.bench_yaw['end_state'] = int(bs.state)
+                self._queue_bench_write_locked(aborted, int(bs.state),
+                                               int(bs.file_index))
 
     def trigger_record(self):
         """Fire-and-forget dataset capture (Feature 1): the boat saves a
@@ -1965,6 +2114,7 @@ class BoatLink:
                 # the way live telemetry does.
                 'bench_yaw': dict(self.bench_yaw) if self.bench_yaw else None,
                 'bench_yaw_live': len(self.bench_yaw_samples),
+                'bench_csv': self.bench_csv_name,
                 # Read-only view of the rudder test. status() is hit by every
                 # browser poll, so it must never touch rudder_test['rows'].
                 'rudder_test': ({
@@ -2103,6 +2253,7 @@ class BoatLink:
             # File I/O deliberately outside the lock -- a few ms of CSV write
             # must never sit inside the 15 Hz command loop's critical section.
             self._flush_rudder_test_write()
+            self._flush_bench_write()
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -2299,6 +2450,7 @@ class BoatLink:
     def shutdown(self):
         self.disconnect()
         self._flush_rudder_test_write()   # the abort above may have queued one
+        self._flush_bench_write()
         self._stop.set()
 
 
@@ -2506,7 +2658,8 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Yaw angle</label><span class="val" id="bench-yaw-angle">--</span></div>
   <div class="telem-row"><label>Heading &#916;</label><span class="val" id="bench-yaw-hdg">--</span></div>
   <div class="telem-row"><label>Samples</label><span class="val" id="bench-yaw-n">--</span></div>
-  <div id="bench-yaw-note" style="font-size:10px;color:var(--dim);">UI-observed / approximate &mdash; the boat's SD CSV is authoritative.</div>
+  <div class="telem-row"><label>Saved CSV</label><span class="val" id="bench-csv">--</span></div>
+  <div id="bench-yaw-note" style="font-size:10px;color:var(--dim);">UI-observed / approximate &mdash; the boat's SD CSV is authoritative. This laptop also saves its own radio-observed CSV to dataout/.</div>
   <div id="bench-msg" style="font-size:10px;color:var(--warn);">boat records to its own SD card; DISARM stops a run. RESET is one-shot &mdash; ordinary BASE runs keep the learned c.</div>
 </div>
 
@@ -3359,6 +3512,11 @@ function applyStatus(s) {
         refreshBenchPreview();
       }
     }
+
+    // The laptop-side CSV of the last completed run. Outside the bench_yaw
+    // guard on purpose: a run can be written and still have no usable summary,
+    // and the file is exactly what you want to open when that happens.
+    $('bench-csv').textContent = s.bench_csv || '--';
 
     // ---- UI-observed yaw summary of the last completed drive phase ----------
     const by = s.bench_yaw;

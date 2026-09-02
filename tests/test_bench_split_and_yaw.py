@@ -33,6 +33,7 @@ class here guards that.
 import importlib.util
 import math
 import re
+import time
 import unittest
 from pathlib import Path
 
@@ -443,8 +444,16 @@ class AbortTransitionTest(unittest.TestCase):
         self.link = T.BoatLink.__new__(T.BoatLink)
         self.link._lock = __import__('threading').RLock()
         self.link.bench_status = T.BoatLink._blank_bench_status()
+        self.link.motor_status = T.BoatLink._blank_motor_status()
+        self.link.telemetry = T.BoatLink._blank_telemetry()
+        self.link._now = __import__('time').monotonic
         self.link.bench_yaw_samples = []
         self.link.bench_yaw = None
+        # The BASE-run CSV recorder rides the same lifecycle edges.
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = __import__('pathlib').Path('/tmp')
 
     def _drive_then(self, end_state, n=60):
         self.link._handle_bench_status(self._Bs(T.BENCH_STATE_RUN))
@@ -491,8 +500,16 @@ class CollectionGatingTest(unittest.TestCase):
         self.link = T.BoatLink.__new__(T.BoatLink)
         self.link._lock = __import__('threading').RLock()
         self.link.bench_status = T.BoatLink._blank_bench_status()
+        self.link.motor_status = T.BoatLink._blank_motor_status()
+        self.link.telemetry = T.BoatLink._blank_telemetry()
+        self.link._now = __import__('time').monotonic
         self.link.bench_yaw_samples = []
         self.link.bench_yaw = None
+        # The BASE-run CSV recorder rides the same lifecycle edges.
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = __import__('pathlib').Path('/tmp')
 
     def _state(self, state):
         self.link.bench_status = dict(self.link.bench_status,

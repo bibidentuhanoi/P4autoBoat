@@ -53,6 +53,10 @@ class BridgeStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -141,6 +145,10 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -269,6 +277,10 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -628,6 +640,10 @@ class ActuatorApiSafetyTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -920,6 +936,10 @@ class BenchRunLinkTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -1072,6 +1092,10 @@ class FieldTelemetryYawRateTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -1173,6 +1197,10 @@ class BenchLearnerResetTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
@@ -1359,6 +1387,10 @@ class PAssistConfirmTest(unittest.TestCase):
         self.link.rudder_test = None
         self.link.rudder_test_result = None
         self.link._rudder_test_write = None
+        self.link.bench_run = None
+        self.link._bench_write = None
+        self.link.bench_csv_name = None
+        self.link.bench_dir = Path('/tmp')
         self.link._now = espnow_drive.time.monotonic
         self.link.session_id = None
         self.link.session_seq = 0
