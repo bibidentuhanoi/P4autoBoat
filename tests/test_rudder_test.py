@@ -1270,6 +1270,157 @@ class AssistedSafetyOrderingTest(RudderTestBase):
         self.assertIn('boat_target_dps', rows[0])
 
 
+class NotDrivingTest(RudderTestBase):
+    """The fault that actually killed both assisted runs on 2026-09-02: the
+    boat reported zero throttle for the whole drive phase while the tool
+    commanded T20, and the run only failed 2 s later on a staleness timeout
+    that named the wrong cause."""
+
+    def _drive_reporting(self, left, right, seconds=3.0):
+        """Run into the drive phase with the boat reporting this throttle."""
+        self.assertTrue(self._start()[0])
+        t0 = self.clock.t
+        i = 0
+        while self.link.rudder_test is not None and i * 0.05 < seconds:
+            i += 1
+            self.clock.t = t0 + i * 0.05
+            self.link.motor_status = dict(
+                self.link.motor_status, have=True, state=2, servo_power=True,
+                left_throttle=left, right_throttle=right,
+                last_rx_monotonic=self.clock.t)
+            self._tick()
+        return self.link.rudder_test
+
+    def test_a_boat_that_never_drives_aborts_with_an_accurate_reason(self):
+        self.assertIsNone(self._drive_reporting(0.0, 0.0))
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        self.assertTrue(res['aborted'])
+        reason = res['abort_reason'].lower()
+        self.assertIn('not driving', reason)
+        self.assertIn('arm', reason)
+        self.assertNotIn('stale', reason)
+
+    def test_it_aborts_promptly_rather_than_recording_a_useless_run(self):
+        """The old behaviour recorded 2 s of a drifting boat before failing."""
+        self._drive_reporting(0.0, 0.0)
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        # settle 0.5 + at most the confirm window, well short of the full 4.5 s
+        self.assertLess(res['duration_s'],
+                        0.5 + T.RUDDER_TEST_DRIVE_CONFIRM_S + 0.4)
+
+    def test_a_driving_boat_is_not_aborted(self):
+        rt = self._drive_reporting(0.18, 0.22, seconds=2.0)
+        self.assertIsNotNone(rt, 'a driving boat must not trip the check')
+        self.assertTrue(rt['drive_confirmed'])
+
+    def test_spin_up_latency_is_tolerated(self):
+        """Zero for the first moments is the ESCs coming up, not a fault."""
+        self.assertTrue(self._start()[0])
+        t0 = self.clock.t
+        for i in range(1, 40):                      # into the drive phase
+            self.clock.t = t0 + i * 0.05
+            late = (self.clock.t - t0) > 1.2        # reports late, but reports
+            self.link.motor_status = dict(
+                self.link.motor_status, have=True, state=2, servo_power=True,
+                left_throttle=0.18 if late else 0.0,
+                right_throttle=0.22 if late else 0.0,
+                last_rx_monotonic=self.clock.t)
+            self._tick()
+            self.assertIsNotNone(self.link.rudder_test,
+                                 'aborted during normal spin-up latency')
+
+    def test_a_boat_that_stops_driving_mid_run_is_not_re_flagged(self):
+        """Once confirmed, a momentary zero report is a lost packet, not a
+        disarm -- the arm and staleness gates cover a real disarm."""
+        self._start()
+        t0 = self.clock.t
+        for i in range(1, 45):
+            self.clock.t = t0 + i * 0.05
+            drop = 1.5 < (self.clock.t - t0) < 2.5
+            self.link.motor_status = dict(
+                self.link.motor_status, have=True, state=2, servo_power=True,
+                left_throttle=0.0 if drop else 0.18,
+                right_throttle=0.0 if drop else 0.22,
+                last_rx_monotonic=self.clock.t)
+            self._tick()
+        self.assertIsNotNone(self.link.rudder_test)
+
+    def test_the_settle_and_coast_phases_are_not_checked(self):
+        """They command zero throttle, so a zero report is correct there."""
+        self.assertTrue(self._start()[0])
+        t0 = self.clock.t
+        for i in range(1, 9):                       # 0.05 .. 0.40 s, settle
+            self.clock.t = t0 + i * 0.05
+            self._boat_armed(fresh=True)
+            self._tick()
+            self.assertIsNotNone(self.link.rudder_test)
+
+
+class MotorStatusFreshnessTest(RudderTestBase):
+    """MotorStatus is published on CHANGE or once a second, whichever comes
+    first. On a stopped boat -- the state this gate checks -- that is 1 Hz."""
+
+    def test_the_allowance_is_not_the_telemetry_limit(self):
+        """Reusing TELEMETRY_STALE_S meant two lost packets aborted a run."""
+        self.assertGreater(T.RUDDER_TEST_STATUS_MAX_AGE_S, T.TELEMETRY_STALE_S)
+        self.assertGreaterEqual(T.RUDDER_TEST_STATUS_MAX_AGE_S, 3.0)
+
+    def test_two_lost_packets_at_one_hz_no_longer_abort(self):
+        self.assertTrue(self._start()[0])
+        self.clock.advance(2.2)          # would have aborted before
+        self._tick()
+        self.assertIsNotNone(self.link.rudder_test)
+
+    def test_a_genuinely_dead_status_still_aborts(self):
+        self.assertTrue(self._start()[0])
+        self.clock.advance(T.RUDDER_TEST_STATUS_MAX_AGE_S + 0.5)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.link._flush_rudder_test_write()
+        self.assertIn('stale',
+                      self.link.rudder_test_result['abort_reason'].lower())
+
+
+class ArmStateLoggedTest(RudderTestBase):
+    """The two columns whose absence made 2026-09-02 undiagnosable from the
+    file alone: boat_left/right were 0.0 all through the drive phase and there
+    was no way to tell "disarmed" from "armed but refusing"."""
+
+    def test_the_row_carries_the_boat_arm_state_and_rail(self):
+        self._start()
+        self.clock.advance(1.0)
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      state=2, servo_power=True,
+                                      left_throttle=0.18, right_throttle=0.22,
+                                      last_rx_monotonic=self.clock.t)
+        self._tick()
+        self._frame()
+        row = self.link.rudder_test['rows'][-1]
+        self.assertEqual(row['boat_state'], 2)
+        self.assertEqual(row['boat_servo_power'], 1)
+
+    def test_a_disarmed_boat_is_visible_in_the_row(self):
+        self._start()
+        self.clock.advance(0.2)
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      state=0, servo_power=False,
+                                      last_rx_monotonic=self.clock.t)
+        self._frame()
+        row = self.link.rudder_test['rows'][-1]
+        self.assertEqual(row['boat_state'], 0)
+        self.assertEqual(row['boat_servo_power'], 0)
+
+    def test_both_columns_reach_the_csv(self):
+        self._start()
+        res = self._run_to_completion()
+        rows = read_rudder_csv(res['path'])
+        self.assertIn('boat_state', rows[0])
+        self.assertIn('boat_servo_power', rows[0])
+
+
 class MutualExclusionTest(RudderTestBase):
     """Motor P assist and Assisted Steering must never both be on: one
     perturbs differential thrust and the other the rudder, and a result with

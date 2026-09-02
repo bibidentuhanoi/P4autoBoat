@@ -271,10 +271,23 @@ RUDDER_TEST_PHASES = (
     ('coast',         1.0, 0.0),   # motors off, rudder still over: residual yaw
 )
 RUDDER_TEST_TOTAL_S = sum(d for _n, d, _t in RUDDER_TEST_PHASES)
-# The boat's MotorStatus must be this fresh to count as confirmation. This IS a
-# liveness question -- "is the boat still telling us it is armed" -- so it
-# reuses the general telemetry limit rather than the tighter bench gap.
-RUDDER_TEST_STATUS_MAX_AGE_S = TELEMETRY_STALE_S
+# The boat's MotorStatus must be this fresh to count as confirmation.
+#
+# NOT TELEMETRY_STALE_S. That is 2.0 s and is tuned for the ~20 Hz telemetry
+# stream, where 2 s is forty missed frames. MotorStatus is published by
+# task_runtime_diagnostics on CHANGE or once a second, whichever comes first
+# (runtime_metrics.c), so on a boat whose motors are stopped -- exactly the
+# state this gate is checking -- it arrives at 1 Hz and nothing more.
+#
+# Borrowing the 2 s limit therefore meant TWO lost packets aborted a run, which
+# over a lossy ESP-NOW link is close to inevitable: it killed both assisted
+# runs on 2026-09-02, reporting "boat status is stale" while the real fault was
+# elsewhere. 3.5 s tolerates three consecutive misses at the 1 Hz cadence.
+#
+# Relaxing it costs nothing in safety because the direct check below --
+# "is the boat actually driving" -- catches the real fault faster and says
+# what it is, instead of inferring it from a missing packet.
+RUDDER_TEST_STATUS_MAX_AGE_S = 3.5
 # A hole longer than this in the received frames means the recording cannot
 # describe the turn. Same reasoning (and value) as the bench summary.
 RUDDER_TEST_MAX_GAP_S = BENCH_YAW_MAX_GAP_S
@@ -284,6 +297,12 @@ RUDDER_TEST_MAX_GAP_S = BENCH_YAW_MAX_GAP_S
 RUDDER_TEST_DRIVE_S = dict((n, d) for n, d, _t in RUDDER_TEST_PHASES)['drive']
 RUDDER_TEST_MIN_DRIVE_COVERAGE = 0.8    # of the 3 s drive window
 RUDDER_TEST_MIN_DRIVE_FRAMES = 20       # ~20 Hz over 3 s should give ~60
+# How long the boat may report zero throttle while the drive phase is
+# commanding T20 before the run is abandoned. Covers the command reaching the
+# boat, the ESCs spinning up and a MotorStatus coming back at 1 Hz -- so it has
+# to clear one full publish interval with margin. Anything longer than this is
+# not latency, it is a boat that is not driving (almost always: not armed).
+RUDDER_TEST_DRIVE_CONFIRM_S = 1.5
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 # Assisted Steering: the same 0.5/3.0/1.0 profile, but instead of holding a
 # fixed rudder it hands the boat a yaw-rate TARGET and lets the firmware's
@@ -304,6 +323,11 @@ RUDDER_TEST_CSV_COLUMNS = (
     'boat_saturated',    # the loop's output cap bound it
     'boat_assist_on',    # the BOAT's own answer, not what we asked for
     'boat_target_dps',   # the target the BOAT says its loop is holding
+    # The two fields that would have diagnosed the 2026-09-02 runs outright.
+    # boat_left/boat_right showed 0.0 all through the drive phase and there was
+    # no way to tell "disarmed" from "armed but refusing" without them.
+    'boat_state',        # esc_state_t: 0 disarmed, 1 arming, 2 armed
+    'boat_servo_power',  # servo rail actually powered, as the boat reports it
 )
 
 
@@ -1140,6 +1164,7 @@ class BoatLink:
                 't0': now, 'phase': RUDDER_TEST_PHASES[0][0],
                 'rows': [], 'name': name, 'path': str(path),
                 'last_frame_mono': None, 'max_gap_s': 0.0,
+                'drive_started': None, 'drive_confirmed': False,
             }
             self.rudder_test_result = None
             self.throttle = 0.0
@@ -1254,6 +1279,9 @@ class BoatLink:
             # holding. They should agree -- and when they do not, that IS the
             # finding, so neither may stand in for the other.
             'boat_target_dps': ms.get('yaw_target_dps', '') if ms.get('have') else '',
+            'boat_state': ms.get('state', '') if ms.get('have') else '',
+            'boat_servo_power': (1 if ms.get('servo_power') else 0)
+                                if ms.get('have') else '',
         })
 
     def _rudder_test_tick_locked(self, now):
@@ -1275,6 +1303,30 @@ class BoatLink:
             phase = rudder_test_phase_at(now - rt['t0'])
             if phase is None:
                 return self._finish_rudder_test_locked(aborted=False, reason=None)
+
+            # Is the boat DOING what the drive phase is asking? Commanding T20
+            # and getting zero back means the boat is refusing -- disarmed, or
+            # the firmware's safe_stop branch, which also pins the steering
+            # command to zero and so silently flattens an assisted target too.
+            # Both assisted runs on 2026-09-02 recorded 2 s of exactly that and
+            # only failed later, on a staleness timeout that named the wrong
+            # cause. Catch it directly and say so.
+            if phase[0] == 'drive' and phase[1] > 0.0:
+                ms = self.motor_status
+                driving = ms.get('have') and (
+                    abs(ms.get('left_throttle', 0.0)) > 0.01
+                    or abs(ms.get('right_throttle', 0.0)) > 0.01)
+                if driving:
+                    rt['drive_confirmed'] = True
+                elif not rt.get('drive_confirmed'):
+                    if rt.get('drive_started') is None:
+                        rt['drive_started'] = now
+                    elif (now - rt['drive_started']) > RUDDER_TEST_DRIVE_CONFIRM_S:
+                        return self._abort_rudder_test_locked(
+                            'boat is not driving — commanded %.2f, boat reports '
+                            '%.2f/%.2f (check ARM)'
+                            % (phase[1], ms.get('left_throttle', 0.0),
+                               ms.get('right_throttle', 0.0)))
             rt['phase'] = phase[0]
             self.throttle = phase[1]
             self.motor_split = False
