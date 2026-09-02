@@ -611,14 +611,15 @@ static void status_commit_current(bool force)
             }
         }
         /* A discrete change is never withheld -- an operator must see an arm
-         * or mode change at once. Either way we are about to publish, so the
-         * budget is measured from the last thing that actually went on the
-         * air. Stamping it only on the continuous path (the first version of
-         * this) left a stale mark behind every discrete publish, so the next
-         * continuous change slipped out immediately and the comment claiming
-         * otherwise was simply false. */
-        s_status_continuous_us = esp_timer_get_time();
+         * or mode change at once. */
     }
+
+    /* Stamped on EVERY publish, forced ones included, because the budget is
+     * measured from what actually went on the air. Stamping it only on the
+     * continuous path left a stale mark behind every discrete publish; leaving
+     * it inside `if (!force)` left one behind every forced publish. Both let
+     * the next continuous update slip out ahead of its turn. */
+    s_status_continuous_us = esp_timer_get_time();
 
     uint32_t next = generation + 1U;
     s_status_buffers[next & 1U] = status;

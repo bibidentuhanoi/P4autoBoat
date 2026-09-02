@@ -112,8 +112,29 @@ class RudderTestBase(unittest.TestCase):
         link.pb2 = T.load_boat_pb2()
         link._close_locked = lambda: setattr(link, 'connected', False)
         # Every command the sequence emits lands here instead of a serial port.
-        link._write_locked = lambda payload: (self.writes.append(payload),
-                                              self.write_ok)[1]
+        # The fake boat ACKNOWLEDGES an assist-mode change by reflecting it
+        # into MotorStatus, which is what a real one does -- assist_rudder is
+        # in the immediate-publish set, so the answer comes back promptly. Set
+        # self.boat_acks_assist False to model a boat that never confirms.
+        self.boat_acks_assist = True
+        pb2_ack = T.load_boat_pb2()
+
+        def _write(payload):
+            self.writes.append(payload)
+            if self.boat_acks_assist:
+                msg = pb2_ack.BoatMessage()
+                try:
+                    msg.ParseFromString(payload)
+                except Exception:                     # noqa: BLE001
+                    return self.write_ok
+                if msg.WhichOneof('payload') == 'assist':
+                    link.motor_status = dict(
+                        link.motor_status, have=True,
+                        assist_rudder=bool(msg.assist.rudder_assist),
+                        assist_motor_p=bool(msg.assist.p_on),
+                        last_rx_monotonic=self.clock.t)
+            return self.write_ok
+        link._write_locked = _write
         self.link = link
         self._boat_armed(fresh=True)
 
@@ -143,11 +164,17 @@ class RudderTestBase(unittest.TestCase):
                                        last_rx_monotonic=self.clock.t)
             self.link._collect_rudder_test_row_locked(yaw, heading, self.clock.t)
 
+    def _settle_ack(self):
+        """One tick, which is where an assisted run's profile clock starts:
+        the boat has acknowledged the mode and t0 is set from that moment."""
+        self._tick()
+
     def _run_to_completion(self, dt=1.0 / 15.0, frame_every=3):
         """Drive the sequence at the real 15 Hz tick with ~5 Hz telemetry."""
         if self.link.rudder_test is None:
             ok, err = self._start(seq=self.link.winch_command_seq + 1)
             self.assertTrue(ok, err)
+        self._settle_ack()
         i = 0
         while self.link.rudder_test is not None:
             self.clock.advance(dt)
@@ -1007,6 +1034,7 @@ class AssistedModeTest(RudderTestBase):
 
     def test_it_turns_the_loop_off_on_an_abort_too(self):
         self._assisted()
+        self._settle_ack()
         self.clock.advance(1.0)
         self._tick()
         self.link.stop(self.link.winch_command_seq + 1)
@@ -1017,6 +1045,7 @@ class AssistedModeTest(RudderTestBase):
         """Stick -1 is LEFT, which the firmware turns into a POSITIVE yaw
         target -- physical left produces positive IMU yaw on this boat."""
         self._assisted(sign=-1)
+        self._settle_ack()
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
@@ -1027,6 +1056,7 @@ class AssistedModeTest(RudderTestBase):
 
     def test_right_commands_full_right_stick(self):
         self._assisted(sign=+1)
+        self._settle_ack()
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
@@ -1039,6 +1069,7 @@ class AssistedModeTest(RudderTestBase):
         on, and the coast must not keep asking for a turn the jets can no
         longer produce -- that would wind the rudder over with no authority."""
         self._assisted(sign=-1)
+        self._settle_ack()
         seen = {}
         for i in range(120):
             self.clock.advance(0.05)
@@ -1066,6 +1097,7 @@ class AssistedModeTest(RudderTestBase):
 
     def test_the_rows_carry_the_mode_and_the_boat_reported_loop_state(self):
         self._assisted(sign=-1)
+        self._settle_ack()
         self.clock.advance(1.0)
         self.link.motor_status = dict(self.link.motor_status,
                                       rudder_cmd=-0.42, rudder_pulse_us=1700,
@@ -1130,6 +1162,15 @@ class AssistedSafetyOrderingTest(RudderTestBase):
             if which == 'assist':
                 self.sent.append(('assist', msg.assist.p_on,
                                   msg.assist.rudder_assist))
+                # Acknowledge, exactly as the base fixture's boat does --
+                # without this the run never leaves the pre-confirmation wait
+                # and there is no ordering to observe.
+                if self.boat_acks_assist:
+                    self.link.motor_status = dict(
+                        self.link.motor_status, have=True,
+                        assist_rudder=bool(msg.assist.rudder_assist),
+                        assist_motor_p=bool(msg.assist.p_on),
+                        last_rx_monotonic=self.clock.t)
             elif which == 'steer':
                 self.sent.append(('steer', round(msg.steer.left, 4)))
             elif which == 'motor':
@@ -1150,6 +1191,7 @@ class AssistedSafetyOrderingTest(RudderTestBase):
 
     def test_the_stick_stays_zero_for_the_whole_settle_phase(self):
         self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
         t0 = self.clock.t
         for i in range(1, 25):                      # 0.05 .. 1.20 s
             self.clock.t = t0 + i * 0.05
@@ -1177,6 +1219,7 @@ class AssistedSafetyOrderingTest(RudderTestBase):
         steering command -- full rudder, hard over. Disabling first left a
         one-tick window of exactly that on every abort."""
         self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
@@ -1197,6 +1240,7 @@ class AssistedSafetyOrderingTest(RudderTestBase):
 
     def test_zero_throttle_is_also_sent_before_the_mode_change(self):
         self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self._tick()
@@ -1233,6 +1277,7 @@ class AssistedSafetyOrderingTest(RudderTestBase):
 
     def test_a_completed_run_zeroes_before_the_mode_change_too(self):
         self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
         while self.link.rudder_test is not None:
             self.clock.advance(1.0 / 15.0)
             self._boat_armed(fresh=True)
@@ -1251,6 +1296,7 @@ class AssistedSafetyOrderingTest(RudderTestBase):
         """They should agree -- and when they do not, that IS the finding, so
         neither may stand in for the other."""
         self.link.start_rudder_test(-1, 1, assisted=True)
+        self._settle_ack()
         self.clock.advance(1.0)
         self._boat_armed(fresh=True)
         self.link.motor_status = dict(self.link.motor_status,
@@ -1441,6 +1487,163 @@ class ArmStateLoggedTest(RudderTestBase):
         rows = read_rudder_csv(res['path'])
         self.assertIn('boat_state', rows[0])
         self.assertIn('boat_servo_power', rows[0])
+
+
+class AssistAcknowledgementTest(RudderTestBase):
+    """The stick may never leave zero on the strength of what we ASKED for.
+
+    In Assisted mode -1.0 means +2 deg/s and the firmware turns it into a few
+    tenths of rudder. If the boat is not in that mode, the identical -1.0 is a
+    RAW steering command: FULL RUDDER, hard over. So only the boat's own
+    assist_rudder makes +/-1 safe to send."""
+
+    def _sticks(self):
+        return {round(s, 3) for s in self._stick_trace}
+
+    def _run(self, ticks=60, ack=True, drop_at=None):
+        self._stick_trace = []
+        self.boat_acks_assist = ack
+        ok, err = self.link.start_rudder_test(-1, 1, assisted=True)
+        self.assertTrue(ok, err)
+        t0 = self.clock.t
+        for i in range(1, ticks + 1):
+            self.clock.t = t0 + i * 0.05
+            if drop_at is not None and (self.clock.t - t0) >= drop_at:
+                self.link.motor_status = dict(self.link.motor_status,
+                                              assist_rudder=False,
+                                              last_rx_monotonic=self.clock.t)
+            else:
+                self._boat_armed(fresh=True)
+                if ack:
+                    self.link.motor_status = dict(self.link.motor_status,
+                                                  assist_rudder=True,
+                                                  last_rx_monotonic=self.clock.t)
+            self._tick()
+            self._stick_trace.append(self.link.rudder)
+            if self.link.rudder_test is None:
+                break
+
+    # ---- the invariant ---------------------------------------------------
+
+    def test_full_stick_is_never_sent_before_the_boat_confirms(self):
+        self._run(ticks=80, ack=False)
+        self.assertEqual(self._sticks(), {0.0},
+                         'a rate demand went out while the boat was in raw '
+                         'mode -- that is full rudder, hard over')
+
+    def test_the_throttle_also_stays_at_zero_before_confirmation(self):
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        t0 = self.clock.t
+        for i in range(1, 30):
+            self.clock.t = t0 + i * 0.05
+            self._boat_armed(fresh=True)
+            self._tick()
+            if self.link.rudder_test is None:
+                break
+            self.assertEqual(self.link.throttle, 0.0)
+
+    def test_the_profile_clock_does_not_start_until_confirmation(self):
+        """Otherwise the 0.5 s settle would be spent waiting, and the drive
+        phase would open with the loop possibly not yet running."""
+        self.boat_acks_assist = False
+        self.link.start_rudder_test(-1, 1, assisted=True)
+        self.assertIsNone(self.link.rudder_test['t0'])
+        self.assertEqual(self.link.rudder_test['phase'], 'awaiting_assist')
+        self.clock.advance(0.5)
+        self._boat_armed(fresh=True)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test['t0'], 'clock started unacked')
+        # now the boat confirms
+        self.boat_acks_assist = True
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      assist_rudder=True, state=2,
+                                      servo_power=True,
+                                      last_rx_monotonic=self.clock.t)
+        self._tick()
+        self.assertIsNotNone(self.link.rudder_test['t0'])
+        self.assertEqual(self.link.rudder_test['phase'], 'rudder_settle')
+
+    def test_a_confirmed_run_does_command_full_stick(self):
+        """The gate must not be so strict that it never lets a good run go."""
+        self._run(ticks=80, ack=True)
+        self.assertIn(-1.0, self._sticks())
+
+    # ---- staleness of the confirmation ----------------------------------
+
+    def test_a_leftover_confirmation_from_before_the_request_is_not_accepted(self):
+        """A status that arrived BEFORE we asked cannot be an answer to it."""
+        self.boat_acks_assist = False
+        self.link.motor_status = dict(self.link.motor_status, have=True,
+                                      state=2, servo_power=True,
+                                      assist_rudder=True,
+                                      last_rx_monotonic=self.clock.t)
+        self.clock.advance(0.1)          # request happens AFTER that status
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.clock.advance(0.1)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test['t0'],
+                          'a stale confirmation started the profile')
+
+    # ---- timeout ---------------------------------------------------------
+
+    def test_it_aborts_when_confirmation_never_arrives(self):
+        self._run(ticks=120, ack=False)
+        self.assertIsNone(self.link.rudder_test)
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        self.assertTrue(res['aborted'])
+        self.assertIn('never confirmed', res['abort_reason'].lower())
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertEqual(self.link.throttle, 0.0)
+
+    def test_the_timeout_is_generous_against_one_radio_round_trip(self):
+        self.assertGreaterEqual(T.RUDDER_TEST_ASSIST_ACK_S, 1.0)
+
+    # ---- losing the mode mid-run ----------------------------------------
+
+    def test_it_aborts_if_assisted_mode_drops_during_the_run(self):
+        """Every command in flight would be reinterpreted as raw steering."""
+        self._run(ticks=80, ack=True, drop_at=1.2)
+        self.assertIsNone(self.link.rudder_test)
+        self.link._flush_rudder_test_write()
+        res = self.link.rudder_test_result
+        self.assertTrue(res['aborted'])
+        self.assertIn('dropped out', res['abort_reason'].lower())
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertEqual(self.link.throttle, 0.0)
+
+    def test_no_full_stick_survives_the_drop(self):
+        self._run(ticks=80, ack=True, drop_at=1.2)
+        self.assertEqual(self.link.rudder, 0.0)
+
+    # ---- raw runs are untouched -----------------------------------------
+
+    def test_the_second_layer_is_present_though_unreachable(self):
+        """Honest note: these two guards CANNOT be reached while the gate above
+        works, so no behavioural test can kill a mutation that removes them --
+        and mutation testing confirms exactly that. They are kept anyway,
+        because the hazard is full rudder hard over, and pinned here at source
+        level so a later edit cannot quietly delete them.
+
+        If you change the gate, do not trust this file to catch it."""
+        src = TOOL.read_text()
+        tick = src[src.index('def _rudder_test_tick_locked'):]
+        tick = tick[:tick.index('\n    def ')]
+        assert "if (phase[0] == 'drive' and confirmed) else 0.0)" in tick, (
+            "the stick assignment no longer carries the confirmation guard")
+        wait = tick.split("if rt['t0'] is None:", 1)[1].split('return', 1)[0]
+        for held in ('self.throttle = 0.0', 'self.rudder = 0.0'):
+            assert held in wait, (
+                'the pre-confirmation wait no longer holds %s' % held)
+
+    def test_a_raw_run_needs_no_acknowledgement(self):
+        """Raw runs never send a rate demand, so there is nothing to confirm."""
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1)[0])
+        self.assertIsNotNone(self.link.rudder_test['t0'])
+        self.assertAlmostEqual(self.link.rudder, -T.RUDDER_TEST_DEFLECTION)
 
 
 class MutualExclusionTest(RudderTestBase):

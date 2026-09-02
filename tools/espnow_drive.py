@@ -303,6 +303,10 @@ RUDDER_TEST_MIN_DRIVE_FRAMES = 20       # ~20 Hz over 3 s should give ~60
 # to clear one full publish interval with margin. Anything longer than this is
 # not latency, it is a boat that is not driving (almost always: not armed).
 RUDDER_TEST_DRIVE_CONFIRM_S = 1.5
+# How long to wait for the BOAT to confirm Assisted Steering before giving up.
+# assist_rudder is in MotorStatus's immediate-publish set, so a healthy boat
+# acknowledges within one radio round trip; 2 s is many times that.
+RUDDER_TEST_ASSIST_ACK_S = 2.0
 RUDDER_TEST_DIR = Path('/workspaces/BoatEspP4/dataout')
 # Assisted Steering: the same 0.5/3.0/1.0 profile, but instead of holding a
 # fixed rudder it hands the boat a yaw-rate TARGET and lets the firmware's
@@ -1152,6 +1156,10 @@ class BoatLink:
 
             now = self._now()
             name, path = self._next_rudder_test_path(sign, assisted)
+            # An assisted run's profile clock does not start until the boat has
+            # confirmed the mode. Until then t0 is None, every phase lookup is
+            # skipped, and the stick stays at zero.
+            ack_deadline = (now + RUDDER_TEST_ASSIST_ACK_S) if assisted else None
             self.rudder_test = {
                 'sign': int(sign),
                 'assisted': bool(assisted),
@@ -1161,7 +1169,11 @@ class BoatLink:
                            else float(sign) * RUDDER_TEST_DEFLECTION),
                 'target_dps': (-float(sign) * ASSIST_TEST_TARGET_DPS
                                if assisted else 0.0),
-                't0': now, 'phase': RUDDER_TEST_PHASES[0][0],
+                't0': (None if assisted else now),
+                'phase': ('awaiting_assist' if assisted
+                          else RUDDER_TEST_PHASES[0][0]),
+                'assist_sent_at': now if assisted else None,
+                'ack_deadline': ack_deadline,
                 'rows': [], 'name': name, 'path': str(path),
                 'last_frame_mono': None, 'max_gap_s': 0.0,
                 'drive_started': None, 'drive_confirmed': False,
@@ -1236,6 +1248,10 @@ class BoatLink:
         if rt is None:
             return
         now = self._now() if now is None else now
+        if rt['t0'] is None:
+            # Still waiting for the boat to confirm Assisted mode. Nothing is
+            # being commanded yet, so there is no run to record against.
+            return
         elapsed = now - rt['t0']
         phase = rudder_test_phase_at(elapsed)
         gap = 0.0 if rt['last_frame_mono'] is None else (now - rt['last_frame_mono'])
@@ -1300,6 +1316,43 @@ class BoatLink:
             if not ok:
                 return self._abort_rudder_test_locked(why)
 
+            # ---- Assisted mode must be CONFIRMED before the profile runs ----
+            #
+            # In Assisted mode the stick is a yaw-RATE demand: -1.0 means
+            # +2 deg/s. If the boat is NOT in that mode, the identical -1.0 is
+            # a RAW steering command -- full rudder, hard over. So the stick
+            # may never leave zero on the word of what we asked for; only the
+            # boat's own assist_rudder makes it safe.
+            if rt.get('assisted'):
+                ms = self.motor_status
+                last = ms.get('last_rx_monotonic')
+                # The confirmation must have ARRIVED after we asked, or a
+                # leftover status from a previous run could satisfy it.
+                confirmed = (ms.get('have') and ms.get('assist_rudder')
+                             and last is not None
+                             and last >= rt['assist_sent_at'])
+                if rt['t0'] is None:
+                    if confirmed:
+                        rt['t0'] = now          # profile starts here, not before
+                        rt['phase'] = RUDDER_TEST_PHASES[0][0]
+                    else:
+                        # Held at zero throughout the wait -- see above.
+                        self.throttle = 0.0
+                        self.motor_split = False
+                        self.rudder = 0.0
+                        if now >= rt['ack_deadline']:
+                            return self._abort_rudder_test_locked(
+                                'boat never confirmed Assisted Steering '
+                                '(waited %.1f s) — not sending a rate demand '
+                                'the boat would read as full rudder'
+                                % RUDDER_TEST_ASSIST_ACK_S)
+                        return
+                elif not confirmed:
+                    # It dropped mid-run. Everything we are commanding would be
+                    # reinterpreted as raw steering, so stop now.
+                    return self._abort_rudder_test_locked(
+                        'boat dropped out of Assisted Steering mid-run')
+
             phase = rudder_test_phase_at(now - rt['t0'])
             if phase is None:
                 return self._finish_rudder_test_locked(aborted=False, reason=None)
@@ -1352,7 +1405,15 @@ class BoatLink:
                 # the loop holding straight before the motors come on, and the
                 # coast must not keep asking for a turn the jets can no longer
                 # produce -- that would wind the rudder over with no authority.
-                self.rudder = rt['rudder'] if phase[0] == 'drive' else 0.0
+                # `confirmed` is re-asserted here deliberately. The gate
+                # above already returns unless the boat is in Assisted mode, so
+                # this cannot fire today -- it is here so that the ONE
+                # assignment capable of putting +/-1 on the wire carries the
+                # condition that makes +/-1 mean 2 deg/s rather than FULL
+                # RUDDER. Any future edit that reorders the gate must defeat
+                # this too.
+                self.rudder = (rt['rudder']
+                               if (phase[0] == 'drive' and confirmed) else 0.0)
             else:
                 self.rudder = rt['rudder']
             # The stream loop sends these straight after; a write failure there
@@ -1412,7 +1473,14 @@ class BoatLink:
         result = {
             'name': rt['name'], 'path': rt['path'], 'sign': rt['sign'],
             'pct': RUDDER_TEST_PCT,
-            'frames': len(rows), 'duration_s': round(self._now() - rt['t0'], 3),
+            # t0 is None when the run never got past the Assisted-mode
+            # confirmation wait -- there is no profile to have a duration.
+            # Computing it anyway raised inside the finish path, which the
+            # tick's own except-handler then swallowed by re-aborting an
+            # already-cleared run: the abort left NO result at all.
+            'frames': len(rows),
+            'duration_s': (round(self._now() - rt['t0'], 3)
+                           if rt['t0'] is not None else 0.0),
             'span_s': round(span, 3), 'max_gap_s': round(rt['max_gap_s'], 3),
             # No frames at all is the worst gap there is, so say so rather than
             # reporting a tidy 0.0 for a recording that captured nothing.
@@ -1586,8 +1654,10 @@ class BoatLink:
                 'rudder_test': ({
                     'active': True,
                     'phase': self.rudder_test['phase'],
+                    'awaiting_assist': self.rudder_test['t0'] is None,
                     'sign': self.rudder_test['sign'],
-                    'elapsed_s': round(self._now() - self.rudder_test['t0'], 2),
+                    'elapsed_s': (round(self._now() - self.rudder_test['t0'], 2)
+                                  if self.rudder_test['t0'] is not None else 0.0),
                     'total_s': RUDDER_TEST_TOTAL_S,
                     'pct': RUDDER_TEST_PCT,
                     'frames': len(self.rudder_test['rows']),
@@ -2849,10 +2919,13 @@ function applyStatus(s) {
     const rt = s.rudder_test, rtr = s.rudder_test_result;
     const rtPill = $('rt-pill');
     if (rt && rt.active) {
-      rtPill.textContent = (rt.sign < 0 ? '-' : '+') + rt.pct + ' ' + rt.phase.toUpperCase();
+      rtPill.textContent = rt.awaiting_assist
+        ? 'WAITING FOR ASSIST'
+        : (rt.sign < 0 ? '-' : '+') + rt.pct + ' ' + rt.phase.toUpperCase();
       rtPill.classList.add('up'); rtPill.classList.remove('stale');
-      $('rt-phase').textContent =
-        rt.phase + '  ' + rt.elapsed_s.toFixed(1) + ' / ' + rt.total_s.toFixed(1) + 's';
+      $('rt-phase').textContent = rt.awaiting_assist
+        ? 'waiting for the boat to confirm Assisted Steering...'
+        : rt.phase + '  ' + rt.elapsed_s.toFixed(1) + ' / ' + rt.total_s.toFixed(1) + 's';
       $('rt-file').textContent = rt.name;
       $('rt-frames').textContent = rt.frames + ' collecting...';
       setRudderTestLockout(true);

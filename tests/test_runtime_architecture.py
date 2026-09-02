@@ -1242,8 +1242,9 @@ def test_motorstatus_does_not_publish_at_the_control_rate():
     # behind each discrete publish, so the next continuous change slips out
     # immediately -- which the first version of this fix did, while carrying a
     # comment claiming the opposite.
-    tail = commit.split("if (discrete_same) {", 1)[1]
-    after = tail.split("}", 1)[1]
+    # ...and outside the !force block, so a forced publish stamps it as well.
+    forced = commit.split("if (!force) {", 1)[1]
+    after = forced.split("\n    }\n", 1)[1]
     assert "s_status_continuous_us = esp_timer_get_time();" in after, (
         "the publish budget is not stamped on the discrete path, so a discrete "
         "change lets the next continuous one bypass the rate limit")
