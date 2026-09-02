@@ -77,6 +77,7 @@ import json
 import math
 import csv
 import os
+import random
 import re
 import struct
 import sys
@@ -644,6 +645,8 @@ class BoatLink:
         # a time-based check and authorise a rate demand the boat is not in a
         # mode to receive.
         self.assist_request_id = 0
+        # 0 means "not yet seeded"; the first request picks a random start so
+        # a restart cannot reuse the previous session's ids.
         self._assist_req_seq = 0
         self.bridge_status = self._blank_bridge_status()
         self._diag_counts = {}
@@ -996,11 +999,29 @@ class BoatLink:
         return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
 
     def _next_assist_request_id(self):
-        """Monotonic, never 0. 0 is the boat's power-on value, so treating it
-        as a real id would make a boat that has never applied anything look
-        like it had just acknowledged us."""
-        self._assist_req_seq = getattr(self, '_assist_req_seq', 0) + 1
-        return self._assist_req_seq
+        """Unique within a session AND across restarts, never 0.
+
+        A counter starting at 1 every launch is not enough: restart this tool
+        while the boat is still in assisted mode from the last session, and its
+        standing MotorStatus echoes id 1 -- which the new session's first
+        request also claims. The stale packet then answers for a request it
+        never saw, which is the whole failure the id exists to prevent.
+
+        So the sequence STARTS somewhere random in the 32-bit space. Two
+        launches colliding needs the same start out of ~4.29e9, rather than
+        being certain.
+
+        0 is skipped on wraparound: it is the boat's power-on value, and
+        accepting it would let a boat that has applied nothing look as though
+        it had just acknowledged us."""
+        seq = getattr(self, '_assist_req_seq', 0)
+        if seq == 0:
+            seq = random.getrandbits(32)
+        seq = (seq + 1) & 0xFFFFFFFF
+        if seq == 0:
+            seq = 1                       # wraparound never lands on 0
+        self._assist_req_seq = seq
+        return seq
 
     def _send_steer_rate_locked(self, target_dps):
         """Yaw-rate demand, deg/s. Its own message on purpose -- see the

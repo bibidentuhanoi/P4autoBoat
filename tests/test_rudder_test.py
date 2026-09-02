@@ -1722,6 +1722,50 @@ class AssistAcknowledgementTest(RudderTestBase):
                           '0 == 0 authorised a rate demand')
         self.assertEqual(self.link.rudder_test.get('rate_dps', 0.0), 0.0)
 
+    def test_ids_do_not_repeat_across_a_python_restart(self):
+        """A counter starting at 1 every launch is not enough. Restart this
+        tool while the boat is still in assisted mode from the last session and
+        its standing MotorStatus echoes id 1 -- which the new session's first
+        request also claims. The stale packet then answers for a request it
+        never saw, which is exactly what the id exists to prevent."""
+        import importlib.util as _il
+        ids = []
+        for _ in range(4):
+            spec = _il.spec_from_file_location('espnow_restart_%d' % len(ids), TOOL)
+            mod = _il.module_from_spec(spec)
+            spec.loader.exec_module(mod)               # a fresh "process"
+            link = mod.BoatLink.__new__(mod.BoatLink)
+            ids.append([link._next_assist_request_id() for _ in range(3)])
+        firsts = [batch[0] for batch in ids]
+        self.assertEqual(len(set(firsts)), len(firsts),
+                         'two restarts began from the same id')
+        for batch in ids:
+            self.assertNotIn(1, batch,
+                             'ids still start from a fixed counter')
+
+    def test_a_previous_sessions_id_does_not_authorize_this_one(self):
+        """The restart hazard, end to end: the boat is still echoing the id
+        from before the restart, and the fresh session must not accept it."""
+        stale_from_last_session = 1          # what the old counter would emit
+        self.boat_acks_assist = False
+        self.assertTrue(self.link.start_rudder_test(-1, 1, assisted=True)[0])
+        self.assertNotEqual(self.link.rudder_test['assist_request_id'],
+                            stale_from_last_session)
+        self.clock.advance(0.1)
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, state=2, servo_power=True,
+            assist_rudder=True, assist_request_id=stale_from_last_session,
+            last_rx_monotonic=self.clock.t)
+        self._tick()
+        self.assertIsNone(self.link.rudder_test['t0'])
+        self.assertEqual(self.link.rudder_test.get('rate_dps', 0.0), 0.0)
+
+    def test_wraparound_skips_zero(self):
+        """0 is the boat's power-on value; an id of 0 would pair with a boat
+        that has applied nothing."""
+        self.link._assist_req_seq = 0xFFFFFFFF
+        self.assertEqual(self.link._next_assist_request_id(), 1)
+
     def test_request_ids_are_unique_across_requests(self):
         seen = set()
         for _ in range(5):

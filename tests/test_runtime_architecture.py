@@ -748,6 +748,10 @@ typedef struct {
 #define boat_BoatMessage_assist_tag 16
 #define boat_BoatMessage_size 128
 #define boat_SystemStatus_size 32
+/* The publishers size their buffers from these. The value is irrelevant
+ * to this harness -- only that the name exists, as the generated header
+ * provides it, so a hardcoded literal cannot creep back in. */
+#define boat_MotorStatus_size 56
 #define boat_CalibrateStatus_size 35
 #define boat_BenchStatus_size 44
 #define boat_BoatMessage_fields NULL
@@ -1205,6 +1209,70 @@ def test_the_learner_is_frozen_unless_the_escs_are_actually_armed():
     tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
     assert "esc_driver_get_state() == ESC_STATE_ARMED" in tick
     assert "driving ? decision->throttle : 0.0f" in tick
+
+
+def test_no_publisher_hardcodes_its_protobuf_buffer():
+    """Every publish buffer must be sized from the GENERATED schema.
+
+    pipeline_publish_motor_status used a hardcoded 32, which fitted while
+    MotorStatus carried only state/throttles/winch/servo_power -- 16 bytes on
+    an armed, driving boat. The rudder and assisted-steering fields took a
+    populated message to 41, so pb_encode ran out of buffer and returned
+    false, and the publish silently stopped for exactly as long as the boat
+    was doing something worth reporting.
+
+    That is what froze MotorStatus 0.16 s into both assisted runs on
+    2026-09-02 while raw runs (24 bytes) kept working -- and fanout_locked
+    logged "motor_status encode failed" the entire time.
+
+    A literal is the bug: it cannot track a schema that grows."""
+    src = (ROOT / "main" / "pipeline.c").read_text()
+    bufs = re.findall(r'uint8_t buf\[([^\]]+)\]', src)
+    assert bufs, "no publish buffers found -- has this file moved?"
+    for decl in bufs:
+        assert '_size' in decl, (
+            "publish buffer 'uint8_t buf[%s]' is a hardcoded size; derive it "
+            "from the generated schema (e.g. boat_MotorStatus_size + 16) so it "
+            "cannot fall behind a message that grows" % decl)
+    assert 'uint8_t buf[boat_MotorStatus_size + 16];' in src
+
+
+def test_a_fully_populated_motorstatus_fits_its_buffer():
+    """Checked against the schema's own worst case, not against a message we
+    happen to build: boat_MotorStatus_size IS nanopb's maximum encoding."""
+    hdr = (ROOT / "main" / "proto" / "boat.pb.h").read_text()
+    m = re.search(r'#define boat_MotorStatus_size\s+(\d+)', hdr)
+    assert m, "boat_MotorStatus_size missing from the generated header"
+    schema_max = int(m.group(1))
+
+    import sys
+    sys.path.insert(0, str(ROOT))
+    from proto import boat_pb2
+    msg = boat_pb2.BoatMessage()
+    ms = msg.motor_status
+    # Every field non-default, so protobuf omits none of them.
+    ms.state = 2
+    ms.left_throttle = 0.18
+    ms.right_throttle = 0.22
+    ms.winch_speed = -0.5
+    ms.servo_power = True
+    ms.rudder_cmd = -0.46
+    ms.rudder_pulse_us = 1805
+    ms.rudder_saturated = True
+    ms.assist_rudder = True
+    ms.assist_motor_p = True
+    ms.yaw_target_dps = 2.0
+    ms.yaw_filt_dps = 1.37
+    ms.assist_request_id = 0xFFFFFFFF
+    populated = len(msg.SerializeToString())
+
+    assert populated > 32, (
+        "a populated MotorStatus is only %d bytes, so the old hardcoded 32 "
+        "would still fit and this test proves nothing -- check the fixture "
+        "actually sets every field" % populated)
+    assert populated <= schema_max + 16, (
+        "a populated MotorStatus (%d bytes) does not fit the buffer the "
+        "publisher allocates (%d + 16)" % (populated, schema_max))
 
 
 def test_motorstatus_does_not_publish_at_the_control_rate():

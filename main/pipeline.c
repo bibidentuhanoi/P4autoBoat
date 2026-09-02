@@ -258,7 +258,18 @@ void pipeline_publish_motor_status(const boat_MotorStatus *mstatus)
 {
     if (!s_msg_mutex) return;
 
-    uint8_t buf[32];
+    /* Sized from the GENERATED schema, like every other publisher here. It
+     * was a hardcoded 32, which fitted while MotorStatus carried only
+     * state/throttles/winch/servo_power (16 bytes armed and driving). The
+     * rudder and assisted-steering fields took a populated message to 41, so
+     * pb_encode ran out of buffer and returned false -- and the publish
+     * silently stopped for exactly as long as the boat was doing something
+     * interesting. That is what froze MotorStatus 0.16 s into both assisted
+     * runs on 2026-09-02, while raw runs (24 bytes) kept working.
+     *
+     * fanout_locked does log "motor_status encode failed", so the serial
+     * console had it the whole time. */
+    uint8_t buf[boat_MotorStatus_size + 16];
     xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
     s_msg.which_payload = boat_BoatMessage_motor_status_tag;
     s_msg.payload.motor_status = *mstatus;
