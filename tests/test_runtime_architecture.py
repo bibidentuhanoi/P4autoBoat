@@ -1192,6 +1192,68 @@ def test_the_learner_is_frozen_unless_the_escs_are_actually_armed():
     assert "driving ? decision->throttle : 0.0f" in tick
 
 
+def test_motorstatus_does_not_publish_at_the_control_rate():
+    """MotorStatus is a STATUS channel, not a telemetry stream.
+
+    The assisted rudder loop moves rudder_cmd / yaw_target_dps / yaw_filt_dps
+    on every fresh fusion sample (~50 Hz). Comparing those in the
+    publish-if-changed test put MotorStatus on the air at that rate, over a
+    link already carrying ~20 Hz of telemetry. It congested, MotorStatus was
+    what got dropped, and both assisted runs on 2026-09-02 aborted on a
+    staleness gate while the boat was driving perfectly.
+
+    The raw RUD_T20 runs recorded BEFORE that change completed cleanly at
+    4.51 s with the same tool and the same gate, which is what pins the cause
+    on the flood rather than on the link."""
+    src = (ROOT / "main" / "motor_control.c").read_text()
+
+    # The two comparisons must stay separate, with the fast floats OUT of the
+    # discrete one -- putting any of them back restores the flood.
+    disc = _function_body(src, "static bool motor_status_discrete_equal(")
+    for fast in ("rudder_cmd", "yaw_target_dps", "yaw_filt_dps",
+                 "rudder_pulse_us", "rudder_saturated"):
+        assert fast not in disc, (
+            "%s is back in the immediate-publish comparison -- MotorStatus "
+            "will flood the radio again" % fast)
+    for slow in ("state", "left_throttle", "right_throttle", "winch_speed",
+                 "servo_power", "assist_rudder", "assist_motor_p"):
+        assert slow in disc, "%s must still publish immediately" % slow
+
+    cont = _function_body(src, "static bool motor_status_continuous_equal(")
+    for fast in ("rudder_cmd", "yaw_target_dps", "yaw_filt_dps"):
+        assert fast in cont
+
+    # ...and the continuous path must actually be rate-limited.
+    commit = _function_body(src, "static void status_commit_current(bool force)")
+    assert "if (discrete_same) {" in commit
+    # Pin the LIVE comparison, not merely a mention of the constant: an
+    # `if (0 && ...)` still contains the name while publishing every time,
+    # and an earlier version of this test accepted exactly that.
+    assert ("            if (s_status_continuous_us != 0 &&\n"
+            "                (esp_timer_get_time() - s_status_continuous_us)\n"
+            "                    < MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US) {\n"
+            "                portEXIT_CRITICAL(&s_status_lock);\n"
+            "                return;\n"
+            "            }") in commit, (
+        "the continuous rate limit is not a live guard that returns early")
+
+    # The budget is stamped on EVERY publish, not only the continuous one.
+    # Stamping it only inside the discrete_same branch leaves a stale mark
+    # behind each discrete publish, so the next continuous change slips out
+    # immediately -- which the first version of this fix did, while carrying a
+    # comment claiming the opposite.
+    tail = commit.split("if (discrete_same) {", 1)[1]
+    after = tail.split("}", 1)[1]
+    assert "s_status_continuous_us = esp_timer_get_time();" in after, (
+        "the publish budget is not stamped on the discrete path, so a discrete "
+        "change lets the next continuous one bypass the rate limit")
+
+    # A rate that is not meaningfully slower than the source is no fix at all.
+    m = re.search(r"#define MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US\s+(\d+)", src)
+    assert m, "the rate-limit interval is gone"
+    assert int(m.group(1)) >= 50000, "faster than 20 Hz is back toward the flood"
+
+
 def test_ordinary_forward_driving_is_not_bench_only():
     """The feature is "hold the throttle and the boat straightens out", not
     "press BASE and watch a number". Every other trim test drives the learner

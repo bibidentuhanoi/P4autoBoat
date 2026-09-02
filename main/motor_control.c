@@ -544,8 +544,10 @@ static bool motor_status_discrete_equal(const boat_MotorStatus *a,
 }
 
 /* CONTINUOUS control values, which move on essentially every 100 Hz cycle once
- * the assisted loop is live. Treating a change in these as "publish now" put
- * MotorStatus on the air at 100 Hz over a link carrying ~20 Hz of telemetry;
+ * the assisted loop is live -- the loop re-computes on every fresh fusion
+ * sample, so ~50 Hz, and status_commit_current runs at the 100 Hz control
+ * rate. Treating a change in these as "publish now" put MotorStatus on the air
+ * at the fusion rate over a link carrying ~20 Hz of telemetry;
  * it congested, MotorStatus was what got dropped, and the rudder-test
  * staleness gate then killed both assisted runs on 2026-09-02 while the boat
  * was in fact driving perfectly well.
@@ -600,18 +602,22 @@ static void status_commit_current(bool force)
             return;                       /* nothing moved at all */
         }
         if (discrete_same) {
-            /* Only the fast control values moved. Rate-limit those, or the
-             * assisted loop publishes at the 100 Hz control rate. */
-            const int64_t now = esp_timer_get_time();
+            /* Only the fast control values moved. Rate-limit those. */
             if (s_status_continuous_us != 0 &&
-                (now - s_status_continuous_us) < MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US) {
+                (esp_timer_get_time() - s_status_continuous_us)
+                    < MOTOR_STATUS_CONTINUOUS_MIN_INTERVAL_US) {
                 portEXIT_CRITICAL(&s_status_lock);
                 return;
             }
-            s_status_continuous_us = now;
         }
-        /* A discrete change always publishes immediately, and resets the
-         * window so the next continuous update is measured from here. */
+        /* A discrete change is never withheld -- an operator must see an arm
+         * or mode change at once. Either way we are about to publish, so the
+         * budget is measured from the last thing that actually went on the
+         * air. Stamping it only on the continuous path (the first version of
+         * this) left a stale mark behind every discrete publish, so the next
+         * continuous change slipped out immediately and the comment claiming
+         * otherwise was simply false. */
+        s_status_continuous_us = esp_timer_get_time();
     }
 
     uint32_t next = generation + 1U;
