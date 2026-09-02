@@ -582,6 +582,9 @@ setTimeout(() => {
   const active = calls.filter(call => call.path === '/api/winch' && call.body.speed !== 0);
   elements['winch-up-btn'].listeners.pointerup();
   console.log(JSON.stringify(active));
+  // The page runs a session watchdog on a setInterval, which keeps node's
+  // event loop alive forever. Exit deliberately once the measurement is done.
+  process.exit(0);
 }, 250);
 """
         result = subprocess.run(

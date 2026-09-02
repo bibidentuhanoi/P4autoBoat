@@ -180,6 +180,74 @@ class HideAndReturnTest(BrowserHttpTest):
         self.assertIn("throttle: 0", rel.group(1))
 
 
+class SessionRecoveryTest(BrowserHttpTest):
+    """Every way a session can go missing must recover on its own.
+
+    These are page-behaviour tests, and they exist because the HTTP-level
+    reload test passed while the page was broken: it called /api/session twice
+    itself, proving the SERVER contract and nothing about whether the page ever
+    invokes it. The result was a UI that went silently dead -- sliders moved,
+    the boat did not, and the only clue was a lease message in the terminal."""
+
+    def setUp(self):
+        super().setUp()
+        self.src = TOOL.read_text()
+
+    def test_a_watchdog_acquires_a_session_whenever_one_is_missing(self):
+        m = re.search(r'async function ensureSession\(\) \{(.*?)\n\}',
+                      self.src, re.S)
+        self.assertIsNotNone(m, 'no session watchdog')
+        body = m.group(1)
+        self.assertIn('!connected || sessionId', body)
+        self.assertIn('document.hidden', body,
+                      'a hidden tab must not silently reclaim control')
+        self.assertIn('openSession()', body)
+        self.assertIn('setInterval(ensureSession', self.src)
+
+    def test_reloading_while_already_connected_acquires_one(self):
+        """THE bug. The connect button never fires on a reload, so nothing
+        claimed a session and every command was refused as no_session."""
+        m = re.search(r'function setConnectedUI\(isConn, port\) \{(.*?)\n\}',
+                      self.src, re.S)
+        self.assertIsNotNone(m)
+        body = m.group(1)
+        self.assertIn('ensureSession()', body,
+                      'becoming connected does not acquire a session, so a '
+                      'reload while connected leaves the UI unable to drive')
+
+    def test_a_dead_session_refusal_is_not_a_dead_end(self):
+        m = re.search(r'async function sendHeartbeat\(\) \{(.*?)\n\}',
+                      self.src, re.S)
+        after = m.group(1).split("r.code === 'no_session'", 1)[1]
+        self.assertIn('ensureSession()', after,
+                      'the page gives the session up and never reclaims one')
+
+    def test_losing_the_connection_gives_up_the_session(self):
+        m = re.search(r'function setConnectedUI\(isConn, port\) \{(.*?)\n\}',
+                      self.src, re.S)
+        self.assertIn('sessionId = null', m.group(1))
+
+    def test_the_heartbeat_does_not_gate_on_the_pages_view_of_connectivity(self):
+        """It gated on the page's `connected` flag, which lags the server's own
+        state -- so the first heartbeats after connecting were dropped and the
+        lease could expire before any ever arrived. The server knows whether it
+        is connected; asking it is the reliable answer."""
+        m = re.search(r'async function sendHeartbeat\(\) \{(.*?)\n\}',
+                      self.src, re.S)
+        first = m.group(1).strip().splitlines()[0]
+        self.assertIn('!sessionId', first)
+        self.assertNotIn('!connected', first)
+
+    def test_recovery_cannot_itself_start_the_boat(self):
+        """Re-acquiring is only safe because a new session starts at ZERO."""
+        sid = self.open_session()
+        self.hb(sid, 1, throttle=0.4)
+        self.post('/api/stop', {'seq': 1})
+        fresh = self.open_session()          # what the watchdog does
+        self.assert_stopped()
+        self.assertNotEqual(fresh, sid)
+
+
 class ReloadWhileConnectedTest(BrowserHttpTest):
 
     def test_reloading_while_connected_starts_from_zero(self):

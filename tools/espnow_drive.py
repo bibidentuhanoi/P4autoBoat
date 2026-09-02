@@ -2014,7 +2014,12 @@ class BoatLink:
                         and self._anything_commanded_locked()):
                     if self.lease_expired_at is None:
                         self.lease_expired_at = now_mono
-                        print('[lease] browser heartbeat lost — zeroing',
+                        print('[lease] no browser heartbeat for %.2fs — '
+                              'zeroing. The page claims a control session on '
+                              'connect and heartbeats at %d Hz; if you are '
+                              'seeing this while driving, RELOAD the page '
+                              '(Ctrl-Shift-R) so it runs the current JS.'
+                              % (CONTROL_LEASE_S, CONTROL_HEARTBEAT_HZ),
                               flush=True)
                     self._zero_controls_locked()
                     self._transmit_zeros_locked()
@@ -2579,7 +2584,10 @@ async function refreshPorts() {
 }
 
 function setConnectedUI(isConn, port) {
+  const became = isConn && !connected;
   connected = isConn;
+  if (became) ensureSession();      // covers a reload while already connected
+  if (!isConn) { stopHeartbeat(); sessionId = null; }
   if (!isConn) {
     clearWinchRenewal();
     winchDir = 0;
@@ -2683,8 +2691,26 @@ async function openSession() {
 // heartbeats make safe to do.
 var hbInFlight = false, hbPending = false;
 
+// SESSION WATCHDOG. A session can be missing for several unrelated reasons --
+// the page was reloaded while already connected (the connect button never
+// fires, so nothing claimed one), STOP or DISARM gave it up, or a heartbeat
+// was refused because it had gone. Every one of those used to leave the UI
+// permanently dead: sliders moved, nothing happened, and the only clue was
+// "[lease] browser heartbeat lost" in the terminal.
+//
+// So instead of re-acquiring at each of those sites, one watchdog notices the
+// state and fixes it. Re-acquiring is always safe: a new session starts at
+// ZERO, so this can restore the ability to drive but never motion itself.
+var acquiring = false;
+async function ensureSession() {
+  if (!connected || sessionId || acquiring || document.hidden) return;
+  acquiring = true;
+  try { await openSession(); } finally { acquiring = false; }
+}
+setInterval(ensureSession, 500);
+
 async function sendHeartbeat() {
-  if (!connected || !sessionId) return;
+  if (!sessionId) return;
   if (hbInFlight) { hbPending = true; return; }
   hbInFlight = true;
   try {
@@ -2698,8 +2724,11 @@ async function sendHeartbeat() {
       // mid-transition -- in both cases the session is healthy and the lease
       // was refreshed, so dropping it would stop the boat for no reason.
       if (r.code === 'no_session' || r.code === 'wrong_session') {
+        // Give this one up, and let the watchdog claim a fresh one. NOT a
+        // dead end: going quiet here is what made the UI unrecoverable.
         stopHeartbeat();
         sessionId = null;
+        ensureSession();
       }
     }
   } finally {
