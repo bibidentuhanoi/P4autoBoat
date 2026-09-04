@@ -21,6 +21,105 @@ sys.modules[SPEC.name] = espnow_drive
 SPEC.loader.exec_module(espnow_drive)
 
 
+# ---- shared node harness for the page's own JavaScript ---------------------
+# The page's <script> runs for real inside node's vm against this fake DOM. A
+# scenario appends JS that creates the vm context, runs `script`, drives the
+# page, prints one JSON line and calls process.exit(): the page starts a
+# session watchdog on setInterval, which would otherwise keep node alive.
+PAGE_JS_HARNESS_PRELUDE = r"""
+const fs = require('fs');
+const vm = require('vm');
+const script = fs.readFileSync(0, 'utf8');
+const calls = [];      // every fetch that carried a body: {path, body}
+const gets = [];       // every body-less fetch: path
+const replies = {};    // path -> JSON reply, for scenarios that need a real answer
+const elements = {};
+
+class FakeClassList {
+  constructor() { this.names = new Set(); }
+  add(...names) { names.forEach(n => this.names.add(n)); }
+  remove(...names) { names.forEach(n => this.names.delete(n)); }
+  toggle(name, force) {
+    const on = force === undefined ? !this.names.has(name) : !!force;
+    if (on) this.names.add(name); else this.names.delete(name);
+    return on;
+  }
+  contains(name) { return this.names.has(name); }
+}
+class FakeElement {
+  constructor(id = '') {
+    this.id = id;
+    // A range input reads '0' in a real page; only the winch speed starts
+    // elsewhere. The two checkboxes ticked in the markup start ticked.
+    this.value = id === 'winch-speed' ? '50' : '0';
+    this.checked = id === 'motor-link' || id === 'map-follow';
+    this.textContent = '';
+    this.disabled = false;
+    this.hidden = false;
+    this.open = false;
+    this.style = {};
+    this.options = [];
+    this.listeners = {};
+    this.classList = new FakeClassList();
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  appendChild(child) { this.options.push(child); }
+}
+const document = {
+  head: new FakeElement('head'),
+  getElementById(id) {
+    if (!elements[id]) elements[id] = new FakeElement(id);
+    return elements[id];
+  },
+  createElement(tag) { const el = new FakeElement(); el.tagName = tag; return el; },
+  addEventListener() {},
+};
+const windowObject = { addEventListener() {} };
+async function fetch(path, opts = {}) {
+  if (opts.body) calls.push({ path, body: JSON.parse(opts.body) });
+  else gets.push(path);
+  return { json: async () => (path in replies) ? replies[path]
+                            : (path === '/api/ports' ? { ports: [] } : { ok: true }) };
+}
+class FakeWebSocket { close() {} }
+const context = {
+  document,
+  window: windowObject,
+  navigator: { sendBeacon() { return true; } },
+  location: { host: '127.0.0.1:8765' },
+  fetch,
+  WebSocket: FakeWebSocket,
+  Blob,
+  console,
+  setTimeout,
+  setInterval,
+  clearInterval,
+};
+const CONNECTED_STATUS = {
+  connected: true,
+  port: '/dev/test',
+  armed_cmd: false,
+  servo_rail_cut: false,
+  winch_command_seq: 0,
+  seq: 0,
+  last_error: null,
+  telemetry: { have: false, stale: true, age_s: null },
+  bridge_status: { have: false, stale: true, age_s: null },
+};
+"""
+
+
+def run_page_js(scenario_js, timeout=3.0):
+    """Run the page's <script> in node against the fake DOM above, followed by
+    the scenario (which sees `context`, `elements`, `calls`, `gets`, `replies`
+    and `CONNECTED_STATUS`, must create the vm context and run `script` itself,
+    and must end with process.exit)."""
+    page_script = espnow_drive.PAGE.rsplit('<script>', 1)[1].split('</script>', 1)[0]
+    return subprocess.run(
+        ['node', '-e', PAGE_JS_HARNESS_PRELUDE + scenario_js], input=page_script,
+        text=True, capture_output=True, timeout=timeout, check=False)
+
+
 class BridgeStatusDecodeTest(unittest.TestCase):
     def setUp(self):
         self.link = espnow_drive.BoatLink.__new__(espnow_drive.BoatLink)
@@ -523,85 +622,18 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
 
     def test_held_winch_is_renewed_with_increasing_command_sequences(self):
         """Catches the browser sending only one command for a long button hold."""
-        page_script = espnow_drive.PAGE.rsplit('<script>', 1)[1].split('</script>', 1)[0]
-        harness = r"""
-const fs = require('fs');
-const vm = require('vm');
-const script = fs.readFileSync(0, 'utf8');
-const calls = [];
-const elements = {};
-
-class FakeClassList {
-  add() {}
-  remove() {}
-  toggle() {}
-}
-class FakeElement {
-  constructor(id = '') {
-    this.id = id;
-    this.value = id === 'winch-speed' ? '50' : '';
-    this.textContent = '';
-    this.disabled = false;
-    this.options = [];
-    this.listeners = {};
-    this.classList = new FakeClassList();
-  }
-  addEventListener(name, callback) { this.listeners[name] = callback; }
-  appendChild(child) { this.options.push(child); }
-}
-const document = {
-  getElementById(id) {
-    if (!elements[id]) elements[id] = new FakeElement(id);
-    return elements[id];
-  },
-  createElement() { return new FakeElement(); },
-  addEventListener() {},
-};
-const windowObject = { addEventListener() {} };
-async function fetch(path, opts = {}) {
-  if (opts.body) calls.push({ path, body: JSON.parse(opts.body) });
-  return { json: async () => path === '/api/ports' ? { ports: [] } : { ok: true } };
-}
-class FakeWebSocket { close() {} }
-const context = {
-  document,
-  window: windowObject,
-  navigator: { sendBeacon() { return true; } },
-  location: { host: '127.0.0.1:8765' },
-  fetch,
-  WebSocket: FakeWebSocket,
-  Blob,
-  console,
-  setTimeout,
-  setInterval,
-  clearInterval,
-};
+        result = run_page_js(r"""
 vm.createContext(context);
 vm.runInContext(script, context);
-context.applyStatus({
-  connected: true,
-  port: '/dev/test',
-  armed_cmd: false,
-  servo_rail_cut: false,
-  winch_command_seq: 0,
-  seq: 0,
-  last_error: null,
-  telemetry: { have: false, stale: true, age_s: null },
-  bridge_status: { have: false, stale: true, age_s: null },
-});
+context.applyStatus(CONNECTED_STATUS);
 elements['winch-up-btn'].listeners.pointerdown({ preventDefault() {} });
 setTimeout(() => {
   const active = calls.filter(call => call.path === '/api/winch' && call.body.speed !== 0);
   elements['winch-up-btn'].listeners.pointerup();
   console.log(JSON.stringify(active));
-  // The page runs a session watchdog on a setInterval, which keeps node's
-  // event loop alive forever. Exit deliberately once the measurement is done.
   process.exit(0);
 }, 250);
-"""
-        result = subprocess.run(
-            ['node', '-e', harness], input=page_script, text=True,
-            capture_output=True, timeout=2.0, check=False)
+""")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         active = json.loads(result.stdout.strip().splitlines()[-1])
@@ -1431,3 +1463,556 @@ class PAssistConfirmTest(unittest.TestCase):
         self.assertIn('id="p-confirm"', page)
         self.assertIn("bn.p_on", page)
         self.assertIn("bp !== pAssistOn", page)
+
+
+# ---- waypoint mission, step 1: the map, the trail, the tidied page ----------
+
+def _telemetry_link(with_track=True):
+    """A BoatLink with just the attributes both telemetry decoders touch --
+    the same set FieldTelemetryYawRateTest builds -- plus, optionally, the
+    trail. Most fixtures in this file build links this way (__new__, never
+    __init__), so a decoder that assumed the trail exists would break them."""
+    link = espnow_drive.BoatLink.__new__(espnow_drive.BoatLink)
+    link._lock = threading.Lock()
+    link.pb2 = espnow_drive.load_boat_pb2()
+    link.telemetry = espnow_drive.BoatLink._blank_telemetry()
+    link.bench_status = espnow_drive.BoatLink._blank_bench_status()
+    link.bench_yaw_samples = []
+    link.bench_yaw = None
+    link.rudder_test = None
+    link.rudder_test_result = None
+    link._rudder_test_write = None
+    link.bench_run = None
+    link._bench_write = None
+    link.bench_csv_name = None
+    link.bench_dir = Path('/tmp')
+    link._now = espnow_drive.time.monotonic
+    link.session_id = 'test-session'
+    link.session_seq = 0
+    link.session_last_hb = float('inf')
+    link.lease_expired_at = None
+    link._assist_off_req_id = None
+    link._assist_off_next_retry = 0.0
+    link.assist_rudder_on = False
+    link._diag_counts = {}
+    if with_track:
+        link.gps_track = espnow_drive.GpsTrack()
+    return link
+
+
+def _field_frame(gps_valid, lat, lon, heading=90.0, seq=1):
+    """One MSG_FIELD_TELEMETRY frame as the S3 hands it over (delimiter off)."""
+    payload = espnow_drive.struct.pack(
+        espnow_drive.FIELD_TELEMETRY_FMT,
+        0.0, 0.0, heading,           # pitch, roll, heading
+        1 if gps_valid else 0,       # gps_valid
+        lat, lon,                    # lat, lon
+        1.0, 45.0,                   # speed, course
+        8,                           # satellites
+        1.1,                         # hdop
+        0.0)                         # yaw_rate
+    return espnow_drive.build_frame(espnow_drive.MSG_FIELD_TELEMETRY,
+                                    payload, seq=seq)[:-1]
+
+
+class GpsTrackTest(unittest.TestCase):
+    """The trail the map draws. Pure: no link, no serial, no page."""
+
+    def test_records_a_first_fix_and_ignores_jitter_after_it(self):
+        track = espnow_drive.GpsTrack(min_move_m=1.5)
+        self.assertTrue(track.add(21.0, 105.8))
+        # ~0.6 m north: inside the jitter band, so not a new point.
+        self.assertFalse(track.add(21.0 + 0.6 / 111320.0, 105.8))
+        # ~2.2 m north: the boat actually moved.
+        self.assertTrue(track.add(21.0 + 2.2 / 111320.0, 105.8))
+        self.assertEqual(len(track), 2)
+
+    def test_points_are_lat_lon_pairs_in_order(self):
+        track = espnow_drive.GpsTrack(min_move_m=0.0)
+        track.add(21.0, 105.8)
+        track.add(21.001, 105.801)
+        self.assertEqual(track.points(), [[21.0, 105.8], [21.001, 105.801]])
+
+    def test_invalid_fixes_and_null_island_are_not_recorded(self):
+        track = espnow_drive.GpsTrack()
+        self.assertFalse(track.add(21.0, 105.8, valid=False))
+        self.assertFalse(track.add(0.0, 0.0))
+        self.assertFalse(track.add(float('nan'), 105.8))
+        self.assertFalse(track.add(21.0, float('inf')))
+        self.assertFalse(track.add(91.0, 105.8))
+        self.assertFalse(track.add(21.0, -181.0))
+        self.assertEqual(len(track), 0)
+
+    def test_oldest_points_drop_first_at_the_cap(self):
+        track = espnow_drive.GpsTrack(max_points=3, min_move_m=0.0)
+        for i in range(5):
+            track.add(21.0 + i * 0.001, 105.8)
+        self.assertEqual(len(track), 3)
+        self.assertAlmostEqual(track.points()[0][0], 21.002)
+
+    def test_clear_empties_the_trail(self):
+        track = espnow_drive.GpsTrack(min_move_m=0.0)
+        track.add(21.0, 105.8)
+        track.clear()
+        self.assertEqual(track.points(), [])
+
+    def test_distance_is_about_right_at_hanoi_latitude(self):
+        # 0.001 deg of longitude at 21 N is ~104 m.
+        d = espnow_drive.GpsTrack.distance_m(21.0, 105.8, 21.0, 105.801)
+        self.assertAlmostEqual(d, 103.9, delta=1.0)
+
+
+class TelemetryFeedsTheTrailTest(unittest.TestCase):
+    """Both telemetry decoders feed the trail, and a link built without one
+    (as most fixtures here are) keeps decoding rather than crashing."""
+
+    def test_a_field_telemetry_fix_lands_in_the_trail(self):
+        link = _telemetry_link()
+        link._handle_incoming_frame(_field_frame(True, 21.0, 105.8))
+        self.assertEqual(link.gps_track.points(), [[21.0, 105.8]])
+        self.assertAlmostEqual(link.telemetry['lat'], 21.0)
+
+    def test_a_legacy_snapshot_fix_lands_in_the_trail(self):
+        link = _telemetry_link()
+        msg = link.pb2.BoatMessage()
+        msg.sensors.imu.heading = 12.0
+        msg.sensors.gps.valid = True
+        msg.sensors.gps.latitude = 21.0
+        msg.sensors.gps.longitude = 105.8
+        frame = espnow_drive.build_frame(espnow_drive.MSG_SENSOR,
+                                         msg.SerializeToString(), seq=2)
+        link._handle_incoming_frame(frame[:-1])
+        self.assertEqual(len(link.gps_track), 1)
+        self.assertAlmostEqual(link.gps_track.points()[0][1], 105.8, places=5)
+
+    def test_no_fix_updates_telemetry_but_not_the_trail(self):
+        link = _telemetry_link()
+        link._handle_incoming_frame(_field_frame(False, 21.0, 105.8))
+        self.assertTrue(link.telemetry['have'])
+        self.assertFalse(link.telemetry['gps_valid'])
+        self.assertEqual(len(link.gps_track), 0)
+
+    def test_a_link_without_a_track_still_decodes(self):
+        link = _telemetry_link(with_track=False)
+        link._handle_incoming_frame(_field_frame(True, 21.0, 105.8))
+        self.assertAlmostEqual(link.telemetry['lon'], 105.8)
+
+
+class TrackApiTest(unittest.TestCase):
+    """/api/track hands the page the trail, /api/track/clear empties it, and
+    the 20 Hz status carries only the COUNT -- never the points."""
+
+    def setUp(self):
+        # A real link (constructor, idle background threads) rather than the
+        # __new__ fixture: this is the one place status() is read whole.
+        self.link = espnow_drive.BoatLink(espnow_drive.load_boat_pb2())
+        self.link.gps_track = espnow_drive.GpsTrack(min_move_m=0.0)
+
+        class TestHandler(espnow_drive.Handler):
+            pass
+
+        TestHandler.link = self.link
+        self.server = espnow_drive.ThreadingHTTPServer(('127.0.0.1', 0), TestHandler)
+        self.server_thread = threading.Thread(target=self.server.serve_forever)
+        self.server_thread.start()
+        host, port = self.server.server_address
+        self.base_url = f'http://{host}:{port}'
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=1.0)
+        self.link.shutdown()
+
+    def request(self, path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib_request.Request(
+            self.base_url + path, data=data,
+            headers={'Content-Type': 'application/json'} if body is not None else {},
+            method='POST' if body is not None else 'GET')
+        try:
+            with urllib_request.urlopen(req, timeout=1.0) as response:
+                return response.status, json.load(response)
+        except urllib_error.HTTPError as exc:
+            return exc.code, None
+
+    def test_track_is_served_then_cleared(self):
+        self.link.gps_track.add(21.0, 105.8)
+        self.link.gps_track.add(21.001, 105.8)
+        code, body = self.request('/api/track')
+        self.assertEqual(code, 200)
+        self.assertEqual(body['points'], [[21.0, 105.8], [21.001, 105.8]])
+        self.assertEqual(body['max_points'], espnow_drive.GPS_TRACK_MAX_POINTS)
+        self.assertEqual(body['min_move_m'], 0.0)
+        code, body = self.request('/api/track/clear', {})
+        self.assertEqual((code, body), (200, {'ok': True}))
+        self.assertEqual(self.request('/api/track')[1]['points'], [])
+
+    def test_status_carries_the_count_and_not_the_points(self):
+        self.link.gps_track.add(21.0, 105.8)
+        self.link.gps_track.add(21.001, 105.8)
+        code, status = self.request('/api/status')
+        self.assertEqual(code, 200)
+        self.assertEqual(status['gps_track_points'], 2)
+        self.assertNotIn('21.001', json.dumps(status))
+
+
+class PageLayoutTest(unittest.TestCase):
+    """The page was re-arranged around the map. Nothing may go missing: every
+    card, every data row, every control keeps its id."""
+
+    CARD_IDS = ['drive-card', 'bench-card', 'rudder-test-card', 'telemetry-card',
+                'sensors-card', 'motorstatus-card', 'bridge-card']
+    ROW_IDS = ['t-heading', 't-attitude', 't-yawrate', 't-fix', 't-gps-chip',
+               't-latlon', 't-sats', 't-speed',
+               's-camera', 's-tof-a', 's-tof-b', 's-imu', 's-mag',
+               'm-armstate', 'm-throttle', 'm-winch', 'm-servo',
+               'b-pkts', 'b-rssi', 'b-lr-rate', 'b-frames', 'b-hello', 'b-drops',
+               'bench-eff', 'bench-c-src', 'bench-learn-c', 'bench-progress',
+               'bench-file', 'bench-yaw-rate', 'bench-yaw-angle', 'bench-yaw-hdg',
+               'bench-yaw-n', 'bench-csv', 'rt-phase', 'rt-file', 'rt-frames']
+    CONTROL_IDS = ['port-select', 'refresh-btn', 'connect-btn', 'state-dot',
+                   'arm-label', 'arm-btn', 'bench', 'motor-link', 'throttle',
+                   'motor-left', 'motor-right', 'rudder', 'servo-on-btn',
+                   'servo-off-btn', 'winch-speed', 'winch-up-btn', 'winch-down-btn',
+                   'calibrate-btn', 'record-btn', 'stop-btn', 'bench-throttle',
+                   'bench-delta', 'bench-left', 'bench-right', 'bench-base',
+                   'bench-reset-c', 'bench-reset', 'p-assist', 'rt-minus', 'rt-plus',
+                   'rt-assist', 'rt-al', 'rt-ar']
+    MAP_IDS = ['layout', 'map-toggle', 'map-panel', 'map', 'map-layer', 'map-follow',
+               'map-center', 'map-clear', 'map-fix', 'map-pos', 'map-speed',
+               'map-course', 'map-heading', 'map-sats', 'map-trail', 'map-note']
+
+    def test_every_card_row_and_control_is_still_there(self):
+        for el in self.CARD_IDS + self.ROW_IDS + self.CONTROL_IDS + self.MAP_IDS:
+            self.assertIn('id="%s"' % el, espnow_drive.PAGE, el)
+
+    def test_the_markup_is_balanced(self):
+        html = espnow_drive.PAGE.split('<script>', 1)[0]
+        for tag in ('div', 'details', 'summary', 'section', 'header', 'footer'):
+            self.assertEqual(html.count('<' + tag), html.count('</' + tag + '>'), tag)
+
+    def test_doing_is_left_the_map_is_middle_and_telling_is_right(self):
+        page = espnow_drive.PAGE
+        order = ['id="col-do"', 'id="drive-card"', 'id="bench-card"',
+                 'id="rudder-test-card"', 'id="map-panel"', 'id="col-tell"',
+                 'id="telemetry-card"', 'id="motorstatus-card"',
+                 'id="sensors-card"', 'id="bridge-card"']
+        positions = [page.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_tests_and_diagnostics_fold_but_the_essentials_never_do(self):
+        page = espnow_drive.PAGE
+        # Collapsed by default: the two test cards. Open by default: the two
+        # diagnostic cards. Both remember what you last did with them.
+        self.assertIn('<details class="card" id="bench-card">', page)
+        self.assertIn('<details class="card" id="rudder-test-card">', page)
+        self.assertIn('<details class="card" id="sensors-card" open>', page)
+        self.assertIn('<details class="card" id="bridge-card" open>', page)
+        for card in ('drive-card', 'telemetry-card', 'motorstatus-card'):
+            self.assertIn('<div class="card" id="%s">' % card, page)
+        self.assertIn("'bench-card', 'rudder-test-card', 'sensors-card', 'bridge-card'", page)
+
+    def test_the_map_menu_offers_open_layers(self):
+        page = espnow_drive.PAGE
+        for value in ('osm', 'satellite', 'dark'):
+            self.assertIn('<option value="%s"' % value, page)
+        self.assertIn('tile.openstreetmap.org', page)
+        self.assertNotIn('google.com', page)
+
+    def test_the_page_gets_its_constants_from_the_tool(self):
+        match = espnow_drive.re.search(r'const PAGE_CONFIG = (\{.*?\});', espnow_drive.PAGE)
+        self.assertIsNotNone(match)
+        cfg = json.loads(match.group(1))
+        self.assertEqual(cfg, espnow_drive.PAGE_CONFIG)
+        self.assertEqual(cfg['trail_max_points'], espnow_drive.GPS_TRACK_MAX_POINTS)
+        self.assertEqual(cfg['trail_min_move_m'], espnow_drive.GPS_TRACK_MIN_MOVE_M)
+        self.assertIn('leaflet@1.9.4/dist/leaflet.js', cfg['leaflet_js'])
+        self.assertTrue(cfg['leaflet_js_sri'].startswith('sha256-'))
+        self.assertTrue(cfg['leaflet_css_sri'].startswith('sha256-'))
+
+    def test_no_stale_claim_that_motorstatus_is_not_decoded(self):
+        self.assertNotIn('no MotorStatus decode here', espnow_drive.PAGE)
+        self.assertNotIn("isn't decoded here", espnow_drive.__doc__)
+
+
+class MapPageJsTest(unittest.TestCase):
+    """The map code in the page, run for real in node against a fake Leaflet.
+    Put the boat where the GPS says; zoom in once on the first fix; grow the
+    trail only when the boat actually moved; never move the marker on a
+    no-fix frame; dim it when telemetry goes stale."""
+
+    FAKE_LEAFLET = r"""
+const lcalls = [];
+let lastMap = null;
+class FakeMap {
+  constructor() { this.zoom = 5; this.handlers = {}; }
+  setView(ll, z) { lcalls.push(['map.setView', ll, z]); if (z !== undefined) this.zoom = z; return this; }
+  panTo(ll) { lcalls.push(['map.panTo', ll]); return this; }
+  on(ev, fn) { this.handlers[ev] = fn; return this; }
+  removeLayer() { return this; }
+  getZoom() { return this.zoom; }
+  invalidateSize() { lcalls.push(['map.invalidateSize']); return this; }
+}
+class FakeLayer {
+  constructor(kind, arg, opts) {
+    this.kind = kind; this.arg = arg; this.opts = opts || {}; this.handlers = {};
+    this.latlngs = (kind === 'polyline') ? arg.slice() : [];
+  }
+  addTo() { lcalls.push(['addTo', this.kind]); return this; }
+  on(ev, fn) { this.handlers[ev] = fn; return this; }
+  setLatLng(ll) { lcalls.push(['marker.setLatLng', ll]); return this; }
+  setIcon(icon) { lcalls.push(['marker.setIcon', icon.opts.html]); return this; }
+  setOpacity(o) { lcalls.push(['marker.setOpacity', o]); return this; }
+  addLatLng(ll) { this.latlngs.push(ll); lcalls.push(['trail.addLatLng', ll]); return this; }
+  setLatLngs(lls) { this.latlngs = lls.slice(); lcalls.push(['trail.setLatLngs', lls.length]); return this; }
+}
+context.L = {
+  map: (id) => { lcalls.push(['L.map', id]); lastMap = new FakeMap(); return lastMap; },
+  tileLayer: (url, opts) => { lcalls.push(['L.tileLayer', url]); return new FakeLayer('tile', url, opts); },
+  polyline: (lls, opts) => new FakeLayer('polyline', lls, opts),
+  marker: (ll, opts) => new FakeLayer('marker', ll, opts),
+  divIcon: (opts) => ({ opts }),
+};
+function fix(over) {
+  return Object.assign({}, CONNECTED_STATUS, { gps_track_points: 0, telemetry: Object.assign({
+    have: true, stale: false, age_s: 0.05, heading: 45.0, pitch: 0, roll: 0, yaw_rate: 0,
+    gps_valid: true, lat: 21.0, lon: 105.8, speed_mps: 1.2, course_deg: 90.0,
+    satellites: 8, hdop: 1.1 }, over || {}) });
+}
+function report() {
+  const el = (id) => document.getElementById(id);
+  console.log(JSON.stringify({
+    lcalls,
+    fix: el('map-fix').textContent,
+    pos: el('map-pos').textContent,
+    speed: el('map-speed').textContent,
+    heading: el('map-heading').textContent,
+    trail: el('map-trail').textContent,
+    note: el('map-note').textContent,
+    noteHidden: el('map-note').hidden,
+    follow: el('map-follow').checked,
+    posts: calls.map(c => c.path),
+    gets,
+  }));
+  process.exit(0);
+}
+"""
+
+    def run_map(self, scenario_js, before_js=''):
+        result = run_page_js(
+            self.FAKE_LEAFLET + before_js
+            + '\nvm.createContext(context);\nvm.runInContext(script, context);\n'
+            + scenario_js + '\nsetTimeout(report, 120);\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    @staticmethod
+    def only(out, name):
+        return [c for c in out['lcalls'] if c[0] == name]
+
+    def test_the_map_is_built_at_load_on_openstreetmap(self):
+        out = self.run_map('')
+        self.assertEqual(self.only(out, 'L.map'), [['L.map', 'map']])
+        tiles = self.only(out, 'L.tileLayer')
+        self.assertEqual(len(tiles), 1)
+        self.assertIn('tile.openstreetmap.org', tiles[0][1])
+        self.assertIn(['addTo', 'polyline'], out['lcalls'])
+        self.assertIn(['addTo', 'marker'], out['lcalls'])
+        self.assertIn('waiting for a GPS fix', out['note'])
+        self.assertFalse(out['noteHidden'])
+        # Before the first status the markup itself says so.
+        self.assertIn('id="map-fix">NO DATA<', espnow_drive.PAGE)
+
+    def test_first_fix_places_the_boat_and_zooms_in(self):
+        out = self.run_map('context.applyStatus(fix());')
+        self.assertEqual(self.only(out, 'marker.setLatLng'),
+                         [['marker.setLatLng', [21.0, 105.8]]])
+        self.assertIn(['map.setView', [21.0, 105.8], 17], out['lcalls'])
+        icons = self.only(out, 'marker.setIcon')
+        self.assertTrue(icons and 'rotate(45deg)' in icons[-1][1], icons)
+        self.assertEqual(self.only(out, 'trail.addLatLng'),
+                         [['trail.addLatLng', [21.0, 105.8]]])
+        self.assertEqual(out['fix'], 'FIX')
+        self.assertEqual(out['pos'], '21.000000, 105.800000')
+        self.assertEqual(out['speed'], '1.2 m/s (4.3 km/h)')
+        self.assertEqual(out['heading'], '45°')
+        self.assertEqual(out['trail'], '1 pts')
+        self.assertTrue(out['noteHidden'])
+
+    def test_a_repeat_fix_adds_no_trail_point_but_a_real_move_does(self):
+        out = self.run_map("""
+context.applyStatus(fix());
+context.applyStatus(fix({ lat: 21.0 + 0.5 / 111320 }));   // ~0.5 m: jitter
+context.applyStatus(fix({ lat: 21.0 + 3.0 / 111320 }));   // ~3 m: moved
+""")
+        self.assertEqual(len(self.only(out, 'marker.setLatLng')), 3)
+        self.assertEqual(len(self.only(out, 'trail.addLatLng')), 2)
+        self.assertEqual(out['trail'], '2 pts')
+        # Follow is on: the first fix zooms, every later one pans.
+        self.assertEqual(len(self.only(out, 'map.panTo')), 2)
+
+    def test_no_fix_leaves_the_marker_where_it_was(self):
+        out = self.run_map("""
+context.applyStatus(fix());
+context.applyStatus(fix({ gps_valid: false, lat: 0.0, lon: 0.0 }));
+""")
+        self.assertEqual(len(self.only(out, 'marker.setLatLng')), 1)
+        self.assertEqual(out['fix'], 'NO FIX')
+        self.assertEqual(out['pos'], '--')
+        self.assertEqual(len(self.only(out, 'trail.addLatLng')), 1)
+
+    def test_stale_telemetry_dims_the_boat(self):
+        out = self.run_map("""
+context.applyStatus(fix());
+context.applyStatus(fix({ stale: true, age_s: 3.4 }));
+""")
+        icons = self.only(out, 'marker.setIcon')
+        self.assertNotIn('stale', icons[0][1])
+        self.assertIn('stale', icons[-1][1])
+        self.assertEqual(out['fix'], 'STALE 3s')
+        self.assertEqual(len(self.only(out, 'trail.addLatLng')), 1)
+
+    def test_dragging_switches_follow_off_and_centre_switches_it_back(self):
+        out = self.run_map("""
+context.applyStatus(fix());
+lastMap.handlers.dragstart();
+context.applyStatus(fix({ lat: 21.0 + 3.0 / 111320 }));
+lcalls.push(['pansWhileOff', lcalls.filter(c => c[0] === 'map.panTo').length,
+             elements['map-follow'].checked]);
+elements['map-center'].listeners.click();
+""")
+        self.assertEqual(self.only(out, 'pansWhileOff'), [['pansWhileOff', 0, False]])
+        self.assertTrue(out['follow'])
+        views = self.only(out, 'map.setView')
+        self.assertEqual(views[-1][1][0], 21.0 + 3.0 / 111320)
+        self.assertGreaterEqual(views[-1][2], 16)
+
+    def test_clear_trail_empties_the_page_and_tells_the_tool(self):
+        out = self.run_map("""
+context.applyStatus(fix());
+elements['map-clear'].listeners.click();
+""")
+        self.assertIn('/api/track/clear', out['posts'])
+        self.assertEqual(out['trail'], '0 pts')
+        self.assertEqual(self.only(out, 'trail.setLatLngs')[-1], ['trail.setLatLngs', 0])
+
+    def test_the_trail_is_fetched_from_the_tool_at_start(self):
+        out = self.run_map(
+            '', before_js="replies['/api/track'] = { points: [[21.0, 105.8], [21.001, 105.8]] };")
+        self.assertIn('/api/track', out['gets'])
+        self.assertEqual(self.only(out, 'trail.setLatLngs')[-1], ['trail.setLatLngs', 2])
+        self.assertEqual(out['trail'], '2 pts')
+
+    def test_a_trail_cleared_on_the_tool_side_clears_the_page(self):
+        # The count in status went DOWN: someone cleared it, or the tool
+        # restarted. Statuses are spaced out as they are in life (20 Hz), so
+        # the start-up fetch has answered before the first one lands.
+        out = self.run_map("""
+(async () => {
+  const tick = () => new Promise(resolve => setTimeout(resolve, 20));
+  await tick();
+  context.applyStatus(fix());
+  await tick();
+  context.applyStatus(Object.assign(fix({ lat: 21.0 + 3.0 / 111320 }), { gps_track_points: 2 }));
+  await tick();
+  context.applyStatus(Object.assign(fix({ lat: 21.0 + 6.0 / 111320 }), { gps_track_points: 0 }));
+})();
+""", before_js="replies['/api/track'] = { points: [] };")
+        self.assertEqual(out['gets'].count('/api/track'), 2)
+        self.assertEqual(self.only(out, 'trail.setLatLngs')[-1], ['trail.setLatLngs', 0])
+        self.assertEqual(out['trail'], '0 pts')
+
+    def test_the_map_can_be_hidden_for_a_bench_session(self):
+        # No GPS on the bench: MAP in the top bar folds the map away and the
+        # two columns sit side by side. Showing it again re-measures the map.
+        out = self.run_map("""
+elements['map-toggle'].listeners.click();
+lcalls.push(['hidden', elements['map-panel'].hidden,
+             elements['layout'].classList.contains('no-map'),
+             elements['map-toggle'].classList.contains('on')]);
+elements['map-toggle'].listeners.click();
+lcalls.push(['shown', elements['map-panel'].hidden,
+             elements['layout'].classList.contains('no-map'),
+             elements['map-toggle'].classList.contains('on')]);
+""")
+        self.assertEqual(self.only(out, 'hidden'), [['hidden', True, True, False]])
+        self.assertEqual(self.only(out, 'shown'), [['shown', False, False, True]])
+        self.assertIn(['map.invalidateSize'], out['lcalls'])
+
+    def test_without_leaflet_the_page_still_shows_the_numbers(self):
+        # No fake L: the page must ask for Leaflet (with integrity hashes) and
+        # keep the readout live while it waits.
+        result = run_page_js(r"""
+vm.createContext(context);
+vm.runInContext(script, context);
+context.applyStatus(Object.assign({}, CONNECTED_STATUS, { gps_track_points: 0, telemetry: {
+  have: true, stale: false, age_s: 0.05, heading: 10.0, pitch: 0, roll: 0, yaw_rate: 0,
+  gps_valid: true, lat: 21.0, lon: 105.8, speed_mps: 0.0, course_deg: 0.0,
+  satellites: 5, hdop: 2.0 } }));
+const injected = document.head.options.map(el => ({
+  tag: el.tagName, src: el.src, href: el.href, integrity: el.integrity }));
+console.log(JSON.stringify({ injected, pos: elements['map-pos'].textContent,
+  fix: elements['map-fix'].textContent, note: elements['map-note'].textContent }));
+process.exit(0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        tags = {item['tag']: item for item in out['injected']}
+        self.assertIn('leaflet@1.9.4/dist/leaflet.js', tags['script']['src'])
+        self.assertIn('leaflet@1.9.4/dist/leaflet.css', tags['link']['href'])
+        self.assertTrue(tags['script']['integrity'].startswith('sha256-'))
+        self.assertTrue(tags['link']['integrity'].startswith('sha256-'))
+        self.assertEqual(out['pos'], '21.000000, 105.800000')
+        self.assertEqual(out['fix'], 'FIX')
+        self.assertIn('loading', out['note'])
+
+
+class StopResetsEverySliderTest(unittest.TestCase):
+    """Per-motor mode: STOP must put the Left/Right sliders back to 0 as well,
+    and the next heartbeat must carry zeros. The boat IS at zero after STOP, so
+    a slider still showing 40 % is a lie -- and the next nudge would have sent
+    that motor straight back to 40 %."""
+
+    def test_stop_zeroes_left_and_right_and_the_next_heartbeat(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+context.applyStatus(CONNECTED_STATUS);
+setTimeout(async () => {
+  // Unlink, then push the left motor to 40 %.
+  elements['motor-link'].checked = false;
+  elements['motor-link'].listeners.change({ target: elements['motor-link'] });
+  elements['motor-left'].value = '40';
+  elements['motor-left'].listeners.input({ target: elements['motor-left'] });
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const before = { left: elements['motor-left'].value,
+                   ctrl: JSON.parse(JSON.stringify(context.ctrl)) };
+  await elements['stop-btn'].listeners.click();
+  const sliders = {};
+  for (const id of ['throttle', 'motor-left', 'motor-right', 'rudder']) {
+    sliders[id] = { value: Number(elements[id].value), label: elements[id + '-val'].textContent };
+  }
+  // The page takes a fresh session after STOP; its heartbeat is what the boat obeys.
+  await context.openSession();
+  await context.sendHeartbeat();
+  const states = calls.filter(c => c.path === '/api/state').map(c => c.body);
+  console.log(JSON.stringify({ before, sliders, ctrl: context.ctrl,
+                               linkChecked: elements['motor-link'].checked,
+                               lastState: states[states.length - 1] }));
+  process.exit(0);
+}, 50);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['before']['left'], '40')
+        self.assertAlmostEqual(out['before']['ctrl']['left'], 0.4)
+        for slider in out['sliders'].values():
+            self.assertEqual(slider, {'value': 0, 'label': '0%'})
+        self.assertEqual(out['ctrl'], {'throttle': 0, 'rudder': 0, 'left': 0,
+                                       'right': 0, 'split': True})
+        self.assertFalse(out['linkChecked'])      # the operator's choice survives
+        last = out['lastState']
+        self.assertEqual((last['throttle'], last['left'], last['right'], last['rudder']),
+                         (0, 0, 0, 0))

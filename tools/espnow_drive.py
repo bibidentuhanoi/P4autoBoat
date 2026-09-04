@@ -53,12 +53,21 @@ even though the serial process remains connected. The continuous base stream
 feeds the firmware's control-link-loss failsafe (motor_control.c), which stops
 the boat if the whole stream goes silent for 400ms.
 
-NOTE: the armed/force state shown in the page is still just the last command
-WE SENT, never confirmed by the boat -- MotorStatus (which would confirm it)
-isn't decoded here, only SensorSnapshot (GPS/IMU) is. If ARM doesn't visibly
-do anything on the boat, that's consistent with "sent but refused" (no GPS
-lock, force unchecked) as much as "never arrived" -- telemetry moving proves
-the LINK is alive, not that any specific command was accepted.
+The page is three columns on a laptop: what you DO on the left (connect,
+drive, the tests), the map in the middle, what the boat TELLS you on the
+right (telemetry, confirmed motor state, sensor health, bridge). The map is
+Leaflet with OpenStreetMap tiles (a satellite and a dark layer are one click
+away), fetched from the internet when the page loads; with no internet the
+map box says so and everything else keeps working. The boat's trail is kept
+by THIS process (GpsTrack) so a reload gets it back, and served at /api/track.
+
+NOTE: the armed/force state in the Drive card is the last command WE SENT.
+The boat's own answer -- real arm state, real per-motor throttle, servo rail
+-- arrives in MotorStatus and is shown in "Motor (confirmed by boat)"; the two
+disagreeing is exactly the thing to look at when an ARM does nothing. If ARM
+doesn't visibly do anything, that's consistent with "sent but refused" (no
+GPS lock, force unchecked) as much as "never arrived" -- telemetry moving
+proves the LINK is alive, not that any specific command was accepted.
 
 SAFETY: bench-test on blocks before this ever touches water. An unexpected
 throttle with the propeller in the water is the one genuinely dangerous
@@ -72,6 +81,7 @@ Then open the printed http://127.0.0.1:PORT/ URL (done automatically if a
 browser is available).
 """
 import base64
+import collections
 import hashlib
 import json
 import math
@@ -115,6 +125,15 @@ SEND_HZ = 15
 HTTP_HOST = '127.0.0.1'        # LAN-reachable would let anyone drive the boat
 TELEMETRY_STALE_S = 2.0        # snapshot task runs ~20Hz normally -- 2s is a generous margin
 WINCH_LEASE_S = 0.30           # nonzero command must be renewed before firmware's 400ms failsafe
+GPS_TRACK_MAX_POINTS = 5000    # the map's trail; oldest fixes drop first
+GPS_TRACK_MIN_MOVE_M = 1.5     # under typical fix jitter, so a moored boat
+                               # does not scribble the trail full of noise
+# Leaflet, pinned and hash-checked. The page loads it from the CDN at runtime
+# (never from <head>): an offline laptop still gets the page instantly.
+LEAFLET_JS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'
+LEAFLET_JS_SRI = 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo='
+LEAFLET_CSS_URL = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'
+LEAFLET_CSS_SRI = 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY='
 
 WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'   # RFC 6455 handshake constant
 WS_PUSH_HZ = 20                 # status push rate over /ws -- at least matches the
@@ -620,6 +639,57 @@ def summarize_yaw(samples, aborted=False, drive_s=BENCH_DRIVE_S):
     return out
 
 
+class GpsTrack:
+    """The boat's trail for the map: every valid fix that moved at least
+    min_move_m from the last one kept. It lives in this process rather than
+    in the page so a browser reload (or a second tab) gets the whole trail
+    back with one request (/api/track). Bounded: the oldest points drop
+    first, so a long day on the water cannot grow it without limit."""
+
+    def __init__(self, max_points: int = GPS_TRACK_MAX_POINTS,
+                 min_move_m: float = GPS_TRACK_MIN_MOVE_M):
+        self.max_points = max_points
+        self.min_move_m = min_move_m
+        self._points = collections.deque(maxlen=max_points)
+
+    def __len__(self):
+        return len(self._points)
+
+    @staticmethod
+    def _usable(lat, lon) -> bool:
+        # NaN/inf and out-of-range values are garbage; (0, 0) is the "null
+        # island" a receiver reports before it has any idea where it is.
+        return (math.isfinite(lat) and math.isfinite(lon)
+                and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+                and not (lat == 0.0 and lon == 0.0))
+
+    @staticmethod
+    def distance_m(lat1, lon1, lat2, lon2) -> float:
+        """Metres between two fixes. Equirectangular: exact enough for the few
+        metres between consecutive fixes, and cheap enough for 20 Hz."""
+        k = 111320.0                              # metres per degree of latitude
+        dy = (lat2 - lat1) * k
+        dx = (lon2 - lon1) * k * math.cos(math.radians((lat1 + lat2) / 2.0))
+        return math.hypot(dx, dy)
+
+    def add(self, lat, lon, valid: bool = True) -> bool:
+        """Record a fix. Returns True if it became a new trail point."""
+        if not valid or not self._usable(lat, lon):
+            return False
+        if self._points:
+            last_lat, last_lon = self._points[-1]
+            if self.distance_m(last_lat, last_lon, lat, lon) < self.min_move_m:
+                return False
+        self._points.append((float(lat), float(lon)))
+        return True
+
+    def clear(self):
+        self._points.clear()
+
+    def points(self) -> list:
+        return [[lat, lon] for lat, lon in self._points]
+
+
 def load_boat_pb2():
     try:
         from proto import boat_pb2
@@ -672,6 +742,7 @@ class BoatLink:
         self.seq = 0
         self.last_error = None
         self.telemetry = self._blank_telemetry()
+        self.gps_track = GpsTrack()      # the map's trail, fed by every fix
         self.calibrate_status = self._blank_calibrate_status()
         self.system_status = self._blank_system_status()
         self.motor_status = self._blank_motor_status()
@@ -2163,6 +2234,9 @@ class BoatLink:
                 'seq': self.seq,
                 'last_error': self.last_error,
                 'telemetry': self._with_age(self.telemetry, TELEMETRY_STALE_S),
+                # The trail itself is served by /api/track on demand; this
+                # push runs 20x a second, so it carries only the count.
+                'gps_track_points': self._track_len_locked(),
                 # Bridge status arrives ~1/s from the S3 -- a longer stale
                 # window than telemetry is correct, not a copy/paste of it.
                 'bridge_status': self._with_age(self.bridge_status, 3.0),
@@ -2225,6 +2299,32 @@ class BoatLink:
             }
             if cs.state in (4, 5):
                 self.calibrating = False
+
+    # ---- the map's trail ------------------------------------------------
+
+    def _record_fix_locked(self, gps_valid, lat, lon):
+        """Add a fix to the trail. Caller holds self._lock. The tests build
+        links with __new__ and only the attributes they need, so a link with
+        no track simply does not record -- that is not an error."""
+        track = getattr(self, 'gps_track', None)
+        if track is not None:
+            track.add(lat, lon, valid=bool(gps_valid))
+
+    def _track_len_locked(self) -> int:
+        track = getattr(self, 'gps_track', None)
+        return len(track) if track is not None else 0
+
+    def track_snapshot(self) -> dict:
+        """The whole trail, for /api/track -- on demand, never in the 20 Hz
+        status push."""
+        with self._lock:
+            return {'points': self.gps_track.points(),
+                    'max_points': self.gps_track.max_points,
+                    'min_move_m': self.gps_track.min_move_m}
+
+    def track_clear(self):
+        with self._lock:
+            self.gps_track.clear()
 
     def _stream_loop(self):
         period = 1.0 / self.send_hz
@@ -2364,6 +2464,7 @@ class BoatLink:
                 }
                 self._collect_bench_yaw_locked(yaw_rate, heading)
                 self._collect_rudder_test_row_locked(yaw_rate, heading)
+                self._record_fix_locked(gps_valid, lat, lon)
             return
 
         if msg_type == MSG_MOTOR_STATUS:
@@ -2446,6 +2547,7 @@ class BoatLink:
             }
             self._collect_bench_yaw_locked(s.imu.yaw_rate, s.imu.heading)
             self._collect_rudder_test_row_locked(s.imu.yaw_rate, s.imu.heading)
+            self._record_fix_locked(s.gps.valid, s.gps.latitude, s.gps.longitude)
 
     def _read_loop(self):
         """Telemetry downlink: same serial connection as the command uplink,
@@ -2485,7 +2587,7 @@ class BoatLink:
 # .btn-arm/.state-dot/.motor-slider-row rules -- see feedback_projection_
 # constants in project memory: dashboard.html is the visual source of truth,
 # match it exactly rather than reinvent a palette.
-PAGE = """<!DOCTYPE html>
+_PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -2507,8 +2609,11 @@ PAGE = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', monospace;
          font-size: 13px; min-height: 100vh; display: flex; flex-direction: column;
-         align-items: center; padding: 24px 16px; }
-  header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+         align-items: center; padding: 16px 16px 24px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+           width: 100%; max-width: 1640px; }
+  .menu-btn { margin-left: auto; font-size: 10px; letter-spacing: 1px; padding: 4px 10px; }
+  .menu-btn.on { color: var(--accent); border-color: var(--accent); }
   header h1 { font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); }
   .pill { padding: 3px 10px; border-radius: 10px; font-size: 10px; letter-spacing: 1px;
           text-transform: uppercase; border: 1px solid var(--border); color: var(--dim); }
@@ -2562,6 +2667,67 @@ PAGE = """<!DOCTYPE html>
   .telem-row .val.warn { color: var(--warn); }
   .pill { min-width: 0; overflow-wrap: break-word; white-space: normal; }
   .pill.stale { color: var(--warn); border-color: var(--warn); }
+
+  /* ---- layout: what you DO on the left, the map in the middle, what the
+     boat TELLS you on the right. Cards keep their 360px width; only the
+     wrappers are new. The map panel is sticky, so it stays in view while
+     either column scrolls. Hide the map (MAP in the top bar -- a bench
+     session has no GPS) and the two columns sit side by side instead. */
+  .layout { width: 100%; max-width: 1640px; display: grid; column-gap: 16px;
+            grid-template-columns: 360px minmax(0, 1fr) 360px;
+            grid-template-areas: "do map tell"; align-items: start; }
+  .layout.no-map { grid-template-columns: 360px 360px; grid-template-areas: "do tell";
+                   justify-content: center; }
+  .col { display: flex; flex-direction: column; align-items: center; min-width: 0; }
+  .col-do { grid-area: do; }
+  .col-tell { grid-area: tell; }
+  .map-panel { grid-area: map; position: sticky; top: 16px; min-width: 0;
+               height: calc(100vh - 32px); min-height: 420px; margin-bottom: 16px;
+               display: flex; flex-direction: column; background: var(--card);
+               border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .map-panel[hidden] { display: none; }
+  @media (max-width: 1180px) {
+    .layout { grid-template-columns: 360px minmax(0, 1fr);
+              grid-template-areas: "do map" "tell map"; }
+  }
+  @media (max-width: 780px) {
+    .layout, .layout.no-map { grid-template-columns: minmax(0, 1fr);
+                              grid-template-areas: "do" "map" "tell"; }
+    .layout.no-map { grid-template-areas: "do" "tell"; }
+    .map-panel { position: static; height: 70vh; }
+  }
+  /* Folding cards keep every row, just tucked under the title; the title
+     pill keeps updating while folded. */
+  details.card > summary.card-title { cursor: pointer; list-style: none;
+                                      margin-bottom: 0; user-select: none; }
+  details.card > summary.card-title::-webkit-details-marker { display: none; }
+  details.card > summary.card-title::before { content: '▸'; color: var(--dim); margin-right: 8px; }
+  details.card[open] > summary.card-title { margin-bottom: 12px; }
+  details.card[open] > summary.card-title::before { content: '▾'; }
+
+  /* ---- map ---- */
+  .map-menu { gap: 8px; margin-bottom: 8px; }
+  .map-menu .title { margin-right: auto; }
+  .map-menu select { flex: 0 1 auto; padding: 3px 6px; font-size: 11px; }
+  .map-menu button { padding: 3px 8px; font-size: 10px; text-transform: uppercase;
+                     letter-spacing: 1px; }
+  .map-readout { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px;
+                 font-size: 11px; }
+  .map-readout label { font-size: 10px; color: var(--dim); text-transform: uppercase;
+                       letter-spacing: 1px; margin-right: 5px; }
+  .map-readout b { color: var(--accent); }
+  .map-box { position: relative; flex: 1 1 auto; min-height: 240px; border-radius: 6px;
+             overflow: hidden; background: #0A1220; border: 1px solid var(--border); }
+  #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+  #map-note { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+              z-index: 1100; pointer-events: none; max-width: 80%; text-align: center;
+              background: rgba(5, 8, 15, 0.88); border: 1px solid var(--border);
+              border-radius: 6px; padding: 8px 12px; font-size: 11px; color: var(--warn); }
+  #map-note[hidden] { display: none; }
+  .boat-icon { background: none; border: none; }
+  .boat-arrow { display: block; width: 26px; height: 26px; filter: drop-shadow(0 0 3px #000); }
+  .boat-arrow.stale { opacity: 0.45; }
+  .leaflet-container { background: #0A1220; font-family: inherit; }
 </style>
 </head>
 <body>
@@ -2569,7 +2735,11 @@ PAGE = """<!DOCTYPE html>
 <header>
   <h1>ESP-NOW Drive</h1>
   <span class="pill" id="conn-pill">DISCONNECTED</span>
+  <button class="menu-btn on" id="map-toggle" title="show or hide the map (a bench session has no GPS)">MAP</button>
 </header>
+
+<div class="layout" id="layout">
+<div class="col col-do" id="col-do">
 
 <div class="card">
   <div class="card-title">Connect</div>
@@ -2641,8 +2811,8 @@ PAGE = """<!DOCTYPE html>
   <button id="stop-btn">STOP</button>
 </div>
 
-<div class="card" id="bench-card">
-  <div class="card-title">Throttle mismatch test <span class="pill" id="bench-pill" style="margin-left:6px;">IDLE</span></div>
+<details class="card" id="bench-card">
+  <summary class="card-title">Throttle mismatch test <span class="pill" id="bench-pill" style="margin-left:6px;">IDLE</span></summary>
   <div class="row slider-row">
     <label>Throttle %</label>
     <input type="number" id="bench-throttle" min="1" max="60" step="1" value="20" style="width:56px;">
@@ -2689,10 +2859,10 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Saved CSV</label><span class="val" id="bench-csv">--</span></div>
   <div id="bench-yaw-note" style="font-size:10px;color:var(--dim);">UI-observed / approximate &mdash; the boat's SD CSV is authoritative. This laptop also saves its own radio-observed CSV to dataout/.</div>
   <div id="bench-msg" style="font-size:10px;color:var(--warn);">boat records to its own SD card; DISARM stops a run. RESET is one-shot &mdash; ordinary BASE runs keep the learned c.</div>
-</div>
+</details>
 
-<div class="card" id="rudder-test-card">
-  <div class="card-title">Rudder test <span class="pill" id="rt-pill" style="margin-left:6px;">IDLE</span></div>
+<details class="card" id="rudder-test-card">
+  <summary class="card-title">Rudder test <span class="pill" id="rt-pill" style="margin-left:6px;">IDLE</span></summary>
   <!-- Fixed sequence: rudder over for 0.5s, then T20 for exactly 3.0s, then
        1.0s of coast still held over, then centre. Named by SIGN only -- which
        way the boat physically turns is what this test is FOR, so the buttons
@@ -2717,8 +2887,38 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div id="rt-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
+</details>
+
 </div>
-</div>
+
+<section class="map-panel" id="map-panel">
+  <div class="card-title map-menu">
+    <span class="title">Map</span>
+    <span class="pill" id="map-fix">NO DATA</span>
+    <select id="map-layer" title="map layer">
+      <option value="osm">OpenStreetMap</option>
+      <option value="satellite">Satellite (Esri)</option>
+      <option value="dark">Dark (Carto)</option>
+    </select>
+    <label class="bench" style="color:var(--dim);"><input type="checkbox" id="map-follow" checked>Follow boat</label>
+    <button id="map-center" title="centre on the boat and follow it again (also retries loading the map)">&#8982; Centre</button>
+    <button id="map-clear" title="forget the trail drawn so far -- on this page and in the tool">Clear trail</button>
+  </div>
+  <div class="map-readout">
+    <span><label>Lat / Lon</label><b id="map-pos">--</b></span>
+    <span><label>Speed</label><b id="map-speed">--</b></span>
+    <span><label>Course</label><b id="map-course">--</b></span>
+    <span><label>Heading</label><b id="map-heading">--</b></span>
+    <span><label>Sats / HDOP</label><b id="map-sats">--</b></span>
+    <span><label>Trail</label><b id="map-trail">0 pts</b></span>
+  </div>
+  <div class="map-box">
+    <div id="map"></div>
+    <div id="map-note">loading map…</div>
+  </div>
+</section>
+
+<div class="col col-tell" id="col-tell">
 
 <div class="card" id="telemetry-card">
   <div class="card-title">Telemetry <span class="pill" id="telem-pill" style="margin-left:6px;">NO DATA YET</span></div>
@@ -2735,15 +2935,6 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Speed / Course</label><span class="val" id="t-speed">--</span></div>
 </div>
 
-<div class="card" id="sensors-card">
-  <div class="card-title">Sensors (boot check) <span class="pill" id="sensors-pill" style="margin-left:6px;">NO DATA YET</span></div>
-  <div class="telem-row"><label>Camera</label><span class="val" id="s-camera">--</span></div>
-  <div class="telem-row"><label>ToF A</label><span class="val" id="s-tof-a">--</span></div>
-  <div class="telem-row"><label>ToF B</label><span class="val" id="s-tof-b">--</span></div>
-  <div class="telem-row"><label>IMU</label><span class="val" id="s-imu">--</span></div>
-  <div class="telem-row"><label>Compass</label><span class="val" id="s-mag">--</span></div>
-</div>
-
 <div class="card" id="motorstatus-card">
   <div class="card-title">Motor (confirmed by boat) <span class="pill" id="mstat-pill" style="margin-left:6px;">NO DATA YET</span></div>
   <div class="telem-row"><label>Arm state</label><span class="val" id="m-armstate">--</span></div>
@@ -2752,8 +2943,17 @@ PAGE = """<!DOCTYPE html>
   <div class="telem-row"><label>Servo rail</label><span class="val" id="m-servo">--</span></div>
 </div>
 
-<div class="card" id="bridge-card">
-  <div class="card-title">Bridge (S3) <span class="pill" id="bridge-pill" style="margin-left:6px;">NO DATA YET</span></div>
+<details class="card" id="sensors-card" open>
+  <summary class="card-title">Sensors (boot check) <span class="pill" id="sensors-pill" style="margin-left:6px;">NO DATA YET</span></summary>
+  <div class="telem-row"><label>Camera</label><span class="val" id="s-camera">--</span></div>
+  <div class="telem-row"><label>ToF A</label><span class="val" id="s-tof-a">--</span></div>
+  <div class="telem-row"><label>ToF B</label><span class="val" id="s-tof-b">--</span></div>
+  <div class="telem-row"><label>IMU</label><span class="val" id="s-imu">--</span></div>
+  <div class="telem-row"><label>Compass</label><span class="val" id="s-mag">--</span></div>
+</details>
+
+<details class="card" id="bridge-card" open>
+  <summary class="card-title">Bridge (S3) <span class="pill" id="bridge-pill" style="margin-left:6px;">NO DATA YET</span></summary>
   <div class="telem-row"><label>ESP-NOW pkts</label><span class="val" id="b-pkts">--</span></div>
   <div class="telem-row"><label>Uplink RSSI</label><span class="val" id="b-rssi">--</span></div>
   <div class="telem-row"><label>LR peer rate</label><span class="val" id="b-lr-rate">--</span></div>
@@ -2766,12 +2966,15 @@ PAGE = """<!DOCTYPE html>
     the boat (radio/channel/range); pkts climbing but no telemetry above means
     a decode problem on this end.
   </div>
+</details>
+
+</div>
 </div>
 
 <footer>
   <div>tx seq <span id="seq">0</span> <span id="err" class="err"></span></div>
-  <div style="margin-top:6px;">ARM/DISARM above is the last command sent, not confirmed by
-  the boat (no MotorStatus decode here) -- but GPS/IMU telemetry updating means the ESP-NOW
+  <div style="margin-top:6px;">ARM/DISARM in the Drive card is the last command sent; the boat's
+  own answer is in "Motor (confirmed by boat)". GPS/IMU telemetry updating means the ESP-NOW
   link itself is genuinely alive.</div>
 </footer>
 
@@ -2856,12 +3059,25 @@ $('connect-btn').addEventListener('click', async () => {
   if (res.ok) {
     winchDir = 0;
     setConnectedUI(true, port);
-    $('throttle').value = 0; $('throttle-val').textContent = '0%';
-    $('rudder').value = 0; $('rudder-val').textContent = '0%';
+    zeroDriveUI();
   } else {
     $('hint').textContent = `connect failed: ${res.error}`;
   }
 });
+
+// Every path that puts the boat at zero -- STOP, DISARM, a fresh control
+// session, a reconnect, the tab going away, calibration -- must put the
+// SLIDERS at zero too. Only the linked throttle and the rudder used to be
+// reset, so in per-motor mode the Left/Right sliders kept showing a value the
+// boat no longer had, and the next nudge sent that motor straight back to it.
+// The link/unlink MODE is the operator's choice and survives; the values do not.
+function zeroDriveUI() {
+  for (const id of ['throttle', 'motor-left', 'motor-right', 'rudder']) {
+    $(id).value = 0;
+    $(id + '-val').textContent = '0%';
+  }
+  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: !$('motor-link').checked };
+}
 
 $('throttle').addEventListener('input', (e) => {
   const v = parseInt(e.target.value);
@@ -2922,7 +3138,7 @@ async function openSession() {
     ctrlSeq = 0;
     // Taking control starts from a stopped boat; mirror that locally so the
     // first heartbeat cannot re-assert a stale slider position.
-    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
+    zeroDriveUI();
     stopHeartbeat();
     hbInFlight = false;
     hbTimer = setInterval(sendHeartbeat, Math.round(1000 / (r.heartbeat_hz || 12)));
@@ -2997,7 +3213,7 @@ function stopHeartbeat() {
 // event catches -- a crash, the network dying, a laptop lid closing.
 function releaseControl(beacon) {
   stopHeartbeat();
-  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
+  zeroDriveUI();
   sessionId = null;
   const body = new Blob(['{}'], { type: 'application/json' });
   if (beacon && navigator.sendBeacon) navigator.sendBeacon('/api/release', body);
@@ -3126,14 +3342,12 @@ $('servo-off-btn').addEventListener('click', () => setServoPower(false));
 $('stop-btn').addEventListener('click', async () => {
   clearWinchRenewal();
   winchDir = 0;
-  $('throttle').value = 0; $('throttle-val').textContent = '0%';
-  $('rudder').value = 0; $('rudder-val').textContent = '0%';
+  zeroDriveUI();
   await api('/api/stop', 'POST', { seq: ++winchCommandSeq });
   // STOP drops the session server-side; mirror it so the UI does not keep
   // heartbeating a session that no longer exists. ARM re-acquires one.
   stopHeartbeat();
   sessionId = null;
-  ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
 });
 
 $('arm-btn').addEventListener('click', async () => {
@@ -3150,7 +3364,7 @@ $('arm-btn').addEventListener('click', async () => {
     // starts at ZERO, which is exactly what ARM requires: the server refuses
     // to arm against a held control.
     if (!sessionId) await openSession();
-    else { ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false }; await sendHeartbeat(); }
+    else { zeroDriveUI(); await sendHeartbeat(); }
   }
   const r = await api('/api/arm', 'POST', { arm: nextArm, force });
   if (r && !r.ok) $('hint').textContent = r.error || 'refused';
@@ -3158,7 +3372,7 @@ $('arm-btn').addEventListener('click', async () => {
     // DISARM dropped the session server-side; stop pretending to hold one.
     stopHeartbeat();
     sessionId = null;
-    ctrl = { throttle: 0, rudder: 0, left: 0, right: 0, split: false };
+    zeroDriveUI();
   }
 });
 
@@ -3171,7 +3385,12 @@ $('calibrate-btn').addEventListener('click', async () => {
   }
   // While started, the tool streams a CalibrateCommand keepalive instead of
   // motor/steer/winch, so the boat never sees a manual command (which aborts).
-  await api('/api/calibrate', 'POST', { start, seq: ++winchCommandSeq });
+  const r = await api('/api/calibrate', 'POST', { start, seq: ++winchCommandSeq });
+  // The boat is under the firmware's own control now (or has just been handed
+  // back, zeroed). Sliders and heartbeat must say zero as well: otherwise the
+  // throttle the operator held BEFORE the sweep would be quietly resumed the
+  // moment it ends, with nobody touching anything.
+  if (!start || (r && r.ok)) zeroDriveUI();
 });
 
 // Dataset capture (Feature 1) -- fire-and-forget, no ack. The boat saves the
@@ -3447,6 +3666,7 @@ function applyStatus(s) {
     $('t-sats').textContent = t.have ? `${t.satellites} / ${t.hdop.toFixed(1)}` : '--';
     $('t-speed').textContent = (t.have && t.gps_valid)
       ? `${t.speed_mps.toFixed(1)} m/s / ${t.course_deg.toFixed(0)}°` : '--';
+    mapUpdate(t, s.gps_track_points);
 
     // Sensor-health / boot check (SystemStatus). The boat sends this ~1Hz over
     // the field link; without it, 'NO FIX' hid whether the GPS chip was even
@@ -3656,6 +3876,309 @@ function applyStatus(s) {
     $('b-drops').textContent = b.have ? `${b.reasm_drops}` : '--';
 }
 
+// ---- map -------------------------------------------------------------------
+// The boat on a real map, live. Leaflet and the tiles come from the internet;
+// the library is loaded HERE, when the page runs, never from <head>, so a
+// laptop with no connection still gets the page at once and the map box says
+// what is missing. The trail is kept by the Python side (/api/track); this
+// page mirrors it and applies the same distance rule between fetches.
+const PAGE_CONFIG = __PAGE_CONFIG__;
+const MAP_LAYERS = {
+  osm: { url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', maxZoom: 19,
+         attribution: '&copy; OpenStreetMap contributors' },
+  satellite: { url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+               maxZoom: 19, attribution: 'Tiles &copy; Esri' },
+  dark: { url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', subdomains: 'abcd',
+          maxZoom: 20, attribution: '&copy; OpenStreetMap contributors &copy; CARTO' },
+};
+const MAP_FIRST_FIX_ZOOM = 17;      // a lake or a pool: a few hundred metres across
+const MAP_HOME = [16.5, 106.5];     // Vietnam, until the boat says where it is
+const MAP_TRAIL_MAX = PAGE_CONFIG.trail_max_points;
+const MAP_TRAIL_MIN_MOVE_M = PAGE_CONFIG.trail_min_move_m;
+const mapState = { map: null, marker: null, trail: null, layer: null, ready: false,
+                   loading: false, shown: true, follow: true, hasFix: false, last: null,
+                   lastHeading: null, markerStale: false, tilesFailing: false,
+                   trailPts: [], serverPts: 0, fetchingTrail: false };
+
+// localStorage is a convenience, never a dependency: missing, full or
+// throwing (some private windows do) all fall back to the defaults.
+function storeGet(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v;
+  } catch (e) { return fallback; }
+}
+function storeSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* no storage: fine */ }
+}
+
+function mapNote(text) {
+  const n = $('map-note');
+  n.textContent = text || '';
+  n.hidden = !text;
+}
+
+// What the box in the middle of the map should say right now, derived from
+// state rather than from whichever event happened to fire last.
+function mapRefreshNote() {
+  if (mapState.tilesFailing) {
+    mapNote('map tiles are not loading — no internet?');
+  } else if (!mapState.hasFix) {
+    mapNote((mapState.last ? 'last known position — ' : '')
+            + 'waiting for a GPS fix (indoors? hide the map with MAP, top right)');
+  } else {
+    mapNote('');
+  }
+}
+
+// MAP in the top bar. A bench session has no GPS, so the map can get out of
+// the way: with it hidden the two columns sit side by side.
+function mapSetShown(on) {
+  mapState.shown = !!on;
+  $('map-panel').hidden = !mapState.shown;
+  $('layout').classList.toggle('no-map', !mapState.shown);
+  $('map-toggle').classList.toggle('on', mapState.shown);
+  storeSet('espnow.map.shown', mapState.shown ? '1' : '0');
+  // Leaflet sized itself while the box was display:none (0 x 0); tell it.
+  if (mapState.shown && mapState.ready) mapState.map.invalidateSize();
+}
+
+function mapBoot() {
+  mapSetShown(storeGet('espnow.map.shown', '1') !== '0');
+  if (mapState.ready || mapState.loading) return;
+  if (typeof L !== 'undefined') { mapInit(); return; }
+  mapState.loading = true;
+  mapNote('loading map…');
+  const css = document.createElement('link');
+  css.rel = 'stylesheet';
+  css.href = PAGE_CONFIG.leaflet_css;
+  css.integrity = PAGE_CONFIG.leaflet_css_sri;
+  css.crossOrigin = '';
+  document.head.appendChild(css);
+  const js = document.createElement('script');
+  js.src = PAGE_CONFIG.leaflet_js;
+  js.integrity = PAGE_CONFIG.leaflet_js_sri;
+  js.crossOrigin = '';
+  let settled = false;
+  js.onload = () => { if (settled) return; settled = true; mapState.loading = false; mapInit(); };
+  js.onerror = () => { if (settled) return; settled = true; mapFail(); };
+  setTimeout(() => { if (!settled) { settled = true; mapFail(); } }, 20000);
+  document.head.appendChild(js);
+}
+
+function mapFail() {
+  mapState.loading = false;
+  mapNote('map not available: Leaflet did not load from ' + PAGE_CONFIG.leaflet_js
+          + ' (no internet?). Everything else works. Centre = try again.');
+}
+
+function mapInit() {
+  if (mapState.ready) return;
+  const map = L.map('map', { zoomControl: true, attributionControl: true });
+  mapState.map = map;
+  mapSetLayer(storeGet('espnow.map.layer', 'osm'));
+  const remembered = mapRememberedPosition();
+  mapState.last = remembered;
+  mapState.markerStale = true;
+  map.setView(remembered || MAP_HOME, remembered ? 16 : 5);
+  mapState.trail = L.polyline([], { color: '#00BFFF', weight: 3, opacity: 0.85 }).addTo(map);
+  mapState.marker = L.marker(remembered || MAP_HOME, {
+    icon: boatIcon(0, true), opacity: remembered ? 1 : 0,
+    interactive: false, zIndexOffset: 1000 }).addTo(map);
+  // Dragging the map is the operator saying "let me look around": follow
+  // switches itself off. Zooming does not -- you still want the boat centred.
+  map.on('dragstart', () => mapSetFollow(false));
+  mapState.ready = true;
+  mapRefreshNote();
+  mapFetchTrail();
+}
+
+function mapRememberedPosition() {
+  const parts = storeGet('espnow.map.last', '').split(',');
+  if (parts.length !== 2) return null;
+  const lat = Number(parts[0]), lon = Number(parts[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || (lat === 0 && lon === 0)) return null;
+  return [lat, lon];
+}
+
+function mapSetLayer(key) {
+  if (!MAP_LAYERS[key]) key = 'osm';
+  const def = MAP_LAYERS[key];
+  if (mapState.layer) mapState.map.removeLayer(mapState.layer);
+  mapState.tilesFailing = false;
+  const layer = L.tileLayer(def.url, { subdomains: def.subdomains || 'abc',
+                                       maxZoom: def.maxZoom, attribution: def.attribution });
+  // "load" fires once every visible tile is done, failed ones included, so
+  // count the failures per round rather than clearing the note on "load".
+  let failed = 0;
+  layer.on('loading', () => { failed = 0; });
+  layer.on('tileerror', () => { failed += 1; });
+  layer.on('load', () => { mapState.tilesFailing = failed > 0; mapRefreshNote(); });
+  layer.addTo(mapState.map);
+  mapState.layer = layer;
+  $('map-layer').value = key;
+  storeSet('espnow.map.layer', key);
+}
+
+function boatIcon(heading, stale) {
+  const h = Number.isFinite(heading) ? Math.round(heading) : 0;
+  return L.divIcon({
+    className: 'boat-icon', iconSize: [26, 26], iconAnchor: [13, 13],
+    html: '<svg class="boat-arrow' + (stale ? ' stale' : '') + '" viewBox="0 0 24 24"'
+        + ' style="transform: rotate(' + h + 'deg)">'
+        + '<path d="M12 2 L19 21 L12 17 L5 21 Z" fill="#00BFFF" stroke="#05080F"'
+        + ' stroke-width="1.5"></path></svg>' });
+}
+
+function mapSetFollow(on) {
+  mapState.follow = !!on;
+  $('map-follow').checked = mapState.follow;
+}
+
+// Called on every status push (20 Hz). The readout strip always updates; the
+// marker and trail only once Leaflet is up.
+function mapUpdate(t, serverPts) {
+  const have = !!(t && t.have);
+  const fix = have && !!t.gps_valid && Number.isFinite(t.lat) && Number.isFinite(t.lon)
+              && !(t.lat === 0 && t.lon === 0);
+  const pill = $('map-fix');
+  if (!have) {
+    pill.textContent = 'NO DATA';
+    pill.classList.remove('up', 'stale');
+  } else if (t.stale) {
+    pill.textContent = 'STALE ' + t.age_s.toFixed(0) + 's';
+    pill.classList.remove('up'); pill.classList.add('stale');
+  } else if (!fix) {
+    pill.textContent = 'NO FIX';
+    pill.classList.remove('up'); pill.classList.add('stale');
+  } else {
+    pill.textContent = 'FIX';
+    pill.classList.remove('stale'); pill.classList.add('up');
+  }
+  $('map-pos').textContent = fix ? t.lat.toFixed(6) + ', ' + t.lon.toFixed(6) : '--';
+  $('map-speed').textContent = fix
+    ? t.speed_mps.toFixed(1) + ' m/s (' + (t.speed_mps * 3.6).toFixed(1) + ' km/h)' : '--';
+  $('map-course').textContent = fix ? t.course_deg.toFixed(0) + '°' : '--';
+  $('map-heading').textContent = have ? t.heading.toFixed(0) + '°' : '--';
+  $('map-sats').textContent = have ? t.satellites + ' / ' + t.hdop.toFixed(1) : '--';
+  if (Number.isInteger(serverPts)) mapSyncTrail(serverPts);
+  if (!mapState.ready) return;
+  if (!fix) {
+    // Keep the boat where it was: the last known position is still the best
+    // guess, just dimmer. Never jump to 0,0.
+    if (mapState.last && !mapState.markerStale) {
+      mapState.marker.setIcon(boatIcon(mapState.lastHeading, true));
+      mapState.markerStale = true;
+    }
+    return;
+  }
+  const stale = !!t.stale;
+  const ll = [t.lat, t.lon];
+  mapState.marker.setLatLng(ll);
+  if (mapState.lastHeading === null || stale !== mapState.markerStale
+      || Math.abs(t.heading - mapState.lastHeading) >= 2) {
+    mapState.marker.setIcon(boatIcon(t.heading, stale));
+    mapState.lastHeading = t.heading;
+    mapState.markerStale = stale;
+  }
+  if (!mapState.last) mapState.marker.setOpacity(1);
+  mapState.last = ll;
+  if (!mapState.hasFix) {
+    mapState.hasFix = true;
+    mapState.map.setView(ll, MAP_FIRST_FIX_ZOOM);
+    mapRefreshNote();
+  } else if (mapState.follow) {
+    mapState.map.panTo(ll, { animate: false });
+  }
+  if (!stale) mapTrailAppend(t.lat, t.lon);
+}
+
+function geoDistanceM(lat1, lon1, lat2, lon2) {
+  const k = 111320;                 // metres per degree of latitude
+  const dy = (lat2 - lat1) * k;
+  const dx = (lon2 - lon1) * k * Math.cos((lat1 + lat2) / 2 * Math.PI / 180);
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function mapTrailAppend(lat, lon) {
+  const pts = mapState.trailPts;
+  if (pts.length) {
+    const p = pts[pts.length - 1];
+    if (geoDistanceM(p[0], p[1], lat, lon) < MAP_TRAIL_MIN_MOVE_M) return;
+  }
+  pts.push([lat, lon]);
+  if (pts.length > MAP_TRAIL_MAX) {
+    pts.splice(0, pts.length - MAP_TRAIL_MAX);
+    mapState.trail.setLatLngs(pts);
+  } else {
+    mapState.trail.addLatLng([lat, lon]);
+  }
+  $('map-trail').textContent = pts.length + ' pts';
+  storeSet('espnow.map.last', lat.toFixed(6) + ',' + lon.toFixed(6));
+}
+
+async function mapFetchTrail() {
+  if (!mapState.ready || mapState.fetchingTrail) return;
+  mapState.fetchingTrail = true;
+  try {
+    const r = await api('/api/track', 'GET');
+    if (!r || !Array.isArray(r.points)) return;
+    mapState.trailPts = r.points.slice();
+    mapState.serverPts = r.points.length;
+    mapState.trail.setLatLngs(mapState.trailPts);
+    $('map-trail').textContent = mapState.trailPts.length + ' pts';
+  } catch (e) {
+    // the tool was unreachable for a moment; the next status asks again
+  } finally {
+    mapState.fetchingTrail = false;
+  }
+}
+
+function mapSyncTrail(serverPts) {
+  // The trail lives in the Python process; this page only mirrors it. A count
+  // that went DOWN means it was cleared (or the tool restarted); one well
+  // ahead of ours means this page missed points (the map loaded late).
+  if (!mapState.ready) return;
+  if (serverPts < mapState.serverPts || serverPts > mapState.trailPts.length + 20) {
+    if (mapState.fetchingTrail) return;        // ask again on the next status
+    mapFetchTrail();
+  }
+  mapState.serverPts = serverPts;
+}
+
+$('map-toggle').addEventListener('click', () => mapSetShown(!mapState.shown));
+$('map-layer').addEventListener('change', (e) => {
+  if (mapState.ready) mapSetLayer(e.target.value);
+  else storeSet('espnow.map.layer', e.target.value);
+});
+$('map-follow').addEventListener('change', (e) => mapSetFollow(e.target.checked));
+$('map-center').addEventListener('click', () => {
+  if (!mapState.ready) { mapBoot(); return; }     // doubles as "try loading again"
+  mapSetFollow(true);
+  if (mapState.last) mapState.map.setView(mapState.last, Math.max(mapState.map.getZoom(), 16));
+});
+$('map-clear').addEventListener('click', async () => {
+  mapState.trailPts = [];
+  mapState.serverPts = 0;
+  if (mapState.ready) mapState.trail.setLatLngs([]);
+  $('map-trail').textContent = '0 pts';
+  await api('/api/track/clear', 'POST', {});
+});
+
+// ---- folding cards ----------------------------------------------------------
+// The two tests and the two diagnostics fold under their titles so the Drive
+// card and the map get the screen. Nothing is removed -- the title pill keeps
+// updating while folded -- and each card remembers how you left it.
+const FOLDING_CARDS = ['bench-card', 'rudder-test-card', 'sensors-card', 'bridge-card'];
+function foldingCardsInit() {
+  for (const id of FOLDING_CARDS) {
+    const card = $(id);
+    const remembered = storeGet('espnow.card.' + id, null);
+    if (remembered !== null) card.open = remembered === '1';
+    card.addEventListener('toggle', () => storeSet('espnow.card.' + id, card.open ? '1' : '0'));
+  }
+}
+
 // Status arrives by push, not poll -- /ws streams the same dict /api/status
 // serves, at WS_PUSH_HZ, so the telemetry/bridge cards update as fast as the
 // boat itself produces new data instead of on a fixed client-side timer.
@@ -3677,10 +4200,23 @@ function connectStatusWS() {
 refreshPorts();
 setConnectedUI(false, null);
 connectStatusWS();
+foldingCardsInit();
+mapBoot();
 </script>
 </body>
 </html>
 """
+
+# What the page needs to know from this side, in one place, so the two never
+# drift apart: the trail rule it applies between fetches, and the pinned
+# Leaflet files with their hashes.
+PAGE_CONFIG = {
+    'leaflet_js': LEAFLET_JS_URL, 'leaflet_js_sri': LEAFLET_JS_SRI,
+    'leaflet_css': LEAFLET_CSS_URL, 'leaflet_css_sri': LEAFLET_CSS_SRI,
+    'trail_max_points': GPS_TRACK_MAX_POINTS,
+    'trail_min_move_m': GPS_TRACK_MIN_MOVE_M,
+}
+PAGE = _PAGE_TEMPLATE.replace('__PAGE_CONFIG__', json.dumps(PAGE_CONFIG))
 
 
 def _ws_text_frame(text: str) -> bytes:
@@ -3742,6 +4278,8 @@ class Handler(BaseHTTPRequestHandler):
             ports = [{'device': p.device, 'description': p.description}
                      for p in list_ports.comports()]
             self._json({'ports': ports})
+        elif self.path == '/api/track':
+            self._json(self.link.track_snapshot())
         elif self.path == '/ws':
             self._handle_ws()
         else:
@@ -3787,6 +4325,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok': ok, 'error': err})
         elif self.path == '/api/disconnect':
             self.link.disconnect()
+            self._json({'ok': True})
+        elif self.path == '/api/track/clear':
+            self.link.track_clear()
             self._json({'ok': True})
         elif self.path == '/api/session':
             # Claim control. Supersedes any existing session and starts from a

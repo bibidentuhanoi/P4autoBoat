@@ -181,7 +181,15 @@ class HideAndReturnTest(BrowserHttpTest):
         self.assertIsNotNone(rel)
         self.assertIn('sessionId = null', rel.group(1))
         self.assertIn('/api/release', rel.group(1))
-        self.assertIn("throttle: 0", rel.group(1))
+        # Zeroing lives in one shared helper (STOP, DISARM, a new session and
+        # a reconnect all use it); release must still go through it, and the
+        # helper must zero every slider, not just the linked throttle.
+        self.assertIn('zeroDriveUI()', rel.group(1))
+        zero = re.search(r'function zeroDriveUI\(\) \{(.*?)\n\}', src, re.S)
+        self.assertIsNotNone(zero, 'the shared zeroing helper moved')
+        self.assertIn('throttle: 0', zero.group(1))
+        for slider in ('throttle', 'motor-left', 'motor-right', 'rudder'):
+            self.assertIn("'%s'" % slider, zero.group(1))
 
 
 class SessionRecoveryTest(BrowserHttpTest):
