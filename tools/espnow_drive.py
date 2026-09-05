@@ -1363,6 +1363,11 @@ class BoatLink:
         self._lake_writer = None
         self._lake_id_next_cache = None
         self.lake_id_dir = LAKE_ID_DIR
+        # Fill the next-order cache ONCE here, at startup on the main thread
+        # with no lock held, so every status path (HTTP poll and the WebSocket
+        # push alike) has it from the first message. The real page uses the
+        # WebSocket, and a GET-only pre-step left NEXT ORDER at '--'.
+        self._lake_id_refresh_next()
         # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
         # the default so a forgotten toggle cannot silently make every run a B.
         self.p_assist_on = False
@@ -5490,6 +5495,7 @@ class Handler(BaseHTTPRequestHandler):
         period = 1.0 / WS_PUSH_HZ
         try:
             while True:
+                self.link.ensure_lake_id_next()          # no-op once cached; never under the lock
                 self.wfile.write(_ws_text_frame(json.dumps(self.link.status())))
                 time.sleep(period)
         except (BrokenPipeError, ConnectionResetError, OSError):

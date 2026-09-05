@@ -985,3 +985,20 @@ class KeepaliveTest(LakeBase):
         r = self._wait_result()
         self.assertEqual(r['status'], 'aborted')
         self.assertIn('manual', r['reason'])
+
+
+class NextOrderReachesThePageTest(unittest.TestCase):
+    """The real page takes status over the WebSocket, not the HTTP poll. A
+    cache filled only by the GET handler left NEXT ORDER at '--' in a real
+    Chromium render of the served page."""
+
+    def test_a_real_link_has_the_cache_from_construction(self):
+        link = T.BoatLink(T.load_boat_pb2())
+        nxt = link.lake_id_next()
+        self.assertEqual(sorted(nxt), ['T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
+        self.assertIn(nxt['T20_M30']['next_order'], ('LR', 'RL'))
+
+    def test_the_websocket_producer_fills_the_cache_too(self):
+        src = TOOL.read_text()
+        i = src.index('self.wfile.write(_ws_text_frame(json.dumps(self.link.status())))')
+        self.assertIn('ensure_lake_id_next()', src[i - 200:i])
