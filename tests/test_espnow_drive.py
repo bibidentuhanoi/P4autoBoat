@@ -1811,6 +1811,68 @@ function report() {
     def only(out, name):
         return [c for c in out['lcalls'] if c[0] == name]
 
+    # Captures every tile layer the page creates, so a scenario can fire the
+    # layer's own Leaflet events ('loading' / 'tileerror' / 'tileload' /
+    # 'load') exactly as the browser would.
+    CAPTURE_TILES = r"""
+const tileLayers = [];
+const _tl = context.L.tileLayer;
+context.L.tileLayer = (url, opts) => { const l = _tl(url, opts); tileLayers.push(l); return l; };
+"""
+
+    def test_a_dead_tile_server_falls_back_to_the_next_layer(self):
+        """tile.openstreetmap.org is blackholed on some networks (it resolved
+        to 127.0.0.1 on the dev box) while Esri answers. A round in which
+        EVERY tile fails and none loads means the server is unreachable, not a
+        flaky tile: the map must switch layers and say so, not sit grey under
+        'no internet?'."""
+        out = self.run_map(
+            "tileLayers[0].handlers.loading(); tileLayers[0].handlers.tileerror();"
+            "tileLayers[0].handlers.tileerror(); tileLayers[0].handlers.load();",
+            before_js=self.CAPTURE_TILES)
+        tiles = self.only(out, 'L.tileLayer')
+        self.assertEqual(len(tiles), 2, tiles)
+        self.assertIn('tile.openstreetmap.org', tiles[0][1])
+        self.assertIn('arcgisonline', tiles[1][1])
+        self.assertIn('OpenStreetMap tiles unreachable', out['note'])
+        self.assertIn('Satellite', out['note'])
+
+    def test_a_partially_failing_round_does_not_switch(self):
+        """One bad tile among good ones is the old behaviour: keep the layer,
+        show the note."""
+        out = self.run_map(
+            "tileLayers[0].handlers.loading(); tileLayers[0].handlers.tileload();"
+            "tileLayers[0].handlers.tileerror(); tileLayers[0].handlers.load();",
+            before_js=self.CAPTURE_TILES)
+        self.assertEqual(len(self.only(out, 'L.tileLayer')), 1)
+        self.assertIn('not loading', out['note'])
+
+    def test_every_layer_dead_ends_with_the_no_internet_note(self):
+        out = self.run_map(
+            "for (let i = 0; i < 3; i++) { const l = tileLayers[tileLayers.length - 1];"
+            " l.handlers.loading(); l.handlers.tileerror(); l.handlers.load(); }",
+            before_js=self.CAPTURE_TILES)
+        self.assertEqual([c[1].split('/')[2] for c in self.only(out, 'L.tileLayer')],
+                         ['tile.openstreetmap.org', 'server.arcgisonline.com', '{s}.basemaps.cartocdn.com'])
+        self.assertIn('no internet', out['note'])
+
+    def test_a_manual_pick_restarts_the_fallback_chain(self):
+        out = self.run_map(
+            "tileLayers[0].handlers.loading(); tileLayers[0].handlers.tileerror(); tileLayers[0].handlers.load();"
+            "elements['map-layer'].listeners.change({ target: { value: 'osm' } });",
+            before_js=self.CAPTURE_TILES)
+        urls = [c[1].split('/')[2] for c in self.only(out, 'L.tileLayer')]
+        self.assertEqual(urls, ['tile.openstreetmap.org', 'server.arcgisonline.com', 'tile.openstreetmap.org'])
+
+    def test_a_fallback_is_not_saved_as_the_preference(self):
+        out = self.run_map(
+            "tileLayers[0].handlers.loading(); tileLayers[0].handlers.tileerror(); tileLayers[0].handlers.load();",
+            before_js=self.CAPTURE_TILES)
+        self.assertEqual(len(self.only(out, 'L.tileLayer')), 2)
+        # the page's own preference store must still say osm (or nothing)
+        src = TOOL_SRC if 'TOOL_SRC' in globals() else (MODULE_PATH.read_text())
+        self.assertIn("if (!opts.noPersist) storeSet('espnow.map.layer', key);", src)
+
     def test_the_map_is_built_at_load_on_openstreetmap(self):
         out = self.run_map('')
         self.assertEqual(self.only(out, 'L.map'), [['L.map', 'map']])

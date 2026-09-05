@@ -5035,6 +5035,13 @@ const MAP_LAYERS = {
   dark: { url: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', subdomains: 'abcd',
           maxZoom: 20, attribution: '&copy; OpenStreetMap contributors &copy; CARTO' },
 };
+// Fallback order when a layer's SERVER is unreachable. tile.openstreetmap.org
+// is blackholed on some networks (it resolved to 127.0.0.1 on the dev box)
+// while Esri answers -- and a phone hotspot in the field may or may not reach
+// either. A dead layer must not leave the map grey with "no internet?" when a
+// working one is a click away; a manual pick resets the chain.
+const MAP_LAYER_FALLBACK = ['osm', 'satellite', 'dark'];
+const MAP_LAYER_LABEL = { osm: 'OpenStreetMap', satellite: 'Satellite (Esri)', dark: 'Dark (Carto)' };
 const MAP_FIRST_FIX_ZOOM = 17;      // a lake or a pool: a few hundred metres across
 const MAP_HOME = [16.5, 106.5];     // Vietnam, until the boat says where it is
 const MAP_TRAIL_MAX = PAGE_CONFIG.trail_max_points;
@@ -5058,8 +5065,11 @@ function storeSet(key, value) {
 
 function mapNote(text) {
   const n = $('map-note');
-  n.textContent = text || '';
-  n.hidden = !text;
+  // A fallback in force is always worth saying, alongside whatever else.
+  const extra = mapState.fallbackNote || '';
+  const shown = text ? (text + (extra ? '  ·  ' + extra : '')) : extra;
+  n.textContent = shown;
+  n.hidden = !shown;
 }
 
 // What the box in the middle of the map should say right now, derived from
@@ -5145,23 +5155,44 @@ function mapRememberedPosition() {
   return [lat, lon];
 }
 
-function mapSetLayer(key) {
+function mapSetLayer(key, opts) {
+  opts = opts || {};
   if (!MAP_LAYERS[key]) key = 'osm';
   const def = MAP_LAYERS[key];
   if (mapState.layer) mapState.map.removeLayer(mapState.layer);
   mapState.tilesFailing = false;
+  mapState.layerKey = key;
+  mapState.fallbackNote = opts.fallbackNote || null;
   const layer = L.tileLayer(def.url, { subdomains: def.subdomains || 'abc',
                                        maxZoom: def.maxZoom, attribution: def.attribution });
   // "load" fires once every visible tile is done, failed ones included, so
   // count the failures per round rather than clearing the note on "load".
-  let failed = 0;
-  layer.on('loading', () => { failed = 0; });
+  let failed = 0, loaded = 0;
+  layer.on('loading', () => { failed = 0; loaded = 0; });
   layer.on('tileerror', () => { failed += 1; });
-  layer.on('load', () => { mapState.tilesFailing = failed > 0; mapRefreshNote(); });
+  layer.on('tileload', () => { loaded += 1; });
+  layer.on('load', () => {
+    if (failed > 0 && loaded === 0) {
+      // Every tile of the round failed and none arrived: the server is
+      // unreachable, not a tile. Try the next layer once instead of sitting
+      // on a grey map.
+      const tried = mapState.triedLayers || (mapState.triedLayers = []);
+      if (!tried.includes(key)) tried.push(key);
+      const next = MAP_LAYER_FALLBACK.find((k) => !tried.includes(k));
+      if (next) {
+        mapSetLayer(next, { fallbackNote: MAP_LAYER_LABEL[key] + ' tiles unreachable — using '
+                                          + MAP_LAYER_LABEL[next], noPersist: true });
+        mapRefreshNote();                 // say so now, not after the next tile round
+        return;
+      }
+    }
+    mapState.tilesFailing = failed > 0;
+    mapRefreshNote();
+  });
   layer.addTo(mapState.map);
   mapState.layer = layer;
   $('map-layer').value = key;
-  storeSet('espnow.map.layer', key);
+  if (!opts.noPersist) storeSet('espnow.map.layer', key);   // a fallback is not a preference
 }
 
 function boatIcon(heading, stale) {
@@ -5292,6 +5323,7 @@ function mapSyncTrail(serverPts) {
 
 $('map-toggle').addEventListener('click', () => mapSetShown(!mapState.shown));
 $('map-layer').addEventListener('change', (e) => {
+  mapState.triedLayers = [];                      // a manual pick restarts the chain
   if (mapState.ready) mapSetLayer(e.target.value);
   else storeSet('espnow.map.layer', e.target.value);
 });
