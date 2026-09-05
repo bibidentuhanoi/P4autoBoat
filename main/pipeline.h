@@ -117,7 +117,7 @@ void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
  * the run is actually accepted. 0 leaves the learner untouched, which is what
  * every ordinary run sends. */
 typedef void (*bench_command_handler_fn)(uint32_t kind, float base, float delta,
-                                         float reset_c);
+                                         float reset_c, bool abort);
 void pipeline_register_bench_handler(bench_command_handler_fn handler);
 
 /* Runtime P-assist switch. Runtime so both arms of an A/B run the same

@@ -221,6 +221,204 @@ static void each_run_measures_its_own_motors_off_zero(void)
     assert(bench_baseline_yaw(&b) == 0.0f);
 }
 
+
+/* ---- BASE_LONG: the 10 s lake variant --------------------------------------
+ *
+ * A separate KIND, not a configurable duration. Everything else -- throttle,
+ * commands, learner, P, aborts, recording -- is BASE's, unchanged. These pin
+ * that "everything else" really is unchanged, because a long run that quietly
+ * differs from BASE is worse than no long run at all: its numbers would look
+ * comparable and would not be.
+ */
+
+static bench_cfg_t cfg_long(void)
+{
+    bench_cfg_t c = {
+        .baseline_us = US(0.5), .run_us = US(10.0), .coast_us = US(1.0),
+        .max_yaw_dps = 200.0f,
+    };
+    return c;
+}
+
+static void base_long_commands_exactly_like_base(void)
+{
+    float l, r, bl, br;
+    bench_commands(BENCH_KIND_BASE,      0.20f, 0.04f, &bl, &br);
+    bench_commands(BENCH_KIND_BASE_LONG, 0.20f, 0.04f, &l, &r);
+    assert(l == bl && r == br);
+    /* both motors equal: any turn IS the mismatch, exactly as for BASE */
+    assert(fabsf(l - 0.20f) < 1e-6f && fabsf(r - 0.20f) < 1e-6f);
+
+    /* and at a different throttle, and with a delta that BASE ignores */
+    bench_commands(BENCH_KIND_BASE,      0.35f, 0.10f, &bl, &br);
+    bench_commands(BENCH_KIND_BASE_LONG, 0.35f, 0.10f, &l, &r);
+    assert(l == bl && r == br);
+}
+
+/* The whole point: 0.5 s baseline + 10 s drive + 1 s coast, every sample kept. */
+static void base_long_drives_ten_seconds_and_fits(void)
+{
+    bench_cfg_t c = cfg_long();
+    bench_t b;
+    bench_init(&b);
+    assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+
+    unsigned n_baseline = 0, n_run = 0, n_coast = 0;
+    int64_t t = 0;
+    bool finished = false;
+    for (int i = 0; i < 2000 && !finished; ++i) {       /* 20 s of headroom */
+        t = (int64_t)i * 10000;                        /* 100 Hz */
+        bench_out_t o = bench_step_notrim(&b, &c, t, 1.0f, true);
+        if (o.finished) { finished = true; break; }
+        if (b.state == BENCH_BASELINE) { n_baseline++; assert(o.left_cmd == 0.0f); }
+        else if (b.state == BENCH_RUN) {
+            n_run++;
+            assert(fabsf(o.left_cmd - 0.20f) < 1e-6f);
+            assert(fabsf(o.right_cmd - 0.20f) < 1e-6f);
+        } else if (b.state == BENCH_COAST) { n_coast++; assert(o.left_cmd == 0.0f); }
+    }
+    assert(finished);
+    assert(b.state == BENCH_SAVED);
+
+    /* 100 Hz: 0.5 s -> 50, 10 s -> 1000, 1 s -> 100 */
+    assert(n_baseline == 50);
+    assert(n_run == 1000);
+    assert(n_coast == 100);
+
+    /* THE buffer question. Every sample of the whole run, no overflow, and no
+     * silent drop -- an overflowed run would look complete and be short. */
+    assert(!b.overflow);
+    assert(b.count == n_baseline + n_run + n_coast);
+    assert(b.count == 1150);
+    assert(b.count <= BENCH_MAX_SAMPLES);
+}
+
+static void base_long_leaves_ordinary_base_at_three_seconds(void)
+{
+    /* The existing profile, byte for byte: 0.5 + 3 + 1 at 100 Hz. */
+    bench_cfg_t c = cfg();
+    bench_t b;
+    bench_init(&b);
+    assert(bench_start(&b, BENCH_KIND_BASE, 0.20f, 0.0f, 0));
+    unsigned n_run = 0;
+    bool finished = false;
+    for (int i = 0; i < 2000 && !finished; ++i) {
+        bench_out_t o = bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+        if (o.finished) { finished = true; break; }
+        if (b.state == BENCH_RUN) n_run++;
+    }
+    assert(finished);
+    assert(n_run == 300);                 /* 3.0 s, unchanged */
+    assert(b.count == 450);               /* 50 + 300 + 100 */
+    assert(!b.overflow);
+}
+
+/* The buffer must hold the long run with real margin, not exactly. */
+static void the_buffer_has_margin_over_the_long_run(void)
+{
+    const unsigned needed = 1150u;        /* (0.5 + 10 + 1) s at 100 Hz */
+    assert(BENCH_MAX_SAMPLES >= needed);
+    /* At least 10% spare, so a late tick or a slightly long phase cannot
+     * silently truncate the one run this mode exists to capture. */
+    assert(BENCH_MAX_SAMPLES >= needed + needed / 10u);
+    assert(BENCH_MAX_SAMPLES <= 65535u);  /* b.count is uint16_t */
+}
+
+/* Every abort that protects a BASE run protects a long one identically. */
+static void base_long_aborts_exactly_like_base(void)
+{
+    bench_cfg_t c = cfg_long();
+
+    /* disarm, deep into the drive phase where a short run would already be over */
+    {
+        bench_t b; bench_init(&b);
+        assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+        for (int i = 0; i < 500; ++i)
+            (void)bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+        assert(b.state == BENCH_RUN);
+        bench_out_t o = bench_step_notrim(&b, &c, 5000000, 1.0f, false);
+        assert(o.aborted && b.state == BENCH_FAILED);
+        assert(o.left_cmd == 0.0f && o.right_cmd == 0.0f);
+    }
+    /* excessive yaw */
+    {
+        bench_t b; bench_init(&b);
+        assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+        for (int i = 0; i < 500; ++i)
+            (void)bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+        bench_out_t o = bench_step_notrim(&b, &c, 5000000, 9999.0f, true);
+        assert(o.aborted && b.state == BENCH_FAILED);
+        assert(o.left_cmd == 0.0f && o.right_cmd == 0.0f);
+    }
+    /* NaN yaw -- the comparison is written so NaN trips it too */
+    {
+        bench_t b; bench_init(&b);
+        assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+        for (int i = 0; i < 500; ++i)
+            (void)bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+        bench_out_t o = bench_step_notrim(&b, &c, 5000000, NAN, true);
+        assert(o.aborted && b.state == BENCH_FAILED);
+        assert(o.left_cmd == 0.0f && o.right_cmd == 0.0f);
+    }
+    /* explicit abort (the STOP path) */
+    {
+        bench_t b; bench_init(&b);
+        assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+        for (int i = 0; i < 500; ++i)
+            (void)bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+        bench_abort(&b);
+        assert(b.state == BENCH_FAILED);
+        bench_out_t o = bench_step_notrim(&b, &c, 5100000, 1.0f, true);
+        assert(o.left_cmd == 0.0f && o.right_cmd == 0.0f && !o.active);
+    }
+}
+
+static void a_long_run_blocks_a_second_start(void)
+{
+    bench_cfg_t c = cfg_long();
+    bench_t b; bench_init(&b);
+    assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+    for (int i = 0; i < 300; ++i)
+        (void)bench_step_notrim(&b, &c, (int64_t)i * 10000, 1.0f, true);
+    assert(!bench_start(&b, BENCH_KIND_BASE, 0.20f, 0.0f, 3000000));
+    assert(!bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 3000000));
+}
+
+/* Trim and P are recorded per sample through the WHOLE long drive, not just
+ * its first three seconds -- the learner working over ten seconds is the
+ * entire reason for this mode. */
+static void trim_and_p_are_recorded_across_the_long_drive(void)
+{
+    bench_cfg_t c = cfg_long();
+    bench_t b; bench_init(&b);
+    assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
+    bench_assist_t a = { .yaw_filt = 1.5f, .correction = 0.02f,
+                         .learned_c = 0.19f, .on = true, .at_cap = false };
+    bool finished = false;
+    for (int i = 0; i < 1300 && !finished; ++i) {
+        bench_out_t o = bench_step(&b, &c, (int64_t)i * 10000, 1.0f, true,
+                                   0.08f, &a);
+        if (o.finished) finished = true;
+    }
+    assert(finished && !b.overflow);
+
+    /* a sample from LATE in the drive: 9 s in, past any 3 s profile */
+    const bench_sample_t *late = NULL;
+    for (uint16_t i = 0; i < b.count; ++i) {
+        if (b.samples[i].t_s > 9.0f && b.samples[i].t_s < 10.0f) {
+            late = &b.samples[i]; break;
+        }
+    }
+    assert(late != NULL);
+    assert(late->p_flags & BENCH_P_ON);
+    assert(fabsf(late->p_yaw - 1.5f) < 1e-6f);
+    assert(fabsf(late->p_corr - 0.02f) < 1e-6f);
+    assert(fabsf(late->c_learn - 0.19f) < 1e-6f);
+    /* trim really reached the commands that were recorded */
+    assert(late->left < late->right);
+    assert(fabsf(late->c - (0.08f / (2.0f * 0.20f))) < 1e-5f);
+}
+
 int main(void)
 {
     commands_per_kind();
@@ -232,5 +430,13 @@ int main(void)
     buffer_overflow_is_flagged_not_fatal();
     start_is_refused_while_a_run_is_going();
     each_run_measures_its_own_motors_off_zero();
+    /* ---- BASE_LONG ---- */
+    base_long_commands_exactly_like_base();
+    base_long_drives_ten_seconds_and_fits();
+    base_long_leaves_ordinary_base_at_three_seconds();
+    the_buffer_has_margin_over_the_long_run();
+    base_long_aborts_exactly_like_base();
+    a_long_run_blocks_a_second_start();
+    trim_and_p_are_recorded_across_the_long_drive();
     return 0;
 }

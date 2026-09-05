@@ -16,6 +16,7 @@ finding. Neither may stand in for the other.
 
 import csv
 import importlib.util
+import re
 import threading
 import unittest
 from pathlib import Path
@@ -217,3 +218,124 @@ class UISurfacingTest(BenchRecordingTest):
         self.assertIn("id=\"bench-csv\"", src)
         self.assertIn("$('bench-csv').textContent = s.bench_csv", src)
         self.assertIn('dataout/', src)
+
+
+class BaseLongRecordingTest(BenchRecordingTest):
+    """BENCH_KIND_BASE_LONG (3): the same BASE run, driven 10 s instead of 3.
+
+    The laptop side has one job here and it is not subtle: never let a 10 s run
+    be mistaken for a 3 s one. They are the same experiment at different
+    durations, so their numbers look comparable and are not -- a long run
+    averaged into the historical BASE_T20_* set would quietly corrupt the whole
+    series. Distinct kind, distinct filename, no exceptions.
+    """
+
+    def test_the_long_kind_exists_and_is_three(self):
+        self.assertEqual(D.BENCH_KIND['both_long'], 3)
+        self.assertEqual(D.BENCH_KIND_NAME[3], 'BASE10')
+
+    def test_a_long_run_writes_a_distinctly_named_csv(self):
+        self._run(kind=3)
+        got = self._written()
+        self.assertTrue(got)
+        self.assertTrue(got[0].startswith('BASE10_T20_'),
+                        'unexpected name %r' % got[0])
+
+    def test_a_long_run_can_never_be_globbed_with_historical_base_files(self):
+        """BASE_T20_* is 21 runs of real 3 s data. A 10 s file landing in that
+        set would be averaged with them and nobody would ever know."""
+        self._run(kind=0)          # ordinary BASE
+        self._run(kind=3)          # the long one
+        got = self._written()
+        self.assertEqual(len(got), 2)
+        base = [n for n in got if n.startswith('BASE_T20_')]
+        long_ = [n for n in got if n.startswith('BASE10_T20_')]
+        self.assertEqual(len(base), 1)
+        self.assertEqual(len(long_), 1)
+        # the decisive property: the historical glob must not catch the new file
+        import fnmatch
+        self.assertFalse(fnmatch.fnmatch(long_[0], 'BASE_T20_*'),
+                         '%s matches the historical BASE glob' % long_[0])
+
+    def test_the_columns_are_exactly_the_same_as_base(self):
+        """'Keep MotorStatus columns and raw samples exactly as recorded.'"""
+        self._run(kind=0)
+        self._run(kind=3)
+        got = self._written()
+        cols = [list(self._rows(n)[0].keys()) for n in got]
+        self.assertEqual(cols[0], cols[1])
+        self.assertEqual(cols[0], list(D.BENCH_CSV_COLUMNS))
+        for name in ('boat_left', 'boat_right', 'boat_state',
+                     'boat_servo_power'):
+            self.assertIn(name, cols[0])
+
+    def test_the_header_identifies_the_long_mode(self):
+        self._run(kind=3)
+        head = (self.dir / self._written()[0]).read_text()
+        self.assertIn('kind=BASE10', head)
+        self.assertIn('NOT the boat SD card', head)
+
+    def test_an_aborted_long_run_is_marked_like_any_other(self):
+        self._run(kind=3, yaws=(1.0, 2.0), end=D.BENCH_STATE_FAILED)
+        head = (self.dir / self._written()[0]).read_text()
+        self.assertIn('ABORTED', head)
+
+
+class BaseLongPipelineTest(unittest.TestCase):
+    """The command path, and the parts of the firmware the laptop depends on."""
+
+    def setUp(self):
+        self.tool = TOOL.read_text()
+        self.mc = (ROOT / 'main' / 'motor_control.c').read_text()
+        self.bh = (ROOT / 'main' / 'bench_run.h').read_text()
+
+    def test_the_api_accepts_the_long_kind(self):
+        self.assertIn("'both_long': 3", self.tool)
+
+    def test_there_is_a_separate_clearly_labelled_button(self):
+        self.assertIn('id="bench-base-long"', self.tool)
+        self.assertIn("runBench('both_long', 0)", self.tool)
+        # ...and the ordinary BASE button is untouched
+        self.assertIn("$('bench-base').addEventListener('click', "
+                      "() => runBench('both', 0));", self.tool)
+
+    def test_the_long_button_is_disabled_with_the_others_during_a_run(self):
+        """Mutual exclusion: it must be in the same disable list, or it could
+        be pressed mid-run and refused only server-side."""
+        m = re.search(r"\['bench-left', 'bench-right', 'bench-base',(.*?)\]",
+                      self.tool, re.S)
+        self.assertIsNotNone(m, 'the bench disable list moved')
+        self.assertIn('bench-base-long', m.group(1))
+
+    def test_ordinary_base_is_still_exactly_three_seconds(self):
+        self.assertIn('#define BENCH_RUN_US_BASE  3000000', self.mc)
+        self.assertIn('#define BENCH_RUN_US_SPLIT 3000000', self.mc)
+
+    def test_the_long_run_is_ten_seconds(self):
+        self.assertIn('#define BENCH_RUN_US_BASE_LONG 10000000', self.mc)
+
+    def test_the_firmware_validation_bound_includes_the_new_kind(self):
+        """Without this a long request silently executes as a 3 s BASE."""
+        self.assertIn('if (kind > (uint32_t)BENCH_KIND_BASE_LONG) '
+                      'kind = (uint32_t)BENCH_KIND_BASE;', self.mc)
+
+    def test_the_sd_filename_does_not_collide_with_base(self):
+        """The boat's own file is authoritative; a 10 s run filed as T20_B_xx
+        would be indistinguishable from the 3 s runs."""
+        self.assertIn("(s_bench.kind == BENCH_KIND_BASE_LONG) ? 'G'", self.mc)
+
+    def test_the_buffer_is_sized_for_the_long_run(self):
+        m = re.search(r'#define BENCH_MAX_SAMPLES (\d+)u', self.bh)
+        self.assertIsNotNone(m)
+        n = int(m.group(1))
+        needed = int((0.5 + 10 + 1) * 100)      # 100 Hz control task
+        self.assertGreaterEqual(n, needed)
+        self.assertGreaterEqual(n, needed + needed // 10, 'less than 10% margin')
+        self.assertLessEqual(n, 65535, 'bench_t.count is uint16_t')
+
+    def test_no_protobuf_change_was_needed(self):
+        """kind is already a uint32 in BenchCommand and BenchStatus, so a new
+        enumerated value needs no schema change and no regeneration."""
+        proto = (ROOT / 'main' / 'proto' / 'boat.proto').read_text()
+        self.assertIn('uint32 kind  = 1;', proto)
+        self.assertRegex(proto, r'message BenchStatus \{[^}]*uint32 kind\s+= 2;')

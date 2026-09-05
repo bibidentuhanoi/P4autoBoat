@@ -280,6 +280,11 @@ static bench_t s_bench;
  * which way, so it stays short. */
 #define BENCH_RUN_US_SPLIT 3000000
 #define BENCH_RUN_US_BASE  3000000
+/* BENCH_KIND_BASE_LONG: the same BASE run, driven for 10 s instead of 3 so the
+ * trim learner has room to converge and be seen doing it on open water.
+ * Nothing else about the run differs -- commands, learner, P, aborts and
+ * recording are BASE's. BENCH_MAX_SAMPLES is sized for this. */
+#define BENCH_RUN_US_BASE_LONG 10000000
 
 static bench_cfg_t s_bench_cfg = {
     .baseline_us = 500000,
@@ -288,6 +293,9 @@ static bench_cfg_t s_bench_cfg = {
     .max_yaw_dps = 200.0f,   /* safety only -- a held boat never gets near this */
 };
 static bool s_bench_start_pending = false;
+/* STOP. Set by the command handler, consumed by bench_tick BEFORE the run is
+ * stepped, so the cycle it lands in ends with the ESCs at zero. */
+static bool s_bench_abort_pending = false;
 /* > 0 asks the learner to restart from that c. Consumed by the single run it
  * arrived with -- never latched, so an ordinary run that follows cannot
  * inherit it. */
@@ -940,14 +948,23 @@ static void assist_command_handler(bool p_on, bool rudder_assist,
 }
 
 static void bench_command_handler(uint32_t kind, float base, float delta,
-                                  float reset_c)
+                                  float reset_c, bool abort)
 {
     portENTER_CRITICAL(&s_arbiter_lock);
-    s_bench_start_pending = true;
-    s_bench_req_kind = kind;
-    s_bench_req_base = base;
-    s_bench_req_delta = delta;
-    s_bench_req_reset_c = reset_c;
+    if (abort) {
+        /* A pure abort. It sets nothing a start reads, so it can never be
+         * mistaken for one -- and it wins over any start still waiting in
+         * the same window: STOP pressed after START means stop. */
+        s_bench_abort_pending = true;
+        s_bench_start_pending = false;
+        s_bench_req_reset_c = 0.0f;
+    } else {
+        s_bench_start_pending = true;
+        s_bench_req_kind = kind;
+        s_bench_req_base = base;
+        s_bench_req_delta = delta;
+        s_bench_req_reset_c = reset_c;
+    }
     portEXIT_CRITICAL(&s_arbiter_lock);
 }
 
@@ -1129,11 +1146,18 @@ static void trim_learn_tick(const control_decision_t *decision)
      * LIVE, and bench_tick reads its c every tick, so the correction reaches
      * the jets during the run and the file records it happening.
      *
+     * BASE_LONG is that same run driven for 10 s instead of 3, so it belongs
+     * here for exactly the same reason -- and more pointedly, giving the
+     * learner room to converge IS why the long mode exists. Leave it out and
+     * the long run drives with c frozen and files a record of the learner
+     * doing nothing, which looks like a valid BASE result and is not.
+     *
      * A LEFT/RIGHT run is the opposite -- the boat is deliberately turning,
      * and learning from a commanded turn would poison c with the very
      * perturbation the test applies. Calibration owns the motors outright. */
     const bool bench_learning = s_bench_active &&
-                                s_bench.kind == BENCH_KIND_BASE &&
+                                (s_bench.kind == BENCH_KIND_BASE ||
+                                 s_bench.kind == BENCH_KIND_BASE_LONG) &&
                                 s_bench.state == BENCH_RUN;
     if (s_calibrating || (s_bench_active && !bench_learning)) {
         s_trim_why = "bench/cal owns the motors";
@@ -1686,10 +1710,27 @@ static void load_cal_cfg(void)
  * coast) so which part is useful can be decided later, off the file. */
 static void bench_write_csv(void)
 {
+    /* 'G' for the lonG BASE run. It must NOT share 'B': the boat's own files
+     * are the authoritative record, and a 10 s run filed as T20_B_xx would be
+     * indistinguishable from the 3 s runs it must never be averaged with.
+     * Still 8.3-safe -- "T20_G_01.CSV" is 8 + 3. */
     const char kc = (s_bench.kind == BENCH_KIND_LEFT) ? 'L'
-                  : (s_bench.kind == BENCH_KIND_RIGHT) ? 'R' : 'B';
+                  : (s_bench.kind == BENCH_KIND_RIGHT) ? 'R'
+                  : (s_bench.kind == BENCH_KIND_BASE_LONG) ? 'G' : 'B';
     unsigned pct = (unsigned)(s_bench.base * 100.0f + 0.5f);
     if (pct > 99u) pct = 99u;
+
+    /* An overflowed buffer is not a recording of the run. Writing the part
+     * that fit would produce a file that looks complete and is short --
+     * and a short file of a 10 s run is exactly a 3 s file. Nothing is
+     * written; the state says why. */
+    if (s_bench.overflow) {
+        ESP_LOGE(TAG, "BENCH,save_failed,overflow,samples=%u,cap=%u -- nothing written",
+                 (unsigned)s_bench.count, (unsigned)BENCH_MAX_SAMPLES);
+        s_bench.state = BENCH_FAILED;
+        s_bench_file_index = 0;
+        return;
+    }
 
     char name[16];
     unsigned idx = 0;
@@ -1720,15 +1761,21 @@ static void bench_write_csv(void)
     if (n <= 0 || fs_sdcard_write(name, chunk, (size_t)n) != ESP_OK) {
         ESP_LOGE(TAG, "BENCH,save_failed,%s", name);
         s_bench.state = BENCH_FAILED;
+        s_bench_file_index = 0;             /* no file worth pointing at */
         return;
     }
 
     const float base_s = (float)s_bench_cfg.baseline_us / 1000000.0f;
     const float run_s  = base_s + (float)s_bench_cfg.run_us / 1000000.0f;
     n = 0;
-    for (uint16_t i = 0; i < s_bench.count; ++i) {
+    uint16_t i = 0;
+    for (; i < s_bench.count; ++i) {
         if ((size_t)n > sizeof(chunk) - 96u) {      /* flush before it can truncate */
-            (void)fs_sdcard_append(name, chunk, (size_t)n);
+            /* Every append is checked. A card that fails mid-file used to
+             * leave a truncated CSV on disk and a SAVED status pointing at
+             * it -- the worst possible outcome, a partial run that passes for
+             * a complete one. */
+            if (fs_sdcard_append(name, chunk, (size_t)n) != ESP_OK) goto fail;
             n = 0;
         }
         const bench_sample_t *smp = &s_bench.samples[i];
@@ -1745,13 +1792,20 @@ static void bench_write_csv(void)
                          (double)smp->p_corr,
                          (double)(0.5f * (smp->right - smp->left)),
                          (unsigned)((smp->p_flags & BENCH_P_AT_CAP) ? 1u : 0u));
-        if (w < 0 || (size_t)w >= sizeof(chunk) - (size_t)n) break;
+        if (w < 0 || (size_t)w >= sizeof(chunk) - (size_t)n) goto fail;
         n += w;
     }
-    if (n > 0) (void)fs_sdcard_append(name, chunk, (size_t)n);
+    if (n > 0 && fs_sdcard_append(name, chunk, (size_t)n) != ESP_OK) goto fail;
 
-    ESP_LOGI(TAG, "BENCH,saved,%s,samples=%u%s", name, (unsigned)s_bench.count,
-             s_bench.overflow ? ",OVERFLOW" : "");
+    /* Only here, with every byte confirmed, is the run SAVED. */
+    ESP_LOGI(TAG, "BENCH,saved,%s,samples=%u", name, (unsigned)s_bench.count);
+    return;
+
+fail:
+    ESP_LOGE(TAG, "BENCH,save_failed,%s,at_sample=%u/%u -- file on card is INCOMPLETE",
+             name, (unsigned)i, (unsigned)s_bench.count);
+    s_bench.state = BENCH_FAILED;
+    s_bench_file_index = 0;
 }
 
 /* One bench tick. Mirrors calibration_tick: the control task owns the ESCs,
@@ -1833,19 +1887,45 @@ static void bench_tick(int64_t now_us)
     portENTER_CRITICAL(&s_arbiter_lock);
     bool start_req = s_bench_start_pending;
     s_bench_start_pending = false;
+    bool abort_req = s_bench_abort_pending;
+    s_bench_abort_pending = false;
     uint32_t kind = s_bench_req_kind;
     float base = s_bench_req_base, delta = s_bench_req_delta;
     float reset_c = s_bench_req_reset_c;
     s_bench_req_reset_c = 0.0f;             /* one shot, consumed here */
     portEXIT_CRITICAL(&s_arbiter_lock);
 
+    if (abort_req) {
+        /* STOP. Handled FIRST, before any start and before the run is
+         * stepped, so the cycle it lands in ends with the ESCs at zero rather
+         * than one more cycle of drive. A running bench is the last ESC write
+         * of every cycle and is exempt from the link-loss failsafe, so this is
+         * the ONLY way the laptop's STOP can reach it -- DISARM is the other,
+         * and STOP is deliberately not DISARM. */
+        start_req = false;                  /* STOP after START means stop */
+        if (s_bench_active) {
+            bench_abort(&s_bench);          /* state -> BENCH_FAILED */
+            esc_driver_set_throttle(0.0f, 0.0f);
+            s_bench_active = false;
+            s_bench_file_index = 0;         /* nothing was, or will be, saved */
+            ESP_LOGW(TAG, "BENCH,aborted,reason=STOP -- nothing saved");
+            bench_status_commit();          /* publish FAILED at once */
+        }
+        return;
+    }
+
     if (start_req && !s_bench_active && !s_calibrating) {
         if (esc_driver_get_state() == ESC_STATE_ARMED && !s_rail_cut &&
             fs_sdcard_ready() && !s_bench_save_pending) {
-            if (kind > (uint32_t)BENCH_KIND_RIGHT) kind = (uint32_t)BENCH_KIND_BASE;
+            /* Unknown kinds still fall back to the safest run. The bound has
+             * to include BASE_LONG or a long request would silently execute
+             * as an ordinary 3 s BASE -- and be filed as one. */
+            if (kind > (uint32_t)BENCH_KIND_BASE_LONG) kind = (uint32_t)BENCH_KIND_BASE;
             bench_init(&s_bench);
-            s_bench_cfg.run_us = (kind == (uint32_t)BENCH_KIND_BASE)
-                               ? BENCH_RUN_US_BASE : BENCH_RUN_US_SPLIT;
+            s_bench_cfg.run_us =
+                  (kind == (uint32_t)BENCH_KIND_BASE)      ? BENCH_RUN_US_BASE
+                : (kind == (uint32_t)BENCH_KIND_BASE_LONG) ? BENCH_RUN_US_BASE_LONG
+                :                                            BENCH_RUN_US_SPLIT;
             if (bench_start(&s_bench, (bench_kind_t)kind, base, delta, now_us)) {
                 s_bench_active = true;
                 s_bench_file_index = 0;
@@ -1944,9 +2024,15 @@ static void bench_tick(int64_t now_us)
                  o.reason ? o.reason : "?");
     }
 
-    /* ~5 Hz, plus always on a terminal state, same as the calibration status. */
+    /* ~5 Hz, plus always on a terminal state, same as the calibration status.
+     *
+     * Not while a save is pending: bench_step has already set SAVED, but the
+     * file does not exist yet. If the divider landed on the finish tick, a
+     * SAVED with file_index 0 went out before the write -- and the laptop
+     * would finalize the run on it. The flush publishes the real answer,
+     * SAVED or FAILED, once the bytes are confirmed. */
     static uint8_t bench_status_div = 0;
-    if ((++bench_status_div % 20) == 0 || o.aborted) {
+    if (((++bench_status_div % 20) == 0 && !s_bench_save_pending) || o.aborted) {
         bench_status_commit();
     }
 }

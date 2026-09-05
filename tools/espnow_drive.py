@@ -197,8 +197,13 @@ def clamp(v, lo, hi):
 # and records every sample to its OWN SD card, so a radio dropout cannot spoil
 # the measurement -- this tool only presses the button and shows progress.
 # Reading the runs afterwards is tools/bench_analyze.py.
-BENCH_KIND = {'both': 0, 'left': 1, 'right': 2}
-BENCH_KIND_NAME = {0: 'BASE', 1: 'LEFT', 2: 'RIGHT'}
+# 'both_long' (3) is BENCH_KIND_BASE_LONG: the same BASE run driven for 10 s
+# instead of 3. A distinct kind and a distinct FILENAME, deliberately -- the
+# two are the same experiment at different durations, so their numbers look
+# comparable and are not. A 10 s file landing in the historical BASE_T20_* set
+# would be averaged with 21 runs of real 3 s data and nobody would ever know.
+BENCH_KIND = {'both': 0, 'left': 1, 'right': 2, 'both_long': 3}
+BENCH_KIND_NAME = {0: 'BASE', 1: 'LEFT', 2: 'RIGHT', 3: 'BASE10'}
 BENCH_STATE_NAME = {0: 'idle', 1: 'still', 2: 'driving', 3: 'coasting',
                     4: 'SAVED', 5: 'FAILED'}
 # A live run publishes its state at ~5 Hz. Anything older than this cannot
@@ -223,22 +228,26 @@ BENCH_STATE_FAILED = 5
 TRIMLEARN_C_MIN = 0.10
 TRIMLEARN_C_MAX = 0.35
 
-# Length of the boat's drive phase, mirrored from motor_control.c
-# (BENCH_RUN_US_SPLIT / BENCH_RUN_US_BASE, both 3000000). Only used to judge
-# whether the yaw telemetry we happened to catch covers the whole run.
-BENCH_DRIVE_S = 3.0
+# Length of the boat's drive phase PER KIND, mirrored from motor_control.c:
+# BENCH_RUN_US_BASE / _SPLIT are 3 s; BENCH_RUN_US_BASE_LONG (kind 3,
+# BASE_LONG) is 10 s. Only used to judge whether the yaw telemetry we happened
+# to catch covers the whole run -- and that judgement has to know which run:
+# 3 s of frames is a complete BASE and less than a third of a BASE10.
+BENCH_DRIVE_S = 3.0                       # the default; every kind but one
+BENCH_DRIVE_S_BY_KIND = {0: 3.0, 1: 3.0, 2: 3.0, 3: 10.0}
 # The boat publishes telemetry at roughly 20 Hz, so a 3 s drive phase should
-# yield ~60 frames. Below this the summary is too thin to mean anything.
+# yield ~60 frames (a 10 s BASE10 ~200). Below this the summary is too thin to
+# mean anything.
 BENCH_YAW_MIN_SAMPLES = 12
 # Fraction of the drive phase the caught samples must span to count as complete.
 BENCH_YAW_MIN_COVERAGE = 0.6
-# Longest hole in the caught frames that still leaves a 3 s run describable.
+# Longest hole in the caught frames that still leaves a run describable.
 #
 # Deliberately NOT TELEMETRY_STALE_S. That one is a LIVENESS test -- "is the
 # boat still talking to us" -- and 2 s of it is a generous margin for a
 # readout that only has to stop showing a frozen number. Here the question is
-# a different one: can these samples describe a 3 s turn? A 2 s hole leaves
-# one third of the run and would still pass, while the integrated angle
+# a different one: can these samples describe the turn? A 2 s hole in a 3 s
+# run leaves one third of it and would still pass, while the integrated angle
 # quietly interpolated straight across the missing two thirds. At ~20 Hz this
 # is about six consecutive dropped frames.
 BENCH_YAW_MAX_GAP_S = 0.30
@@ -536,7 +545,7 @@ def _r3(v):
     return v if not isinstance(v, float) else round(v, 3)
 
 
-def summarize_yaw(samples, aborted=False):
+def summarize_yaw(samples, aborted=False, drive_s=BENCH_DRIVE_S):
     """samples: list of (t_monotonic, yaw_rate_dps, heading_deg | None).
 
     Gyro yaw is the primary measurement. Heading change is accumulated from
@@ -606,7 +615,7 @@ def summarize_yaw(samples, aborted=False):
 
     out['incomplete'] = (out['aborted']
                          or out['n'] < BENCH_YAW_MIN_SAMPLES
-                         or out['span_s'] < BENCH_DRIVE_S * BENCH_YAW_MIN_COVERAGE
+                         or out['span_s'] < drive_s * BENCH_YAW_MIN_COVERAGE
                          or out['stale'])
     return out
 
@@ -1024,6 +1033,13 @@ class BoatLink:
             if not self.connected:
                 return False, 'serial link is disconnected'
             writes_ok = (
+                # FIRST on the wire. A running bench OWNS the ESCs: its output
+                # overrides the zeros below every cycle, and the boat's
+                # link-loss failsafe leaves it alone by design. Without this,
+                # STOP could not stop a bench run at all -- only DISARM could.
+                # It is the one case where the zeros alone do nothing, so it
+                # goes out before them.
+                self._send_bench_abort_locked(),
                 self._send_motor_locked(0.0, 0.0),
                 self._send_steer_locked(0.0),
                 self._send_winch_locked(0.0),
@@ -1363,6 +1379,13 @@ class BoatLink:
                                'mutually exclusive, switch it OFF first')
             return self._send_assist_locked(self.p_assist_on if not on else False,
                                             bool(on))
+
+    def _send_bench_abort_locked(self):
+        """BenchCommand.abort: stop the run the boat is driving. A dedicated
+        field, not a magic kind -- it can never be mistaken for a start."""
+        msg = self.pb2.BoatMessage()
+        msg.bench.abort = True
+        return self._write_locked(msg.SerializeToString())
 
     def send_bench(self, kind, base, delta, command_seq, reset_c=0.0):
         """Ask the BOAT to run one bench test and record it to its own SD card.
@@ -1966,8 +1989,9 @@ class BoatLink:
         self.telemetry inside it, and this has to see the same bench state they
         were decoded against.
 
-        Bounded: a run is 3 s of ~20 Hz telemetry (~60 frames), so a cap well
-        above that costs nothing and stops a stuck 'driving' state (a lost
+        Bounded: a run is 3 s of ~20 Hz telemetry (~60 frames), or 10 s for
+        a BASE10 (~200), so a cap well above either costs nothing and stops a
+        stuck 'driving' state (a lost
         terminal packet, say) growing this without limit for the whole
         session."""
         if not self.bench_status.get('have'):
@@ -2051,8 +2075,11 @@ class BoatLink:
                 # worst possible output here.
                 aborted = int(bs.state) not in (BENCH_STATE_COAST,
                                                 BENCH_STATE_SAVED)
-                self.bench_yaw = summarize_yaw(self.bench_yaw_samples,
-                                               aborted=aborted)
+                self.bench_yaw = summarize_yaw(
+                    self.bench_yaw_samples, aborted=aborted,
+                    # Judged against THIS run's drive length. With the 3 s
+                    # default a 3 s fragment of a BASE10 passed as complete.
+                    drive_s=BENCH_DRIVE_S_BY_KIND.get(int(bs.kind), BENCH_DRIVE_S))
                 self.bench_yaw['kind'] = self.bench_status['kind']
                 self.bench_yaw['base'] = self.bench_status['base']
                 self.bench_yaw['end_state'] = int(bs.state)
@@ -2635,7 +2662,8 @@ PAGE = """<!DOCTYPE html>
          measure it. Do not rename to LEFT TURN / RIGHT TURN until it has. -->
     <button id="bench-left" title="port jet commanded stronger, starboard weaker (before trim)">LEFT MOTOR STRONGER</button>
     <button id="bench-right" title="starboard jet commanded stronger, port weaker (before trim)">RIGHT MOTOR STRONGER</button>
-    <button id="bench-base" title="both equal -- any turn IS the mismatch">BASE TEST</button>
+    <button id="bench-base" title="both equal -- any turn IS the mismatch; 3 s drive">BASE TEST</button>
+    <button id="bench-base-long" title="the SAME base test, driven 10 s instead of 3 -- for open water, where the trim learner has room to converge. Same throttle, learner, P, aborts and recording; only the duration differs. Files as BASE10_*, never pooled with 3 s BASE runs.">BASE TEST 10s</button>
   </div>
   <div class="row" style="margin-top:6px;">
     <label style="min-width:auto;">Restart learner at c</label>
@@ -2753,7 +2781,12 @@ let connected = false;
 let armedCmd = false;
 let servoRailOn = false;
 // Mirrors BenchStatus in boat.proto (see BENCH_KIND_NAME / BENCH_STATE_NAME).
-const BENCH_KIND_NAME = { 0: 'BASE', 1: 'LEFT', 2: 'RIGHT' };
+const BENCH_KIND_NAME = { 0: 'BASE', 1: 'LEFT', 2: 'RIGHT', 3: 'BASE10' };
+// The letter the BOAT puts in the SD filename (motor_control.c, bench_write_csv).
+// Explicit, not derived from the display name: BASE10.charAt(0) is 'B', and the
+// boat writes 'G'. Showing a filename that does not exist on the card is worse
+// than showing none.
+const BENCH_SD_CHAR = { 0: 'B', 1: 'L', 2: 'R', 3: 'G' };
 const BENCH_STATE = { 0: 'IDLE', 1: 'STILL', 2: 'DRIVING', 3: 'COASTING',
                       4: 'SAVED', 5: 'FAILED' };
 let calibrating = false;
@@ -3161,6 +3194,10 @@ async function runBench(kind, resetC) {
 $('bench-left').addEventListener('click', () => runBench('left', 0));
 $('bench-right').addEventListener('click', () => runBench('right', 0));
 $('bench-base').addEventListener('click', () => runBench('both', 0));
+// The 10 s variant is a SEPARATE button on purpose: the 3 s BASE stays the
+// default and the safest thing to reach for, and a long run on open water is
+// always a deliberate choice, never a mode the short button can fall into.
+$('bench-base-long').addEventListener('click', () => runBench('both_long', 0));
 
 // The 4.5 s sequence runs on the server's own command loop; this call returns
 // at once and progress arrives through the normal status poll. Nothing here
@@ -3172,7 +3209,7 @@ var _rtLockedOut = null;
 function setRudderTestLockout(on) {
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
-  ['bench-left', 'bench-right', 'bench-base', 'bench-reset', 'p-assist',
+  ['bench-left', 'bench-right', 'bench-base', 'bench-base-long', 'bench-reset', 'p-assist',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -3486,7 +3523,7 @@ function applyStatus(s) {
       if (bn.have && bn.file_index) {
         var pct = Math.round(bn.base * 100);
         $('bench-file').textContent = 'T' + (pct < 10 ? '0' : '') + pct + '_'
-          + (BENCH_KIND_NAME[bn.kind] || '?').charAt(0) + '_'
+          + (BENCH_SD_CHAR[bn.kind] || '?') + '_'
           + (bn.file_index < 10 ? '0' : '') + bn.file_index + '.CSV';
       } else if (!bn.have) {
         $('bench-file').textContent = '--';

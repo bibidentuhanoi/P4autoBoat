@@ -10,6 +10,8 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
     'bench_analyze_under_test', REPO_ROOT / 'tools' / 'bench_analyze.py')
@@ -660,3 +662,90 @@ class POnClassificationTest(unittest.TestCase):
             _rc, text = self.run_ab(f)
             self.assertIn('A=4 B=4', text)
             self.assertIn('every B file confirms p_on=1: yes', text)
+
+
+class Base10SdFilesTest(unittest.TestCase):
+    """The boat files a 10 s BASE run as T<pct>_G_<nn>.CSV. The analyzer must
+    see it, call it BASE10, show it on its own, and never let it near the B
+    runs or the historical B/L/R trim calculation -- a 10 s run averaged into
+    3 s data would quietly corrupt the whole series."""
+
+    HEADER = ('t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,'
+              'split,at_cap\n')
+
+    def _write_run(self, folder, name, drive_s, yaw=-6.0, c=0.20):
+        rows = [self.HEADER]
+        t = 0.0
+        while t < 0.5 + drive_s + 1.0:
+            ph = 'baseline' if t < 0.5 else ('run' if t < 0.5 + drive_s else 'coast')
+            l = r = 0.20 if ph == 'run' else 0.0
+            rows.append('%.3f,%s,%.3f,%.3f,%.3f,%.4f,0,0.000,%.4f,0.0000,0.0000,0\n'
+                        % (t, ph, yaw if ph == 'run' else 0.0, l, r, c, c))
+            t += 0.01
+        (folder / name).write_text(''.join(rows))
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+        self._write_run(self.folder, 'T20_B_01.CSV', 3.0, yaw=-6.0)
+        self._write_run(self.folder, 'T20_B_02.CSV', 3.0, yaw=-6.2)
+        self._write_run(self.folder, 'T20_G_01.CSV', 10.0, yaw=-2.0)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_G_files_are_discovered_and_labelled_BASE10(self):
+        m = ba.NAME_RE.match('T20_G_01.CSV')
+        self.assertIsNotNone(m, 'the analyzer cannot see T20_G_01.CSV at all')
+        self.assertEqual(m.group(2), 'G')
+        self.assertEqual(ba.KIND_NAME['G'], 'BASE10')
+
+    def test_the_three_original_letters_are_untouched(self):
+        for k, v in (('B', 'BASE'), ('L', 'LEFT'), ('R', 'RIGHT')):
+            self.assertEqual(ba.KIND_NAME[k], v)
+
+    def test_sequence_analysis_excludes_G(self):
+        runs = ba.sequence_runs(self.folder)
+        names = [Path(r['path']).name if isinstance(r, dict) and 'path' in r
+                 else str(r) for r in runs]
+        self.assertFalse(any('_G_' in n for n in names),
+                         'a 10 s run got into the BASE sequence')
+
+    def test_the_report_shows_G_separately_as_BASE10(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = ba.main([str(self.folder)])
+        out = buf.getvalue()
+        self.assertIn('T20_G_01.CSV', out)
+        self.assertIn('BASE10', out)
+        # the per-file table labels it BASE10, never BASE
+        line = [l for l in out.splitlines() if 'T20_G_01.CSV' in l][0]
+        self.assertIn('BASE10', line)
+        self.assertNotRegex(line, r'\bBASE\b(?!10)')
+
+    def test_G_is_never_pooled_into_the_B_median(self):
+        """The B median must be from the two B runs only (~ -6.1), not pulled
+        toward the -2.0 of the long run."""
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ba.main([str(self.folder)])
+        out = buf.getvalue()
+        m = re.search(r'T20 BASE\s+median\s+([-+]\d+\.\d+)', out)
+        self.assertIsNotNone(m, 'no BASE median line:\n' + out)
+        self.assertLess(float(m.group(1)), -5.0)
+        self.assertGreater(float(m.group(1)), -7.0)
+
+    def test_G_is_not_in_the_BLR_trim_calculation(self):
+        src = (ROOT / 'tools' / 'bench_analyze.py').read_text()
+        # the historical calculation iterates exactly these
+        self.assertIn("for k in ('B', 'L', 'R'):", src)
+        self.assertIn("if not all(k in got for k in 'BLR'):", src)
+        self.assertNotIn("for k in ('B', 'L', 'R', 'G')", src)
+        self.assertNotIn("'BLRG'", src.replace('[BLRG]', ''))
+
+    def test_ab_analysis_excludes_G(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ba.main([str(self.folder), '--ab'])
+        self.assertNotIn('T20_G_01', buf.getvalue().split('BASE10')[0]
+                         if 'BASE10' in buf.getvalue() else buf.getvalue())

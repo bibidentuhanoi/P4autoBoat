@@ -385,7 +385,8 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
             s_bench_handler(s_rx_msg.payload.bench.kind,
                             s_rx_msg.payload.bench.base,
                             s_rx_msg.payload.bench.delta,
-                            s_rx_msg.payload.bench.reset_c);
+                            s_rx_msg.payload.bench.reset_c,
+                            s_rx_msg.payload.bench.abort);
         }
         break;
 

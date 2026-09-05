@@ -12,6 +12,8 @@ static float clampf(float v, float lo, float hi)
 void bench_commands(bench_kind_t kind, float base, float delta,
                     float *left, float *right)
 {
+    /* BASE and BASE_LONG both fall through to equal motors -- they differ only
+     * in how long the drive phase lasts, which is the caller's cfg, not ours. */
     float l = base, r = base;
     if (kind == BENCH_KIND_LEFT) {
         l = base + delta;

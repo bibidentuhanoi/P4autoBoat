@@ -220,6 +220,17 @@ message BenchCommand {
   // what every ordinary BASE run sends -- c must carry over between runs or
   // convergence can never be observed.
   float  reset_c = 4;
+  // ABORT the run the boat is currently driving. Sent by the laptop's STOP.
+  //
+  // Why a field of its own: a running bench owns the ESCs -- its output is the
+  // last write of every control cycle, overriding the manual path, and the
+  // link-loss failsafe deliberately leaves it alone. So the motor zeros STOP
+  // already sends cannot reach it; only DISARM could, and only because
+  // bench_step happens to check `armed`. Not a magic kind value, so it can
+  // never be mistaken for a start; not DISARM, so STOP keeps its armed-state
+  // semantics. false/absent on every existing start, so nothing sent before
+  // this field existed changes meaning.
+  bool   abort = 5;
 }
 
 // No string field on purpose: nanopb strings need a size option, and the file

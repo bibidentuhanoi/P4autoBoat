@@ -23,8 +23,13 @@ import statistics
 import sys
 from pathlib import Path
 
-NAME_RE = re.compile(r'^T(\d{2})_([BLR])_(\d{2})\.CSV$', re.IGNORECASE)
-KIND_NAME = {'B': 'BASE', 'L': 'LEFT', 'R': 'RIGHT'}
+# G is BENCH_KIND_BASE_LONG: the same BASE run driven for 10 s instead of 3.
+# It is discovered and shown, and it is NEVER pooled with B -- the two are the
+# same experiment at different durations, so their numbers look comparable and
+# are not. Every B-only path below (the sequence, the A/B, the B/L/R trim
+# calculation) filters on the letter, so a G file cannot leak into them.
+NAME_RE = re.compile(r'^T(\d{2})_([BLRG])_(\d{2})\.CSV$', re.IGNORECASE)
+KIND_NAME = {'B': 'BASE', 'L': 'LEFT', 'R': 'RIGHT', 'G': 'BASE10'}
 DEFAULT_TAIL_S = 1.5
 MIN_STEADY_SAMPLES = 10
 
@@ -755,6 +760,16 @@ def main(argv=None):
                         if abs(x - med) > 3 * mad:
                             print('        OUTLIER %+.2f (%.0fx the usual scatter)'
                                   % (x, abs(x - med) / mad))
+        if 'G' in got:
+            # The 10 s runs, on their own line and NOWHERE else on this level:
+            # not in the B median above, not in the verdict, the gain or the
+            # suggested trim below. Same experiment, different duration --
+            # the numbers look comparable and are not.
+            v = got['G']
+            print('T%s BASE10 median %+7.2f deg/s   n=%d   spread %.2f   '
+                  '(10 s runs -- shown apart, never pooled with BASE)'
+                  % (pct, statistics.median(v), len(v),
+                     (max(v) - min(v)) if len(v) > 1 else 0.0))
         if mixed:
             # Everything below -- the verdict, the gain, the suggested trim --
             # assumes one trim per level. With several it is the sweep above

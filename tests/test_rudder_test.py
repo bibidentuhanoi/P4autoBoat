@@ -1893,8 +1893,23 @@ class UnchangedBenchBehaviourTest(unittest.TestCase):
         self.src = TOOL.read_text()
 
     def test_bench_kinds_are_untouched(self):
-        self.assertEqual(T.BENCH_KIND, {'both': 0, 'left': 1, 'right': 2})
-        self.assertEqual(T.BENCH_KIND_NAME, {0: 'BASE', 1: 'LEFT', 2: 'RIGHT'})
+        """The three original kinds keep their names AND their numbers.
+
+        Asserting a subset rather than the whole dict, because kinds are
+        additive by design: BASE_LONG (3) was added without touching these. But
+        renumbering or removing one of them would silently re-point every
+        historical file and every firmware switch, so those stay pinned
+        exactly."""
+        for name, num in (('both', 0), ('left', 1), ('right', 2)):
+            self.assertEqual(T.BENCH_KIND[name], num)
+        for num, label in ((0, 'BASE'), (1, 'LEFT'), (2, 'RIGHT')):
+            self.assertEqual(T.BENCH_KIND_NAME[num], label)
+        # ...and no new kind may reuse a number or a label
+        self.assertEqual(len(set(T.BENCH_KIND.values())), len(T.BENCH_KIND))
+        self.assertEqual(len(set(T.BENCH_KIND_NAME.values())),
+                         len(T.BENCH_KIND_NAME))
+        self.assertEqual(set(T.BENCH_KIND.values()),
+                         set(T.BENCH_KIND_NAME.keys()))
 
     def test_bench_buttons_still_send_the_same_three_kinds(self):
         for kind in ("'left'", "'right'", "'both'"):

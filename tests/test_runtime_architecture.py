@@ -193,7 +193,8 @@ typedef struct { uint32_t state; uint32_t level_index; float level_throttle; flo
 #define boat_CalibrateStatus_init_zero {0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
 #define boat_BenchStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0}
-typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
+typedef struct { uint32_t kind; float base; float delta; float reset_c;
+    bool abort; } boat_BenchCommand;
 typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
 typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
@@ -204,7 +205,7 @@ typedef void (*steer_command_handler_fn)(const boat_SteerCommand *);
 typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
 typedef void (*calibrate_command_handler_fn)(bool, bool);
-typedef void (*bench_command_handler_fn)(uint32_t, float, float, float);
+typedef void (*bench_command_handler_fn)(uint32_t, float, float, float, bool);
 typedef void (*assist_command_handler_fn)(bool, bool, uint32_t);
 typedef void (*steer_rate_command_handler_fn)(float);
 void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn handler);
@@ -340,7 +341,17 @@ bool fs_save_esc_trim(const EscTrimNvsBlob *blob) { (void)blob; return true; }
 bool fs_sdcard_ready(void) { return true; }
 esp_err_t fs_sdcard_read(const char *p, void *b, size_t c, size_t *o) { (void)p; (void)b; (void)c; if (o) *o = 0; return ESP_ERR_NOT_FOUND; }
 esp_err_t fs_sdcard_write(const char *p, const void *d, size_t l) { (void)p; (void)d; (void)l; return ESP_OK; }
-esp_err_t fs_sdcard_append(const char *p, const void *d, size_t l) { (void)p; (void)d; (void)l; return ESP_OK; }
+/* Controllable, so the save path can be made to FAIL: an append that returns
+ * an error must never end in a run reported as SAVED. */
+static esp_err_t sd_append_result = ESP_OK;
+static unsigned sd_append_calls = 0;
+static int sd_append_fail_at = -1;     /* fail ONLY this call (0-based); -1 = never */
+esp_err_t fs_sdcard_append(const char *p, const void *d, size_t l) {
+    (void)p; (void)d; (void)l;
+    unsigned idx = sd_append_calls++;
+    if (sd_append_fail_at >= 0 && (int)idx == sd_append_fail_at) return ESP_FAIL;
+    return sd_append_result;
+}
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 
 esp_err_t esc_driver_init(void) { return ESP_OK; }
@@ -730,6 +741,232 @@ def test_pipeline_handlers_do_not_write_actuators():
         subprocess.run([str(binary)], check=True)
 
 
+BENCH_MAIN = r"""
+/* ---- STOP must abort a firmware-owned bench run, and the SD save must be honest.
+ *
+ * Both are about the same thing: a run the boat owns. Once bench_tick has the
+ * ESCs, the laptop's manual motor-zero is overridden every cycle and link-loss
+ * deliberately exempts the run -- so STOP, which only sends zeros, could not
+ * stop a bench run at all. Only DISARM could, and only because bench_step
+ * happens to check `armed`. For a 10 s lake run that is the whole hazard.
+ *
+ * These drive the REAL handler chain: bench_command_handler -> bench_tick ->
+ * bench_step -> ESC write -> BenchStatus, on the real control cycle. Calling
+ * bench_abort() directly proves nothing about STOP. */
+static void bench_drive(int64_t *t0, int ticks, int64_t step_us, bool keep_link) {
+    for (int i = 0; i < ticks; ++i) {
+        now_us = *t0 + (int64_t)i * step_us;
+        if (keep_link) motor_control_notify_link_rx(now_us);
+        run_one_control_cycle();
+    }
+    *t0 = now_us;
+}
+
+int main(void) {
+    (void)run_scheduled_and_urgent_cycle;     /* shared stub block; unused here */
+    assert(motor_control_init() == ESP_OK);
+    assert(bench_handler != NULL && control_fn != NULL && motor_handler != NULL);
+    esc_state = ESC_STATE_ARMED;
+    servo_power = true;
+    boat_BenchStatus bs;
+    int64_t t0 = now_us + 1;
+
+    /* ---- 1. STOP (the abort command) stops an active run ------------------ */
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);        /* ordinary BASE start */
+    bench_drive(&t0, 80, 10000, true);                    /* past the 0.5 s baseline */
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 2u);                               /* BENCH_RUN */
+    assert(close_enough(esc_left, 0.20f) && close_enough(esc_right, 0.20f));
+
+    /* The laptop's manual zero alone does NOT stop it. This is the bug the
+     * abort command exists for, pinned so it cannot be "fixed" by accident
+     * into STOP-means-DISARM. */
+    motor_handler(&(boat_MotorCommand){.throttle = 0.0f});
+    bench_drive(&t0, 1, 10000, true);
+    assert(close_enough(esc_left, 0.20f) && close_enough(esc_right, 0.20f));
+
+    /* The abort does -- consumed BEFORE the run is stepped, so this very
+     * cycle ends with the ESCs at zero, not one cycle later. */
+    bench_handler(0u, 0.0f, 0.0f, 0.0f, true);
+    bench_drive(&t0, 1, 10000, true);
+    assert(esc_left == 0.0f && esc_right == 0.0f);
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u);                               /* BENCH_FAILED */
+    assert(bs.file_index == 0u);
+    assert(esc_state == ESC_STATE_ARMED);                 /* STOP is not DISARM */
+
+    /* ...and it stays stopped: the run is cleared, not paused. */
+    bench_drive(&t0, 5, 10000, true);
+    assert(esc_left == 0.0f && esc_right == 0.0f);
+    motor_control_bench_flush();                          /* nothing pending */
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u && bs.file_index == 0u);
+
+    /* An abort with no run active is harmless and must not START one. */
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, true);
+    bench_drive(&t0, 3, 10000, true);
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u);
+    assert(esc_left == 0.0f && esc_right == 0.0f);
+
+    /* An abort that arrives with a start in the same window: abort wins. */
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);
+    bench_handler(0u, 0.0f, 0.0f, 0.0f, true);
+    bench_drive(&t0, 3, 10000, true);
+    assert(esc_left == 0.0f && esc_right == 0.0f);
+
+    /* ---- 2. a failed append must never end as SAVED ------------------------ */
+    /* The real sequence: the control task runs the profile to its end (450
+     * ticks for 0.5+3+1 s), then the core-1 task flushes, and ONLY the flush
+     * publishes the outcome -- a run that has finished but not been written
+     * is not SAVED and must not say so. */
+    sd_append_result = ESP_FAIL;
+    sd_append_calls = 0;
+    t0 += 10000;
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);
+    bench_drive(&t0, 500, 10000, true);
+    motor_control_get_bench_status(&bs);
+    assert(bs.state != 4u);                               /* nothing SAVED before the flush */
+    motor_control_bench_flush();
+    assert(sd_append_calls > 0);                          /* it did try */
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u);                               /* FAILED, not SAVED */
+    assert(bs.file_index == 0u);                          /* no file to point at */
+    sd_append_result = ESP_OK;
+
+    /* ---- 2b. ONE mid-file append fails, the rest succeed ------------------- */
+    /* 450 rows is ~27 KB against an 8 KB chunk, so the file goes out in several
+     * appends. If only the FINAL one were checked, a failure in the middle
+     * would leave a file with a hole in it and a SAVED status pointing at it.
+     * Every append is checked; this fails the first and lets the rest through. */
+    sd_append_result = ESP_OK;
+    sd_append_fail_at = 0;
+    sd_append_calls = 0;
+    t0 += 10000;
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);
+    bench_drive(&t0, 500, 10000, true);
+    motor_control_bench_flush();
+    assert(sd_append_calls >= 1);
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u);                               /* FAILED */
+    assert(bs.file_index == 0u);
+    sd_append_fail_at = -1;
+
+    /* ---- 3. and an ordinary clean run still saves, exactly as before ------- */
+    t0 += 10000;
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);
+    bench_drive(&t0, 500, 10000, true);
+    motor_control_get_bench_status(&bs);
+    assert(bs.state != 4u);                               /* not until the flush */
+    motor_control_bench_flush();
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 4u);                               /* SAVED */
+    assert(bs.file_index == 1u);
+    assert(bs.samples == 450u);                           /* 0.5 + 3 + 1 s at 100 Hz */
+    return 0;
+}
+"""
+
+
+def test_stop_aborts_a_bench_run_and_the_sd_save_is_honest():
+    """End to end through the real handler chain. See BENCH_MAIN."""
+    stubs = HARNESS[:HARNESS.index("int main(void) {")]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        for relative, content in STUB_HEADERS.items():
+            path = tmpdir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        shutil.copy(ROOT / "main" / "motor_control.c", tmpdir / "motor_control.c")
+        (tmpdir / "harness.c").write_text(stubs + BENCH_MAIN)
+        binary = tmpdir / "bench_abort_test"
+        subprocess.run(
+            [
+                "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                "-I", str(tmpdir), "-I", str(ROOT / "main"),
+                str(tmpdir / "motor_control.c"), str(ROOT / "main" / "control_arbiter.c"),
+                str(ROOT / "main" / "arm_sequence.c"),
+                str(ROOT / "main" / "esc_trim.c"),
+                str(ROOT / "main" / "esc_trim_cal.c"),
+                str(ROOT / "main" / "bench_run.c"),
+                str(tmpdir / "harness.c"), "-lm", "-o", str(binary),
+            ],
+            check=True,
+        )
+        subprocess.run([str(binary)], check=True)
+
+
+OVERFLOW_MAIN = r"""
+#include "bench_run.h"
+/* The overflow path of the SD save, on its own. No legitimate run can
+ * overflow the real buffer -- that is what BENCH_MAX_SAMPLES was sized for --
+ * so this binary shadows bench_run.h with a cap a plain BASE run (450 samples)
+ * exceeds. Only the save path's HONESTY is under test: an overflowed run must
+ * end FAILED with no file index, never SAVED, and must write nothing. */
+int main(void) {
+    (void)run_scheduled_and_urgent_cycle; (void)close_enough;
+    assert(motor_control_init() == ESP_OK);
+    esc_state = ESC_STATE_ARMED;
+    servo_power = true;
+    boat_BenchStatus bs;
+    int64_t t0 = now_us + 1;
+    bench_handler(0u, 0.20f, 0.0f, 0.0f, false);
+    for (int i = 0; i < 500; ++i) {                      /* the whole 4.5 s profile */
+        now_us = t0 + (int64_t)i * 10000;
+        motor_control_notify_link_rx(now_us);
+        run_one_control_cycle();
+    }
+    sd_append_calls = 0;
+    motor_control_bench_flush();
+    motor_control_get_bench_status(&bs);
+    assert(bs.samples == BENCH_MAX_SAMPLES);            /* it filled, then stopped */
+    motor_control_get_bench_status(&bs);
+    assert(bs.state == 5u);                              /* FAILED */
+    assert(bs.file_index == 0u);
+    assert(sd_append_calls == 0);                        /* nothing written */
+    return 0;
+}
+"""
+
+
+def test_an_overflowed_run_is_never_reported_saved():
+    stubs = HARNESS[:HARNESS.index("int main(void) {")]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        for relative, content in STUB_HEADERS.items():
+            path = tmpdir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        shutil.copy(ROOT / "main" / "motor_control.c", tmpdir / "motor_control.c")
+        # tmpdir is first on the include path, so this shadows the real header
+        # for BOTH motor_control.c and bench_run.c in this build only.
+        hdr = (ROOT / "main" / "bench_run.h").read_text()
+        assert "#define BENCH_MAX_SAMPLES 1280u" in hdr
+        (tmpdir / "bench_run.h").write_text(
+            hdr.replace("#define BENCH_MAX_SAMPLES 1280u", "#define BENCH_MAX_SAMPLES 300u"))
+        # bench_run.c must be compiled from the SAME directory, or its quoted
+        # include resolves to the real header first and the two translation
+        # units disagree on sizeof(bench_t) -- s_bench sized for 300, indexed
+        # to 1280. (That is exactly how this test segfaulted the first time.)
+        shutil.copy(ROOT / "main" / "bench_run.c", tmpdir / "bench_run.c")
+        (tmpdir / "harness.c").write_text(stubs + OVERFLOW_MAIN)
+        binary = tmpdir / "bench_overflow_test"
+        subprocess.run(
+            [
+                "cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                "-I", str(tmpdir), "-I", str(ROOT / "main"),
+                str(tmpdir / "motor_control.c"), str(ROOT / "main" / "control_arbiter.c"),
+                str(ROOT / "main" / "arm_sequence.c"),
+                str(ROOT / "main" / "esc_trim.c"),
+                str(ROOT / "main" / "esc_trim_cal.c"),
+                str(tmpdir / "bench_run.c"),
+                str(tmpdir / "harness.c"), "-lm", "-o", str(binary),
+            ],
+            check=True,
+        )
+        subprocess.run([str(binary)], check=True)
+
+
 PIPELINE_HEADERS = {
     "pipeline.h": r"""
 #pragma once
@@ -750,7 +987,8 @@ typedef struct { uint32_t state; float left_throttle; float right_throttle; floa
 typedef struct { bool start; bool average_into_existing; } boat_CalibrateCommand;
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
-typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
+typedef struct { uint32_t kind; float base; float delta; float reset_c;
+    bool abort; } boat_BenchCommand;
 typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
 typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
@@ -807,7 +1045,7 @@ typedef void (*steer_command_handler_fn)(const boat_SteerCommand *);
 typedef void (*servo_power_handler_fn)(bool);
 typedef void (*steer_raw_command_handler_fn)(const boat_SteerRawCommand *);
 typedef void (*calibrate_command_handler_fn)(bool, bool);
-typedef void (*bench_command_handler_fn)(uint32_t, float, float, float);
+typedef void (*bench_command_handler_fn)(uint32_t, float, float, float, bool);
 typedef void (*assist_command_handler_fn)(bool, bool, uint32_t);
 typedef void (*steer_rate_command_handler_fn)(float);
 void pipeline_register_steer_rate_handler(steer_rate_command_handler_fn handler);
@@ -909,8 +1147,8 @@ static void steer_handler(const boat_SteerCommand *command) { (void)command; ++m
 static void power_handler(bool on) { (void)on; ++manual_control_calls; }
 static void raw_handler(const boat_SteerRawCommand *command) { (void)command; ++manual_control_calls; }
 static void calibrate_handler(bool start, bool average) { (void)start; (void)average; ++calibrate_calls; }
-static void bench_handler(uint32_t kind, float base, float delta, float reset_c)
-{ (void)kind; (void)base; (void)delta; (void)reset_c; }
+static void bench_handler(uint32_t kind, float base, float delta, float reset_c, bool abort) {
+    (void)abort; (void)kind; (void)base; (void)delta; (void)reset_c; }
 static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }
 static void steer_rate_handler(float d) { (void)d; }
 
@@ -990,7 +1228,8 @@ void vTaskDelay(TickType_t ticks);
 typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; } boat_MotorStatus;
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
-typedef struct { uint32_t kind; float base; float delta; float reset_c; } boat_BenchCommand;
+typedef struct { uint32_t kind; float base; float delta; float reset_c;
+    bool abort; } boat_BenchCommand;
 typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
 typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
@@ -1477,11 +1716,25 @@ def test_a_left_or_right_run_never_teaches_the_learner():
     # negation slipped in front would leave every substring intact while
     # switching the learner off for BASE runs -- exactly the state this was
     # just fixed out of.
+    # Pinned as the whole expression, not a substring: a `false &&` or a
+    # negation slipped in front would leave every substring intact while
+    # switching the learner off for BASE runs.
+    #
+    # BOTH base kinds must be here. BASE_LONG is the same experiment driven for
+    # 10 s instead of 3, and its entire purpose is giving the learner room to
+    # converge -- omit it and the long run drives with the learner FROZEN,
+    # producing a file that looks like a BASE run and records the learner doing
+    # nothing. That failure is invisible in the commands and invisible on the
+    # water; only this line prevents it.
     assert ("const bool bench_learning = s_bench_active &&\n"
-            "                                s_bench.kind == BENCH_KIND_BASE &&\n"
+            "                                (s_bench.kind == BENCH_KIND_BASE ||\n"
+            "                                 s_bench.kind == BENCH_KIND_BASE_LONG) &&\n"
             "                                s_bench.state == BENCH_RUN;") in tick, (
-        "bench_learning is no longer exactly "
-        "`s_bench_active && kind == BASE && state == RUN`")
+        "bench_learning is no longer exactly `s_bench_active && "
+        "(kind == BASE || kind == BASE_LONG) && state == RUN`")
+    assert "BENCH_KIND_BASE_LONG" in tick, (
+        "the 10 s BASE run does not keep the trim learner live, so it would "
+        "drive with a frozen c and record the learner doing nothing")
     assert "s_bench.state == BENCH_RUN" in tick, (
         "the learner would run through the motors-off baseline and coast, "
         "where the boat is not being driven at all")

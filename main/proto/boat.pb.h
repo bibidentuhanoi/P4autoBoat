@@ -236,6 +236,17 @@ typedef struct _boat_BenchCommand {
  what every ordinary BASE run sends -- c must carry over between runs or
  convergence can never be observed. */
     float reset_c;
+    /* ABORT the run the boat is currently driving. Sent by the laptop's STOP.
+
+ Why a field of its own: a running bench owns the ESCs -- its output is the
+ last write of every control cycle, overriding the manual path, and the
+ link-loss failsafe deliberately leaves it alone. So the motor zeros STOP
+ already sends cannot reach it; only DISARM could, and only because
+ bench_step happens to check `armed`. Not a magic kind value, so it can
+ never be mistaken for a start; not DISARM, so STOP keeps its armed-state
+ semantics. false/absent on every existing start, so nothing sent before
+ this field existed changes meaning. */
+    bool abort;
 } boat_BenchCommand;
 
 /* No string field on purpose: nanopb strings need a size option, and the file
@@ -302,7 +313,7 @@ extern "C" {
 #define boat_CalibrateCommand_init_default       {0, 0}
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_default          {0, 0, 0}
-#define boat_BenchCommand_init_default           {0, 0, 0, 0}
+#define boat_BenchCommand_init_default           {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0, 0}
@@ -325,7 +336,7 @@ extern "C" {
 #define boat_CalibrateCommand_init_zero          {0, 0}
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_zero             {0, 0, 0}
-#define boat_BenchCommand_init_zero              {0, 0, 0, 0}
+#define boat_BenchCommand_init_zero              {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
@@ -415,6 +426,7 @@ extern "C" {
 #define boat_BenchCommand_base_tag               2
 #define boat_BenchCommand_delta_tag              3
 #define boat_BenchCommand_reset_c_tag            4
+#define boat_BenchCommand_abort_tag              5
 #define boat_BenchStatus_state_tag               1
 #define boat_BenchStatus_kind_tag                2
 #define boat_BenchStatus_base_tag                3
@@ -615,7 +627,8 @@ X(a, STATIC,   SINGULAR, UINT32,   request_id,        3)
 X(a, STATIC,   SINGULAR, UINT32,   kind,              1) \
 X(a, STATIC,   SINGULAR, FLOAT,    base,              2) \
 X(a, STATIC,   SINGULAR, FLOAT,    delta,             3) \
-X(a, STATIC,   SINGULAR, FLOAT,    reset_c,           4)
+X(a, STATIC,   SINGULAR, FLOAT,    reset_c,           4) \
+X(a, STATIC,   SINGULAR, BOOL,     abort,             5)
 #define boat_BenchCommand_CALLBACK NULL
 #define boat_BenchCommand_DEFAULT NULL
 
@@ -724,7 +737,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define BOAT_BOAT_PB_H_MAX_SIZE                  boat_BoatMessage_size
 #define boat_ArmCommand_size                     4
 #define boat_AssistCommand_size                  10
-#define boat_BenchCommand_size                   21
+#define boat_BenchCommand_size                   23
 #define boat_BenchStatus_size                    41
 #define boat_BoatMessage_size                    13275
 #define boat_CalibrateCommand_size               4

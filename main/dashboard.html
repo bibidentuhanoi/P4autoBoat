@@ -514,7 +514,7 @@ message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
 message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
-message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; }
+message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; bool abort = 5; }
 message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; }
 message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; BenchCommand bench = 15; BenchStatus bench_status = 16; AssistCommand assist = 17; SteerRateCommand steer_rate = 18; } }
 `;

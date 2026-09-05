@@ -19,7 +19,18 @@
 #include <stdint.h>
 
 /* 6 s at the 100 Hz control tick -- comfortably covers the 4.5 s profile. */
-#define BENCH_MAX_SAMPLES 600u
+/* Sized for the LONGEST run this firmware can be asked for, which is
+ * BENCH_KIND_BASE_LONG: 0.5 s baseline + 10 s drive + 1 s coast at the 100 Hz
+ * control rate = 1150 samples. 1280 leaves 130 spare (11.3%), so a late tick
+ * or a slightly long phase cannot silently truncate the one run this mode
+ * exists to capture -- an overflowed run looks complete and is short.
+ *
+ * Cost: sizeof(bench_sample_t) is 36 bytes on the target, so the buffer is
+ * 1280 * 36 = 46,080 B of .bss, up 24,480 B from the 600-sample version. One
+ * static buffer, no allocation, no PSRAM, no streaming: DIRAM goes 64.3% ->
+ * 69.8% of 445,392 B, leaving ~131 KB. Measured, not estimated -- see the
+ * linker map entry for .bss.s_bench. */
+#define BENCH_MAX_SAMPLES 1280u
 
 typedef enum {
     BENCH_IDLE = 0,
@@ -34,6 +45,17 @@ typedef enum {
     BENCH_KIND_BASE = 0,   /* both equal -- any turn IS the mismatch */
     BENCH_KIND_LEFT = 1,   /* left stronger, right weaker */
     BENCH_KIND_RIGHT = 2,  /* right stronger, left weaker */
+    /* Identical to BASE in every respect except the commanded drive duration:
+     * same equal-motor commands, same trim learner, same P assist, same
+     * aborts, same recording. Only the clock differs -- 10 s instead of 3 s,
+     * for a lake run where the learner has room to converge and be seen doing
+     * it.
+     *
+     * A separate KIND rather than a duration parameter, deliberately: the two
+     * are different experiments and their files must never pool. A parameter
+     * would also make every historical BASE file ambiguous about how long it
+     * ran. */
+    BENCH_KIND_BASE_LONG = 3,
 } bench_kind_t;
 
 typedef struct {
