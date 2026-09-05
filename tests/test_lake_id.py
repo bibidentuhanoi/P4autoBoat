@@ -10,8 +10,10 @@ import importlib.util
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -877,18 +879,51 @@ class WriterTest(LakeBase):
 
 
 class GuardTest(unittest.TestCase):
+    """This experiment is Python-only. The guard compares the committed
+    history against the A+B baseline it grew from, not the working tree
+    against HEAD (which only ever proved there was nothing uncommitted)."""
 
-    def test_no_firmware_proto_or_kconfig_change_on_this_branch(self):
-        base = subprocess.run(['git', '-C', str(ROOT), 'merge-base', 'HEAD', 'HEAD'],
-                              capture_output=True, text=True).stdout.strip()
-        out = subprocess.run(['git', '-C', str(ROOT), 'diff', '--name-only', 'HEAD', '--',
-                              'main/', 'proto/', 'sdkconfig.defaults'],
-                             capture_output=True, text=True).stdout.split()
-        self.assertEqual(out, [], 'this experiment must be Python-only: %s' % out)
+    BASELINE = 'e7abc06'      # the reconstructed A+B firmware the boat matches
+    PATHS = ['main/', 'proto/', 'partitions.csv',
+             ':(glob)**/Kconfig*', ':(glob)**/sdkconfig*']
 
-    def test_the_rudder_maximum_stays_1805_here(self):
-        src = (ROOT / 'tests' / 'test_steer_direction.py').read_text()
-        self.assertIn('FULL_LEFT_US = 1805', src)
+    def _git(self, *args):
+        return subprocess.run(['git', '-C', str(ROOT)] + list(args),
+                              capture_output=True, text=True)
+
+    def test_no_firmware_proto_or_config_change_since_the_baseline(self):
+        anc = self._git('merge-base', '--is-ancestor', self.BASELINE, 'HEAD')
+        self.assertEqual(anc.returncode, 0,
+                         '%s is not an ancestor of HEAD: update BASELINE deliberately, '
+                         'never let this guard pass by accident' % self.BASELINE)
+        committed = self._git('diff', '--name-only', self.BASELINE, 'HEAD', '--',
+                              *self.PATHS).stdout.split()
+        self.assertEqual(committed, [], 'firmware/proto/config changed since %s: %s'
+                         % (self.BASELINE, committed))
+        working = self._git('diff', '--name-only', 'HEAD', '--', *self.PATHS).stdout.split()
+        self.assertEqual(working, [], 'uncommitted firmware/proto/config change: %s' % working)
+
+    def test_the_guard_can_actually_fail(self):
+        """The baseline's own parent differs from it in main/ (that commit IS a
+        firmware change), so the very same command must report it."""
+        out = self._git('diff', '--name-only', self.BASELINE + '~1', self.BASELINE, '--',
+                        *self.PATHS).stdout.split()
+        self.assertTrue(any(f.startswith('main/') for f in out), out)
+
+    def test_the_active_rudder_maximum_is_1805(self):
+        kconfig = (ROOT / 'main' / 'Kconfig.projbuild').read_text()
+        m = re.search(r'config STEER_PULSE_MAX_US\s*\n\s*int[^\n]*\n\s*default (\d+)', kconfig)
+        self.assertIsNotNone(m, 'STEER_PULSE_MAX_US default not found')
+        self.assertEqual(m.group(1), '1805')
+        sdk = ROOT / 'sdkconfig'
+        if sdk.exists():
+            self.assertRegex(sdk.read_text(), r'(?m)^CONFIG_STEER_PULSE_MAX_US=1805$')
+        self.assertIn('FULL_LEFT_US = 1805',
+                      (ROOT / 'tests' / 'test_steer_direction.py').read_text())
+        for rel in ('main/Kconfig.projbuild', 'main/drivers/steer_driver.c',
+                    'main/stability_control.h'):
+            self.assertNotIn('1835', (ROOT / rel).read_text(), rel)
+        self.assertIn('value="1805"', (ROOT / 'main' / 'dashboard.html').read_text())
 
 
 class UiTest(unittest.TestCase):
@@ -1002,3 +1037,480 @@ class NextOrderReachesThePageTest(unittest.TestCase):
         src = TOOL.read_text()
         i = src.index('self.wfile.write(_ws_text_frame(json.dumps(self.link.status())))')
         self.assertIn('ensure_lake_id_next()', src[i - 200:i])
+
+
+# ---------------------------------------------------------------------------
+# Review fixes, 2026-09-05. Each class below reproduces a failure the earlier
+# suite let through; every test here failed (or errored on a missing API)
+# against 68122fc before the fix it guards.
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_espnow_drive import run_page_js          # noqa: E402  the node page harness
+
+
+def _lake_folders(tmp):
+    return sorted(p.name for p in Path(tmp).iterdir() if p.name.startswith('LAKE_ID_'))
+
+
+class _BlockingWriterow:
+    """Stands in for the samples DictWriter: the first writerow blocks until
+    released, so the queue behind it fills exactly as it would on a stalled
+    disk. Released rows go to the real writer."""
+
+    def __init__(self, real, gate):
+        self.real, self.gate, self.blocked = real, gate, threading.Event()
+
+    def writerow(self, row):
+        self.blocked.set()
+        self.gate.wait(15.0)
+        return self.real.writerow(row)
+
+
+class FinalizeGuaranteeTest(LakeBase):
+    """Item 1: finalize must never be lost to a full data queue."""
+
+    def test_full_queue_abort_still_finalizes_closes_and_releases(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        w = self.link._lake_writer
+        handles = list(w._fh.values())
+        gate = threading.Event()
+        blocker = _BlockingWriterow(w._w['samples'], gate)
+        w._w['samples'] = blocker
+        self._frame(yaw=0.1)                                # the row the writer sticks on
+        self.assertTrue(blocker.blocked.wait(2.0), 'writer never picked up the row')
+        template = dict(self.link.lake_id['rows'][-1])
+        while w.error is None:                              # fill the DATA queue behind it
+            w.put('row', template)
+        self.assertEqual(w.error, 'writer queue full')
+        self.sent.clear()
+        self._tick()                                        # abort table sees the failure
+        with self.link._lock:
+            self.assertTrue(self.link.lake_id['finalizing'])
+        self.assertEqual(self.link.throttle, 0.0)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.assertIn(('motor', 0.0, 0.0), self.sent)
+        self.assertIn(('steer', 0.0), self.sent)
+        gate.set()                                          # the disk comes back
+        r = self._wait_result(timeout=10.0)
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('queue full', r['reason'])
+        self.assertIsNone(self.link.lake_id, 'run stuck in finalizing')
+        self.assertIsNone(self.link._lake_writer)
+        self.assertTrue(all(fh.closed for fh in handles), 'CSV handles left open')
+        d = self.tmp / r['name']
+        self.assertTrue((d / 'summary.json').exists())
+        s = json.load(open(d / 'summary.json'))
+        self.assertEqual(s['status'], 'aborted')
+        rec = s['recording']
+        self.assertGreater(rec['sample_rows_dropped'], 0)
+        self.assertEqual(rec['sample_rows_enqueued'], rec['sample_rows_written'])
+        self.assertFalse(rec['complete'])
+        self.assertEqual(self.link.lake_id_next()['T20_M30']['next_order'], 'LR')
+        self.assertEqual(self.link.lake_id_next()['T20_M30']['complete_runs'], 0)
+
+    def test_finalize_runs_even_when_the_writer_thread_never_started(self):
+        d = self.tmp / 'LAKE_ID_T20_M30_LR_001'
+        w = T.LakeIdWriter(d)
+        w.prepare()                                         # files exist, thread NOT started
+        done = threading.Event(); got = {}
+
+        def on_done(res):
+            got['res'] = res; done.set()
+        w.finalize({'status': 'aborted', 'reason': 'x'}, on_done)
+        self.assertTrue(done.wait(3.0), 'finalize callback never fired')
+        self.assertTrue((d / 'summary.json').exists())
+        self.assertIsInstance(got['res'], dict)
+        self.assertTrue(got['res']['ok'], got['res'])
+
+
+class _BadClose:
+    """A file handle whose final close fails (a USB stick pulled, a full
+    filesystem discovered at flush)."""
+
+    def __init__(self, fh):
+        self._fh = fh
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def close(self):
+        raise OSError('simulated final close failure')
+
+
+class RecordingFailureStatusTest(LakeBase):
+    """Item 2: a run whose recording failed at the end is never COMPLETE and
+    never advances the LR/RL order."""
+
+    def test_final_close_failure_is_not_complete_and_keeps_the_order(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        w = self.link._lake_writer
+        w._fh['samples'] = _BadClose(w._fh['samples'])
+        self._drive(2.5); self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self._drive(56.0)
+        r = self._wait_result()
+        self.assertNotEqual(r['status'], 'complete')
+        self.assertEqual(r['status'], 'incomplete_recording_failed')
+        self.assertIn('simulated final close failure', r['write_error'])
+        self.assertIn('recording failed', r['reason'])
+        self.assertEqual(r['profile_status'], 'complete')     # the motion itself did finish
+        self.assertTrue(r['stop_confirmed'])
+        s = json.load(open(self.tmp / r['name'] / 'summary.json'))
+        self.assertEqual(s['status'], 'incomplete_recording_failed')
+        self.assertIn('simulated', s['write_error'])
+        self.assertEqual(s['profile_status'], 'complete')
+        n = self.link.lake_id_next()['T20_M30']
+        self.assertEqual(n['next_order'], 'LR')
+        self.assertEqual(n['complete_runs'], 0)
+
+    def test_summary_replace_failure_is_not_complete_and_keeps_the_order(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        d = self.tmp / self.link.lake_id['name']
+        (d / 'summary.json').mkdir()                        # os.replace onto a directory fails
+        self._drive(2.5); self._drive(56.0)
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'incomplete_recording_failed')
+        self.assertIsNotNone(r['write_error'])
+        self.assertFalse(r['summary_written'])
+        self.assertEqual(r['profile_status'], 'complete')
+        n = self.link.lake_id_next()['T20_M30']
+        self.assertEqual(n['next_order'], 'LR')
+        self.assertEqual(n['complete_runs'], 0)
+
+    def test_scan_never_counts_missing_unreadable_or_write_failed_summaries(self):
+        for name, content in (
+                ('LAKE_ID_T20_M30_LR_001', None),                      # no summary at all
+                ('LAKE_ID_T20_M30_RL_002', '{not json'),               # unreadable
+                ('LAKE_ID_T20_M30_LR_003', json.dumps({'status': 'complete',
+                                                       'write_error': 'OSError: x'})),
+                ('LAKE_ID_T20_M30_RL_004', json.dumps({'status': 'incomplete_recording_failed'})),
+                ('LAKE_ID_T20_M30_LR_005', json.dumps(['not', 'an', 'object']))):
+            d = self.tmp / name; d.mkdir()
+            if content is not None:
+                (d / 'summary.json').write_text(content)
+        n = T.lake_id_scan(self.tmp)['T20_M30']
+        self.assertEqual(n['complete_runs'], 0)
+        self.assertEqual(n['next_order'], 'LR')
+        self.assertEqual(n['next_index'], 6)
+
+    def test_the_page_never_shows_complete_with_a_write_error(self):
+        result = run_page_js(r"""
+vm.createContext(context); vm.runInContext(script, context);
+const st = Object.assign({}, CONNECTED_STATUS, {
+  lake_id: null,
+  lake_id_result: { status: 'complete', write_error: 'OSError: simulated', reason: null,
+                    name: 'LAKE_ID_T20_M30_LR_001', order: 'LR', frames: 10,
+                    warnings: [], summary_warnings: [], published: true },
+  lake_id_next: {},
+  lake_id_defaults: { throttles: [0.2, 0.3], magnitudes: [0.3, 0.6],
+                      firmware_label: 'x', note_fields: ['battery'] } });
+context.renderLakeId(st);
+console.log(JSON.stringify({ pill: elements['lake-pill'].textContent,
+                             stale: elements['lake-pill'].classList.contains('stale'),
+                             phase: elements['lake-phase'].textContent }));
+process.exit(0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertNotEqual(out['pill'], 'COMPLETE')
+        self.assertTrue(out['stale'])
+        self.assertIn('simulated', out['phase'])
+
+
+class RefusalMonitorTest(LakeBase):
+    """Item 3: boat-applied L/R are watched for the WHOLE powered run, on
+    freshly received MotorStatus only."""
+
+    def _events(self):
+        return [e['event'] for e in self._files(self.link.lake_id_result['name'])[1]]
+
+    def _powered_following(self, seconds=5.0):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(seconds)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self.assertTrue(self.link.lake_id['drive_confirmed'])
+
+    def _zeros(self, seconds):
+        """Fresh MotorStatus packets reporting L=R=0 while telemetry,
+        SystemStatus and the browser heartbeat all stay alive."""
+        self._boat(0.0, 0.0, 0.0)
+        self._drive(seconds, boat_follows=False, refresh_ms=True)
+
+    def test_initial_refusal_over_1_5_s_aborts(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(2.5, boat_follows=False)            # straight commanded, boat never applies
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self._drive(0.8, boat_follows=False)            # zero reports span ~1.3 s
+        self.assertIsNotNone(self.link.lake_id, 'aborted before zero reports spanned 1.5 s')
+        self._drive(0.6, boat_follows=False)            # ~1.9 s
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('not driving', r['reason'])
+        self.assertIn('boat_refusal', self._events())
+
+    def test_initial_response_inside_the_window_passes(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(8.0, lag=1.2)                       # boat applies 1.2 s after the command
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertTrue(self.link.lake_id['drive_confirmed'])
+
+    def test_brief_zero_after_confirmation_does_not_abort(self):
+        self._powered_following()
+        self._zeros(1.0)
+        self.assertIsNotNone(self.link.lake_id, 'a 1 s zero interval aborted the run')
+        self._drive(2.0)                                # boat drives again
+        self.assertIsNotNone(self.link.lake_id)
+        self.link.stop(self.link.winch_command_seq + 1)
+        self._wait_result()
+        self.assertNotIn('boat_refusal', self._events())
+
+    def test_zero_reports_spanning_over_1_5_s_after_confirmation_abort(self):
+        self._powered_following()
+        self._zeros(3.0)
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('not driving', r['reason'])
+        self.assertNotIn('stale', r['reason'])          # MotorStatus was fresh throughout
+        self.assertIn('boat_refusal', self._events())
+        self.assertEqual(self.link.throttle, 0.0)
+
+    def test_recovery_to_nonzero_resets_the_timer(self):
+        self._powered_following()
+        self._zeros(1.0)
+        self._drive(0.3)                                # a nonzero report resets the interval
+        self._zeros(1.0)
+        self.assertIsNotNone(self.link.lake_id, 'two short zero intervals were summed')
+        self._zeros(0.8)                                # this one interval alone passes 1.5 s
+        r = self._wait_result()
+        self.assertIn('not driving', r['reason'])
+
+    def test_one_old_zero_packet_and_wall_clock_are_not_proof(self):
+        self._powered_following()
+        self._boat(0.0, 0.0, 0.0)                       # ONE zero packet, then silence
+        self._drive(1.3, boat_follows=False, refresh_ms=False)
+        self.assertIsNotNone(self.link.lake_id)         # neither refusal nor stale (< 1.5 s)
+        self._drive(1.0)                                # a nonzero packet clears it
+        self.assertIsNotNone(self.link.lake_id)
+
+    def test_the_stop_phase_zeros_never_count_as_refusal(self):
+        r = self._run_full()
+        self.assertEqual(r['status'], 'complete')
+        self.assertNotIn('boat_refusal', self._events())
+
+    def test_operator_stop_never_counts_as_refusal(self):
+        self._powered_following()
+        self.link.stop(self.link.winch_command_seq + 1)
+        r = self._wait_result()
+        self.assertIn('STOP', r['reason'])
+        self.assertNotIn('boat_refusal', self._events())
+
+    def test_packets_from_before_the_powered_command_are_ignored(self):
+        """A zero packet from BEFORE the command can be up to 1.5 s old and
+        still pass the precheck's freshness rule. Counted into the interval,
+        it would make the first fresh zero after the command look like 1.5 s
+        of refusal and abort before the boat had any time to respond."""
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(0.9, boat_follows=False)            # zero reports until t=0.9 s
+        self._drive(1.2, boat_follows=False, refresh_ms=False)   # silence: 1.1 s old at the gate
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self._zeros(0.5)                                # fresh zeros 2.1-2.6 s: a NEW, 0.5 s interval
+        self.assertIsNotNone(self.link.lake_id, 'the pre-command packet was counted into the interval')
+        self._drive(3.0)                                # then it drives
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertTrue(self.link.lake_id['drive_confirmed'])
+
+
+class StartTwoPhaseTest(LakeBase):
+    """Item 4: the recorder is prepared with the lock RELEASED, and a refused
+    start leaves nothing behind but its own cleanup."""
+
+    def _patch_open(self, fail_on):
+        real = open
+        opened = []
+
+        def fake(path, *a, **k):
+            if str(path).endswith(fail_on):
+                raise OSError('simulated open failure: %s' % fail_on)
+            fh = real(path, *a, **k)
+            opened.append(fh)
+            return fh
+        T.open = fake
+        self.addCleanup(lambda: T.__dict__.pop('open', None))
+        return opened
+
+    def test_first_file_failure_refuses_and_leaves_no_folder(self):
+        self._patch_open('samples.csv')
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertIn('cannot create', err)
+        self.assertIsNone(self.link.lake_id)
+        self.assertEqual(_lake_folders(self.tmp), [])
+
+    def test_second_file_failure_closes_the_first_and_cleans_up(self):
+        opened = self._patch_open('events.csv')
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertEqual(len(opened), 1)
+        self.assertTrue(opened[0].closed, 'samples.csv handle leaked')
+        self.assertEqual(_lake_folders(self.tmp), [])
+        self.assertIsNone(self.link.lake_id)
+        self.assertIsNone(self.link._lake_writer)
+        T.__dict__.pop('open', None)                    # disk is fine again
+        ok, err = self._start()                         # and the next press works
+        self.assertTrue(ok, err)
+
+    def test_no_disk_operation_while_the_control_lock_is_held(self):
+        held = []
+        real_open, real_mkdir = open, Path.mkdir
+        lock = self.link._lock
+
+        def fake_open(path, *a, **k):
+            held.append(('open', str(path), lock._is_owned()))
+            return real_open(path, *a, **k)
+
+        def fake_mkdir(self_, *a, **k):
+            held.append(('mkdir', str(self_), lock._is_owned()))
+            return real_mkdir(self_, *a, **k)
+        T.open = fake_open
+        Path.mkdir = fake_mkdir
+        self.addCleanup(lambda: (T.__dict__.pop('open', None), setattr(Path, 'mkdir', real_mkdir)))
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self.assertTrue(any(op == 'mkdir' for op, _p, _h in held), held)
+        self.assertTrue(any(op == 'open' for op, _p, _h in held), held)
+        self.assertEqual([h for h in held if h[2]], [],
+                         'disk I/O while BoatLink._lock was held: %r' % held)
+
+    def test_state_change_during_preparation_refuses_and_cleans_only_its_own(self):
+        real_prepare = T.LakeIdWriter.prepare
+
+        def prepare_then_disarm(w):
+            real_prepare(w)
+            self.link.armed_cmd = False                 # the operator DISARMed meanwhile
+        T.LakeIdWriter.prepare = prepare_then_disarm
+        self.addCleanup(lambda: setattr(T.LakeIdWriter, 'prepare', real_prepare))
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertIn('ARM', err)
+        self.assertIsNone(self.link.lake_id)
+        self.assertIsNone(self.link._lake_writer)
+        self.assertEqual(_lake_folders(self.tmp), [])
+
+    def test_a_start_that_loses_the_race_cannot_touch_the_winner(self):
+        real_prepare = T.LakeIdWriter.prepare
+        winner = {}
+
+        def prepare_with_a_competitor(w):
+            real_prepare(w)                             # this attempt's folder exists now
+            if not winner:
+                T.LakeIdWriter.prepare = real_prepare
+                winner['result'] = self.link.start_lake_id(
+                    0.2, 0.3, self.link.winch_command_seq + 7)   # a second press lands and wins
+        T.LakeIdWriter.prepare = prepare_with_a_competitor
+        self.addCleanup(lambda: setattr(T.LakeIdWriter, 'prepare', real_prepare))
+        ok, err = self._start(seq=self.link.winch_command_seq + 1)
+        self.assertFalse(ok, err)
+        self.assertEqual(winner['result'], (True, None))
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertTrue(self.link.lake_id['name'].endswith('_002'), self.link.lake_id['name'])
+        self.assertEqual(_lake_folders(self.tmp), [self.link.lake_id['name']])
+        for fh in self.link._lake_writer._fh.values():
+            self.assertFalse(fh.closed, 'the winner\'s files were closed by the loser')
+        with self.link._lock:
+            self.link._abort_lake_id_locked('test')
+        self._wait_result()
+
+    def test_two_simultaneous_starts_collide_on_the_folder_only(self):
+        real_scan = T.lake_id_scan
+        barrier = threading.Barrier(2, timeout=5)
+
+        def scan_together(d):
+            out = real_scan(d)
+            try:
+                barrier.wait()                          # both compute the same name
+            except threading.BrokenBarrierError:
+                pass
+            return out
+        T.lake_id_scan = scan_together
+        self.addCleanup(lambda: setattr(T, 'lake_id_scan', real_scan))
+        results = {}
+
+        def go(tag, seq):
+            results[tag] = self.link.start_lake_id(0.2, 0.3, seq)
+        ta = threading.Thread(target=go, args=('a', 11))
+        tb = threading.Thread(target=go, args=('b', 12))
+        ta.start(); tb.start(); ta.join(5); tb.join(5)
+        oks = [tag for tag, (ok, _e) in results.items() if ok]
+        self.assertEqual(len(oks), 1, results)
+        loser = [tag for tag in results if tag not in oks][0]
+        self.assertIn('cannot create', results[loser][1])
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertEqual(_lake_folders(self.tmp), [self.link.lake_id['name']])
+        d = Path(self.link.lake_id['dir'])
+        self.assertTrue((d / 'samples.csv').exists() and (d / 'events.csv').exists())
+        T.lake_id_scan = real_scan                      # the finish rescans; no barrier there
+        with self.link._lock:
+            self.link._abort_lake_id_locked('test')
+        self._wait_result()
+
+
+class RecordingCountsTest(LakeBase):
+    """Item 6: summary.json separates what was received, enqueued and written."""
+
+    def test_summary_separates_received_enqueued_and_written(self):
+        r = self._run_full()
+        rows, events, s = self._files(r['name'])
+        rec = s['recording']
+        self.assertEqual(rec['frames_received'], rec['sample_rows_enqueued'])
+        self.assertEqual(rec['sample_rows_enqueued'], rec['sample_rows_written'])
+        self.assertEqual(rec['sample_rows_dropped'], 0)
+        self.assertEqual(rec['sample_rows_written'], len(rows))
+        self.assertEqual(rec['events_attempted'], rec['events_enqueued'])
+        self.assertEqual(rec['events_enqueued'], rec['events_written'])
+        self.assertEqual(rec['events_written'], len(events))
+        self.assertEqual(rec['events_dropped'], 0)
+        self.assertTrue(rec['complete'])
+        self.assertEqual(r['recording'], rec)
+        self.assertEqual(s['sample_count'], len(rows))     # existing fields survive
+        self.assertEqual(s['event_count'], len(events))
+
+
+class LiveWarningTest(LakeBase):
+    """Item 7: the tool says exactly which warnings are live."""
+
+    def test_frozen_imu_warning_is_live_and_never_aborts(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        end = self.clock.t + 1.5
+        while self.clock.t < end:
+            self.clock.advance(DT)
+            self._all_fresh()
+            self._boat(0.18, 0.22, 0.0)
+            self._tick()
+            self._frame(yaw=1.234, heading=77.0)           # identical IMU tuple every frame
+        self.assertIsNotNone(self.link.lake_id, 'a frozen IMU aborted the run')
+        self.assertTrue(any('identical' in w for w in self.link.lake_id['warnings']),
+                        self.link.lake_id['warnings'])
+
+    def test_the_card_and_code_say_which_warnings_are_live(self):
+        src = TOOL.read_text()
+        i = src.index('id="lake-card"')
+        card = src[i:src.index('</details>', i)]
+        self.assertIn('Live warnings', card)
+        self.assertIn('post-run', card)
+        self.assertNotIn('# live warnings (never aborts)', src)
+
+
+class FirmwareLabelTest(LakeBase):
+    """Provenance: the default label must not claim a build nobody verified."""
+
+    def test_default_label_is_honest_about_the_unknown_build(self):
+        d = T.LAKE_ID_FIRMWARE_LABEL_DEFAULT
+        self.assertNotIn('4e81341b', d)
+        self.assertIn('unknown', d)
+        self.assertIn('believed', d)
+        self.assertIn('1805', d)
+        r = self._run_full()
+        _r, _e, s = self._files(r['name'])
+        self.assertEqual(s['provenance']['firmware_label'], d)
+        self.assertIn('not verified', s['provenance']['firmware_label_note'])

@@ -464,7 +464,12 @@ LAKE_ID_RULES = {
     'radius_min_yaw_sigma': 3.0,        # |mean yaw - straight bias| / straight yaw std
     'straight_steady_speed_tail_s': 5.0,
 }
-LAKE_ID_FIRMWARE_LABEL_DEFAULT = '4e81341b9800a672… / A+B / rudder max 1805 / tested 2026-09-05'
+# The boat's firmware was built from main with no recorded SHA; the label says
+# so. It is operator-supplied and BELIEVED -- the tool cannot read the flash.
+LAKE_ID_FIRMWARE_LABEL_DEFAULT = ('main-branch build / exact firmware SHA unknown / '
+                                  'rudder max believed 1805 / flashed 2026-09-05')
+LAKE_ID_FIRMWARE_LABEL_NOTE = ('operator-supplied / believed; not verified against the '
+                               'flashed binary (the tool cannot read it)')
 LAKE_ID_NOTE_FIELDS = ('battery', 'payload_load', 'mechanical_config', 'wind',
                        'current', 'waves', 'unusual_events')
 LAKE_ID_CSV_COLUMNS = (
@@ -496,6 +501,9 @@ LAKE_ID_SAMPLES_HEADER = (
 LAKE_ID_STATUS_COMPLETE = 'complete'
 LAKE_ID_STATUS_STOP_UNCONFIRMED = 'incomplete_stop_unconfirmed'
 LAKE_ID_STATUS_ABORTED = 'aborted'
+# The motion finished but the RECORD of it did not (a final flush, close or
+# summary write failed). Never COMPLETE, never advances the LR/RL order.
+LAKE_ID_STATUS_RECORDING_FAILED = 'incomplete_recording_failed'
 
 
 def lake_id_phases(throttle, magnitude, order):
@@ -557,12 +565,17 @@ def lake_id_scan(directory):
         cond, _order, idx = m.group(1), m.group(2), int(m.group(3))
         c = out.setdefault(cond, {'complete': 0, 'max_index': 0})
         c['max_index'] = max(c['max_index'], idx)
+        # Only a readable summary that says COMPLETE *and* carries no write
+        # error counts. Missing, unreadable, malformed or write-failed runs
+        # occupy their index and nothing more.
         try:
             with open(p / 'summary.json') as fh:
-                if json.load(fh).get('status') == LAKE_ID_STATUS_COMPLETE:
-                    c['complete'] += 1
+                summary = json.load(fh)
         except (OSError, ValueError):
-            pass
+            continue
+        if (isinstance(summary, dict) and summary.get('status') == LAKE_ID_STATUS_COMPLETE
+                and not summary.get('write_error')):
+            c['complete'] += 1
     result = {}
     for t in LAKE_ID_THROTTLES:
         for m_ in LAKE_ID_MAGNITUDES:
@@ -871,7 +884,8 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'stop_confirmed': stop_confirmed,
         'settings': dict(settings, phases=[list(p) for p in phases],
                          profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S),
-        'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown'),
+        'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown',
+                           firmware_label_note=LAKE_ID_FIRMWARE_LABEL_NOTE),
         'operator_notes': {k: (notes or {}).get(k, '') for k in LAKE_ID_NOTE_FIELDS},
         'sample_count': len(rows), 'event_count': len(events),
         'phase_coverage': coverage,
@@ -896,47 +910,145 @@ class LakeIdWriter:
     blocks, never touches a file); this thread does every open/write/flush/
     close and the atomic summary. Any failure is recorded in `error` for the
     control loop to act on -- the thread itself stays alive so a later
-    finalize can still preserve whatever it can."""
+    finalize can still preserve whatever it can.
+
+    Lifecycle: prepare() (disk work, BoatLink lock RELEASED) -> start() (the
+    thread) -> put() -> finalize(). A start refused after prepare() calls
+    discard(), which removes only what prepare() created.
+
+    The queue holds ONE slot more than the data limit and put() refuses rows
+    and events at that limit, so finalize() always has a free slot. A full
+    data queue is a recording failure that aborts the run -- and the abort's
+    own finalize must never be the item that gets dropped."""
 
     def __init__(self, directory, maxsize=LAKE_ID_QUEUE_MAX):
         import queue
         self.dir = Path(directory)
-        self.q = queue.Queue(maxsize=maxsize)
+        self.data_max = int(maxsize)
+        self.q = queue.Queue(maxsize=self.data_max + 1)
         self.error = None
+        self.rows_enqueued = 0
+        self.rows_dropped = 0
         self.rows_written = 0
+        self.events_enqueued = 0
+        self.events_dropped = 0
+        self.events_written = 0
         self.finalized = threading.Event()
         self.result = None
         self._fh = {}
         self._w = {}
         self._pending = 0
+        self._created = []              # files THIS writer created, in order
+        self._dir_created = False
+        self._finalize_queued = False
         self._thread = threading.Thread(target=self._loop, name='lake-id-writer', daemon=True)
 
-    def open(self):
-        """Called on the HTTP thread BEFORE the run starts; raises on failure so
-        the precheck can refuse without ever powering the motors."""
-        self.dir.mkdir(parents=True, exist_ok=False)
-        self._fh['samples'] = open(self.dir / 'samples.csv', 'w', newline='')
-        for line in LAKE_ID_SAMPLES_HEADER:
-            self._fh['samples'].write(line + '\n')
-        self._w['samples'] = csv.DictWriter(self._fh['samples'], fieldnames=list(LAKE_ID_CSV_COLUMNS))
-        self._w['samples'].writeheader()
-        self._fh['events'] = open(self.dir / 'events.csv', 'w', newline='')
-        self._w['events'] = csv.DictWriter(self._fh['events'], fieldnames=list(LAKE_ID_EVENT_COLUMNS))
-        self._w['events'].writeheader()
-        for fh in self._fh.values():
-            fh.flush()
+    # ---- lifecycle ---------------------------------------------------------
+
+    def prepare(self):
+        """Create the folder and both CSVs with their headers. Disk work: call
+        with the BoatLink lock RELEASED. Raises on failure -- after closing
+        and removing everything this call itself created, and nothing else.
+        The thread is not started here."""
+        try:
+            self.dir.mkdir(parents=True, exist_ok=False)
+            self._dir_created = True
+            self._open_csv('samples', LAKE_ID_CSV_COLUMNS, LAKE_ID_SAMPLES_HEADER)
+            self._open_csv('events', LAKE_ID_EVENT_COLUMNS, ())
+            for fh in self._fh.values():
+                fh.flush()
+        except Exception:
+            self.discard()
+            raise
+
+    def _open_csv(self, kind, columns, header_lines):
+        path = self.dir / (kind + '.csv')
+        fh = open(path, 'w', newline='')
+        self._fh[kind] = fh
+        self._created.append(path)
+        for line in header_lines:
+            fh.write(line + '\n')
+        w = csv.DictWriter(fh, fieldnames=list(columns))
+        w.writeheader()
+        self._w[kind] = w
+
+    def start(self):
+        """Start the writer thread. Only after prepare() succeeded."""
+        if 'samples' not in self._fh or 'events' not in self._fh:
+            raise RuntimeError('recorder not prepared')
         self._thread.start()
 
+    def discard(self):
+        """Undo prepare(): close every handle, remove the files this writer
+        created, then its folder if that leaves it empty. Never removes
+        anything it did not create."""
+        for fh in list(self._fh.values()):
+            try:
+                fh.close()
+            except Exception:                            # noqa: BLE001
+                pass
+        self._fh.clear()
+        self._w.clear()
+        for path in reversed(self._created):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._created = []
+        if self._dir_created:
+            try:
+                self.dir.rmdir()                          # refuses a non-empty folder
+            except OSError:
+                pass
+            self._dir_created = False
+
+    # ---- the data path (control thread, under the BoatLink lock) -----------
+
     def put(self, kind, item):
-        """Non-blocking. A full queue is a recording failure, not a stall."""
+        """Non-blocking. True if enqueued. Rows and events are refused at the
+        DATA limit, which keeps the slot above it free for finalize(); a
+        refusal is a recording failure (recorded in `error`), never a stall."""
         import queue
-        try:
-            self.q.put_nowait((kind, item))
-        except queue.Full:
-            self.error = 'writer queue full'
+        full = self.q.qsize() >= self.data_max
+        if not full:
+            try:
+                self.q.put_nowait((kind, item))
+            except queue.Full:
+                full = True
+        if full:
+            self.error = self.error or 'writer queue full'
+            if kind == 'row':
+                self.rows_dropped += 1
+            elif kind == 'event':
+                self.events_dropped += 1
+            return False
+        if kind == 'row':
+            self.rows_enqueued += 1
+        elif kind == 'event':
+            self.events_enqueued += 1
+        return True
 
     def finalize(self, summary, on_done):
-        self.put('finalize', (summary, on_done))
+        """Hand the run to the writer: flush, close, write summary.json, then
+        on_done(result). Non-blocking and cannot be dropped: it takes the
+        reserved slot, and if the thread is not alive (never started, or gone)
+        it runs on a one-shot thread so on_done still fires. False only if a
+        finalize is already pending."""
+        import queue
+        if self._finalize_queued:
+            return False
+        self._finalize_queued = True
+        if self._thread.is_alive():
+            try:
+                self.q.put_nowait(('finalize', (summary, on_done)))
+                return True
+            except queue.Full:                            # cannot happen: see put()
+                pass
+        threading.Thread(target=self._finalize_and_report, args=(summary, on_done),
+                         name='lake-id-finalize', daemon=True).start()
+        return True
+
+    # ---- the thread --------------------------------------------------------
 
     def _loop(self):
         while True:
@@ -951,12 +1063,10 @@ class LakeIdWriter:
                 elif kind == 'event':
                     self._w['events'].writerow(item)
                     self._fh['events'].flush()
+                    self.events_written += 1
                 elif kind == 'finalize':
                     summary, on_done = item
-                    err = self._finalize(summary)
-                    self.result = err
-                    self.finalized.set()
-                    on_done(err)
+                    self._finalize_and_report(summary, on_done)
                     return
             except Exception as exc:                       # noqa: BLE001
                 # ANY failure, not just OSError: a closed handle raises
@@ -966,34 +1076,93 @@ class LakeIdWriter:
                 # draining so finalize can still preserve what it can.
                 self.error = self.error or ('%s: %s' % (type(exc).__name__, exc))
                 print('[lake-id] recording failed: %s' % self.error, file=sys.stderr, flush=True)
-                if kind == 'finalize':
-                    self.result = self.error
-                    self.finalized.set()
-                    try:
-                        item[1](self.error)
-                    except Exception:                    # noqa: BLE001
-                        pass
-                    return
             finally:
                 self.q.task_done()
 
+    def _finalize_and_report(self, summary, on_done):
+        try:
+            result = self._finalize(summary)
+        except Exception as exc:                           # noqa: BLE001
+            err = '%s: %s' % (type(exc).__name__, exc)
+            self.error = self.error or err
+            result = self._verdict(summary, err, 'finalize', False)
+        self.result = result
+        self.finalized.set()
+        try:
+            on_done(result)
+        except Exception as exc:                           # noqa: BLE001
+            print('[lake-id] result callback failed: %s: %s' % (type(exc).__name__, exc),
+                  file=sys.stderr, flush=True)
+
+    def _recording(self, summary, err):
+        """The honest count block: received vs enqueued vs written, so a lost
+        row or event is visible in summary.json rather than implied away."""
+        rec = dict(summary.get('recording') or {})
+        rec.update({
+            'sample_rows_enqueued': self.rows_enqueued,
+            'sample_rows_dropped': self.rows_dropped,
+            'sample_rows_written': self.rows_written,
+            'events_enqueued': self.events_enqueued,
+            'events_dropped': self.events_dropped,
+            'events_written': self.events_written,
+            'write_error': err,
+            'complete': err is None,
+            'note': ('written = handed to the file; the final flush/close verdict is '
+                     'write_error, and dropped rows/events are lost'),
+        })
+        return rec
+
+    def _verdict(self, summary, err, stage, summary_written):
+        """The structured result on_done() receives. A COMPLETE run whose
+        record failed is downgraded here, once, for both the file and the
+        in-memory result."""
+        status, profile_status = summary.get('status'), summary.get('profile_status')
+        reason = summary.get('reason')
+        if err is not None and status == LAKE_ID_STATUS_COMPLETE:
+            profile_status, status = LAKE_ID_STATUS_COMPLETE, LAKE_ID_STATUS_RECORDING_FAILED
+            reason = 'recording failed: %s' % err
+        return {'ok': err is None, 'error': err, 'stage': stage,
+                'summary_written': bool(summary_written), 'status': status,
+                'profile_status': profile_status, 'reason': reason,
+                'recording': self._recording(summary, err)}
+
     def _finalize(self, summary):
+        """Flush and close both CSVs, then summary.json via tmp + atomic
+        replace. Returns the structured verdict; a failure anywhere here is
+        part of it -- the motion may have finished, the record of it did not."""
         err = self.error
-        for fh in self._fh.values():
+        stage = 'recording' if err else None
+        for name, fh in list(self._fh.items()):
             try:
                 fh.flush(); fh.close()
-            except Exception as exc:                         # noqa: BLE001
-                err = err or ('%s: %s' % (type(exc).__name__, exc))
-        summary = dict(summary, write_error=err, samples_written=self.rows_written)
+            except Exception as exc:                       # noqa: BLE001
+                if err is None:
+                    err, stage = '%s: %s' % (type(exc).__name__, exc), 'close_' + name
+        self._fh.clear()
+        summary = dict(summary)
+        summary['recording'] = self._recording(summary, err)
+        summary['write_error'] = err
+        summary['samples_written'] = self.rows_written
+        if err is not None and summary.get('status') == LAKE_ID_STATUS_COMPLETE:
+            summary['profile_status'] = LAKE_ID_STATUS_COMPLETE
+            summary['status'] = LAKE_ID_STATUS_RECORDING_FAILED
+            summary['reason'] = 'recording failed: %s' % err
+        summary_written = False
         tmp = self.dir / 'summary.json.tmp'
         try:
             with open(tmp, 'w') as fh:
                 json.dump(summary, fh, indent=1, sort_keys=True)
                 fh.flush(); os.fsync(fh.fileno())
             os.replace(tmp, self.dir / 'summary.json')     # atomic
-        except Exception as exc:                             # noqa: BLE001
-            err = err or ('%s: %s' % (type(exc).__name__, exc))
-        return err
+            summary_written = True
+        except Exception as exc:                           # noqa: BLE001
+            if err is None:
+                err, stage = '%s: %s' % (type(exc).__name__, exc), 'summary'
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return self._verdict(summary, err, stage, summary_written)
 
 
 def rudder_test_drive_coverage(rows):
@@ -2655,10 +2824,45 @@ class BoatLink:
     def _lake_id_refresh_next(self):
         self._lake_id_next_cache = lake_id_scan(getattr(self, 'lake_id_dir', LAKE_ID_DIR))
 
+    def _lake_id_refusal_locked(self, command_seq):
+        """Every reason a START is refused, in one place, because it is asked
+        TWICE: before the recorder is prepared (a hopeless press never touches
+        the disk) and again after (nothing that changed while the lock was
+        released can slip through). Claims nothing."""
+        if command_seq <= self.winch_command_seq:
+            return 'stale command sequence'
+        if self.lake_id is not None:
+            return 'a lake steering test is already running'
+        if self.rudder_test is not None:
+            return 'a rudder test is running'
+        if not self.connected:
+            return 'serial link is disconnected'
+        if self.calibrating:
+            return 'calibration is running — stop it first'
+        if self._bench_running_locked():
+            return 'a bench run is going — wait for it to finish'
+        if (self.throttle != 0.0 or self.motor_left != 0.0
+                or self.motor_right != 0.0 or self.rudder != 0.0):
+            return 'set the throttle and rudder to zero first'
+        if not self.armed_cmd:
+            return 'ARM first — the lake test spins the thrusters'
+        if self.session_id is None:
+            return 'no browser control session — reload the page'
+        if self.p_assist_on:
+            return 'Motor P is ON — turn it off first'
+        if self.assist_rudder_on or self._assist_off_pending_locked():
+            return 'Rudder Assist is ON, or not yet confirmed OFF — turn it off first'
+        return None
+
     def start_lake_id(self, throttle, magnitude, command_seq, notes=None,
                       firmware_label=None):
         """One press. Refusals are the server's, not the page's. Returns
-        (ok, error)."""
+        (ok, error).
+
+        validate -> prepare OUTSIDE the lock -> revalidate -> install. The
+        recorder's mkdir/open/write/flush must never sit inside the lock the
+        15 Hz stream and STOP are waiting for, and a start that is refused
+        after preparing cleans up only what it created."""
         try:
             throttle = float(throttle); magnitude = float(magnitude)
         except (TypeError, ValueError):
@@ -2672,68 +2876,64 @@ class BoatLink:
         notes = {k: str((notes or {}).get(k, '') or '')[:500] for k in LAKE_ID_NOTE_FIELDS}
         label = (firmware_label if isinstance(firmware_label, str) and firmware_label.strip()
                  else LAKE_ID_FIRMWARE_LABEL_DEFAULT)
-        # Provenance and the directory scan involve git and disk: done here on
-        # the HTTP thread, before the lock, never inside it.
+        # ---- pass 1: validate under the lock; claims nothing ---------------
+        with self._lock:
+            why = self._lake_id_refusal_locked(command_seq)
+        if why:
+            return False, why
+        # ---- disk and git work with the lock RELEASED ----------------------
         provenance = lake_id_provenance(__file__)
-        scan = lake_id_scan(getattr(self, 'lake_id_dir', LAKE_ID_DIR))
+        base_dir = Path(getattr(self, 'lake_id_dir', LAKE_ID_DIR))
+        scan = lake_id_scan(base_dir)
         self._lake_id_next_cache = scan
         cond = lake_id_condition(throttle, magnitude)
         order, index = scan[cond]['next_order'], scan[cond]['next_index']
         name = 'LAKE_ID_%s_%s_%03d' % (cond, order, index)
-        directory = Path(getattr(self, 'lake_id_dir', LAKE_ID_DIR)) / name
+        directory = base_dir / name
+        writer = LakeIdWriter(directory)
+        try:
+            writer.prepare()                  # mkdir(exist_ok=False): unique or refused
+        except Exception as exc:              # noqa: BLE001  (cleaned up its own files)
+            return False, 'cannot create the run folder: %s' % exc
+        # ---- pass 2: revalidate, then install -------------------------------
         with self._lock:
-            if command_seq <= self.winch_command_seq:
-                return False, 'stale command sequence'
-            if self.lake_id is not None:
-                return False, 'a lake steering test is already running'
-            if self.rudder_test is not None:
-                return False, 'a rudder test is running'
-            if not self.connected:
-                return False, 'serial link is disconnected'
-            if self.calibrating:
-                return False, 'calibration is running — stop it first'
-            if self._bench_running_locked():
-                return False, 'a bench run is going — wait for it to finish'
-            if (self.throttle != 0.0 or self.motor_left != 0.0
-                    or self.motor_right != 0.0 or self.rudder != 0.0):
-                return False, 'set the throttle and rudder to zero first'
-            if not self.armed_cmd:
-                return False, 'ARM first — the lake test spins the thrusters'
-            if self.session_id is None:
-                return False, 'no browser control session — reload the page'
-            # The files are opened NOW, on this thread: a recording that cannot
-            # be created is a precheck failure with the motors never touched.
-            writer = LakeIdWriter(directory)
-            try:
-                writer.open()
-            except OSError as exc:
-                return False, 'cannot create the run folder: %s' % exc
-            self.winch_command_seq = command_seq
-            now = self._now()
-            self.lake_id = {
-                't0': now, 'throttle': throttle, 'magnitude': magnitude,
-                'order': order, 'condition': cond, 'index': index, 'name': name,
-                'dir': str(directory),
-                'phases': lake_id_phases(throttle, magnitude, order),
-                'phase': 'precheck', 'phase_start': now,
-                'precheck': {}, 'precheck_met_at': {},
-                'rows': [], 'events': 0, 'last_frame_mono': None, 'max_gap_s': 0.0,
-                'last_gps': None, 'cmd_last': None,
-                'drive_started': None, 'drive_confirmed': False,
-                'stop_entered_at': None, 'stop_confirmed': None, 'teardown_logged': False,
-                'warnings': [], 'finalizing': False,
-                'notes': notes, 'firmware_label': label, 'provenance': provenance,
-                'imu_nonfinite': False,
-            }
-            self._lake_writer = writer
-            self.lake_id_result = None
-            self._lake_id_event_locked('button_pressed',
-                                       'throttle=%.2f magnitude=%.2f order=%s' % (throttle, magnitude, order))
-            self._lake_id_event_locked('phase_enter', 'precheck: zeros commanded, waiting up to %.1f s'
-                                       % LAKE_ID_PRECHECK_S)
-            self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
-            self.motor_split = False; self.rudder = 0.0
-            return True, None
+            why = self._lake_id_refusal_locked(command_seq)
+            if why is None:
+                try:
+                    writer.start()
+                except Exception as exc:      # noqa: BLE001
+                    why = 'cannot start the recorder: %s' % exc
+            if why is None:
+                self.winch_command_seq = command_seq
+                now = self._now()
+                self.lake_id = {
+                    't0': now, 'throttle': throttle, 'magnitude': magnitude,
+                    'order': order, 'condition': cond, 'index': index, 'name': name,
+                    'dir': str(directory),
+                    'phases': lake_id_phases(throttle, magnitude, order),
+                    'phase': 'precheck', 'phase_start': now,
+                    'precheck': {}, 'precheck_met_at': {},
+                    'rows': [], 'events': 0, 'frames_received': 0,
+                    'last_frame_mono': None, 'max_gap_s': 0.0,
+                    'last_gps': None, 'cmd_last': None,
+                    'drive_started': None, 'drive_confirmed': False,
+                    'ms_seen_rx': None, 'zero_since': None,
+                    'stop_entered_at': None, 'stop_confirmed': None, 'teardown_logged': False,
+                    'warnings': [], 'finalizing': False,
+                    'notes': notes, 'firmware_label': label, 'provenance': provenance,
+                    'imu_nonfinite': False, 'imu_last': None,
+                }
+                self._lake_writer = writer
+                self.lake_id_result = None
+                self._lake_id_event_locked('button_pressed',
+                                           'throttle=%.2f magnitude=%.2f order=%s' % (throttle, magnitude, order))
+                self._lake_id_event_locked('phase_enter', 'precheck: zeros commanded, waiting up to %.1f s'
+                                           % LAKE_ID_PRECHECK_S)
+                self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+                self.motor_split = False; self.rudder = 0.0
+                return True, None
+        writer.discard()                      # disk work: outside the lock again
+        return False, why
 
     def _lake_id_event_locked(self, event, detail=''):
         rt = self.lake_id
@@ -2826,18 +3026,36 @@ class BoatLink:
         if self.session_id is None or (now - self.session_last_hb) > LAKE_ID_SUPERVISION_S:
             return 'browser supervision lost'
         if ph is not None and ph[2] > 0.0:
+            # Boat-applied L/R are watched for the WHOLE powered run, not just
+            # until the first acknowledgement: the boat's own link-loss failsafe
+            # zeroes the motors while its telemetry keeps flowing, and a run
+            # that carried on would record a believable dataset of nothing.
+            # Judged on NEWLY RECEIVED MotorStatus only, by packet receive
+            # times: one old zero packet and the wall clock prove nothing.
             if rt['drive_started'] is None:
-                rt['drive_started'] = now
-            driving = (ms.get('left_throttle', 0.0) or 0.0) > 0.0 or (ms.get('right_throttle', 0.0) or 0.0) > 0.0
-            if driving and not rt['drive_confirmed']:
-                rt['drive_confirmed'] = True
-                self._lake_id_event_locked('command_path_confirm',
-                                           'boat-applied L=%.3f R=%.3f' % (ms.get('left_throttle', 0.0), ms.get('right_throttle', 0.0)))
-            elif not rt['drive_confirmed']:
-                informed = ms.get('last_rx_monotonic', 0) >= rt['drive_started'] + LAKE_ID_DRIVE_CONFIRM_S
-                if informed:
-                    self._lake_id_event_locked('boat_refusal', 'commanded %.2f, boat-applied L/R still zero' % ph[2])
-                    return 'boat is not driving — commanded %.2f, boat-applied L/R still zero' % ph[2]
+                rt['drive_started'] = now             # the powered command goes out this tick
+            rx = ms.get('last_rx_monotonic') if ms.get('have') else None
+            if rx is not None and rx != rt['ms_seen_rx']:
+                rt['ms_seen_rx'] = rx
+                if rx > rt['drive_started']:          # packets from before the command say nothing
+                    left = ms.get('left_throttle', 0.0) or 0.0
+                    right = ms.get('right_throttle', 0.0) or 0.0
+                    if left != 0.0 or right != 0.0:
+                        rt['zero_since'] = None
+                        if not rt['drive_confirmed']:
+                            rt['drive_confirmed'] = True
+                            self._lake_id_event_locked('command_path_confirm',
+                                                       'boat-applied L=%.3f R=%.3f' % (left, right))
+                    else:
+                        if rt['zero_since'] is None:
+                            rt['zero_since'] = rx
+                        span = rx - rt['zero_since']
+                        if span > LAKE_ID_DRIVE_CONFIRM_S:
+                            self._lake_id_event_locked(
+                                'boat_refusal', 'commanded %.2f, boat-applied L/R zero across fresh '
+                                'reports spanning %.2f s' % (ph[2], span))
+                            return ('boat is not driving — commanded %.2f, boat-applied L/R zero '
+                                    'for %.1f s' % (ph[2], span))
         return None
 
     def _lake_id_tick_locked(self, now):
@@ -2924,6 +3142,7 @@ class BoatLink:
             return
         now = self._now() if now is None else now
         tel, ms, ss = self.telemetry, self.motor_status, self.system_status
+        rt['frames_received'] += 1
         elapsed = now - rt['t0']
         gap = 0.0 if rt['last_frame_mono'] is None else (now - rt['last_frame_mono'])
         if rt['last_frame_mono'] is not None and gap > rt['max_gap_s']:
@@ -2974,10 +3193,22 @@ class BoatLink:
         }
         if len(rt['rows']) < LAKE_ID_MAX_ROWS:
             rt['rows'].append(row)
-        self._lake_writer.put('row', row)
-        # live warnings (never aborts)
+        self._lake_writer.put('row', row)     # a refusal is counted and aborts via the tick
         if rt['imu_nonfinite']:
             return self._abort_lake_id_locked('non-finite IMU value')
+        # LIVE warnings -- exactly these two, and neither aborts: (1) the IMU
+        # tuple identical for >= frozen_imu_s, (2) yaw sign opposite to the
+        # hypothesis during a turn. The recording error is shown live too but
+        # it ABORTS (abort table). GPS advisories, L/R differential drift,
+        # coverage, missing notes and the STOP verdict are POST-RUN analysis
+        # in lake_id_summarize().
+        key = (yaw_rate, heading, tel.get('pitch'), tel.get('roll'))
+        if rt['imu_last'] is not None and key == rt['imu_last'][0]:
+            if now - rt['imu_last'][1] >= LAKE_ID_RULES['frozen_imu_s']:
+                self._lake_id_warn_locked('IMU values identical for >= %.1f s (warning only; check the IMU)'
+                                          % LAKE_ID_RULES['frozen_imu_s'])
+        else:
+            rt['imu_last'] = (key, now)
         if phase in ('turn_a', 'turn_b') and isinstance(yaw_rate, (int, float)) and self.rudder != 0.0:
             expected_pos = self.rudder < 0.0        # LEFT -> positive yaw hypothesis
             y = yaw_rate
@@ -3017,19 +3248,44 @@ class BoatLink:
             firmware_label=rt['firmware_label'], max_gap_s=rt['max_gap_s'])
         summary['live_warnings'] = list(rt['warnings'])
         summary['t_utc_end'] = lake_id_utc()
+        # What THIS side counted; the writer adds enqueued/written/dropped.
+        summary['recording'] = {'frames_received': rt['frames_received'],
+                                'sample_rows_in_memory': len(rt['rows']),
+                                'events_attempted': rt['events']}
         pending = {'name': rt['name'], 'dir': rt['dir'], 'status': status, 'reason': reason,
                    'phase': rt['phase'], 'order': rt['order'], 'condition': rt['condition'],
                    'throttle': rt['throttle'], 'magnitude': rt['magnitude'],
-                   'frames': len(rt['rows']), 'max_gap_s': round(rt['max_gap_s'], 3),
+                   'frames': len(rt['rows']), 'frames_received': rt['frames_received'],
+                   'max_gap_s': round(rt['max_gap_s'], 3),
                    'stop_confirmed': rt['stop_confirmed'], 'warnings': list(rt['warnings']),
                    'summary_warnings': list(summary['warnings'])}
 
-        def on_done(err):
+        def on_done(result):
+            # The writer's structured verdict is THE status: a run whose final
+            # flush, close or summary write failed is published as
+            # incomplete_recording_failed, never as complete, whatever the
+            # motion did (that is kept as profile_status).
+            #
+            # Rescan FIRST (disk, on the writer thread, no lock): the moment
+            # the result is visible, NEXT ORDER already reflects it. The other
+            # way round the page could show COMPLETE next to a stale order.
+            # A failed rescan must not hold the result back, though.
+            try:
+                self._lake_id_refresh_next()
+            except Exception as exc:                       # noqa: BLE001
+                print('[lake-id] next-order rescan failed: %s: %s' % (type(exc).__name__, exc),
+                      file=sys.stderr, flush=True)
             with self._lock:
-                self.lake_id_result = dict(pending, write_error=err, published=True)
+                self.lake_id_result = dict(
+                    pending, published=True,
+                    status=result.get('status') or pending['status'],
+                    reason=result.get('reason') if result.get('status') else pending['reason'],
+                    profile_status=result.get('profile_status'),
+                    write_error=result.get('error'), write_stage=result.get('stage'),
+                    summary_written=bool(result.get('summary_written')),
+                    recording=result.get('recording'))
                 self.lake_id = None
                 self._lake_writer = None
-            self._lake_id_refresh_next()          # disk scan, outside the lock
 
         self._lake_writer.finalize(summary, on_done)
 
@@ -3938,7 +4194,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="telem-row"><label>Next order</label><span class="val" id="lake-next">--</span></div>
   <div class="motor-slider-row" style="gap:6px;"><label style="font-size:10px;white-space:nowrap;">firmware label</label>
-    <input type="text" id="lake-fw" style="flex:1;min-width:120px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:10px;" title="prefilled with the build believed flashed; edit only if you flashed something else"></div>
+    <input type="text" id="lake-fw" style="flex:1;min-width:120px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:10px;" title="prefilled with the build BELIEVED flashed: operator-supplied, not verified by the tool; edit if you flashed something else"></div>
   <div id="lake-notes" style="display:grid;grid-template-columns:1fr 1fr;gap:3px;margin:3px 0;"></div>
   <div class="telem-row"><label>Phase</label><span class="val" id="lake-phase">--</span></div>
   <div class="telem-row"><label>Elapsed</label><span class="val" id="lake-elapsed">--</span></div>
@@ -3947,6 +4203,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <div id="lake-warn" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div id="lake-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div style="font-size:10px;color:var(--dim);">MotorStatus values are boat-APPLIED software commands, not measured RPM, thrust or servo angle. Turns measure the operational trimmed boat; recoveries include active autotrim.</div>
+  <div style="font-size:10px;color:var(--dim);">Live warnings (never abort): yaw sign opposite to the hypothesis, IMU values frozen. A recording error aborts. GPS advisories, L/R differential drift, coverage and missing notes are post-run analysis in summary.json.</div>
 </details>
 
 </div>
@@ -4595,10 +4852,12 @@ function renderLakeId(s) {
     $('lake-warn').style.color = li.recording_error ? 'var(--danger)' : 'var(--warn)';
   } else {
     _lakeActive = false;
-    pill.textContent = lr ? (lr.status === 'complete' ? 'COMPLETE'
+    // COMPLETE needs both: the profile finished AND its record was written.
+    const done = !!(lr && lr.status === 'complete' && !lr.write_error);
+    pill.textContent = lr ? (done ? 'COMPLETE'
                             : (lr.status === 'aborted' ? 'ABORTED' : 'INCOMPLETE')) : 'IDLE';
     pill.classList.remove('up');
-    pill.classList.toggle('stale', !!(lr && lr.status !== 'complete'));
+    pill.classList.toggle('stale', !!(lr && !done));
     if (lr) {
       $('lake-phase').textContent = lr.status.toUpperCase().replace(/_/g, ' ')
         + (lr.reason ? ':  ' + lr.reason : '')
