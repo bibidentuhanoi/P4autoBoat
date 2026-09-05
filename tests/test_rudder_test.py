@@ -1004,7 +1004,11 @@ class UiLockoutTest(unittest.TestCase):
 
     def test_every_locked_out_control_is_also_refused_server_side(self):
         """The point of the whole exercise: disabling is decoration."""
-        self.assertEqual(self.src.count('_rudder_test_busy_locked()'), 7)
+        # Seven server-side interlocks, plus the keepalive guard in
+        # _apply_state_locked: an UNCHANGED heartbeat must not overwrite a
+        # running test's command (it is a keepalive, not an input). A ninth
+        # use should be a deliberate decision, so the count stays pinned.
+        self.assertEqual(self.src.count('_rudder_test_busy_locked()'), 8)
         for fn in ('def send_bench', 'def set_calibrate', 'def send_assist',
                    'def set_winch', 'def set_state', 'def set_servo_power'):
             i = self.src.index(fn)

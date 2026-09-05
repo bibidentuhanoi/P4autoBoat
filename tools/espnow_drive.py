@@ -405,6 +405,597 @@ RUDDER_TEST_CSV_COLUMNS = (
 )
 
 
+# ---- one-button lake steering-identification test ---------------------------
+#
+# The foundational dataset for the yaw-rate and waypoint controllers: one press
+# drives straight, deflects the raw physical rudder one way, recovers, deflects
+# it the other way, recovers, and stops -- recording every field-telemetry
+# frame from the moment the button is pressed until the boat has confirmed it
+# is stopped. Laptop-driven exactly like the rudder test: this process sets
+# throttle/rudder every tick and the existing 15 Hz stream transmits them. The
+# boat does not know this test exists. No Motor P, no Rudder Assist, no mode
+# switching during the run; those are separate experiments.
+#
+# SCIENTIFIC WORDING, deliberately repeated wherever the data is written:
+#   - MotorStatus carries boat-APPLIED software commands (throttle, rudder,
+#     PWM). There is no RPM, thrust or servo-angle feedback on this boat.
+#   - Autotrim is live while the rudder is centred (STRAIGHT and both RECOVER
+#     phases) and frozen during the two TURN phases. So the turns identify the
+#     rudder response of the OPERATIONAL, TRIMMED boat, and the recoveries are
+#     operational recovery under active autotrim -- not a passive hull test.
+#     The learner's c is NOT in field telemetry and is not recorded.
+#   - "Straight bias" is observed yaw/heading/course bias plus the commanded
+#     L/R differential; it is not a measurement of physical motor mismatch.
+LAKE_ID_DIR = RUDDER_TEST_DIR
+LAKE_ID_THROTTLES = (0.20, 0.30)        # never auto-increased; server whitelist
+LAKE_ID_MAGNITUDES = (0.30, 0.60)
+LAKE_ID_PRECHECK_S = 2.0
+LAKE_ID_PHASE_S = 10.0
+LAKE_ID_STOP_S = 5.0
+LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
+LAKE_ID_POWERED_S = 50.0
+LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
+LAKE_ID_TELEM_MAX_AGE_S = 1.0
+LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # ~1 Hz idle publish + scheduling jitter
+LAKE_ID_SYSTEMSTATUS_MAX_AGE_S = 3.0    # ~1 Hz publish; three missed = gone
+LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 300 ms lease
+LAKE_ID_STOP_CONFIRM_MAX_AGE_S = 1.5
+LAKE_ID_RUDDER_NEUTRAL_US = 1516
+LAKE_ID_RUDDER_CENTRE_TOL_US = 10
+LAKE_ID_DRIVE_CONFIRM_S = RUDDER_TEST_DRIVE_CONFIRM_S
+LAKE_ID_MAX_GAP_S = RUDDER_TEST_MAX_GAP_S
+LAKE_ID_MIN_PHASE_COVERAGE = RUDDER_TEST_MIN_DRIVE_COVERAGE
+LAKE_ID_QUEUE_MAX = 8192
+LAKE_ID_FLUSH_EVERY_ROWS = 20
+LAKE_ID_MAX_ROWS = 6000                 # ~59 s at 20 Hz is ~1200; a stuck run cannot grow this
+# Provisional analysis thresholds. Every one is RECORDED in summary.json next
+# to the numbers it was applied to, and none produces a valid/invalid label --
+# only warnings -- until our own lake data justifies hard limits.
+LAKE_ID_RULES = {
+    'steady_window_s': 4.0,             # last N s of a turn = steady window
+    'response_threshold_frac': 0.2,     # delay = |yaw-bias| first >= this * |steady-bias|
+    'rise_low_frac': 0.1, 'rise_high_frac': 0.9,
+    'recovery_band_frac': 0.2,          # recovered when |yaw-bias| <= this * |steady_prev-bias|
+    'diff_drift_warn': 0.02,            # commanded L/R differential drift within a phase
+    'frozen_imu_s': 1.0,                # identical IMU tuple for this long -> warning only
+    'gps_advisory_min_sats': 6, 'gps_advisory_max_hdop': 2.5,
+    'radius_min_gps_valid_fraction': 0.8,
+    'radius_min_speed_mps': 0.3,
+    'radius_min_yaw_sigma': 3.0,        # |mean yaw - straight bias| / straight yaw std
+    'straight_steady_speed_tail_s': 5.0,
+}
+LAKE_ID_FIRMWARE_LABEL_DEFAULT = '4e81341b9800a672… / A+B / rudder max 1805 / tested 2026-09-05'
+LAKE_ID_NOTE_FIELDS = ('battery', 'payload_load', 'mechanical_config', 'wind',
+                       'current', 'waves', 'unusual_events')
+LAKE_ID_CSV_COLUMNS = (
+    't_utc', 't_mono', 'elapsed_s', 'phase', 'phase_elapsed_s', 'order',
+    'throttle_set', 'magnitude_set',
+    'yaw_dps', 'heading_deg', 'pitch_deg', 'roll_deg',
+    'gps_valid', 'lat', 'lon', 'speed_mps', 'course_deg', 'satellites', 'hdop',
+    'gps_values_changed',
+    'cmd_throttle', 'cmd_rudder',
+    'boat_applied_left_cmd', 'boat_applied_right_cmd',
+    'boat_applied_rudder_cmd', 'boat_applied_rudder_pwm_us',
+    'boat_state', 'boat_servo_power', 'boat_assist_motor_p', 'boat_assist_rudder',
+    'boat_yaw_target_dps', 'boat_yaw_filt_dps', 'boat_saturated',
+    'imu_ok', 'mag_ok', 'gps_ok', 'tof_a_ok', 'tof_b_ok', 'camera_ok',
+    'telem_age_s', 'motor_status_age_s', 'system_status_age_s', 'gap_s',
+)
+LAKE_ID_EVENT_COLUMNS = ('t_utc', 't_mono', 'elapsed_s', 'phase', 'event', 'detail')
+LAKE_ID_SAMPLES_HEADER = (
+    '# lake steering-identification run -- recorded by tools/espnow_drive.py from '
+    'ESP-NOW field-telemetry frames (~20 Hz), NOT the boat SD card',
+    '# boat_applied_* are boat-APPLIED SOFTWARE COMMANDS from MotorStatus: not '
+    'measured RPM, thrust or servo angle -- no actuator feedback exists',
+    '# gps_values_changed is ADVISORY only: lat/lon/speed/course differ from the '
+    'previous row. It is not a fix flag, timestamp or sequence and must not be '
+    'used for GPS rate, latency or freshness; GPS is 10 Hz under 20 Hz frames',
+    '# autotrim: live while rudder is centred (straight/recover), frozen during '
+    'turns; its c is not in field telemetry and is not recorded',
+)
+LAKE_ID_STATUS_COMPLETE = 'complete'
+LAKE_ID_STATUS_STOP_UNCONFIRMED = 'incomplete_stop_unconfirmed'
+LAKE_ID_STATUS_ABORTED = 'aborted'
+
+
+def lake_id_phases(throttle, magnitude, order):
+    """(name, duration_s, throttle, rudder) x7. Canonical rudder: -1 = LEFT."""
+    s = -1.0 if order == 'LR' else 1.0
+    m = abs(float(magnitude))
+    t = float(throttle)
+    return (
+        ('precheck',  LAKE_ID_PRECHECK_S, 0.0, 0.0),
+        ('straight',  LAKE_ID_PHASE_S,    t,   0.0),
+        ('turn_a',    LAKE_ID_PHASE_S,    t,   s * m),
+        ('recover_a', LAKE_ID_PHASE_S,    t,   0.0),
+        ('turn_b',    LAKE_ID_PHASE_S,    t,  -s * m),
+        ('recover_b', LAKE_ID_PHASE_S,    t,   0.0),
+        ('stop',      LAKE_ID_STOP_S,     0.0, 0.0),
+    )
+
+
+def lake_id_phase_at(phases, elapsed):
+    """(name, dur, thr, rud, start_s) for this elapsed time, or None once the
+    57 s profile is over. From elapsed time, never a counter, so a late tick
+    cannot shift a boundary."""
+    edge = 0.0
+    for name, dur, thr, rud in phases:
+        if elapsed < edge + dur:
+            return name, dur, thr, rud, edge
+        edge += dur
+    return None
+
+
+def lake_id_phase_windows(phases):
+    out, edge = {}, 0.0
+    for name, dur, _t, _r in phases:
+        out[name] = (edge, edge + dur)
+        edge += dur
+    return out
+
+
+def lake_id_condition(throttle, magnitude):
+    return 'T%02d_M%02d' % (int(round(throttle * 100)), int(round(magnitude * 100)))
+
+
+LAKE_ID_FOLDER_RE = re.compile(r'^LAKE_ID_(T\d{2}_M\d{2})_(LR|RL)_(\d{3})$')
+
+
+def lake_id_scan(directory):
+    """Per condition: how many COMPLETE runs exist and the next free index.
+    Read from disk so it survives restarts. Aborted and stop-unconfirmed runs
+    occupy an index but never advance the LR/RL order."""
+    out = {}
+    try:
+        entries = list(Path(directory).iterdir())
+    except OSError:
+        entries = []
+    for p in entries:
+        m = LAKE_ID_FOLDER_RE.match(p.name)
+        if not m or not p.is_dir():
+            continue
+        cond, _order, idx = m.group(1), m.group(2), int(m.group(3))
+        c = out.setdefault(cond, {'complete': 0, 'max_index': 0})
+        c['max_index'] = max(c['max_index'], idx)
+        try:
+            with open(p / 'summary.json') as fh:
+                if json.load(fh).get('status') == LAKE_ID_STATUS_COMPLETE:
+                    c['complete'] += 1
+        except (OSError, ValueError):
+            pass
+    result = {}
+    for t in LAKE_ID_THROTTLES:
+        for m_ in LAKE_ID_MAGNITUDES:
+            cond = lake_id_condition(t, m_)
+            c = out.get(cond, {'complete': 0, 'max_index': 0})
+            result[cond] = {
+                'complete_runs': c['complete'],
+                'next_order': 'LR' if c['complete'] % 2 == 0 else 'RL',
+                'next_index': c['max_index'] + 1,
+            }
+    return result
+
+
+def lake_id_utc(t=None):
+    t = time.time() if t is None else t
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(t)) + '.%03dZ' % int((t % 1) * 1000)
+
+
+def lake_id_provenance(tool_path):
+    """What ran. git HEAD alone is not enough for uncommitted code, so: HEAD,
+    dirty flag, modified files, and the sha256 of the file actually executing.
+    Everything that cannot be established says 'unknown' rather than guessing."""
+    import subprocess
+    tool_path = Path(tool_path).resolve()
+    root = tool_path.parent.parent
+    out = {'git_head': 'unknown', 'git_dirty': None, 'git_modified_files': [],
+           'espnow_drive_sha256': 'unknown', 'espnow_drive_path': str(tool_path),
+           'rudder_pulse_config_believed': {'source': 'unknown'}}
+    try:
+        out['espnow_drive_sha256'] = hashlib.sha256(tool_path.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    try:
+        head = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short', 'HEAD'],
+                              capture_output=True, text=True, timeout=3)
+        if head.returncode == 0:
+            out['git_head'] = head.stdout.strip()
+        st = subprocess.run(['git', '-C', str(root), 'status', '--porcelain',
+                             '--untracked-files=no'],
+                            capture_output=True, text=True, timeout=3)
+        if st.returncode == 0:
+            files = [l[3:] for l in st.stdout.splitlines() if l.strip()]
+            out['git_dirty'] = bool(files)
+            out['git_modified_files'] = files
+    except (OSError, subprocess.SubprocessError):
+        pass
+    cfg = root / 'sdkconfig'
+    try:
+        text = cfg.read_text()
+        vals = {}
+        for key in ('STEER_PULSE_MIN_US', 'STEER_PULSE_NEUTRAL_US', 'STEER_PULSE_MAX_US'):
+            m = re.search(r'^CONFIG_%s=(\d+)$' % key, text, re.M)
+            vals[key.lower()] = int(m.group(1)) if m else None
+        vals['source'] = str(cfg)
+        vals['sdkconfig_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+        vals['note'] = ('BELIEVED from the repo sdkconfig at run start; the tool '
+                        'cannot read the flashed firmware')
+        out['rudder_pulse_config_believed'] = vals
+    except OSError:
+        pass
+    return out
+
+
+def _lake_mean(xs):
+    return (sum(xs) / len(xs)) if xs else None
+
+
+def _lake_std(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = sum(xs) / len(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def _lake_integrate_wrapped(vals):
+    """Sum of consecutive wrap-aware deltas: a turn through >180 deg still
+    adds up correctly."""
+    vals = [v for v in vals if isinstance(v, (int, float)) and math.isfinite(v)]
+    return sum(wrap_deg(vals[i] - vals[i - 1]) for i in range(1, len(vals))) if len(vals) >= 2 else None
+
+
+def _lake_fnum(v, nd=4):
+    return round(v, nd) if isinstance(v, (int, float)) and math.isfinite(v) else None
+
+
+def lake_id_phase_coverage(rows, window):
+    """The rudder-test coverage rule, per phase: where the frames sit inside
+    the window, not just how many there are."""
+    start, end = window
+    inside = [r for r in rows if start <= r['elapsed_s'] < end]
+    length = end - start
+    out = {'frames': len(inside), 'first_delay_s': round(length, 3),
+           'tail_gap_s': round(length, 3), 'span_s': 0.0,
+           'max_gap_s': round(length, 3), 'coverage_ok': False}
+    if not inside:
+        return out
+    first, last = inside[0]['elapsed_s'], inside[-1]['elapsed_s']
+    gaps = [inside[i]['elapsed_s'] - inside[i - 1]['elapsed_s'] for i in range(1, len(inside))]
+    worst = max([first - start, end - last] + gaps)
+    out.update({'first_delay_s': round(first - start, 3), 'tail_gap_s': round(end - last, 3),
+                'span_s': round(last - first, 3), 'max_gap_s': round(worst, 3)})
+    out['coverage_ok'] = (out['span_s'] >= length * LAKE_ID_MIN_PHASE_COVERAGE
+                          and worst <= LAKE_ID_MAX_GAP_S)
+    return out
+
+
+def lake_id_summarize(rows, events, settings, provenance, status, reason,
+                      abort_phase=None, stop_confirmed=None, notes=None,
+                      firmware_label=None, max_gap_s=0.0, rules=None):
+    """Pure. Everything the summary says is derived from the rows here, so a
+    test can hand in synthetic rows with known answers."""
+    rules = dict(LAKE_ID_RULES if rules is None else rules)
+    phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'])
+    windows = lake_id_phase_windows(phases)
+    warnings = []
+
+    def yaw_in(name):
+        a, b = windows[name]
+        return [(r['elapsed_s'], r['yaw_dps']) for r in rows
+                if a <= r['elapsed_s'] < b and isinstance(r['yaw_dps'], (int, float))
+                and math.isfinite(r['yaw_dps'])]
+
+    def rows_in(name):
+        a, b = windows[name]
+        return [r for r in rows if a <= r['elapsed_s'] < b]
+
+    coverage = {n: lake_id_phase_coverage(rows, windows[n]) for n in windows}
+    for n, c in coverage.items():
+        if n != 'precheck' and status == LAKE_ID_STATUS_COMPLETE and not c['coverage_ok']:
+            warnings.append('%s: telemetry coverage below policy (span %.2f s, max gap %.2f s)'
+                            % (n, c['span_s'], c['max_gap_s']))
+    if max_gap_s > LAKE_ID_MAX_GAP_S:
+        warnings.append('telemetry gap %.2f s exceeds %.2f s' % (max_gap_s, LAKE_ID_MAX_GAP_S))
+
+    # ---- straight bias -------------------------------------------------
+    sy = [y for _t, y in yaw_in('straight')]
+    sr = rows_in('straight')
+    bias = _lake_mean(sy)
+    bias_std = _lake_std(sy)
+    tail = [r for r in sr if r['elapsed_s'] >= windows['straight'][1] - rules['straight_steady_speed_tail_s']]
+    sp = [r['speed_mps'] for r in tail if r.get('gps_valid') and isinstance(r.get('speed_mps'), (int, float))]
+    diffs = [(r['boat_applied_right_cmd'] - r['boat_applied_left_cmd']) for r in sr
+             if isinstance(r.get('boat_applied_right_cmd'), (int, float))
+             and isinstance(r.get('boat_applied_left_cmd'), (int, float))]
+    straight = {
+        'note': ('observed yaw/heading/course bias plus the commanded L/R '
+                 'differential -- NOT a measurement of physical motor mismatch'),
+        'mean_yaw_dps': _lake_fnum(bias), 'yaw_std_dps': _lake_fnum(bias_std),
+        'heading_drift_deg': _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in sr])),
+        'course_drift_deg': _lake_fnum(_lake_integrate_wrapped(
+            [r['course_deg'] for r in sr if r.get('gps_valid')])),
+        'steady_speed_mps': _lake_fnum(_lake_mean(sp)),
+        'commanded_lr_diff_start': _lake_fnum(diffs[0]) if diffs else None,
+        'commanded_lr_diff_end': _lake_fnum(diffs[-1]) if diffs else None,
+        'commanded_lr_diff_range': _lake_fnum(max(diffs) - min(diffs)) if diffs else None,
+    }
+
+    # ---- per-phase commanded differential drift (autotrim moving) ------
+    for n in ('straight', 'recover_a', 'recover_b', 'turn_a', 'turn_b'):
+        d = [(r['boat_applied_right_cmd'] - r['boat_applied_left_cmd']) for r in rows_in(n)
+             if isinstance(r.get('boat_applied_right_cmd'), (int, float))
+             and isinstance(r.get('boat_applied_left_cmd'), (int, float))]
+        if d and (max(d) - min(d)) > rules['diff_drift_warn']:
+            warnings.append('%s: commanded L/R differential moved %.3f (> %.3f, provisional)'
+                            % (n, max(d) - min(d), rules['diff_drift_warn']))
+
+    # ---- turns -----------------------------------------------------------
+    def turn(name, rudder_cmd):
+        pts = yaw_in(name)
+        a, b = windows[name]
+        out = {'rudder_cmd': rudder_cmd, 'side': 'LEFT' if rudder_cmd < 0 else 'RIGHT',
+               'expected_yaw_sign_hypothesis': '+' if rudder_cmd < 0 else '-',
+               'note': 'rudder response of the operational, trimmed boat'}
+        if not pts or bias is None:
+            out['unavailable'] = 'no yaw samples in phase'
+            return out
+        steady_pts = [y for t, y in pts if t >= b - rules['steady_window_s']]
+        steady = _lake_mean(steady_pts)
+        rel = (steady - bias) if steady is not None else None
+        out['steady_yaw_dps'] = _lake_fnum(steady)
+        out['steady_yaw_minus_bias_dps'] = _lake_fnum(rel)
+        sign = 1.0 if (rel or 0.0) >= 0 else -1.0
+        excursions = [(t, (y - bias) * sign) for t, y in pts]
+        out['peak_yaw_dps'] = _lake_fnum(max((y for t, y in pts), key=lambda v: v * sign) if pts else None)
+        if rel and abs(rel) > 0:
+            thr = rules['response_threshold_frac'] * abs(rel)
+            lo, hi = rules['rise_low_frac'] * abs(rel), rules['rise_high_frac'] * abs(rel)
+            t_thr = next((t for t, e in excursions if e >= thr), None)
+            t_lo = next((t for t, e in excursions if e >= lo), None)
+            t_hi = next((t for t, e in excursions if e >= hi), None)
+            out['response_delay_s'] = _lake_fnum(t_thr - a) if t_thr is not None else None
+            out['rise_time_s'] = _lake_fnum(t_hi - t_lo) if (t_lo is not None and t_hi is not None) else None
+        expected = -1.0 if rudder_cmd < 0 else 1.0        # LEFT -> positive yaw
+        if rel is not None and rel != 0 and (rel > 0) != (expected < 0):
+            warnings.append('%s: steady yaw sign %s disagrees with the hypothesis (%s rudder -> %s yaw)'
+                            % (name, '+' if rel > 0 else '-', out['side'], out['expected_yaw_sign_hypothesis']))
+        pr = rows_in(name)
+        out['heading_change_deg'] = _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in pr]))
+        out['course_change_deg'] = _lake_fnum(_lake_integrate_wrapped(
+            [r['course_deg'] for r in pr if r.get('gps_valid')]))
+        # ---- turn radius: PROVISIONAL, inputs and rules reported together ----
+        win = [r for r in pr if r['elapsed_s'] >= b - rules['steady_window_s']]
+        valid = [r for r in win if r.get('gps_valid') and isinstance(r.get('speed_mps'), (int, float))]
+        frac = (len(valid) / len(win)) if win else 0.0
+        v = _lake_mean([r['speed_mps'] for r in valid])
+        yaw_abs = _lake_mean([r['yaw_dps'] for r in win
+                              if isinstance(r['yaw_dps'], (int, float)) and math.isfinite(r['yaw_dps'])])
+        above = abs(yaw_abs - bias) if (yaw_abs is not None) else None
+        sigma = (above / bias_std) if (above is not None and bias_std > 0) else None
+        rw = []
+        if frac < rules['radius_min_gps_valid_fraction']:
+            rw.append('gps_valid fraction %.2f < %.2f' % (frac, rules['radius_min_gps_valid_fraction']))
+        if v is None or v < rules['radius_min_speed_mps']:
+            rw.append('mean speed %s < %.2f m/s' % (_lake_fnum(v), rules['radius_min_speed_mps']))
+        if sigma is None or sigma < rules['radius_min_yaw_sigma']:
+            rw.append('yaw above straight bias %s sigma < %.1f' % (_lake_fnum(sigma, 2), rules['radius_min_yaw_sigma']))
+        radius = None
+        if v is not None and yaw_abs is not None and yaw_abs != 0.0:
+            radius = v / (abs(yaw_abs) * math.pi / 180.0)
+        out['turn_radius'] = {
+            'provisional': True, 'radius_m': _lake_fnum(radius, 2),
+            'gps_valid_fraction': round(frac, 3), 'mean_speed_mps': _lake_fnum(v),
+            'mean_yaw_dps': _lake_fnum(yaw_abs), 'yaw_above_straight_bias_dps': _lake_fnum(above),
+            'yaw_sigma_vs_straight': _lake_fnum(sigma, 2),
+            'window_s': rules['steady_window_s'], 'rules': {
+                'min_gps_valid_fraction': rules['radius_min_gps_valid_fraction'],
+                'min_speed_mps': rules['radius_min_speed_mps'],
+                'min_yaw_sigma': rules['radius_min_yaw_sigma']},
+            'warnings': rw,
+            'unavailable_reason': None if radius is not None else 'speed or yaw unavailable',
+            'formula': 'speed_mps / (|mean_yaw_dps| * pi / 180)',
+        }
+        warnings.extend('%s turn radius: %s' % (name, w) for w in rw)
+        return out
+
+    def recovery(name, prev_turn):
+        pts = yaw_in(name)
+        a, b = windows[name]
+        out = {'note': 'operational recovery under active autotrim -- not a passive hull time constant'}
+        if not pts or bias is None:
+            out['unavailable'] = 'no yaw samples in phase'
+            return out
+        prev = prev_turn.get('steady_yaw_minus_bias_dps')
+        if prev is None or prev == 0:
+            out['unavailable'] = 'previous turn has no steady yaw'
+            return out
+        band = rules['recovery_band_frac'] * abs(prev)
+        sign = 1.0 if prev > 0 else -1.0
+        t_rec = next((t for t, y in pts if abs(y - bias) <= band), None)
+        out['recovery_time_s'] = _lake_fnum(t_rec - a) if t_rec is not None else None
+        out['recovery_band_dps'] = _lake_fnum(band)
+        opposite = [(y - bias) * -sign for t, y in pts]
+        out['overshoot_dps'] = _lake_fnum(max(opposite)) if opposite and max(opposite) > 0 else 0.0
+        pr = rows_in(name)
+        out['residual_heading_change_deg'] = _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in pr]))
+        return out
+
+    ta = turn('turn_a', phases[2][3])
+    tb = turn('turn_b', phases[4][3])
+    ra = recovery('recover_a', ta)
+    rb = recovery('recover_b', tb)
+    left = ta if ta['side'] == 'LEFT' else tb
+    right = tb if left is ta else ta
+    asym = {}
+    ls, rs = left.get('steady_yaw_minus_bias_dps'), right.get('steady_yaw_minus_bias_dps')
+    if ls and rs:
+        asym['left_over_right_steady_ratio'] = _lake_fnum(abs(ls) / abs(rs), 3) if rs else None
+    if left.get('response_delay_s') is not None and right.get('response_delay_s') is not None:
+        asym['delay_difference_s'] = _lake_fnum(left['response_delay_s'] - right['response_delay_s'], 3)
+
+    # ---- data quality --------------------------------------------------
+    gps_rows = [r for r in rows if r['elapsed_s'] >= windows['straight'][0]]
+    inval = sum(1 for r in gps_rows if not r.get('gps_valid'))
+    if gps_rows and inval:
+        warnings.append('gps_valid false on %d of %d powered rows' % (inval, len(gps_rows)))
+    sats = [r['satellites'] for r in rows if isinstance(r.get('satellites'), (int, float))]
+    hd = [r['hdop'] for r in rows if isinstance(r.get('hdop'), (int, float))]
+    if sats and min(sats) < rules['gps_advisory_min_sats']:
+        warnings.append('advisory: satellites fell to %d (< %d)' % (min(sats), rules['gps_advisory_min_sats']))
+    if hd and max(hd) > rules['gps_advisory_max_hdop']:
+        warnings.append('advisory: hdop reached %.2f (> %.2f)' % (max(hd), rules['gps_advisory_max_hdop']))
+    if any(r.get('boat_assist_motor_p') == 1 for r in rows):
+        warnings.append('Motor P reported ON during the run')
+    if any(r.get('boat_assist_rudder') == 1 for r in rows):
+        warnings.append('Rudder Assist reported ON during the run')
+    # frozen IMU: identical tuple for >= frozen_imu_s -- warning only
+    run_start, run_len = None, 0
+    for r in rows:
+        key = (r['yaw_dps'], r['heading_deg'], r['pitch_deg'], r['roll_deg'])
+        if run_start is not None and key == run_start[0]:
+            if r['elapsed_s'] - run_start[1] >= rules['frozen_imu_s'] and run_len == 0:
+                warnings.append('IMU values identical for >= %.1f s from t=%.2f s (warning only)'
+                                % (rules['frozen_imu_s'], run_start[1]))
+                run_len = 1
+        else:
+            run_start, run_len = (key, r['elapsed_s']), 0
+    for k in LAKE_ID_NOTE_FIELDS:
+        if not (notes or {}).get(k):
+            warnings.append('operator note missing: %s' % k)
+    if stop_confirmed is False:
+        warnings.append('STOP not confirmed by a fresh MotorStatus within the 2 s teardown')
+
+    return {
+        'schema': 'lake_id_summary_v1',
+        'status': status, 'reason': reason, 'abort_phase': abort_phase,
+        'stop_confirmed': stop_confirmed,
+        'settings': dict(settings, phases=[list(p) for p in phases],
+                         profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S),
+        'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown'),
+        'operator_notes': {k: (notes or {}).get(k, '') for k in LAKE_ID_NOTE_FIELDS},
+        'sample_count': len(rows), 'event_count': len(events),
+        'phase_coverage': coverage,
+        'telemetry_max_gap_s': round(max_gap_s, 3),
+        'straight': straight,
+        'turn_a': ta, 'recover_a': ra, 'turn_b': tb, 'recover_b': rb,
+        'asymmetry': asym,
+        'rules': rules,
+        'wording': [
+            'MotorStatus values are boat-applied software commands, not measured RPM, thrust or servo angle',
+            'turn phases measure the rudder response of the operational trimmed boat',
+            'recoveries include active autotrim behaviour and are not passive hull tests',
+            'straight bias is not a direct measurement of physical motor mismatch',
+            'turn radius is provisional; its inputs and rules are reported with it',
+        ],
+        'warnings': warnings,
+    }
+
+
+class LakeIdWriter:
+    """Bounded background writer. The control loop only ever enqueues (never
+    blocks, never touches a file); this thread does every open/write/flush/
+    close and the atomic summary. Any failure is recorded in `error` for the
+    control loop to act on -- the thread itself stays alive so a later
+    finalize can still preserve whatever it can."""
+
+    def __init__(self, directory, maxsize=LAKE_ID_QUEUE_MAX):
+        import queue
+        self.dir = Path(directory)
+        self.q = queue.Queue(maxsize=maxsize)
+        self.error = None
+        self.rows_written = 0
+        self.finalized = threading.Event()
+        self.result = None
+        self._fh = {}
+        self._w = {}
+        self._pending = 0
+        self._thread = threading.Thread(target=self._loop, name='lake-id-writer', daemon=True)
+
+    def open(self):
+        """Called on the HTTP thread BEFORE the run starts; raises on failure so
+        the precheck can refuse without ever powering the motors."""
+        self.dir.mkdir(parents=True, exist_ok=False)
+        self._fh['samples'] = open(self.dir / 'samples.csv', 'w', newline='')
+        for line in LAKE_ID_SAMPLES_HEADER:
+            self._fh['samples'].write(line + '\n')
+        self._w['samples'] = csv.DictWriter(self._fh['samples'], fieldnames=list(LAKE_ID_CSV_COLUMNS))
+        self._w['samples'].writeheader()
+        self._fh['events'] = open(self.dir / 'events.csv', 'w', newline='')
+        self._w['events'] = csv.DictWriter(self._fh['events'], fieldnames=list(LAKE_ID_EVENT_COLUMNS))
+        self._w['events'].writeheader()
+        for fh in self._fh.values():
+            fh.flush()
+        self._thread.start()
+
+    def put(self, kind, item):
+        """Non-blocking. A full queue is a recording failure, not a stall."""
+        import queue
+        try:
+            self.q.put_nowait((kind, item))
+        except queue.Full:
+            self.error = 'writer queue full'
+
+    def finalize(self, summary, on_done):
+        self.put('finalize', (summary, on_done))
+
+    def _loop(self):
+        while True:
+            kind, item = self.q.get()
+            try:
+                if kind == 'row':
+                    self._w['samples'].writerow(item)
+                    self.rows_written += 1
+                    self._pending += 1
+                    if self._pending >= LAKE_ID_FLUSH_EVERY_ROWS:
+                        self._fh['samples'].flush(); self._pending = 0
+                elif kind == 'event':
+                    self._w['events'].writerow(item)
+                    self._fh['events'].flush()
+                elif kind == 'finalize':
+                    summary, on_done = item
+                    err = self._finalize(summary)
+                    self.result = err
+                    self.finalized.set()
+                    on_done(err)
+                    return
+            except Exception as exc:                       # noqa: BLE001
+                # ANY failure, not just OSError: a closed handle raises
+                # ValueError, a bad row ValueError, and a dying writer would
+                # take the finalize -- and the partial data -- with it. Record
+                # it for the control loop (which aborts motion) and keep
+                # draining so finalize can still preserve what it can.
+                self.error = self.error or ('%s: %s' % (type(exc).__name__, exc))
+                print('[lake-id] recording failed: %s' % self.error, file=sys.stderr, flush=True)
+                if kind == 'finalize':
+                    self.result = self.error
+                    self.finalized.set()
+                    try:
+                        item[1](self.error)
+                    except Exception:                    # noqa: BLE001
+                        pass
+                    return
+            finally:
+                self.q.task_done()
+
+    def _finalize(self, summary):
+        err = self.error
+        for fh in self._fh.values():
+            try:
+                fh.flush(); fh.close()
+            except Exception as exc:                         # noqa: BLE001
+                err = err or ('%s: %s' % (type(exc).__name__, exc))
+        summary = dict(summary, write_error=err, samples_written=self.rows_written)
+        tmp = self.dir / 'summary.json.tmp'
+        try:
+            with open(tmp, 'w') as fh:
+                json.dump(summary, fh, indent=1, sort_keys=True)
+                fh.flush(); os.fsync(fh.fileno())
+            os.replace(tmp, self.dir / 'summary.json')     # atomic
+        except Exception as exc:                             # noqa: BLE001
+            err = err or ('%s: %s' % (type(exc).__name__, exc))
+        return err
+
+
 def rudder_test_drive_coverage(rows):
     """How well the caught frames actually cover the DRIVE window.
 
@@ -766,6 +1357,12 @@ class BoatLink:
         self.rudder_test_result = None
         self._rudder_test_write = None
         self.rudder_test_dir = RUDDER_TEST_DIR
+        # One-button lake steering-identification test (see LAKE_ID_*).
+        self.lake_id = None
+        self.lake_id_result = None
+        self._lake_writer = None
+        self._lake_id_next_cache = None
+        self.lake_id_dir = LAKE_ID_DIR
         # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
         # the default so a forgotten toggle cannot silently make every run a B.
         self.p_assist_on = False
@@ -998,6 +1595,12 @@ class BoatLink:
                 throttle is not None or rudder is not None
                 or left is not None or right is not None):
             self._abort_rudder_test_locked('manual control input')
+            return
+        if self._rudder_test_busy_locked():
+            # A repeated heartbeat is a KEEPALIVE, not a command. While a
+            # laptop-driven test owns the controls, applying its (unchanged,
+            # zero) values here would overwrite the test's command between
+            # ticks and leave stray zeros in the recorded cmd_throttle.
             return
         if throttle is not None:
             self.throttle = clamp(float(throttle), -1.0, 1.0)
@@ -1537,6 +2140,8 @@ class BoatLink:
                 return False, 'direction must be -1 or +1'
             if self.rudder_test is not None:
                 return False, 'a rudder test is already running'
+            if getattr(self, 'lake_id', None) is not None:
+                return False, 'a lake steering test is running'
             if not self.connected:
                 return False, 'serial link is disconnected'
             if self.calibrating:
@@ -1622,7 +2227,7 @@ class BoatLink:
         buttons are decoration: a stale tab, a second browser, a curl, or the
         keyboard shortcuts all reach the HTTP API directly. The refusal has to
         live here, where every one of those paths converges."""
-        return self.rudder_test is not None
+        return self.rudder_test is not None or getattr(self, 'lake_id', None) is not None
 
     def _boat_armed_and_fresh_locked(self, now):
         """(ok, why). The BOAT's own confirmation, not what we commanded."""
@@ -1867,6 +2472,11 @@ class BoatLink:
             self._abort_rudder_test_locked('serial write failed')
 
     def _abort_rudder_test_locked(self, reason):
+        # The lake steering test shares every interlock and abort route of the
+        # rudder test (STOP, manual input, disarm, disconnect, servo power,
+        # calibration, a failed write) by going through this one function.
+        if getattr(self, 'lake_id', None) is not None:
+            self._abort_lake_id_locked(reason)
         if self.rudder_test is None:
             return
         self._finish_rudder_test_locked(aborted=True, reason=reason)
@@ -2018,6 +2628,419 @@ class BoatLink:
             print('[%s] could not write %s: %s' % (label, path, exc),
                   file=sys.stderr, flush=True)
             return '%s: %s' % (type(exc).__name__, exc)
+
+    # ---- lake steering-identification test --------------------------------
+
+    def _laptop_test_active_locked(self):
+        return self.rudder_test is not None or getattr(self, 'lake_id', None) is not None
+
+    def lake_id_next(self):
+        """Per-condition next order/index. READS THE CACHE ONLY: status() runs
+        under the lock ten times a second and must never touch the disk. The
+        cache is filled outside the lock by ensure_lake_id_next() (the status
+        handler's pre-step), start_lake_id() and the finalize callback."""
+        cache = getattr(self, '_lake_id_next_cache', None)
+        return dict(cache) if cache else {}
+
+    def ensure_lake_id_next(self):
+        """Fill the cache if empty. Disk I/O; call with the lock NOT held."""
+        if getattr(self, '_lake_id_next_cache', None) is None:
+            self._lake_id_refresh_next()
+
+    def _lake_id_refresh_next(self):
+        self._lake_id_next_cache = lake_id_scan(getattr(self, 'lake_id_dir', LAKE_ID_DIR))
+
+    def start_lake_id(self, throttle, magnitude, command_seq, notes=None,
+                      firmware_label=None):
+        """One press. Refusals are the server's, not the page's. Returns
+        (ok, error)."""
+        try:
+            throttle = float(throttle); magnitude = float(magnitude)
+        except (TypeError, ValueError):
+            return False, 'throttle and magnitude must be numbers'
+        if not any(abs(throttle - t) < 1e-9 for t in LAKE_ID_THROTTLES):
+            return False, 'throttle must be one of %s' % (LAKE_ID_THROTTLES,)
+        if not any(abs(magnitude - m) < 1e-9 for m in LAKE_ID_MAGNITUDES):
+            return False, 'rudder magnitude must be one of %s' % (LAKE_ID_MAGNITUDES,)
+        throttle = min(LAKE_ID_THROTTLES, key=lambda t: abs(t - throttle))
+        magnitude = min(LAKE_ID_MAGNITUDES, key=lambda m: abs(m - magnitude))
+        notes = {k: str((notes or {}).get(k, '') or '')[:500] for k in LAKE_ID_NOTE_FIELDS}
+        label = (firmware_label if isinstance(firmware_label, str) and firmware_label.strip()
+                 else LAKE_ID_FIRMWARE_LABEL_DEFAULT)
+        # Provenance and the directory scan involve git and disk: done here on
+        # the HTTP thread, before the lock, never inside it.
+        provenance = lake_id_provenance(__file__)
+        scan = lake_id_scan(getattr(self, 'lake_id_dir', LAKE_ID_DIR))
+        self._lake_id_next_cache = scan
+        cond = lake_id_condition(throttle, magnitude)
+        order, index = scan[cond]['next_order'], scan[cond]['next_index']
+        name = 'LAKE_ID_%s_%s_%03d' % (cond, order, index)
+        directory = Path(getattr(self, 'lake_id_dir', LAKE_ID_DIR)) / name
+        with self._lock:
+            if command_seq <= self.winch_command_seq:
+                return False, 'stale command sequence'
+            if self.lake_id is not None:
+                return False, 'a lake steering test is already running'
+            if self.rudder_test is not None:
+                return False, 'a rudder test is running'
+            if not self.connected:
+                return False, 'serial link is disconnected'
+            if self.calibrating:
+                return False, 'calibration is running — stop it first'
+            if self._bench_running_locked():
+                return False, 'a bench run is going — wait for it to finish'
+            if (self.throttle != 0.0 or self.motor_left != 0.0
+                    or self.motor_right != 0.0 or self.rudder != 0.0):
+                return False, 'set the throttle and rudder to zero first'
+            if not self.armed_cmd:
+                return False, 'ARM first — the lake test spins the thrusters'
+            if self.session_id is None:
+                return False, 'no browser control session — reload the page'
+            # The files are opened NOW, on this thread: a recording that cannot
+            # be created is a precheck failure with the motors never touched.
+            writer = LakeIdWriter(directory)
+            try:
+                writer.open()
+            except OSError as exc:
+                return False, 'cannot create the run folder: %s' % exc
+            self.winch_command_seq = command_seq
+            now = self._now()
+            self.lake_id = {
+                't0': now, 'throttle': throttle, 'magnitude': magnitude,
+                'order': order, 'condition': cond, 'index': index, 'name': name,
+                'dir': str(directory),
+                'phases': lake_id_phases(throttle, magnitude, order),
+                'phase': 'precheck', 'phase_start': now,
+                'precheck': {}, 'precheck_met_at': {},
+                'rows': [], 'events': 0, 'last_frame_mono': None, 'max_gap_s': 0.0,
+                'last_gps': None, 'cmd_last': None,
+                'drive_started': None, 'drive_confirmed': False,
+                'stop_entered_at': None, 'stop_confirmed': None, 'teardown_logged': False,
+                'warnings': [], 'finalizing': False,
+                'notes': notes, 'firmware_label': label, 'provenance': provenance,
+                'imu_nonfinite': False,
+            }
+            self._lake_writer = writer
+            self.lake_id_result = None
+            self._lake_id_event_locked('button_pressed',
+                                       'throttle=%.2f magnitude=%.2f order=%s' % (throttle, magnitude, order))
+            self._lake_id_event_locked('phase_enter', 'precheck: zeros commanded, waiting up to %.1f s'
+                                       % LAKE_ID_PRECHECK_S)
+            self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+            self.motor_split = False; self.rudder = 0.0
+            return True, None
+
+    def _lake_id_event_locked(self, event, detail=''):
+        rt = self.lake_id
+        if rt is None:
+            return
+        now = self._now()
+        rt['events'] += 1
+        self._lake_writer.put('event', {
+            't_utc': lake_id_utc(), 't_mono': round(now, 4),
+            'elapsed_s': round(now - rt['t0'], 4), 'phase': rt['phase'],
+            'event': event, 'detail': detail})
+
+    def _lake_id_warn_locked(self, text):
+        """Live warning, deduplicated, visible on the card and in the events."""
+        rt = self.lake_id
+        if rt is None or text in rt['warnings']:
+            return
+        rt['warnings'].append(text)
+        self._lake_id_event_locked('warning', text)
+
+    def _lake_id_precheck_locked(self, now):
+        """Every required condition, as a dict of name -> met. Evaluated every
+        tick of the 2 s window; only the state at t=2 s decides."""
+        ms, tel, ss = self.motor_status, self.telemetry, self.system_status
+        ms_age = (now - ms['last_rx_monotonic']) if (ms.get('have') and ms.get('last_rx_monotonic') is not None) else None
+        tel_age = (now - tel['last_rx_monotonic']) if (tel.get('have') and tel.get('last_rx_monotonic') is not None) else None
+        ss_age = (now - ss['last_rx_monotonic']) if (ss.get('have') and ss.get('last_rx_monotonic') is not None) else None
+        finite = all(isinstance(tel.get(k), (int, float)) and math.isfinite(tel.get(k))
+                     for k in ('yaw_rate', 'heading', 'pitch', 'roll'))
+        pwm = ms.get('rudder_pulse_us')
+        return {
+            'link_connected': bool(self.connected),
+            'armed_cmd': bool(self.armed_cmd),
+            'browser_supervision': (self.session_id is not None
+                                    and (now - self.session_last_hb) <= LAKE_ID_SUPERVISION_S),
+            'telemetry_fresh': tel_age is not None and tel_age <= LAKE_ID_TELEM_MAX_AGE_S,
+            'imu_finite': bool(tel.get('have')) and finite,
+            'gps_valid': bool(tel.get('gps_valid')),
+            'motorstatus_fresh': ms_age is not None and ms_age <= LAKE_ID_MOTORSTATUS_MAX_AGE_S,
+            'boat_armed': int(ms.get('state', 0) or 0) == 2,
+            'servo_power': bool(ms.get('servo_power')),
+            'boat_zero_throttle': (ms.get('have') and ms.get('left_throttle') == 0.0
+                                   and ms.get('right_throttle') == 0.0),
+            'boat_rudder_centred': (ms.get('have') and ms.get('rudder_cmd') == 0.0
+                                    and isinstance(pwm, (int, float))
+                                    and abs(pwm - LAKE_ID_RUDDER_NEUTRAL_US) <= LAKE_ID_RUDDER_CENTRE_TOL_US),
+            'motor_p_off': (not self.p_assist_on and not self.bench_status.get('p_on')
+                            and not ms.get('assist_motor_p')),
+            'rudder_assist_off': (not ms.get('assist_rudder') and not self._assist_off_pending_locked()),
+            'systemstatus_fresh': ss_age is not None and ss_age <= LAKE_ID_SYSTEMSTATUS_MAX_AGE_S,
+            'imu_ok': bool(ss.get('imu_ok')),
+            'no_other_test': (not self.calibrating and not self._bench_running_locked()
+                              and self.rudder_test is None),
+            'local_zero': self.throttle == 0.0 and self.rudder == 0.0,
+            'recording_ok': self._lake_writer.error is None,
+        }
+
+    def _lake_id_powered_abort_locked(self, now, rt, ph):
+        """The abort table for a powered or stopping phase. Returns a reason
+        or None. NO yaw-magnitude limit: unexpected yaw is a warning and the
+        operator owns STOP."""
+        ms, tel, ss = self.motor_status, self.telemetry, self.system_status
+        if not self.connected:
+            return 'serial link disconnected'
+        if not self.armed_cmd:
+            return 'disarmed'
+        if self.calibrating:
+            return 'calibration started'
+        if self._lake_writer.error:
+            return 'recording failed: %s' % self._lake_writer.error
+        if rt['imu_nonfinite']:
+            return 'non-finite IMU value'
+        tel_age = (now - tel['last_rx_monotonic']) if tel.get('last_rx_monotonic') is not None else None
+        if tel_age is None or tel_age > LAKE_ID_TELEM_MAX_AGE_S:
+            return 'telemetry stale (%.2f s)' % (tel_age if tel_age is not None else -1)
+        ms_age = (now - ms['last_rx_monotonic']) if ms.get('last_rx_monotonic') is not None else None
+        if ms_age is None or ms_age > LAKE_ID_MOTORSTATUS_MAX_AGE_S:
+            return 'MotorStatus stale (%.2f s)' % (ms_age if ms_age is not None else -1)
+        ss_age = (now - ss['last_rx_monotonic']) if ss.get('last_rx_monotonic') is not None else None
+        if ss_age is None or ss_age > LAKE_ID_SYSTEMSTATUS_MAX_AGE_S:
+            return 'SystemStatus stale (%.2f s)' % (ss_age if ss_age is not None else -1)
+        if not ss.get('imu_ok'):
+            return 'IMU unhealthy (imu_ok=false)'
+        if int(ms.get('state', 0) or 0) != 2:
+            return 'boat not armed (state %s)' % ms.get('state')
+        if not ms.get('servo_power'):
+            return 'servo power lost'
+        if ms.get('assist_rudder') or ms.get('assist_motor_p') or self.p_assist_on:
+            return 'mode changed (assist/P reported ON)'
+        if self.session_id is None or (now - self.session_last_hb) > LAKE_ID_SUPERVISION_S:
+            return 'browser supervision lost'
+        if ph is not None and ph[2] > 0.0:
+            if rt['drive_started'] is None:
+                rt['drive_started'] = now
+            driving = (ms.get('left_throttle', 0.0) or 0.0) > 0.0 or (ms.get('right_throttle', 0.0) or 0.0) > 0.0
+            if driving and not rt['drive_confirmed']:
+                rt['drive_confirmed'] = True
+                self._lake_id_event_locked('command_path_confirm',
+                                           'boat-applied L=%.3f R=%.3f' % (ms.get('left_throttle', 0.0), ms.get('right_throttle', 0.0)))
+            elif not rt['drive_confirmed']:
+                informed = ms.get('last_rx_monotonic', 0) >= rt['drive_started'] + LAKE_ID_DRIVE_CONFIRM_S
+                if informed:
+                    self._lake_id_event_locked('boat_refusal', 'commanded %.2f, boat-applied L/R still zero' % ph[2])
+                    return 'boat is not driving — commanded %.2f, boat-applied L/R still zero' % ph[2]
+        return None
+
+    def _lake_id_tick_locked(self, now):
+        rt = getattr(self, 'lake_id', None)
+        if rt is None or rt['finalizing']:
+            return
+        elapsed = now - rt['t0']
+        ph = lake_id_phase_at(rt['phases'], elapsed)
+
+        # ---- PRECHECK: a waiting window ---------------------------------
+        if ph is not None and ph[0] == 'precheck':
+            self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+            self.motor_split = False; self.rudder = 0.0
+            conds = self._lake_id_precheck_locked(now)
+            for k, v in conds.items():
+                if rt['precheck'].get(k) != v:
+                    self._lake_id_event_locked('precheck_met' if v else 'precheck_wait', k)
+            rt['precheck'] = conds
+            if not self.connected:
+                return self._abort_lake_id_locked('serial link disconnected')
+            if self._lake_writer.error:
+                return self._abort_lake_id_locked('recording failed: %s' % self._lake_writer.error)
+            return
+        if ph is not None and rt['phase'] == 'precheck':
+            # THE GATE: judged on the LATEST states, evaluated here and now --
+            # not on the dict from the previous tick, which could be up to
+            # 67 ms stale and let a condition that just broke slip through.
+            conds = self._lake_id_precheck_locked(now)
+            rt['precheck'] = conds
+            unmet = [k for k, v in conds.items() if not v]
+            if unmet:
+                self._lake_id_event_locked('precheck_fail', ', '.join(unmet))
+                return self._abort_lake_id_locked('precheck failed: ' + ', '.join(unmet))
+            self._lake_id_event_locked('precheck_pass', 'all conditions met at t=%.2f s' % elapsed)
+
+        # ---- 57 s and beyond: STOP confirmation, then bounded teardown ------
+        if ph is None:
+            self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+            self.motor_split = False; self.rudder = 0.0
+            ms = self.motor_status
+            fresh = (ms.get('have') and ms.get('last_rx_monotonic') is not None
+                     and rt['stop_entered_at'] is not None
+                     and ms['last_rx_monotonic'] > rt['stop_entered_at']
+                     and (now - ms['last_rx_monotonic']) <= LAKE_ID_STOP_CONFIRM_MAX_AGE_S)
+            zero = (ms.get('left_throttle') == 0.0 and ms.get('right_throttle') == 0.0
+                    and ms.get('rudder_cmd') == 0.0)
+            if fresh and zero:
+                rt['stop_confirmed'] = True
+                self._lake_id_event_locked('stop_confirmed',
+                                           'fresh MotorStatus: L/R=0, rudder=0 at t=%.2f s' % elapsed)
+                return self._finish_lake_id_locked(LAKE_ID_STATUS_COMPLETE, None)
+            if elapsed < LAKE_ID_PROFILE_S + LAKE_ID_TEARDOWN_MAX_S:
+                if not rt['teardown_logged']:
+                    rt['teardown_logged'] = True
+                    rt['phase'] = 'teardown'
+                    self._lake_id_event_locked('phase_enter', 'teardown: zeros continue, waiting for confirmation')
+                return
+            rt['stop_confirmed'] = False
+            self._lake_id_event_locked('stop_unconfirmed', 'no fresh zero confirmation by t=%.2f s' % elapsed)
+            return self._finish_lake_id_locked(LAKE_ID_STATUS_STOP_UNCONFIRMED,
+                                               'STOP not confirmed by a fresh MotorStatus')
+
+        # ---- powered and STOP phases --------------------------------------
+        name, _dur, thr, rud, start = ph
+        reason = self._lake_id_powered_abort_locked(now, rt, ph)
+        if reason:
+            return self._abort_lake_id_locked(reason)
+        if name != rt['phase']:
+            rt['phase'] = name; rt['phase_start'] = rt['t0'] + start
+            self._lake_id_event_locked('phase_enter', '%s: throttle=%.2f rudder=%+.2f' % (name, thr, rud))
+            if name == 'stop':
+                rt['stop_entered_at'] = now
+        self.throttle = thr; self.motor_left = 0.0; self.motor_right = 0.0
+        self.motor_split = False; self.rudder = rud
+        if rt['cmd_last'] != (thr, rud):
+            rt['cmd_last'] = (thr, rud)
+            self._lake_id_event_locked('cmd_sent', 'throttle=%.2f rudder=%+.2f (repeated by the 15 Hz stream)' % (thr, rud))
+
+    def _collect_lake_id_row_locked(self, yaw_rate, heading, now=None):
+        """One row per RECEIVED telemetry frame, from button press to the end.
+        Enqueued to the writer; never written here."""
+        rt = getattr(self, 'lake_id', None)
+        if rt is None or rt['finalizing']:
+            return
+        now = self._now() if now is None else now
+        tel, ms, ss = self.telemetry, self.motor_status, self.system_status
+        elapsed = now - rt['t0']
+        gap = 0.0 if rt['last_frame_mono'] is None else (now - rt['last_frame_mono'])
+        if rt['last_frame_mono'] is not None and gap > rt['max_gap_s']:
+            rt['max_gap_s'] = gap
+        rt['last_frame_mono'] = now
+        ph = lake_id_phase_at(rt['phases'], elapsed)
+        phase = rt['phase'] if ph is None else ph[0]
+        phase_start = (ph[4] if ph is not None else LAKE_ID_PROFILE_S)
+        gps_now = (tel.get('lat'), tel.get('lon'), tel.get('speed_mps'), tel.get('course_deg'))
+        changed = 1 if (rt['last_gps'] is not None and gps_now != rt['last_gps']) else 0
+        rt['last_gps'] = gps_now
+        vals = [yaw_rate, heading, tel.get('pitch'), tel.get('roll')]
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in vals):
+            rt['imu_nonfinite'] = True
+        def age(d):
+            l = d.get('last_rx_monotonic')
+            return round(now - l, 4) if (d.get('have') and l is not None) else ''
+        row = {
+            't_utc': lake_id_utc(), 't_mono': round(now, 4), 'elapsed_s': round(elapsed, 4),
+            'phase': phase, 'phase_elapsed_s': round(elapsed - phase_start, 4),
+            'order': rt['order'], 'throttle_set': rt['throttle'], 'magnitude_set': rt['magnitude'],
+            'yaw_dps': yaw_rate, 'heading_deg': heading,
+            'pitch_deg': tel.get('pitch'), 'roll_deg': tel.get('roll'),
+            'gps_valid': 1 if tel.get('gps_valid') else 0,
+            'lat': tel.get('lat'), 'lon': tel.get('lon'), 'speed_mps': tel.get('speed_mps'),
+            'course_deg': tel.get('course_deg'), 'satellites': tel.get('satellites'),
+            'hdop': tel.get('hdop'), 'gps_values_changed': changed,
+            'cmd_throttle': self.throttle, 'cmd_rudder': self.rudder,
+            'boat_applied_left_cmd': ms.get('left_throttle') if ms.get('have') else '',
+            'boat_applied_right_cmd': ms.get('right_throttle') if ms.get('have') else '',
+            'boat_applied_rudder_cmd': ms.get('rudder_cmd') if ms.get('have') else '',
+            'boat_applied_rudder_pwm_us': ms.get('rudder_pulse_us') if ms.get('have') else '',
+            'boat_state': ms.get('state') if ms.get('have') else '',
+            'boat_servo_power': (1 if ms.get('servo_power') else 0) if ms.get('have') else '',
+            'boat_assist_motor_p': (1 if ms.get('assist_motor_p') else 0) if ms.get('have') else '',
+            'boat_assist_rudder': (1 if ms.get('assist_rudder') else 0) if ms.get('have') else '',
+            'boat_yaw_target_dps': ms.get('yaw_target_dps') if ms.get('have') else '',
+            'boat_yaw_filt_dps': ms.get('yaw_filt_dps') if ms.get('have') else '',
+            'boat_saturated': (1 if ms.get('rudder_saturated') else 0) if ms.get('have') else '',
+            'imu_ok': (1 if ss.get('imu_ok') else 0) if ss.get('have') else '',
+            'mag_ok': (1 if ss.get('mag_ok') else 0) if ss.get('have') else '',
+            'gps_ok': (1 if ss.get('gps_ok') else 0) if ss.get('have') else '',
+            'tof_a_ok': (1 if ss.get('tof_a_ok') else 0) if ss.get('have') else '',
+            'tof_b_ok': (1 if ss.get('tof_b_ok') else 0) if ss.get('have') else '',
+            'camera_ok': (1 if ss.get('camera_ok') else 0) if ss.get('have') else '',
+            'telem_age_s': age(tel), 'motor_status_age_s': age(ms), 'system_status_age_s': age(ss),
+            'gap_s': round(gap, 4),
+        }
+        if len(rt['rows']) < LAKE_ID_MAX_ROWS:
+            rt['rows'].append(row)
+        self._lake_writer.put('row', row)
+        # live warnings (never aborts)
+        if rt['imu_nonfinite']:
+            return self._abort_lake_id_locked('non-finite IMU value')
+        if phase in ('turn_a', 'turn_b') and isinstance(yaw_rate, (int, float)) and self.rudder != 0.0:
+            expected_pos = self.rudder < 0.0        # LEFT -> positive yaw hypothesis
+            y = yaw_rate
+            if elapsed - phase_start > 3.0 and abs(y) > 0.5 and (y > 0) != expected_pos:
+                self._lake_id_warn_locked('%s: yaw sign opposite to the hypothesis (rudder %+.2f, yaw %+.2f)'
+                                          % (phase, self.rudder, yaw_rate))
+
+    def _abort_lake_id_locked(self, reason):
+        if self.lake_id is None or self.lake_id['finalizing']:
+            return
+        self._lake_id_event_locked('abort', reason)
+        self._finish_lake_id_locked(LAKE_ID_STATUS_ABORTED, reason)
+
+    def _finish_lake_id_locked(self, status, reason):
+        """Zeros first and on the wire now; then hand the run to the writer.
+        The result is PUBLISHED only when the writer has flushed and closed
+        both CSVs and atomically written summary.json."""
+        rt = self.lake_id
+        if rt is None or rt['finalizing']:
+            return
+        self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+        self.motor_split = False; self.rudder = 0.0
+        if self.connected:
+            self._send_motor_locked(0.0, 0.0)
+            self._send_steer_locked(0.0)
+        if status == LAKE_ID_STATUS_COMPLETE:
+            self._lake_id_event_locked('complete', 'profile finished and stop confirmed')
+        elif status == LAKE_ID_STATUS_STOP_UNCONFIRMED:
+            self._lake_id_event_locked('incomplete', reason or '')
+        self._lake_id_event_locked('finalize_started', 'flushing CSVs, writing summary.json')
+        rt['finalizing'] = True
+        settings = {'throttle': rt['throttle'], 'magnitude': rt['magnitude'], 'order': rt['order'],
+                    'condition': rt['condition'], 'index': rt['index'], 'name': rt['name']}
+        summary = lake_id_summarize(
+            rt['rows'], list(range(rt['events'])), settings, rt['provenance'], status, reason,
+            abort_phase=rt['phase'], stop_confirmed=rt['stop_confirmed'], notes=rt['notes'],
+            firmware_label=rt['firmware_label'], max_gap_s=rt['max_gap_s'])
+        summary['live_warnings'] = list(rt['warnings'])
+        summary['t_utc_end'] = lake_id_utc()
+        pending = {'name': rt['name'], 'dir': rt['dir'], 'status': status, 'reason': reason,
+                   'phase': rt['phase'], 'order': rt['order'], 'condition': rt['condition'],
+                   'throttle': rt['throttle'], 'magnitude': rt['magnitude'],
+                   'frames': len(rt['rows']), 'max_gap_s': round(rt['max_gap_s'], 3),
+                   'stop_confirmed': rt['stop_confirmed'], 'warnings': list(rt['warnings']),
+                   'summary_warnings': list(summary['warnings'])}
+
+        def on_done(err):
+            with self._lock:
+                self.lake_id_result = dict(pending, write_error=err, published=True)
+                self.lake_id = None
+                self._lake_writer = None
+            self._lake_id_refresh_next()          # disk scan, outside the lock
+
+        self._lake_writer.finalize(summary, on_done)
+
+    def lake_id_status_locked(self):
+        rt = getattr(self, 'lake_id', None)
+        if rt is None:
+            return None
+        now = self._now()
+        return {'active': True, 'name': rt['name'], 'phase': rt['phase'],
+                'elapsed_s': round(now - rt['t0'], 2), 'profile_s': LAKE_ID_PROFILE_S,
+                'order': rt['order'], 'condition': rt['condition'],
+                'throttle': rt['throttle'], 'magnitude': rt['magnitude'],
+                'frames': len(rt['rows']), 'finalizing': rt['finalizing'],
+                'precheck_unmet': [k for k, v in rt['precheck'].items() if not v],
+                'warnings': list(rt['warnings']),
+                'recording_error': self._lake_writer.error if self._lake_writer else None}
 
     def _flush_rudder_test_write(self):
         """Write the pending CSV. Called from _stream_loop with the lock NOT
@@ -2215,6 +3238,13 @@ class BoatLink:
                 'bench_csv': self.bench_csv_name,
                 # Read-only view of the rudder test. status() is hit by every
                 # browser poll, so it must never touch rudder_test['rows'].
+                'lake_id': self.lake_id_status_locked(),
+                'lake_id_result': (dict(self.lake_id_result) if getattr(self, 'lake_id_result', None) else None),
+                'lake_id_next': self.lake_id_next(),
+                'lake_id_defaults': {'throttles': list(LAKE_ID_THROTTLES),
+                                     'magnitudes': list(LAKE_ID_MAGNITUDES),
+                                     'firmware_label': LAKE_ID_FIRMWARE_LABEL_DEFAULT,
+                                     'note_fields': list(LAKE_ID_NOTE_FIELDS)},
                 'rudder_test': ({
                     'active': True,
                     'phase': self.rudder_test['phase'],
@@ -2337,10 +3367,11 @@ class BoatLink:
                 now_mono = time.monotonic()
                 self._assist_off_tick_locked(now_mono)
                 self._rudder_test_tick_locked(now_mono)
+                self._lake_id_tick_locked(now_mono)
                 # THE LEASE. A rudder test drives itself and is not browser
                 # input, so it keeps its own authority; anything else must be
                 # backed by a live browser saying so.
-                if (self.rudder_test is None
+                if (self.rudder_test is None and getattr(self, 'lake_id', None) is None
                         and not self._drive_lease_ok_locked(now_mono)
                         and self._anything_commanded_locked()):
                     if self.lease_expired_at is None:
@@ -2464,6 +3495,7 @@ class BoatLink:
                 }
                 self._collect_bench_yaw_locked(yaw_rate, heading)
                 self._collect_rudder_test_row_locked(yaw_rate, heading)
+                self._collect_lake_id_row_locked(yaw_rate, heading)
                 self._record_fix_locked(gps_valid, lat, lon)
             return
 
@@ -2547,6 +3579,7 @@ class BoatLink:
             }
             self._collect_bench_yaw_locked(s.imu.yaw_rate, s.imu.heading)
             self._collect_rudder_test_row_locked(s.imu.yaw_rate, s.imu.heading)
+            self._collect_lake_id_row_locked(s.imu.yaw_rate, s.imu.heading)
             self._record_fix_locked(s.gps.valid, s.gps.latitude, s.gps.longitude)
 
     def _read_loop(self):
@@ -2887,6 +3920,28 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div id="rt-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
+</details>
+<details class="card" open id="lake-card">
+  <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
+  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P and Rudder Assist must be OFF. ARM first; STOP or any manual input aborts.</div>
+  <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
+    <label style="font-size:10px;">throttle</label>
+    <select id="lake-throttle"><option value="0.20" selected>T20</option><option value="0.30">T30</option></select>
+    <label style="font-size:10px;">rudder</label>
+    <select id="lake-mag"><option value="0.30" selected>30%</option><option value="0.60">60%</option></select>
+    <button id="lake-start" title="one press runs the whole 57 s profile; STOP aborts">START LAKE TEST</button>
+  </div>
+  <div class="telem-row"><label>Next order</label><span class="val" id="lake-next">--</span></div>
+  <div class="motor-slider-row" style="gap:6px;"><label style="font-size:10px;white-space:nowrap;">firmware label</label>
+    <input type="text" id="lake-fw" style="flex:1;min-width:120px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:10px;" title="prefilled with the build believed flashed; edit only if you flashed something else"></div>
+  <div id="lake-notes" style="display:grid;grid-template-columns:1fr 1fr;gap:3px;margin:3px 0;"></div>
+  <div class="telem-row"><label>Phase</label><span class="val" id="lake-phase">--</span></div>
+  <div class="telem-row"><label>Elapsed</label><span class="val" id="lake-elapsed">--</span></div>
+  <div class="telem-row"><label>Frames</label><span class="val" id="lake-frames">--</span></div>
+  <div class="telem-row"><label>Run</label><span class="val" id="lake-file">--</span></div>
+  <div id="lake-warn" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
+  <div id="lake-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
+  <div style="font-size:10px;color:var(--dim);">MotorStatus values are boat-APPLIED software commands, not measured RPM, thrust or servo angle. Turns measure the operational trimmed boat; recoveries include active autotrim.</div>
 </details>
 
 </div>
@@ -3426,9 +4481,10 @@ $('bench-base-long').addEventListener('click', () => runBench('both_long', 0));
 // browser or a curl all reach the HTTP API without ever seeing it.
 var _rtLockedOut = null;
 function setRudderTestLockout(on) {
+  on = on || _lakeActive;              // a lake run locks the same controls
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
-  ['bench-left', 'bench-right', 'bench-base', 'bench-base-long', 'bench-reset', 'p-assist',
+  ['bench-left', 'bench-right', 'bench-base', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -3464,6 +4520,93 @@ async function runAssistTest(sign) {
 }
 $('rt-al').addEventListener('click', () => runAssistTest(-1));
 $('rt-ar').addEventListener('click', () => runAssistTest(1));
+
+// ---- lake steering-identification test ------------------------------------
+// One button. The 57 s profile runs on the server's stream loop; this page
+// only starts it, shows it, and (through STOP or any slider) aborts it.
+var LAKE_NOTE_FIELDS = ['battery', 'payload_load', 'mechanical_config', 'wind', 'current', 'waves', 'unusual_events'];
+var _lakeActive = false, _lakeFwPrefilled = false, _lakeNextCache = null, _lakeNotesBuilt = false;
+function lakeCondKey() {
+  const t = Math.round(parseFloat($('lake-throttle').value) * 100);
+  const m = Math.round(parseFloat($('lake-mag').value) * 100);
+  return 'T' + String(t).padStart(2, '0') + '_M' + String(m).padStart(2, '0');
+}
+function renderLakeNext() {
+  const n = _lakeNextCache && _lakeNextCache[lakeCondKey()];
+  $('lake-next').textContent = n
+    ? ((n.next_order === 'LR' ? 'LEFT then RIGHT' : 'RIGHT then LEFT') + '  (run #' + n.next_index
+       + ', ' + n.complete_runs + ' complete for ' + lakeCondKey().replace('_', '/') + ')')
+    : '--';
+}
+function buildLakeNotes(fields) {
+  if (_lakeNotesBuilt) return;
+  _lakeNotesBuilt = true;
+  const box = $('lake-notes');
+  (fields || LAKE_NOTE_FIELDS).forEach(function (k) {
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.id = 'lake-note-' + k; inp.placeholder = k.replace('_', ' ');
+    inp.style.cssText = 'background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:2px 4px;font-size:10px;';
+    box.appendChild(inp);
+  });
+}
+async function runLakeId() {
+  if (!connected) { $('lake-msg').textContent = 'not connected'; return; }
+  $('lake-msg').textContent = '';
+  const notes = {};
+  LAKE_NOTE_FIELDS.forEach(function (k) { const el = $('lake-note-' + k); notes[k] = el ? el.value : ''; });
+  const r = await api('/api/lake_id', 'POST', {
+    throttle: parseFloat($('lake-throttle').value),
+    magnitude: parseFloat($('lake-mag').value),
+    firmware_label: $('lake-fw').value, notes: notes,
+    seq: ++winchCommandSeq });
+  if (r && !r.ok) $('lake-msg').textContent = r.error || 'refused';
+}
+$('lake-start').addEventListener('click', runLakeId);
+$('lake-throttle').addEventListener('change', renderLakeNext);
+$('lake-mag').addEventListener('change', renderLakeNext);
+function renderLakeId(s) {
+  const li = s.lake_id, lr = s.lake_id_result;
+  _lakeNextCache = s.lake_id_next || null;
+  if (s.lake_id_defaults) {
+    buildLakeNotes(s.lake_id_defaults.note_fields);
+    if (!_lakeFwPrefilled && !$('lake-fw').value) {
+      $('lake-fw').value = s.lake_id_defaults.firmware_label;   // prefilled, editable, never silently replaced
+      _lakeFwPrefilled = true;
+    }
+  }
+  renderLakeNext();
+  const pill = $('lake-pill');
+  if (li && li.active) {
+    _lakeActive = true;
+    pill.textContent = li.finalizing ? 'FINALIZING' : li.phase.toUpperCase();
+    pill.classList.add('up'); pill.classList.remove('stale');
+    $('lake-phase').textContent = li.phase
+      + (li.precheck_unmet && li.precheck_unmet.length ? '  waiting: ' + li.precheck_unmet.join(', ') : '');
+    $('lake-elapsed').textContent = li.elapsed_s.toFixed(1) + ' / ' + li.profile_s + ' s';
+    $('lake-frames').textContent = li.frames;
+    $('lake-file').textContent = li.name + '  (' + (li.order === 'LR' ? 'LEFT then RIGHT' : 'RIGHT then LEFT') + ')';
+    $('lake-warn').textContent = (li.warnings || []).join('  |  ')
+      + (li.recording_error ? '   RECORDING FAILED: ' + li.recording_error : '');
+    $('lake-warn').style.color = li.recording_error ? 'var(--danger)' : 'var(--warn)';
+  } else {
+    _lakeActive = false;
+    pill.textContent = lr ? (lr.status === 'complete' ? 'COMPLETE'
+                            : (lr.status === 'aborted' ? 'ABORTED' : 'INCOMPLETE')) : 'IDLE';
+    pill.classList.remove('up');
+    pill.classList.toggle('stale', !!(lr && lr.status !== 'complete'));
+    if (lr) {
+      $('lake-phase').textContent = lr.status.toUpperCase().replace(/_/g, ' ')
+        + (lr.reason ? ':  ' + lr.reason : '')
+        + (lr.write_error ? '   WRITE ERROR: ' + lr.write_error : '');
+      $('lake-elapsed').textContent = '--';
+      $('lake-frames').textContent = lr.frames;
+      $('lake-file').textContent = lr.name + '  (' + lr.order + ')';
+      $('lake-warn').textContent = (lr.summary_warnings || []).concat(lr.warnings || []).join('  |  ');
+      $('lake-warn').style.color = lr.write_error ? 'var(--danger)' : 'var(--warn)';
+    }
+  }
+  $('lake-start').disabled = !!(li && li.active) || _rtLockedOut;
+}
 
 // Runtime mode switch. Raw Manual is the boot mode and stays the default.
 var assistRudderOn = false;
@@ -3816,6 +4959,7 @@ function applyStatus(s) {
     }
 
     // ---- rudder test ------------------------------------------------------
+    renderLakeId(s);                 // before the rudder-test block: it sets _lakeActive for the lockout
     const rt = s.rudder_test, rtr = s.rudder_test_result;
     const rtPill = $('rt-pill');
     if (rt && rt.active) {
@@ -4272,6 +5416,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == '/api/status':
+            self.link.ensure_lake_id_next()      # disk scan, before status() takes the lock
             self._json(self.link.status())
         elif self.path == '/api/ports':
             import serial.tools.list_ports as list_ports
@@ -4433,6 +5578,21 @@ class Handler(BaseHTTPRequestHandler):
             # never in this handler.
             ok, err = self.link.start_rudder_test(sign, command_seq, assisted)
             self._json({'ok': ok, 'error': err} if not ok else {'ok': True})
+        elif self.path == '/api/lake_id':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            notes = body.get('notes') or {}
+            if not isinstance(notes, dict):
+                self._json({'ok': False, 'error': 'notes must be an object'}, 400)
+                return
+            # Returns immediately: the 57 s profile runs on the stream loop.
+            ok, err = self.link.start_lake_id(
+                body.get('throttle'), body.get('magnitude'), command_seq,
+                notes=notes, firmware_label=body.get('firmware_label'))
+            self._json({'ok': ok, 'error': err} if not ok else {'ok': True}, 200 if ok else 409)
         elif self.path == '/api/rudder_assist':
             on = body.get('on')
             if not isinstance(on, bool):
