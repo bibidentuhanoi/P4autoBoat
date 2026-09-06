@@ -1,9 +1,13 @@
 """Five review findings on the BASE10 work, each pinned end to end.
 
-1. STOP must abort a firmware-owned bench run. It sent motor zeros, which the
-   run overrides every cycle; only DISARM could stop it. Now STOP also sends
-   BenchCommand.abort, a dedicated backward-compatible field -- not a magic
-   kind, and not by turning STOP into DISARM.
+1. STOP must stop a firmware-owned bench run. It sent motor zeros, which the
+   run overrides every cycle; only DISARM could stop it. The first fix sent
+   BenchCommand.abort from STOP; that was REVERTED on 2026-09-05 because the
+   boat runs main 9543ed1, whose BenchCommand has no abort field and which
+   reads any bench payload as a START. STOP now sends only motor/steer/winch
+   zeros, and a bench the tool believes is running or was just requested is
+   stopped by DISARM -- version-compatible. The 9543ed1-schema proof is in
+   test_stop_main_compat.py; the field itself stays in the A+B schema.
 2. The SD filename shown in the UI was derived from BENCH_KIND_NAME.charAt(0),
    so BASE10 displayed 'B' while the boat wrote 'G'.
 3. Laptop recording completeness assumed a 3 s drive. A 3 s fragment of a 10 s
@@ -64,61 +68,65 @@ def _link(sent):
     return link
 
 
-class StopSendsBenchAbortTest(unittest.TestCase):
+class StopStaysMainCompatibleTest(unittest.TestCase):
+    """STOP never puts a BenchCommand on the wire; a live or just-requested
+    bench is stopped by DISARM, which every firmware honours."""
 
     def setUp(self):
         self.sent = []
         self.link = _link(self.sent)
 
-    def _bench_msgs(self):
-        return [m for m in self.sent if m.WhichOneof('payload') == 'bench']
+    def _kinds(self):
+        return [m.WhichOneof('payload') for m in self.sent]
 
-    def test_the_field_exists_and_is_number_five(self):
+    def test_the_abort_field_stays_in_the_a_b_schema_but_is_never_sent(self):
         f = self.link.pb2.BenchCommand.DESCRIPTOR.fields_by_name.get('abort')
         self.assertIsNotNone(f, 'BenchCommand.abort missing from the pb2 -- '
                                 'regenerate proto/boat_pb2.py')
         self.assertEqual(f.number, 5)
-        self.assertEqual(f.type, f.TYPE_BOOL)
+        self.assertNotIn('_send_bench_abort_locked', TOOL.read_text())
 
-    def test_stop_sends_a_bench_abort(self):
-        """THE fix. STOP must reach the run the boat owns, not just the
-        manual path the run overrides."""
+    def test_stop_sends_its_zeros_and_no_bench_message(self):
         ok, err = self.link.stop(1)
         self.assertTrue(ok, err)
-        aborts = [m for m in self._bench_msgs() if m.bench.abort]
-        self.assertEqual(len(aborts), 1, 'STOP did not send BenchCommand.abort')
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch'])
+        m = self.sent[0]
+        self.assertEqual((m.motor.left, m.motor.right), (0.0, 0.0))
+        self.assertEqual((self.sent[1].steer.left, self.sent[1].steer.right), (0.0, 0.0))
+        self.assertEqual(self.sent[2].winch.speed, 0.0)
 
-    def test_stop_still_sends_its_manual_zeros_too(self):
-        """Additive. The zeros still go out for the manual path -- STOP's
-        existing semantics are preserved, the abort is on top."""
-        self.link.stop(1)
-        kinds = [m.WhichOneof('payload') for m in self.sent]
-        self.assertIn('motor', kinds)
-        self.assertIn('steer', kinds)
-        self.assertIn('winch', kinds)
-        self.assertIn('bench', kinds)
-
-    def test_stop_does_not_touch_the_arm_state(self):
-        """'do not globally change STOP into DISARM'."""
+    def test_stop_does_not_touch_the_arm_state_without_a_bench(self):
         self.link.armed_cmd = True
         self.link.stop(1)
         self.assertTrue(self.link.armed_cmd)
-        self.assertNotIn('arm_cmd', [m.WhichOneof('payload') for m in self.sent])
+        self.assertNotIn('arm_cmd', self._kinds())
 
-    def test_the_abort_is_a_pure_abort_not_a_disguised_start(self):
-        self.link.stop(1)
-        a = [m for m in self._bench_msgs() if m.bench.abort][0]
-        self.assertEqual(a.bench.kind, 0)
-        self.assertEqual(a.bench.base, 0.0)
-        self.assertEqual(a.bench.delta, 0.0)
-        self.assertEqual(a.bench.reset_c, 0.0)
+    def test_stop_disarms_a_running_bench(self):
+        """The version-compatible way to reach a run the boat owns: the boat's
+        bench_step aborts the moment it sees !armed, on every firmware."""
+        self.link.bench_status = dict(self.link.bench_status, have=True, state=2,
+                                      last_rx_monotonic=__import__('time').monotonic())
+        ok, err = self.link.stop(1)
+        self.assertTrue(ok, err)
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'arm_cmd'])
+        self.assertFalse(self.sent[3].arm_cmd.arm)
+        self.assertFalse(self.link.armed_cmd)
 
-    def test_starting_a_run_never_sets_abort(self):
-        """Backward compatibility the other way: every existing start is
-        unchanged on the wire, abort=false, exactly as before the field."""
+    def test_stop_disarms_a_bench_just_requested(self):
         ok, err = self.link.send_bench('both', 0.2, 0.0, 1)
         self.assertTrue(ok, err)
-        starts = self._bench_msgs()
+        self.sent.clear()
+        ok, err = self.link.stop(2)
+        self.assertTrue(ok, err)
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'arm_cmd'])
+        self.assertFalse(self.link.armed_cmd)
+
+    def test_starting_a_run_never_sets_abort(self):
+        """Every start is unchanged on the wire, abort=false, exactly as
+        before the field existed."""
+        ok, err = self.link.send_bench('both', 0.2, 0.0, 1)
+        self.assertTrue(ok, err)
+        starts = [m for m in self.sent if m.WhichOneof('payload') == 'bench']
         self.assertEqual(len(starts), 1)
         self.assertFalse(starts[0].bench.abort)
         self.assertEqual(starts[0].bench.kind, 0)
@@ -127,7 +135,7 @@ class StopSendsBenchAbortTest(unittest.TestCase):
         self.link.connected = False
         ok, err = self.link.stop(1)
         self.assertFalse(ok)
-        self.assertEqual(self._bench_msgs(), [])
+        self.assertEqual(self.sent, [])
 
 
 class SdFilenameDisplayTest(unittest.TestCase):

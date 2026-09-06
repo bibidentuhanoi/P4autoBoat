@@ -229,6 +229,9 @@ BENCH_STATE_NAME = {0: 'idle', 1: 'still', 2: 'driving', 3: 'coasting',
 # still be running -- most likely the terminal SAVED packet was lost over the
 # air. Without this the tool latches on 'driving' and refuses every later run.
 BENCH_RUNNING_STALE_S = 3.0
+# A run we ASKED for is treated as live from the request until the boat's
+# first BenchStatus about it, or until this window passes unanswered.
+BENCH_REQUEST_PENDING_S = 3.0
 # BenchStatus.state == 2 is the drive phase (motor_control.c / bench_run.c:
 # 0 idle, 1 baseline, 2 run, 3 coast, 4 saved, 5 failed). Named because the
 # yaw summary is delimited by it and a bare 2 in that test reads as nothing.
@@ -1507,6 +1510,7 @@ class BoatLink:
         self.system_status = self._blank_system_status()
         self.motor_status = self._blank_motor_status()
         self.bench_status = self._blank_bench_status()
+        self.bench_requested_at = None    # monotonic time of the last send_bench()
         # Yaw telemetry caught while the boat reported itself driving, and the
         # summary derived from it once the phase ends. UI-observed and lossy --
         # the boat's 100 Hz SD CSV is the authoritative record.
@@ -1680,7 +1684,7 @@ class BoatLink:
         msg = self.pb2.BoatMessage()
         msg.arm_cmd.arm = arm
         msg.arm_cmd.force = force
-        self._write_locked(msg.SerializeToString())
+        return self._write_locked(msg.SerializeToString())
 
     def _send_calibrate_locked(self, start: bool):
         msg = self.pb2.BoatMessage()
@@ -1862,7 +1866,18 @@ class BoatLink:
         """Panic stop: zero throttle/rudder and send immediately rather than
         waiting for the next background tick. Does not touch armed_cmd --
         matches the firmware's own link-loss failsafe, which centres/zeroes
-        but leaves the ARM decision to an explicit command."""
+        but leaves the ARM decision to an explicit command -- with ONE
+        exception: a bench run the tool believes is live or just requested
+        owns the ESCs and overrides these zeros every cycle, and the only
+        stop every firmware version honours for it is DISARM, so that case
+        disarms.
+
+        STOP never puts a BenchCommand on the wire. The boat runs main
+        9543ed1, whose BenchCommand has no `abort` field and whose pipeline
+        reads ANY bench payload as a start (kind 0, base 0 -- clamped, not
+        refused): an abort sent to it would start a 3 s zero-throttle BASE
+        run. tests/test_stop_main_compat.py decodes every STOP frame with
+        that firmware's own schema."""
         with self._lock:
             # NEVER rejected as stale. A stop that arrives out of order is
             # still a stop, and refusing it because a sequence number looks old
@@ -1880,20 +1895,21 @@ class BoatLink:
             self._abort_rudder_test_locked('STOP pressed')
             if not self.connected:
                 return False, 'serial link is disconnected'
-            writes_ok = (
-                # FIRST on the wire. A running bench OWNS the ESCs: its output
-                # overrides the zeros below every cycle, and the boat's
-                # link-loss failsafe leaves it alone by design. Without this,
-                # STOP could not stop a bench run at all -- only DISARM could.
-                # It is the one case where the zeros alone do nothing, so it
-                # goes out before them.
-                self._send_bench_abort_locked(),
+            writes_ok = [
                 self._send_motor_locked(0.0, 0.0),
                 self._send_steer_locked(0.0),
                 self._send_winch_locked(0.0),
-            )
+            ]
             if was_calibrating:
                 self._send_calibrate_locked(False)   # re-arm the firmware start latch
+            if self._bench_running_locked() or self._bench_locally_pending_locked():
+                # The zeros above are already out, so a lost disarm degrades
+                # to a boat being told nothing rather than a running one.
+                self.armed_cmd = False
+                self.bench_requested_at = None
+                writes_ok.append(self._send_arm_locked(False, self.force))
+                print('[stop] a bench run is live or pending: DISARMED to stop it '
+                      '(the version-compatible way -- re-ARM when ready)', flush=True)
             if not all(writes_ok):
                 return False, 'serial write failed'
             return True, None
@@ -1968,6 +1984,15 @@ class BoatLink:
         if last is None:
             return False
         return (time.monotonic() - last) < BENCH_RUNNING_STALE_S
+
+    def _bench_locally_pending_locked(self):
+        """A run this tool asked for within BENCH_REQUEST_PENDING_S that the
+        boat has not yet said anything about. The boat starts it on its next
+        control tick, so a STOP inside that window must assume it is live."""
+        t = getattr(self, 'bench_requested_at', None)
+        if t is None:
+            return False
+        return (time.monotonic() - t) <= BENCH_REQUEST_PENDING_S
 
     # ---- control session ------------------------------------------------
 
@@ -2228,13 +2253,6 @@ class BoatLink:
             return self._send_assist_locked(self.p_assist_on if not on else False,
                                             bool(on))
 
-    def _send_bench_abort_locked(self):
-        """BenchCommand.abort: stop the run the boat is driving. A dedicated
-        field, not a magic kind -- it can never be mistaken for a start."""
-        msg = self.pb2.BoatMessage()
-        msg.bench.abort = True
-        return self._write_locked(msg.SerializeToString())
-
     def send_bench(self, kind, base, delta, command_seq, reset_c=0.0):
         """Ask the BOAT to run one bench test and record it to its own SD card.
 
@@ -2290,6 +2308,7 @@ class BoatLink:
             msg.bench.reset_c = reset_c
             if not self._write_locked(msg.SerializeToString()):
                 return False, 'serial write failed'
+            self.bench_requested_at = time.monotonic()
             return True, None
 
     # ---- automatic rudder test ------------------------------------------
@@ -3393,6 +3412,8 @@ class BoatLink:
         with self._lock:
             was_driving = (self.bench_status.get('have')
                            and self.bench_status.get('state') == BENCH_STATE_RUN)
+            if int(bs.state) != 0:
+                self.bench_requested_at = None    # the boat has spoken about the run
             self.bench_status = {
                 'have': True, 'last_rx_monotonic': time.monotonic(),
                 'state': int(bs.state), 'kind': int(bs.kind),
