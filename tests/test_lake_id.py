@@ -61,7 +61,7 @@ class LakeBase(unittest.TestCase):
         for k, v in dict(throttle=0.0, motor_left=0.0, motor_right=0.0, motor_split=False,
                          rudder=0.0, winch_speed=0.0, winch_lease_until=0.0,
                          winch_command_seq=0, armed_cmd=True, force=False,
-                         calibrating=False, servo_rail_cut=None, p_assist_on=False,
+                         calibrating=False, servo_rail_cut=None, p_assist_on=True,
                          assist_rudder_on=False, assist_request_id=0, _assist_req_seq=0,
                          _assist_off_req_id=None, _assist_off_next_retry=0.0,
                          _assist_off_started=0.0, _last_hb_state=None,
@@ -111,7 +111,7 @@ class LakeBase(unittest.TestCase):
                                    last_rx_monotonic=self.clock.t)
 
     def _boat(self, left, right, rudder, pwm=None, state=2, servo=True,
-              assist_rudder=False, assist_p=False, fresh=True):
+              assist_rudder=False, assist_p=True, fresh=True):
         if pwm is None:
             pwm = 1516 + (rudder * 289 if rudder < 0 else rudder * -321)   # 1805 left / 1195 right
             pwm = 1516 - rudder * 289 if rudder < 0 else 1516 - rudder * 321
@@ -330,7 +330,7 @@ class PrecheckWindowTest(LakeBase):
             'gps_valid': lambda: self._telemetry(gps_valid=False),
             'boat_rudder_centred': lambda: self._boat(0.0, 0.0, 0.0, pwm=1540),
             'boat_zero_throttle': lambda: self._boat(0.1, 0.1, 0.0),
-            'motor_p_off': lambda: self._boat(0.0, 0.0, 0.0, assist_p=True),
+            'motor_p_on': lambda: self._boat(0.0, 0.0, 0.0, assist_p=False),
             'rudder_assist_off': lambda: self._boat(0.0, 0.0, 0.0, assist_rudder=True),
             'systemstatus_fresh': lambda: self._system(imu_ok=True, fresh=False),
             'imu_finite': lambda: self._telemetry(yaw=float('nan')),
@@ -709,7 +709,7 @@ class SummaryTest(unittest.TestCase):
                          'gps_valid': 1 if gps else 0, 'speed_mps': speed, 'course_deg': heading,
                          'satellites': 9, 'hdop': 1.0,
                          'boat_applied_left_cmd': 0.18, 'boat_applied_right_cmd': 0.22,
-                         'boat_assist_motor_p': 0, 'boat_assist_rudder': 0})
+                         'boat_assist_motor_p': 1, 'boat_assist_rudder': 0})
             t += 0.05
         return rows
 
@@ -1514,3 +1514,260 @@ class FirmwareLabelTest(LakeBase):
         _r, _e, s = self._files(r['name'])
         self.assertEqual(s['provenance']['firmware_label'], d)
         self.assertIn('not verified', s['provenance']['firmware_label_note'])
+
+
+# ---------------------------------------------------------------------------
+# Mode requirement, 2026-09-05: Motor P ON and Rudder Assist OFF for the whole
+# run, confirmed by the boat, never toggled by the tool. Each test failed
+# against the OFF/OFF version before the change.
+
+
+def _lake_rows(order='LR', bias=0.5, gain=8.0, tau=1.0, speed=1.5, gps=True):
+    """A first-order boat with a straight-running bias, sampled at 20 Hz."""
+    ph = T.lake_id_phases(0.2, 0.3, order)
+    rows, yaw, heading, t = [], bias, 90.0, 0.0
+    while t < 57.0:
+        p = T.lake_id_phase_at(ph, t)
+        target = bias + (-p[3] * gain if p[2] > 0 else 0.0)
+        yaw += (target - yaw) * (0.05 / tau)
+        heading = (heading + yaw * 0.05) % 360
+        rows.append({'elapsed_s': round(t, 3), 'phase': p[0], 'yaw_dps': yaw,
+                     'heading_deg': heading, 'pitch_deg': 1.0, 'roll_deg': 0.0,
+                     'gps_valid': 1 if gps else 0, 'speed_mps': speed, 'course_deg': heading,
+                     'satellites': 9, 'hdop': 1.0,
+                     'boat_applied_left_cmd': 0.18, 'boat_applied_right_cmd': 0.22,
+                     'boat_assist_motor_p': 1, 'boat_assist_rudder': 0})
+        t += 0.05
+    return rows
+
+
+def _lake_sum(rows, order='LR'):
+    settings = {'throttle': 0.2, 'magnitude': 0.3, 'order': order,
+                'condition': 'T20_M30', 'index': 1, 'name': 'x'}
+    return T.lake_id_summarize(rows, [], settings, {'git_head': 'abc'}, 'complete', None,
+                               stop_confirmed=True, notes={k: 'ok' for k in T.LAKE_ID_NOTE_FIELDS},
+                               firmware_label='lbl')
+
+
+class ModeRequirementTest(LakeBase):
+
+    def test_start_refused_when_the_tool_has_p_off(self):
+        self.link.p_assist_on = False
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertIn('Motor P', err)
+        self.assertIsNone(self.link.lake_id)
+
+    def test_start_refused_when_the_tool_has_rudder_assist_on(self):
+        self.link.assist_rudder_on = True
+        ok, err = self._start()
+        self.assertFalse(ok)
+        self.assertIn('Rudder Assist', err)
+
+    def test_the_gate_needs_the_boats_fresh_confirmation_of_p(self):
+        self._boat(0.0, 0.0, 0.0, assist_p=False)     # tool says ON; the boat has not confirmed
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(2.2, boat_follows=False)
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('motor_p_on', r['reason'])
+        self.assertEqual(self.link.throttle, 0.0)
+        self.assertNotIn(('motor', 0.2, 0.2), self.sent)
+
+    def test_a_late_confirmation_inside_the_window_starts(self):
+        self._boat(0.0, 0.0, 0.0, assist_p=False)
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(1.2, boat_follows=False)
+        self.assertIn('motor_p_on', self.link.lake_id_status_locked()['precheck_unmet'])
+        self._boat(0.0, 0.0, 0.0, assist_p=True)      # the boat confirms at ~1.3 s
+        self._drive(1.0, boat_follows=False)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self.assertEqual(self.link.throttle, 0.2)
+
+    def test_mode_confirmation_is_on_the_record(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(3.0)
+        with self.link._lock:
+            self.link._abort_lake_id_locked('test')
+        r = self._wait_result()
+        _rows, events, _s = self._files(r['name'])
+        names = [e['event'] for e in events]
+        self.assertIn('mode_confirmed', names)
+        self.assertLess(names.index('precheck_pass'), names.index('mode_confirmed'))
+
+    def test_p_reported_off_mid_run_aborts_and_is_warned(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self.sent.clear()
+        self._boat(0.18, 0.22, 0.0, assist_p=False)
+        self._frame(yaw=0.4)
+        self._tick()
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('Motor P', r['reason'])
+        self.assertIn(('motor', 0.0, 0.0), self.sent)
+        self.assertIn(('steer', 0.0), self.sent)
+        rows, _events, summary = self._files(r['name'])
+        self.assertTrue(rows, 'partial rows were not preserved')
+        self.assertTrue(any('Motor P reported OFF' in w for w in summary['warnings']),
+                        summary['warnings'])
+
+    def test_rudder_assist_reported_on_mid_run_aborts(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self._boat(0.18, 0.22, 0.0, assist_rudder=True)
+        self._tick()
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('Rudder Assist', r['reason'])
+
+    def test_the_tool_side_p_switch_going_off_mid_run_aborts(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self.link.p_assist_on = False
+        self._tick()
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('Motor P', r['reason'])
+
+    def test_the_tool_sends_no_mode_command_during_the_run(self):
+        raw = []
+        inner = self.link._write_locked
+
+        def capture(payload):
+            raw.append(bytes(payload)); return inner(payload)
+        self.link._write_locked = capture
+        r = self._run_full()
+        self.assertEqual(r['status'], 'complete')
+        kinds = []
+        for p in raw:
+            m = self.link.pb2.BoatMessage(); m.ParseFromString(p)
+            kinds.append(m.WhichOneof('payload'))
+        self.assertNotIn('assist', kinds)
+        self.assertTrue(set(kinds) <= {'motor', 'steer', 'winch'}, kinds)
+        self.assertTrue(self.link.p_assist_on)
+
+    def test_the_card_states_the_mode(self):
+        src = TOOL.read_text()
+        i = src.index('id="lake-card"')
+        card = src[i:src.index('</details>', i)]
+        self.assertIn('Motor P must be ON', card)
+        self.assertIn('Rudder Assist OFF', card)
+        self.assertNotIn('Motor P and Rudder Assist must be OFF', card)
+
+
+class PerformanceSummaryTest(unittest.TestCase):
+    """The summary answers the practical questions, or says why it cannot."""
+
+    PHASES = ('straight', 'turn_a', 'recover_a', 'turn_b', 'recover_b')
+
+    def test_every_phase_reports_signed_mean_abs_peak_integrated_and_coverage(self):
+        s = _lake_sum(_lake_rows())
+        for ph in self.PHASES:
+            y = s[ph]['yaw']
+            for k in ('signed_mean_yaw_dps', 'mean_abs_yaw_dps', 'peak_yaw_dps',
+                      'integrated_yaw_change_deg', 'heading_change_deg', 'coverage'):
+                self.assertIn(k, y, (ph, k))
+                self.assertIsNotNone(y[k], (ph, k))
+            self.assertTrue(y['coverage']['coverage_ok'], ph)
+        self.assertGreater(s['turn_a']['yaw']['integrated_yaw_change_deg'], 15.0)   # LEFT: positive
+        self.assertLess(s['turn_b']['yaw']['integrated_yaw_change_deg'], -15.0)     # RIGHT: negative
+        self.assertGreater(s['turn_a']['yaw']['peak_yaw_dps'], 2.0)
+        self.assertAlmostEqual(s['straight']['yaw']['signed_mean_yaw_dps'], 0.5, places=1)
+        self.assertAlmostEqual(s['straight']['yaw']['mean_abs_yaw_dps'], 0.5, places=1)
+        self.assertTrue(s['turn_a']['settled'])
+        self.assertIsNotNone(s['turn_a']['rise_time_s'])
+
+    def test_an_unsettled_turn_reports_no_rise_or_delay(self):
+        rows = _lake_rows()
+        for i, r in enumerate(rows):
+            if 17.0 <= r['elapsed_s'] < 22.0:                 # oscillating through the steady window
+                r['yaw_dps'] += 3.0 * math.sin(i * 0.9)
+        s = _lake_sum(rows)
+        ta = s['turn_a']
+        self.assertFalse(ta['settled'])
+        self.assertIsNone(ta['rise_time_s'])
+        self.assertIsNone(ta['response_delay_s'])
+        self.assertIn('unsettled', ta['unavailable_reason'])
+        self.assertTrue(any('turn_a' in w and 'unsettled' in w for w in s['warnings']), s['warnings'])
+        self.assertIsNotNone(ta['yaw']['mean_abs_yaw_dps'])    # the plain facts are still there
+
+    def test_insufficient_coverage_flags_instead_of_numbers(self):
+        rows = [r for r in _lake_rows() if not (14.0 <= r['elapsed_s'] < 21.0)]   # a 7 s hole
+        s = _lake_sum(rows)
+        ta = s['turn_a']
+        self.assertFalse(ta['yaw']['coverage']['coverage_ok'])
+        self.assertIsNone(ta['rise_time_s'])
+        self.assertIsNone(ta['response_delay_s'])
+        self.assertIsNone(ta['steady_yaw_minus_bias_dps'])
+        self.assertIn('coverage', ta['unavailable_reason'])
+        self.assertTrue(any('turn_a' in w and 'coverage' in w for w in s['warnings']))
+
+    def test_a_recovery_that_never_settles_reports_no_time(self):
+        rows = _lake_rows()
+        for r in rows:
+            if 22.0 <= r['elapsed_s'] < 32.0:
+                r['yaw_dps'] = 0.5 + 2.4                     # keeps rotating after centring
+        s = _lake_sum(rows)
+        ra = s['recover_a']
+        self.assertIsNone(ra['recovery_time_s'])
+        self.assertIsNone(ra['half_decay_time_s'])
+        self.assertIn('settle', ra['unavailable_reason'])
+        self.assertIn('Motor P and autotrim active', ra['note'])
+        self.assertAlmostEqual(ra['yaw']['mean_abs_yaw_dps'], 2.9, places=1)
+        self.assertTrue(any('recover_a' in w for w in s['warnings']))
+
+    def test_a_settled_recovery_reports_time_half_decay_and_residual(self):
+        ra = _lake_sum(_lake_rows())['recover_a']
+        self.assertIsNotNone(ra['recovery_time_s'])
+        self.assertIsNotNone(ra['half_decay_time_s'])
+        self.assertLess(ra['half_decay_time_s'], ra['recovery_time_s'])
+        self.assertAlmostEqual(ra['half_decay_time_s'], 0.69, delta=0.15)     # ln 2 * tau
+        self.assertIsNotNone(ra['residual_yaw_dps'])
+        self.assertLess(abs(ra['residual_yaw_dps']), 0.2)
+        self.assertIsNone(ra['unavailable_reason'])
+
+    def test_p_reported_off_in_rows_is_a_summary_warning(self):
+        rows = _lake_rows()
+        for r in rows[400:420]:
+            r['boat_assist_motor_p'] = 0
+        s = _lake_sum(rows)
+        self.assertTrue(any('Motor P reported OFF' in w for w in s['warnings']))
+        self.assertFalse(any('Motor P reported ON' in w for w in s['warnings']))
+
+    def test_wording_states_combined_system_and_unrecorded_values(self):
+        s = _lake_sum(_lake_rows())
+        w = ' '.join(s['wording']).lower()
+        self.assertIn('does not isolate', w)
+        self.assertIn('waypoint', w)
+        self.assertIn('turn radius is provisional', w)
+        self.assertEqual(s['mode']['motor_p'], 'ON')
+        self.assertEqual(s['mode']['rudder_assist'], 'OFF')
+        self.assertFalse(s['mode']['p_correction_recorded'])
+        self.assertFalse(s['mode']['learned_c_recorded'])
+        self.assertIn('not the motor P filter', s['mode']['limitation'])
+        head = '\n'.join(T.LAKE_ID_SAMPLES_HEADER)
+        self.assertIn('not the motor P filter', head)
+        self.assertIn('not proof of a nonzero', head)
+        self.assertIn('not recorded', head)
+        for k in ('turn_settled_max_std_frac', 'recovery_hold_s', 'half_decay_frac'):
+            self.assertIn(k, s['rules'])
+
+    def test_a_single_dip_into_the_band_is_not_a_recovery(self):
+        """The hold rule: the boat must STAY inside the band, not touch it once
+        while still swinging."""
+        rows = _lake_rows()
+        for r in rows:
+            t = r['elapsed_s'] - 22.0                     # recover_a, phase-relative
+            if 0.0 <= t < 10.0:
+                if 0.95 <= t < 1.05:
+                    r['yaw_dps'] = 0.5 + 0.1              # one sample deep inside the band
+                elif t < 5.0:
+                    r['yaw_dps'] = 0.5 + 2.0              # still swinging
+                else:
+                    r['yaw_dps'] = 0.5 + 0.1              # settled from 5 s on
+        ra = _lake_sum(rows)['recover_a']
+        self.assertIsNotNone(ra['recovery_time_s'])
+        self.assertGreaterEqual(ra['recovery_time_s'], 4.9)
+        self.assertLess(ra['recovery_time_s'], 5.2)

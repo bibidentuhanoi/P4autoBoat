@@ -399,6 +399,84 @@ static void a_tiny_rudder_offset_does_not_stop_learning(void)
     assert(s.c > cfg.c_init);
 }
 
+/* --- 11. the lake steering-ID profile, as the P gate sees it -------------
+ *
+ * The one-button lake test runs with Motor P ON for the whole 50 powered
+ * seconds and never toggles a mode: straight 10 s, raw rudder 10 s, centred
+ * 10 s, opposite rudder 10 s, centred 10 s, at T20/T30 with 30% or 60% rudder.
+ * What makes that honest is the firmware's own steering gate: P must build
+ * while centred, be EXACTLY zero for every sample of a deflected rudder, and
+ * resume from nothing once the rudder is centred again -- with the impact
+ * reject (|yaw| > TRIM_LEARN_REJECT_DPS) holding it shut for as long as the
+ * boat is still swinging fast. The learner's c freezes through the turns and
+ * carries on in the recoveries, its value retained. */
+static void the_lake_profile_gates_p_off_in_turns_and_on_when_centred(void)
+{
+    const float throttles[] = { 0.20f, 0.30f };
+    const float rudders[]   = { 0.30f, 0.60f };
+    for (unsigned ti = 0; ti < 2; ++ti) {
+        for (unsigned ri = 0; ri < 2; ++ri) {
+            const trim_learn_cfg_t cfg = shipped_cfg();
+            const trim_assist_cfg_t pcfg = shipped_assist_cfg();
+            trim_learn_t s;
+            trim_assist_t pa;
+            trim_learn_init(&s, &cfg);
+            trim_assist_reset(&pa);
+            pilot_t p = cruising();
+            p.p_on = true;
+            p.throttle = throttles[ti];
+            float corr = 0.0f;
+
+            /* straight 10 s: both loops live */
+            const int moved_straight = drive_pilot_for(&s, &cfg, &pa, &pcfg, 10.0f, &p, &corr);
+            assert(moved_straight > 0);
+            assert(corr > 0.0f);
+            const float c_after_straight = s.c;
+
+            /* turn 10 s on the physical rudder: P zero on EVERY sample, c frozen */
+            p.steer = rudders[ri];
+            const int n = (int)(10.0f * FUSION_HZ);
+            for (int i = 0; i < n; ++i) {
+                float sample_corr = 1.0f;
+                (void)drive_sample(&s, &cfg, &pa, &pcfg, &p, &sample_corr);
+                assert(sample_corr == 0.0f);
+                assert(pa.correction == 0.0f);
+            }
+            assert(s.c == c_after_straight);
+            assert(!pa.initialized);
+
+            /* recovery 10 s: the boat is still swinging fast for the first
+             * half second (above the impact reject), then settles */
+            p.steer = 0.0f;
+            p.yaw_dps = 12.0f;                       /* > TRIM_LEARN_REJECT_DPS */
+            (void)drive_pilot_for(&s, &cfg, &pa, &pcfg, 0.5f, &p, &corr);
+            assert(corr == 0.0f);                    /* reject holds it shut */
+            p.yaw_dps = -2.0f;
+            const int moved_recover = drive_pilot_for(&s, &cfg, &pa, &pcfg, 9.5f, &p, &corr);
+            assert(moved_recover > 0);               /* learner resumed, value retained */
+            assert(s.c > c_after_straight);
+            assert(corr > 0.0f);                     /* P resumed once centred and calm */
+
+            /* opposite turn, then the second recovery: same story */
+            p.steer = -rudders[ri];
+            const float c_before_turn_b = s.c;
+            for (int i = 0; i < n; ++i) {
+                float sample_corr = 1.0f;
+                (void)drive_sample(&s, &cfg, &pa, &pcfg, &p, &sample_corr);
+                assert(sample_corr == 0.0f);
+            }
+            assert(s.c == c_before_turn_b);
+            p.steer = 0.0f;
+            (void)drive_pilot_for(&s, &cfg, &pa, &pcfg, 10.0f, &p, &corr);
+            assert(corr > 0.0f);
+            assert(!s.faulted);
+            printf("  lake profile T%02d rudder %.2f: P built, zeroed in both turns, resumed twice; c %.4f -> %.4f\n",
+                   (int)(throttles[ti] * 100.0f + 0.5f), (double)rudders[ri],
+                   (double)c_after_straight, (double)s.c);
+        }
+    }
+}
+
 int main(void)
 {
     ordinary_forward_driving_teaches_the_learner();
@@ -411,6 +489,7 @@ int main(void)
     a_physical_rudder_command_freezes_c_and_zeroes_p();
     each_steering_channel_freezes_independently();
     a_tiny_rudder_offset_does_not_stop_learning();
+    the_lake_profile_gates_p_off_in_turns_and_on_when_centred();
     printf("test_normal_driving_learns: OK\n");
     return 0;
 }

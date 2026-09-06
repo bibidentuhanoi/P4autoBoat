@@ -466,6 +466,9 @@ LAKE_ID_RULES = {
     'radius_min_speed_mps': 0.3,
     'radius_min_yaw_sigma': 3.0,        # |mean yaw - straight bias| / straight yaw std
     'straight_steady_speed_tail_s': 5.0,
+    'turn_settled_max_std_frac': 0.35,  # steady-window std <= this * |steady - bias| = settled
+    'recovery_hold_s': 2.0,             # must STAY inside the band this long to count as recovered
+    'half_decay_frac': 0.5,             # time for |yaw - bias| to first fall to this * the turn's steady
 }
 # The boat's firmware was built from main with no recorded SHA; the label says
 # so. It is operator-supplied and BELIEVED -- the tool cannot read the flash.
@@ -498,6 +501,15 @@ LAKE_ID_SAMPLES_HEADER = (
     '# gps_values_changed is ADVISORY only: lat/lon/speed/course differ from the '
     'previous row. It is not a fix flag, timestamp or sequence and must not be '
     'used for GPS rate, latency or freshness; GPS is 10 Hz under 20 Hz frames',
+    '# mode: Motor P ON and Rudder Assist OFF for the whole run, required and confirmed by '
+    'the boat before any throttle; the tool never toggles a mode during the run',
+    '# the firmware zeroes the Motor P correction while the rudder is deflected (|rudder| > '
+    '0.02) and resumes it when centred, driving, throttle >= 0.15 and |yaw| <= 10 deg/s',
+    '# boat_assist_motor_p is the P SWITCH as the boat reports it, not proof of a nonzero '
+    'correction; the P correction value and the learned trim c are NOT in field telemetry '
+    'and are not recorded',
+    '# boat_yaw_filt_dps / boat_yaw_target_dps belong to the RUDDER controller (Assisted '
+    'Steering), not the motor P filter; with Rudder Assist OFF they read 0',
     '# autotrim: live while rudder is centred (straight/recover), frozen during '
     'turns; its c is not in field telemetry and is not recorded',
 )
@@ -685,11 +697,47 @@ def lake_id_phase_coverage(rows, window):
     return out
 
 
+def _lake_phase_yaw(rows, window):
+    """The plain facts of one phase, reported whatever else can or cannot be
+    computed: signed mean yaw, mean |yaw|, the peak, the integral of gyro yaw
+    over the phase, the compass heading change, and frame coverage."""
+    a, b = window
+    pts = [(r['elapsed_s'], r['yaw_dps']) for r in rows
+           if a <= r['elapsed_s'] < b and isinstance(r['yaw_dps'], (int, float))
+           and math.isfinite(r['yaw_dps'])]
+    out = {'frames': len(pts), 'coverage': lake_id_phase_coverage(rows, window),
+           'signed_mean_yaw_dps': None, 'mean_abs_yaw_dps': None,
+           'peak_yaw_dps': None, 'peak_at_s': None,
+           'integrated_yaw_change_deg': None, 'heading_change_deg': None,
+           'note': ('signed yaw: the LEFT-rudder hypothesis is positive; integrated = '
+                    'trapezoid of gyro yaw over the phase; heading_change = compass')}
+    if pts:
+        ys = [y for _t, y in pts]
+        out['signed_mean_yaw_dps'] = _lake_fnum(_lake_mean(ys))
+        out['mean_abs_yaw_dps'] = _lake_fnum(_lake_mean([abs(y) for y in ys]))
+        pk = max(pts, key=lambda q: abs(q[1]))
+        out['peak_yaw_dps'] = _lake_fnum(pk[1])
+        out['peak_at_s'] = _lake_fnum(pk[0] - a)
+        if len(pts) >= 2:
+            out['integrated_yaw_change_deg'] = _lake_fnum(sum(
+                0.5 * (pts[k - 1][1] + pts[k][1]) * (pts[k][0] - pts[k - 1][0])
+                for k in range(1, len(pts))))
+    inside = [r for r in rows if a <= r['elapsed_s'] < b]
+    out['heading_change_deg'] = _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in inside]))
+    return out
+
+
 def lake_id_summarize(rows, events, settings, provenance, status, reason,
                       abort_phase=None, stop_confirmed=None, notes=None,
                       firmware_label=None, max_gap_s=0.0, rules=None):
     """Pure. Everything the summary says is derived from the rows here, so a
-    test can hand in synthetic rows with known answers."""
+    test can hand in synthetic rows with known answers.
+
+    It answers three practical questions -- how much the boat yaws while
+    straight, how strongly and quickly it turns each way, and how quickly the
+    rotation reduces after centring -- and where the data cannot support a
+    number (poor coverage, an unsettled response, a recovery that never
+    settles) it says so instead of reporting a misleading gain or time."""
     rules = dict(LAKE_ID_RULES if rules is None else rules)
     phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'])
     windows = lake_id_phase_windows(phases)
@@ -724,8 +772,10 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
              if isinstance(r.get('boat_applied_right_cmd'), (int, float))
              and isinstance(r.get('boat_applied_left_cmd'), (int, float))]
     straight = {
-        'note': ('observed yaw/heading/course bias plus the commanded L/R '
-                 'differential -- NOT a measurement of physical motor mismatch'),
+        'note': ('straight running with Motor P ON and autotrim live: observed yaw/heading/'
+                 'course bias plus the commanded L/R differential -- NOT a measurement of '
+                 'physical motor mismatch, and not P\'s isolated contribution'),
+        'yaw': _lake_phase_yaw(rows, windows['straight']),
         'mean_yaw_dps': _lake_fnum(bias), 'yaw_std_dps': _lake_fnum(bias_std),
         'heading_drift_deg': _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in sr])),
         'course_drift_deg': _lake_fnum(_lake_integrate_wrapped(
@@ -736,7 +786,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'commanded_lr_diff_range': _lake_fnum(max(diffs) - min(diffs)) if diffs else None,
     }
 
-    # ---- per-phase commanded differential drift (autotrim moving) ------
+    # ---- per-phase commanded differential drift (autotrim + P moving) ---
     for n in ('straight', 'recover_a', 'recover_b', 'turn_a', 'turn_b'):
         d = [(r['boat_applied_right_cmd'] - r['boat_applied_left_cmd']) for r in rows_in(n)
              if isinstance(r.get('boat_applied_right_cmd'), (int, float))
@@ -746,49 +796,19 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
                             % (n, max(d) - min(d), rules['diff_drift_warn']))
 
     # ---- turns -----------------------------------------------------------
-    def turn(name, rudder_cmd):
-        pts = yaw_in(name)
-        a, b = windows[name]
-        out = {'rudder_cmd': rudder_cmd, 'side': 'LEFT' if rudder_cmd < 0 else 'RIGHT',
-               'expected_yaw_sign_hypothesis': '+' if rudder_cmd < 0 else '-',
-               'note': 'rudder response of the operational, trimmed boat'}
-        if not pts or bias is None:
-            out['unavailable'] = 'no yaw samples in phase'
-            return out
-        steady_pts = [y for t, y in pts if t >= b - rules['steady_window_s']]
-        steady = _lake_mean(steady_pts)
-        rel = (steady - bias) if steady is not None else None
-        out['steady_yaw_dps'] = _lake_fnum(steady)
-        out['steady_yaw_minus_bias_dps'] = _lake_fnum(rel)
-        sign = 1.0 if (rel or 0.0) >= 0 else -1.0
-        excursions = [(t, (y - bias) * sign) for t, y in pts]
-        out['peak_yaw_dps'] = _lake_fnum(max((y for t, y in pts), key=lambda v: v * sign) if pts else None)
-        if rel and abs(rel) > 0:
-            thr = rules['response_threshold_frac'] * abs(rel)
-            lo, hi = rules['rise_low_frac'] * abs(rel), rules['rise_high_frac'] * abs(rel)
-            t_thr = next((t for t, e in excursions if e >= thr), None)
-            t_lo = next((t for t, e in excursions if e >= lo), None)
-            t_hi = next((t for t, e in excursions if e >= hi), None)
-            out['response_delay_s'] = _lake_fnum(t_thr - a) if t_thr is not None else None
-            out['rise_time_s'] = _lake_fnum(t_hi - t_lo) if (t_lo is not None and t_hi is not None) else None
-        expected = -1.0 if rudder_cmd < 0 else 1.0        # LEFT -> positive yaw
-        if rel is not None and rel != 0 and (rel > 0) != (expected < 0):
-            warnings.append('%s: steady yaw sign %s disagrees with the hypothesis (%s rudder -> %s yaw)'
-                            % (name, '+' if rel > 0 else '-', out['side'], out['expected_yaw_sign_hypothesis']))
-        pr = rows_in(name)
-        out['heading_change_deg'] = _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in pr]))
-        out['course_change_deg'] = _lake_fnum(_lake_integrate_wrapped(
-            [r['course_deg'] for r in pr if r.get('gps_valid')]))
-        # ---- turn radius: PROVISIONAL, inputs and rules reported together ----
+    def radius_block(name, pr, b, coverage_ok):
+        """PROVISIONAL turn radius: inputs and rules reported together."""
         win = [r for r in pr if r['elapsed_s'] >= b - rules['steady_window_s']]
         valid = [r for r in win if r.get('gps_valid') and isinstance(r.get('speed_mps'), (int, float))]
         frac = (len(valid) / len(win)) if win else 0.0
         v = _lake_mean([r['speed_mps'] for r in valid])
         yaw_abs = _lake_mean([r['yaw_dps'] for r in win
                               if isinstance(r['yaw_dps'], (int, float)) and math.isfinite(r['yaw_dps'])])
-        above = abs(yaw_abs - bias) if (yaw_abs is not None) else None
+        above = abs(yaw_abs - bias) if (yaw_abs is not None and bias is not None) else None
         sigma = (above / bias_std) if (above is not None and bias_std > 0) else None
         rw = []
+        if not coverage_ok:
+            rw.append('telemetry coverage below policy')
         if frac < rules['radius_min_gps_valid_fraction']:
             rw.append('gps_valid fraction %.2f < %.2f' % (frac, rules['radius_min_gps_valid_fraction']))
         if v is None or v < rules['radius_min_speed_mps']:
@@ -798,7 +818,8 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         radius = None
         if v is not None and yaw_abs is not None and yaw_abs != 0.0:
             radius = v / (abs(yaw_abs) * math.pi / 180.0)
-        out['turn_radius'] = {
+        warnings.extend('%s turn radius: %s' % (name, w) for w in rw)
+        return {
             'provisional': True, 'radius_m': _lake_fnum(radius, 2),
             'gps_valid_fraction': round(frac, 3), 'mean_speed_mps': _lake_fnum(v),
             'mean_yaw_dps': _lake_fnum(yaw_abs), 'yaw_above_straight_bias_dps': _lake_fnum(above),
@@ -811,29 +832,133 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             'unavailable_reason': None if radius is not None else 'speed or yaw unavailable',
             'formula': 'speed_mps / (|mean_yaw_dps| * pi / 180)',
         }
-        warnings.extend('%s turn radius: %s' % (name, w) for w in rw)
+
+    def turn(name, rudder_cmd):
+        pts = yaw_in(name)
+        a, b = windows[name]
+        pr = rows_in(name)
+        yawblk = _lake_phase_yaw(rows, windows[name])
+        out = {'rudder_cmd': rudder_cmd, 'side': 'LEFT' if rudder_cmd < 0 else 'RIGHT',
+               'expected_yaw_sign_hypothesis': '+' if rudder_cmd < 0 else '-',
+               'note': ('rudder response of the operational boat: Motor P is ON but the firmware '
+                        'zeroes its correction while the rudder is deflected, and autotrim is '
+                        'frozen -- the combined system, not an isolated rudder'),
+               'yaw': yawblk, 'peak_yaw_dps': yawblk['peak_yaw_dps'],
+               'settled': None, 'unavailable_reason': None,
+               'steady_yaw_dps': None, 'steady_yaw_minus_bias_dps': None, 'steady_yaw_std_dps': None,
+               'response_delay_s': None, 'rise_time_s': None,
+               'heading_change_deg': _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in pr])),
+               'course_change_deg': _lake_fnum(_lake_integrate_wrapped(
+                   [r['course_deg'] for r in pr if r.get('gps_valid')]))}
+        if not pts or bias is None:
+            out['unavailable_reason'] = out['unavailable'] = 'no yaw samples in phase'
+            return out
+        cov = yawblk['coverage']
+        if not cov['coverage_ok']:
+            out['unavailable_reason'] = ('insufficient telemetry coverage (span %.2f s, max gap '
+                                         '%.2f s): response metrics not reported'
+                                         % (cov['span_s'], cov['max_gap_s']))
+            warnings.append('%s: insufficient coverage -- rise time, delay and steady yaw not reported' % name)
+            out['turn_radius'] = radius_block(name, pr, b, False)
+            return out
+        steady_pts = [y for t, y in pts if t >= b - rules['steady_window_s']]
+        steady = _lake_mean(steady_pts)
+        std = _lake_std(steady_pts)
+        rel = (steady - bias) if steady is not None else None
+        out['steady_yaw_dps'] = _lake_fnum(steady)
+        out['steady_yaw_minus_bias_dps'] = _lake_fnum(rel)
+        out['steady_yaw_std_dps'] = _lake_fnum(std)
+        if rel is None:
+            out['unavailable_reason'] = 'no samples in the steady window'
+            out['turn_radius'] = radius_block(name, pr, b, True)
+            return out
+        detected = (abs(rel) >= rules['radius_min_yaw_sigma'] * bias_std) if bias_std > 0 else (abs(rel) > 0)
+        settled = bool(detected and std <= rules['turn_settled_max_std_frac'] * abs(rel))
+        out['settled'] = settled
+        if not detected:
+            out['unavailable_reason'] = ('no clear response: |steady - bias| %.2f deg/s is under %.1f '
+                                         'sigma of the straight scatter (%.2f deg/s)'
+                                         % (abs(rel), rules['radius_min_yaw_sigma'], bias_std))
+            warnings.append('%s: no clear response above the straight scatter -- rise time and delay '
+                            'not reported' % name)
+        elif not settled:
+            out['unavailable_reason'] = ('unsettled: steady-window std %.2f deg/s exceeds %.2f of '
+                                         '|steady - bias| %.2f deg/s'
+                                         % (std, rules['turn_settled_max_std_frac'], abs(rel)))
+            warnings.append('%s: unsettled response -- rise time and delay not reported (std %.2f '
+                            'vs |steady - bias| %.2f deg/s)' % (name, std, abs(rel)))
+        else:
+            sign = 1.0 if rel >= 0 else -1.0
+            excursions = [(t, (y - bias) * sign) for t, y in pts]
+            thr = rules['response_threshold_frac'] * abs(rel)
+            lo, hi = rules['rise_low_frac'] * abs(rel), rules['rise_high_frac'] * abs(rel)
+            t_thr = next((t for t, e in excursions if e >= thr), None)
+            t_lo = next((t for t, e in excursions if e >= lo), None)
+            t_hi = next((t for t, e in excursions if e >= hi), None)
+            out['response_delay_s'] = _lake_fnum(t_thr - a) if t_thr is not None else None
+            out['rise_time_s'] = _lake_fnum(t_hi - t_lo) if (t_lo is not None and t_hi is not None) else None
+        expected = -1.0 if rudder_cmd < 0 else 1.0        # LEFT -> positive yaw
+        if rel != 0 and (rel > 0) != (expected < 0):
+            warnings.append('%s: steady yaw sign %s disagrees with the hypothesis (%s rudder -> %s yaw)'
+                            % (name, '+' if rel > 0 else '-', out['side'], out['expected_yaw_sign_hypothesis']))
+        out['turn_radius'] = radius_block(name, pr, b, True)
         return out
 
     def recovery(name, prev_turn):
         pts = yaw_in(name)
         a, b = windows[name]
-        out = {'note': 'operational recovery under active autotrim -- not a passive hull time constant'}
+        yawblk = _lake_phase_yaw(rows, windows[name])
+        out = {'note': ('recovery with Motor P and autotrim active -- the combined system returning '
+                        'to straight after the rudder is centred; not a passive hull time constant'),
+               'yaw': yawblk, 'recovery_time_s': None, 'half_decay_time_s': None,
+               'recovery_band_dps': None, 'overshoot_dps': None, 'residual_yaw_dps': None,
+               'unavailable_reason': None,
+               'residual_heading_change_deg': _lake_fnum(_lake_integrate_wrapped(
+                   [r['heading_deg'] for r in rows_in(name)]))}
         if not pts or bias is None:
-            out['unavailable'] = 'no yaw samples in phase'
+            out['unavailable_reason'] = out['unavailable'] = 'no yaw samples in phase'
+            return out
+        cov = yawblk['coverage']
+        if not cov['coverage_ok']:
+            out['unavailable_reason'] = ('insufficient telemetry coverage (span %.2f s, max gap '
+                                         '%.2f s): recovery time not reported' % (cov['span_s'], cov['max_gap_s']))
+            warnings.append('%s: insufficient coverage -- recovery time not reported' % name)
             return out
         prev = prev_turn.get('steady_yaw_minus_bias_dps')
         if prev is None or prev == 0:
-            out['unavailable'] = 'previous turn has no steady yaw'
+            out['unavailable_reason'] = ('previous turn has no usable steady yaw (%s)'
+                                         % (prev_turn.get('unavailable_reason') or 'zero'))
             return out
         band = rules['recovery_band_frac'] * abs(prev)
         sign = 1.0 if prev > 0 else -1.0
-        t_rec = next((t for t, y in pts if abs(y - bias) <= band), None)
-        out['recovery_time_s'] = _lake_fnum(t_rec - a) if t_rec is not None else None
         out['recovery_band_dps'] = _lake_fnum(band)
+        dev = [(t, abs(y - bias)) for t, y in pts]
+        half = rules['half_decay_frac'] * abs(prev)
+        t_half = next((t for t, d in dev if d <= half), None)
+        out['half_decay_time_s'] = _lake_fnum(t_half - a) if t_half is not None else None
+        # Recovered = entered the band AND stayed inside it for recovery_hold_s.
+        # One sample dipping into the band while the boat is still swinging is
+        # not a recovery, and the hold must fit inside the phase to be proven.
+        hold = rules['recovery_hold_s']
+        t_rec = None
+        for k, (t, d) in enumerate(dev):
+            if d > band:
+                continue
+            if t + hold > b:
+                break
+            if all(d2 <= band for t2, d2 in dev[k:] if t2 <= t + hold):
+                t_rec = t
+                break
+        out['recovery_time_s'] = _lake_fnum(t_rec - a) if t_rec is not None else None
+        last = [y - bias for t, y in pts if t >= b - rules['steady_window_s']]
+        out['residual_yaw_dps'] = _lake_fnum(_lake_mean(last))
         opposite = [(y - bias) * -sign for t, y in pts]
         out['overshoot_dps'] = _lake_fnum(max(opposite)) if opposite and max(opposite) > 0 else 0.0
-        pr = rows_in(name)
-        out['residual_heading_change_deg'] = _lake_fnum(_lake_integrate_wrapped([r['heading_deg'] for r in pr]))
+        if t_rec is None:
+            out['unavailable_reason'] = ('did not settle: never stayed within %.2f deg/s of the straight '
+                                         'bias for %.1f s inside the phase' % (band, hold))
+            warnings.append('%s: rotation did not settle within the phase -- recovery time not reported'
+                            % name)
         return out
 
     ta = turn('turn_a', phases[2][3])
@@ -850,20 +975,20 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         asym['delay_difference_s'] = _lake_fnum(left['response_delay_s'] - right['response_delay_s'], 3)
 
     # ---- data quality --------------------------------------------------
-    gps_rows = [r for r in rows if r['elapsed_s'] >= windows['straight'][0]]
-    inval = sum(1 for r in gps_rows if not r.get('gps_valid'))
-    if gps_rows and inval:
-        warnings.append('gps_valid false on %d of %d powered rows' % (inval, len(gps_rows)))
+    powered = [r for r in rows if windows['straight'][0] <= r['elapsed_s'] < windows['stop'][0]]
+    inval = sum(1 for r in powered if not r.get('gps_valid'))
+    if powered and inval:
+        warnings.append('gps_valid false on %d of %d powered rows' % (inval, len(powered)))
     sats = [r['satellites'] for r in rows if isinstance(r.get('satellites'), (int, float))]
     hd = [r['hdop'] for r in rows if isinstance(r.get('hdop'), (int, float))]
     if sats and min(sats) < rules['gps_advisory_min_sats']:
         warnings.append('advisory: satellites fell to %d (< %d)' % (min(sats), rules['gps_advisory_min_sats']))
     if hd and max(hd) > rules['gps_advisory_max_hdop']:
         warnings.append('advisory: hdop reached %.2f (> %.2f)' % (max(hd), rules['gps_advisory_max_hdop']))
-    if any(r.get('boat_assist_motor_p') == 1 for r in rows):
-        warnings.append('Motor P reported ON during the run')
+    if any(r.get('boat_assist_motor_p') == 0 for r in powered):
+        warnings.append('Motor P reported OFF during the run (required ON): the mode requirement was not met')
     if any(r.get('boat_assist_rudder') == 1 for r in rows):
-        warnings.append('Rudder Assist reported ON during the run')
+        warnings.append('Rudder Assist reported ON during the run (required OFF)')
     # frozen IMU: identical tuple for >= frozen_imu_s -- warning only
     run_start, run_len = None, 0
     for r in rows:
@@ -882,11 +1007,27 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         warnings.append('STOP not confirmed by a fresh MotorStatus within the 2 s teardown')
 
     return {
-        'schema': 'lake_id_summary_v1',
+        'schema': 'lake_id_summary_v2',
         'status': status, 'reason': reason, 'abort_phase': abort_phase,
         'stop_confirmed': stop_confirmed,
         'settings': dict(settings, phases=[list(p) for p in phases],
                          profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S),
+        'mode': {
+            'motor_p': 'ON', 'rudder_assist': 'OFF',
+            'required': ('Motor P ON and Rudder Assist OFF for the whole run, confirmed by the '
+                         'boat before any throttle; the tool never toggles a mode during the run'),
+            'p_gating_note': ('the firmware zeroes the P correction while the rudder is deflected '
+                              '(|rudder| > 0.02) and resumes it when centred, driving, throttle >= '
+                              '0.15 and |yaw| <= 10 deg/s; autotrim keeps its learned value, frozen '
+                              'during turns'),
+            'p_correction_recorded': False,
+            'learned_c_recorded': False,
+            'limitation': ('boat_assist_motor_p is the P switch as reported by the boat, not proof '
+                           'of a nonzero correction; the correction value and the learned c are not '
+                           'in field telemetry and are not recorded; boat_yaw_filt_dps and '
+                           'boat_yaw_target_dps belong to the rudder controller (Assisted Steering), '
+                           'not the motor P filter'),
+        },
         'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown',
                            firmware_label_note=LAKE_ID_FIRMWARE_LABEL_NOTE),
         'operator_notes': {k: (notes or {}).get(k, '') for k in LAKE_ID_NOTE_FIELDS},
@@ -899,10 +1040,18 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'rules': rules,
         'wording': [
             'MotorStatus values are boat-applied software commands, not measured RPM, thrust or servo angle',
-            'turn phases measure the rudder response of the operational trimmed boat',
-            'recoveries include active autotrim behaviour and are not passive hull tests',
+            'this recording measures the COMBINED system -- raw rudder, Motor P and autotrim '
+            'together; it does not isolate P\'s contribution',
+            'it does not demonstrate or prove assisted waypoint steering; it is preparation for it',
+            'turn phases measure the rudder response of the operational boat with P gated off by '
+            'the firmware during the deflection',
+            'recoveries are recovery with Motor P and autotrim active, not passive hull tests',
             'straight bias is not a direct measurement of physical motor mismatch',
             'turn radius is provisional; its inputs and rules are reported with it',
+            'the P flag is the switch state, not proof of a nonzero correction; learned c and the '
+            'P correction are not recorded',
+            'a phase with insufficient coverage, no clear or unsettled response, or a recovery '
+            'that did not settle reports no gain or time for it, by rule',
         ],
         'warnings': warnings,
     }
@@ -2867,10 +3016,10 @@ class BoatLink:
             return 'ARM first — the lake test spins the thrusters'
         if self.session_id is None:
             return 'no browser control session — reload the page'
-        if self.p_assist_on:
-            return 'Motor P is ON — turn it off first'
+        if not self.p_assist_on:
+            return 'Motor P must be ON — use the P toggle first, then START'
         if self.assist_rudder_on or self._assist_off_pending_locked():
-            return 'Rudder Assist is ON, or not yet confirmed OFF — turn it off first'
+            return 'Rudder Assist must be OFF, confirmed by the boat — turn it off first'
         return None
 
     def start_lake_id(self, throttle, magnitude, command_seq, notes=None,
@@ -2999,8 +3148,10 @@ class BoatLink:
             'boat_rudder_centred': (ms.get('have') and ms.get('rudder_cmd') == 0.0
                                     and isinstance(pwm, (int, float))
                                     and abs(pwm - LAKE_ID_RUDDER_NEUTRAL_US) <= LAKE_ID_RUDDER_CENTRE_TOL_US),
-            'motor_p_off': (not self.p_assist_on and not self.bench_status.get('p_on')
-                            and not ms.get('assist_motor_p')),
+            # Both the request AND the boat's own answer, in a fresh MotorStatus:
+            # the two can disagree and only the boat's is real.
+            'motor_p_on': (bool(self.p_assist_on) and bool(ms.get('have'))
+                           and bool(ms.get('assist_motor_p'))),
             'rudder_assist_off': (not ms.get('assist_rudder') and not self._assist_off_pending_locked()),
             'systemstatus_fresh': ss_age is not None and ss_age <= LAKE_ID_SYSTEMSTATUS_MAX_AGE_S,
             'imu_ok': bool(ss.get('imu_ok')),
@@ -3040,8 +3191,10 @@ class BoatLink:
             return 'boat not armed (state %s)' % ms.get('state')
         if not ms.get('servo_power'):
             return 'servo power lost'
-        if ms.get('assist_rudder') or ms.get('assist_motor_p') or self.p_assist_on:
-            return 'mode changed (assist/P reported ON)'
+        if ms.get('assist_rudder') or self.assist_rudder_on:
+            return 'mode changed: Rudder Assist reported ON (must stay OFF)'
+        if not ms.get('assist_motor_p') or not self.p_assist_on:
+            return 'mode changed: Motor P reported OFF (must stay ON)'
         if self.session_id is None or (now - self.session_last_hb) > LAKE_ID_SUPERVISION_S:
             return 'browser supervision lost'
         if ph is not None and ph[2] > 0.0:
@@ -3109,6 +3262,12 @@ class BoatLink:
                 self._lake_id_event_locked('precheck_fail', ', '.join(unmet))
                 return self._abort_lake_id_locked('precheck failed: ' + ', '.join(unmet))
             self._lake_id_event_locked('precheck_pass', 'all conditions met at t=%.2f s' % elapsed)
+            ms = self.motor_status
+            self._lake_id_event_locked(
+                'mode_confirmed', 'Motor P ON and Rudder Assist OFF confirmed by MotorStatus '
+                '(assist_motor_p=%d, assist_rudder=%d, request_id=%s)'
+                % (1 if ms.get('assist_motor_p') else 0, 1 if ms.get('assist_rudder') else 0,
+                   ms.get('assist_request_id')))
 
         # ---- 57 s and beyond: STOP confirmation, then bounded teardown ------
         if ph is None:
@@ -4205,7 +4364,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 </details>
 <details class="card" open id="lake-card">
   <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
-  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P and Rudder Assist must be OFF. ARM first; STOP or any manual input aborts.</div>
+  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
     <label style="font-size:10px;">throttle</label>
     <select id="lake-throttle"><option value="0.20" selected>T20</option><option value="0.30">T30</option></select>
