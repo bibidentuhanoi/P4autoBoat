@@ -541,9 +541,20 @@ class AbortTest(LakeBase):
 
     def test_motorstatus_stale(self):
         self._powered()
-        self.clock.advance(1.7); self._hb(); self._telemetry(); self._system()
+        self.clock.advance(2.6); self._hb(); self._telemetry(); self._system()
         self._tick()
         self._assert_aborted('MotorStatus stale')
+
+    def test_one_lost_status_resend_does_not_abort_a_powered_phase(self):
+        """Field, 2026-09-06: during a turn nothing in MotorStatus changes, so
+        the boat only re-sends it once a second; one lost packet made a 1.56 s
+        gap and ended two runs. The powered phases tolerate one lost re-send
+        (2.5 s); the precheck gate and the STOP confirmation keep 1.5 s."""
+        self._powered()
+        self.clock.advance(2.0); self._hb(); self._telemetry(); self._system()
+        self._tick()
+        self.assertIsNotNone(self.link.lake_id, 'a 2.0 s MotorStatus gap aborted the run')
+        self.assertEqual(self.link.throttle, 0.2)
 
     def test_systemstatus_stale_after_three_seconds(self):
         self._powered()

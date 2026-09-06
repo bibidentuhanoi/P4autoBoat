@@ -439,7 +439,12 @@ LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
 LAKE_ID_POWERED_S = 50.0
 LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
 LAKE_ID_TELEM_MAX_AGE_S = 1.0
-LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # ~1 Hz idle publish + scheduling jitter
+LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # gate + STOP confirm: a change publish is due there
+# Powered phases: during a turn nothing in MotorStatus changes, so the boat only
+# re-sends it once a second, and ONE lost packet is a 2.0 s gap. Two runs died
+# that way on 2026-09-06 ("MotorStatus stale (1.56 s)"). One lost re-send is
+# tolerated; a dead link still ends the run within 2.5 s.
+LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S = 2.5
 LAKE_ID_SYSTEMSTATUS_MAX_AGE_S = 3.0    # ~1 Hz publish; three missed = gone
 LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 300 ms lease
 LAKE_ID_STOP_CONFIRM_MAX_AGE_S = 1.5
@@ -3180,7 +3185,7 @@ class BoatLink:
         if tel_age is None or tel_age > LAKE_ID_TELEM_MAX_AGE_S:
             return 'telemetry stale (%.2f s)' % (tel_age if tel_age is not None else -1)
         ms_age = (now - ms['last_rx_monotonic']) if ms.get('last_rx_monotonic') is not None else None
-        if ms_age is None or ms_age > LAKE_ID_MOTORSTATUS_MAX_AGE_S:
+        if ms_age is None or ms_age > LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S:
             return 'MotorStatus stale (%.2f s)' % (ms_age if ms_age is not None else -1)
         ss_age = (now - ss['last_rx_monotonic']) if ss.get('last_rx_monotonic') is not None else None
         if ss_age is None or ss_age > LAKE_ID_SYSTEMSTATUS_MAX_AGE_S:
