@@ -538,11 +538,48 @@ class AbortTest(LakeBase):
         self._tick()
         self._assert_aborted('telemetry stale')
 
-    def test_motorstatus_stale(self):
+    def test_motorstatus_stale_when_telemetry_is_quiet_too(self):
+        """3.6 s without MotorStatus AND telemetry 0.8 s old: the boat may be
+        gone. Abort."""
         self._powered()
-        self.clock.advance(3.6); self._hb(); self._telemetry(); self._system()
+        self.clock.advance(3.6); self._hb(); self._system()
+        self.link.telemetry = dict(self.link.telemetry, last_rx_monotonic=self.clock.t - 0.8)
         self._tick()
         self._assert_aborted('MotorStatus stale')
+
+    def test_lost_status_packets_with_live_telemetry_do_not_abort(self):
+        """Bench, 2026-09-11: three, then four once-a-second status re-sends
+        were lost while telemetry kept arriving. 20 frames a second prove the
+        boat is running and talking; a missing status packet is a lost
+        packet, not a dead boat. While telemetry is fresh the status streams
+        may go stale up to a hard cap."""
+        self._powered()
+        self.clock.advance(6.0); self._hb(); self._telemetry()
+        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 6.0)
+        self._tick()
+        self.assertIsNotNone(self.link.lake_id, 'live telemetry did not keep a lossy status stream alive')
+        self.assertEqual(self.link.throttle, 0.2)
+        names = [e for e in self._events_so_far()]
+        self.assertIn('status_lossy', names)
+
+    def test_the_hard_cap_aborts_even_with_live_telemetry(self):
+        self._powered()
+        self.clock.advance(10.1); self._hb(); self._telemetry(); self._system()
+        self._tick()
+        self._assert_aborted('MotorStatus stale')
+
+    def test_systemstatus_hard_cap_aborts_even_with_live_telemetry(self):
+        self._powered()
+        self.clock.advance(1.0); self._hb(); self._telemetry(); self._boat(0.18, 0.22, 0.0)
+        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 10.1)
+        self._tick()
+        self._assert_aborted('SystemStatus stale')
+
+    def _events_so_far(self):
+        """Event names recorded so far, read back from the run's events.csv."""
+        self._writer_idle()
+        d = self.tmp / self.link.lake_id['name']
+        return [e['event'] for e in csv.DictReader(open(d / 'events.csv'))]
 
     def test_two_lost_status_resends_do_not_abort_a_powered_phase(self):
         """Bench, 2026-09-11: the link lost two consecutive once-a-second
@@ -567,10 +604,11 @@ class AbortTest(LakeBase):
         self.assertIsNotNone(self.link.lake_id, 'a 2.0 s MotorStatus gap aborted the run')
         self.assertEqual(self.link.throttle, 0.2)
 
-    def test_systemstatus_stale_after_four_seconds(self):
+    def test_systemstatus_stale_after_four_seconds_when_telemetry_is_quiet(self):
         self._powered()
         self._drive(2.5, boat_follows=True)
         self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 4.1)
+        self.link.telemetry = dict(self.link.telemetry, last_rx_monotonic=self.clock.t - 0.8)
         self._tick()
         self._assert_aborted('SystemStatus stale')
 
@@ -595,6 +633,8 @@ class AbortTest(LakeBase):
         self.assertEqual(lim['systemstatus_powered'], T.LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S)
         self.assertEqual(lim['telemetry'], T.LAKE_ID_TELEM_MAX_AGE_S)
         self.assertEqual(lim['stop_confirm'], T.LAKE_ID_STOP_CONFIRM_MAX_AGE_S)
+        self.assertEqual(lim['telemetry_alive'], T.LAKE_ID_TELEM_ALIVE_S)
+        self.assertEqual(lim['status_alive_cap'], T.LAKE_ID_STATUS_ALIVE_CAP_S)
 
     def test_imu_unhealthy(self):
         self._powered()
@@ -1860,3 +1900,28 @@ class GpsAdvisoryTest(LakeBase):
         i = src.index('id="lake-card"')
         card = src[i:src.index('</details>', i)]
         self.assertIn('GPS fix is advisory', card)
+
+
+class WarningFloodTest(LakeBase):
+    """The wrong-sign warning used to carry the yaw value in its text, so it
+    was never deduplicated: 20 events a second and an ever-growing status
+    for the page. One warning per phase, with a count."""
+
+    def test_wrong_sign_warning_is_one_per_phase_with_a_count(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(13.0)
+        self.assertEqual(self.link.lake_id['phase'], 'turn_a')
+        self._drive(4.0, yaw_model=lambda a: -25.0)      # LEFT rudder, negative yaw: wrong sign
+        warns = [w for w in self.link.lake_id['warnings'] if 'opposite' in w]
+        self.assertEqual(len(warns), 1, warns)
+        self.assertGreaterEqual(self.link.lake_id['warning_counts'][warns[0]], 10)
+        self._writer_idle()
+        d = self.tmp / self.link.lake_id['name']
+        ev = [e for e in csv.DictReader(open(d / 'events.csv')) if e['event'] == 'warning']
+        self.assertEqual(len(ev), 1)
+        with self.link._lock:
+            self.link._abort_lake_id_locked('test')
+        r = self._wait_result()
+        _rows, _events, summary = self._files(r['name'])
+        self.assertEqual(len(summary['live_warnings']), 1)
+        self.assertGreaterEqual(list(summary['live_warning_counts'].values())[0], 10)

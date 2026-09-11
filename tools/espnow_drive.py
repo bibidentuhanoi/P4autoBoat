@@ -449,6 +449,15 @@ LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # gate + STOP confirm: a change publish 
 # STOP confirmation keep their own, tighter limits.
 LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S = 3.5
 LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S = 4.0   # ~1 Hz publish; two lost + jitter
+# The boat is ALIVE if field telemetry (20 Hz, same radio, same firmware) is this
+# fresh. Then a missing once-a-second status packet is a lost packet, not a dead
+# boat: bench 2026-09-11 lost three and four in a row with telemetry still
+# flowing. While alive, the status streams may go stale up to the hard cap below
+# (their receive ages are in every recorded row); once telemetry goes quiet
+# too, the limits above apply. The boat's own link-loss failsafe and the
+# operator's STOP do not depend on any of this.
+LAKE_ID_TELEM_ALIVE_S = 0.5
+LAKE_ID_STATUS_ALIVE_CAP_S = 10.0
 LAKE_ID_SYSTEMSTATUS_MAX_AGE_S = 3.0    # ~1 Hz publish; three missed = gone
 LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 300 ms lease
 LAKE_ID_STOP_CONFIRM_MAX_AGE_S = 1.5
@@ -1035,7 +1044,9 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
                              'systemstatus_gate': LAKE_ID_SYSTEMSTATUS_MAX_AGE_S,
                              'systemstatus_powered': LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S,
                              'stop_confirm': LAKE_ID_STOP_CONFIRM_MAX_AGE_S,
-                             'browser_supervision': LAKE_ID_SUPERVISION_S}),
+                             'browser_supervision': LAKE_ID_SUPERVISION_S,
+                             'telemetry_alive': LAKE_ID_TELEM_ALIVE_S,
+                             'status_alive_cap': LAKE_ID_STATUS_ALIVE_CAP_S}),
         'mode': {
             'motor_p': 'ON', 'rudder_assist': 'OFF',
             'required': ('Motor P ON and Rudder Assist OFF for the whole run, confirmed by the '
@@ -3111,7 +3122,8 @@ class BoatLink:
                     'drive_started': None, 'drive_confirmed': False,
                     'ms_seen_rx': None, 'zero_since': None,
                     'stop_entered_at': None, 'stop_confirmed': None, 'teardown_logged': False,
-                    'warnings': [], 'finalizing': False,
+                    'warnings': [], 'warning_counts': {}, 'finalizing': False,
+                    'status_lossy': False,
                     'notes': notes, 'firmware_label': label, 'provenance': provenance,
                     'imu_nonfinite': False, 'imu_last': None,
                 }
@@ -3139,9 +3151,14 @@ class BoatLink:
             'event': event, 'detail': detail})
 
     def _lake_id_warn_locked(self, text):
-        """Live warning, deduplicated, visible on the card and in the events."""
+        """Live warning, deduplicated by text, visible on the card and in the
+        events. A repeat only bumps its count: a condition that holds for a
+        whole phase must not become one event per frame."""
         rt = self.lake_id
-        if rt is None or text in rt['warnings']:
+        if rt is None:
+            return
+        rt['warning_counts'][text] = rt['warning_counts'].get(text, 0) + 1
+        if text in rt['warnings']:
             return
         rt['warnings'].append(text)
         self._lake_id_event_locked('warning', text)
@@ -3202,12 +3219,28 @@ class BoatLink:
         tel_age = (now - tel['last_rx_monotonic']) if tel.get('last_rx_monotonic') is not None else None
         if tel_age is None or tel_age > LAKE_ID_TELEM_MAX_AGE_S:
             return 'telemetry stale (%.2f s)' % (tel_age if tel_age is not None else -1)
+        alive = tel_age <= LAKE_ID_TELEM_ALIVE_S
+        ms_limit = LAKE_ID_STATUS_ALIVE_CAP_S if alive else LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S
+        ss_limit = LAKE_ID_STATUS_ALIVE_CAP_S if alive else LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S
         ms_age = (now - ms['last_rx_monotonic']) if ms.get('last_rx_monotonic') is not None else None
-        if ms_age is None or ms_age > LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S:
+        if ms_age is None or ms_age > ms_limit:
             return 'MotorStatus stale (%.2f s)' % (ms_age if ms_age is not None else -1)
         ss_age = (now - ss['last_rx_monotonic']) if ss.get('last_rx_monotonic') is not None else None
-        if ss_age is None or ss_age > LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S:
+        if ss_age is None or ss_age > ss_limit:
             return 'SystemStatus stale (%.2f s)' % (ss_age if ss_age is not None else -1)
+        # On the record: a status stream older than its normal limit, kept
+        # alive by telemetry. One event per stretch, not per tick.
+        lossy = (ms_age > LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S
+                 or ss_age > LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S)
+        if lossy and not rt['status_lossy']:
+            rt['status_lossy'] = True
+            self._lake_id_event_locked('status_lossy', 'MotorStatus %.2f s / SystemStatus %.2f s old, '
+                                       'telemetry %.2f s: boat alive, status packets being lost'
+                                       % (ms_age, ss_age, tel_age))
+        elif not lossy and rt['status_lossy']:
+            rt['status_lossy'] = False
+            self._lake_id_event_locked('status_recovered', 'MotorStatus %.2f s / SystemStatus %.2f s old'
+                                       % (ms_age, ss_age))
         if not ss.get('imu_ok'):
             return 'IMU unhealthy (imu_ok=false)'
         if int(ms.get('state', 0) or 0) != 2:
@@ -3422,8 +3455,10 @@ class BoatLink:
             expected_pos = self.rudder < 0.0        # LEFT -> positive yaw hypothesis
             y = yaw_rate
             if elapsed - phase_start > 3.0 and abs(y) > 0.5 and (y > 0) != expected_pos:
-                self._lake_id_warn_locked('%s: yaw sign opposite to the hypothesis (rudder %+.2f, yaw %+.2f)'
-                                          % (phase, self.rudder, yaw_rate))
+                # Nothing that changes per frame in the text: one warning per
+                # phase, counted; the event's own timestamp says when it began.
+                self._lake_id_warn_locked('%s: yaw sign opposite to the hypothesis (rudder %+.2f)'
+                                          % (phase, self.rudder))
 
     def _abort_lake_id_locked(self, reason):
         if self.lake_id is None or self.lake_id['finalizing']:
@@ -3456,6 +3491,7 @@ class BoatLink:
             abort_phase=rt['phase'], stop_confirmed=rt['stop_confirmed'], notes=rt['notes'],
             firmware_label=rt['firmware_label'], max_gap_s=rt['max_gap_s'])
         summary['live_warnings'] = list(rt['warnings'])
+        summary['live_warning_counts'] = dict(rt['warning_counts'])
         summary['t_utc_end'] = lake_id_utc()
         # What THIS side counted; the writer adds enqueued/written/dropped.
         summary['recording'] = {'frames_received': rt['frames_received'],
