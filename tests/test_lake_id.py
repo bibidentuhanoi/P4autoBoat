@@ -327,7 +327,6 @@ class PrecheckWindowTest(LakeBase):
 
     def test_each_condition_blocks_start_on_its_own(self):
         cases = {
-            'gps_valid': lambda: self._telemetry(gps_valid=False),
             'boat_rudder_centred': lambda: self._boat(0.0, 0.0, 0.0, pwm=1540),
             'boat_zero_throttle': lambda: self._boat(0.1, 0.1, 0.0),
             'motor_p_on': lambda: self._boat(0.0, 0.0, 0.0, assist_p=False),
@@ -1782,3 +1781,48 @@ class PerformanceSummaryTest(unittest.TestCase):
         self.assertIsNotNone(ra['recovery_time_s'])
         self.assertGreaterEqual(ra['recovery_time_s'], 4.9)
         self.assertLess(ra['recovery_time_s'], 5.2)
+
+
+class GpsAdvisoryTest(LakeBase):
+    """2026-09-11: a GPS fix is advisory, not a gate. Nothing in the control
+    loop or the safeguards uses GPS; it only feeds position, speed, course
+    and the provisional radius. Indoors, or before a lock, the test must still
+    run and the record must say what is missing."""
+
+    def _no_fix_ever(self):
+        """Every frame the simulated boat sends carries no fix."""
+        real = self._telemetry
+        self._telemetry = lambda **kw: real(**dict(kw, gps_valid=False, sats=0, hdop=99.0))
+        self._telemetry()
+
+    def test_no_fix_does_not_block_start_and_is_warned_live(self):
+        self._no_fix_ever()
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self.assertNotIn('gps_valid', self.link.lake_id['precheck'] or {})
+        self._drive(2.5, boat_follows=False)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self.assertEqual(self.link.throttle, 0.2)
+        self.assertNotIn('gps_valid', self.link.lake_id['precheck'])
+        self.assertTrue(any('GPS' in w and 'no fix' in w for w in self.link.lake_id['warnings']),
+                        self.link.lake_id['warnings'])
+
+    def test_a_run_without_a_fix_completes_and_says_what_is_missing(self):
+        self._no_fix_ever()
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(2.5)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+        self._drive(56.0)
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'complete')
+        _rows, _events, s = self._files(r['name'])
+        self.assertTrue(any('no GPS fix' in w for w in s['warnings']), s['warnings'])
+        self.assertIsNone(s['straight']['steady_speed_mps'])
+        self.assertIsNone(s['turn_a']['turn_radius']['radius_m'])
+        self.assertIsNotNone(s['turn_a']['yaw']['signed_mean_yaw_dps'])    # gyro data intact
+        self.assertIsNotNone(s['turn_a']['steady_yaw_minus_bias_dps'])
+
+    def test_the_card_says_gps_is_advisory(self):
+        src = TOOL.read_text()
+        i = src.index('id="lake-card"')
+        card = src[i:src.index('</details>', i)]
+        self.assertIn('GPS fix is advisory', card)

@@ -517,6 +517,8 @@ LAKE_ID_SAMPLES_HEADER = (
     'Steering), not the motor P filter; with Rudder Assist OFF they read 0',
     '# autotrim: live while rudder is centred (straight/recover), frozen during '
     'turns; its c is not in field telemetry and is not recorded',
+    '# GPS fix is ADVISORY, not a gate: without it lat/lon/speed/course carry no fix '
+    'and the turn radius is unavailable; yaw and heading metrics are unaffected',
 )
 LAKE_ID_STATUS_COMPLETE = 'complete'
 LAKE_ID_STATUS_STOP_UNCONFIRMED = 'incomplete_stop_unconfirmed'
@@ -982,7 +984,10 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
     # ---- data quality --------------------------------------------------
     powered = [r for r in rows if windows['straight'][0] <= r['elapsed_s'] < windows['stop'][0]]
     inval = sum(1 for r in powered if not r.get('gps_valid'))
-    if powered and inval:
+    if powered and inval == len(powered):
+        warnings.append('no GPS fix during the run -- speed, course and turn radius unavailable '
+                        '(advisory: a fix is not a gate; yaw and heading metrics are unaffected)')
+    elif powered and inval:
         warnings.append('gps_valid false on %d of %d powered rows' % (inval, len(powered)))
     sats = [r['satellites'] for r in rows if isinstance(r.get('satellites'), (int, float))]
     hd = [r['hdop'] for r in rows if isinstance(r.get('hdop'), (int, float))]
@@ -3144,7 +3149,6 @@ class BoatLink:
                                     and (now - self.session_last_hb) <= LAKE_ID_SUPERVISION_S),
             'telemetry_fresh': tel_age is not None and tel_age <= LAKE_ID_TELEM_MAX_AGE_S,
             'imu_finite': bool(tel.get('have')) and finite,
-            'gps_valid': bool(tel.get('gps_valid')),
             'motorstatus_fresh': ms_age is not None and ms_age <= LAKE_ID_MOTORSTATUS_MAX_AGE_S,
             'boat_armed': int(ms.get('state', 0) or 0) == 2,
             'servo_power': bool(ms.get('servo_power')),
@@ -3267,6 +3271,14 @@ class BoatLink:
                 self._lake_id_event_locked('precheck_fail', ', '.join(unmet))
                 return self._abort_lake_id_locked('precheck failed: ' + ', '.join(unmet))
             self._lake_id_event_locked('precheck_pass', 'all conditions met at t=%.2f s' % elapsed)
+            # GPS is ADVISORY, not a gate: nothing in the control loop or the
+            # safeguards uses it. Without a fix the run still measures yaw,
+            # heading and the turn/recovery response; only position, speed,
+            # course and the provisional radius go missing -- say so now.
+            if not self.telemetry.get('gps_valid'):
+                self._lake_id_warn_locked('GPS: no fix at start (%s satellites) -- position, speed, '
+                                          'course and turn radius will be unavailable'
+                                          % self.telemetry.get('satellites'))
             ms = self.motor_status
             self._lake_id_event_locked(
                 'mode_confirmed', 'Motor P ON and Rudder Assist OFF confirmed by MotorStatus '
@@ -4369,7 +4381,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 </details>
 <details class="card" open id="lake-card">
   <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
-  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts.</div>
+  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts. GPS fix is advisory: without it the run still records yaw and heading, but position, speed, course and the turn radius are unavailable.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
     <label style="font-size:10px;">throttle</label>
     <select id="lake-throttle"><option value="0.20" selected>T20</option><option value="0.30">T30</option></select>
