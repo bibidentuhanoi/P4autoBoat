@@ -441,10 +441,14 @@ LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
 LAKE_ID_TELEM_MAX_AGE_S = 1.0
 LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # gate + STOP confirm: a change publish is due there
 # Powered phases: during a turn nothing in MotorStatus changes, so the boat only
-# re-sends it once a second, and ONE lost packet is a 2.0 s gap. Two runs died
-# that way on 2026-09-06 ("MotorStatus stale (1.56 s)"). One lost re-send is
-# tolerated; a dead link still ends the run within 2.5 s.
-LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S = 2.5
+# re-sends it once a second, and each lost packet is another 1 s of age. Two runs
+# died on 2026-09-06 at one lost re-send ("MotorStatus stale (1.56 s)") and one
+# on 2026-09-11 at two ("2.56 s", with SystemStatus lost the same way). TWO lost
+# re-sends are tolerated -- the value the rudder test already uses for the same
+# reason -- and a dead link still ends the run within 3.5 s. The gate and the
+# STOP confirmation keep their own, tighter limits.
+LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S = 3.5
+LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S = 4.0   # ~1 Hz publish; two lost + jitter
 LAKE_ID_SYSTEMSTATUS_MAX_AGE_S = 3.0    # ~1 Hz publish; three missed = gone
 LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 300 ms lease
 LAKE_ID_STOP_CONFIRM_MAX_AGE_S = 1.5
@@ -1021,7 +1025,17 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'status': status, 'reason': reason, 'abort_phase': abort_phase,
         'stop_confirmed': stop_confirmed,
         'settings': dict(settings, phases=[list(p) for p in phases],
-                         profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S),
+                         profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S,
+                         # The freshness limits that were in force: a run's record
+                         # must say how tolerant it was of a lossy link.
+                         freshness_limits_s={
+                             'telemetry': LAKE_ID_TELEM_MAX_AGE_S,
+                             'motorstatus_gate': LAKE_ID_MOTORSTATUS_MAX_AGE_S,
+                             'motorstatus_powered': LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S,
+                             'systemstatus_gate': LAKE_ID_SYSTEMSTATUS_MAX_AGE_S,
+                             'systemstatus_powered': LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S,
+                             'stop_confirm': LAKE_ID_STOP_CONFIRM_MAX_AGE_S,
+                             'browser_supervision': LAKE_ID_SUPERVISION_S}),
         'mode': {
             'motor_p': 'ON', 'rudder_assist': 'OFF',
             'required': ('Motor P ON and Rudder Assist OFF for the whole run, confirmed by the '
@@ -3192,7 +3206,7 @@ class BoatLink:
         if ms_age is None or ms_age > LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S:
             return 'MotorStatus stale (%.2f s)' % (ms_age if ms_age is not None else -1)
         ss_age = (now - ss['last_rx_monotonic']) if ss.get('last_rx_monotonic') is not None else None
-        if ss_age is None or ss_age > LAKE_ID_SYSTEMSTATUS_MAX_AGE_S:
+        if ss_age is None or ss_age > LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S:
             return 'SystemStatus stale (%.2f s)' % (ss_age if ss_age is not None else -1)
         if not ss.get('imu_ok'):
             return 'IMU unhealthy (imu_ok=false)'

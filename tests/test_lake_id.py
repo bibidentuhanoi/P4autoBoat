@@ -540,9 +540,21 @@ class AbortTest(LakeBase):
 
     def test_motorstatus_stale(self):
         self._powered()
-        self.clock.advance(2.6); self._hb(); self._telemetry(); self._system()
+        self.clock.advance(3.6); self._hb(); self._telemetry(); self._system()
         self._tick()
         self._assert_aborted('MotorStatus stale')
+
+    def test_two_lost_status_resends_do_not_abort_a_powered_phase(self):
+        """Bench, 2026-09-11: the link lost two consecutive once-a-second
+        re-sends of BOTH MotorStatus and SystemStatus. Powered phases now
+        tolerate two lost re-sends (MotorStatus 3.5 s, SystemStatus 4.0 s);
+        the gate and the STOP confirmation keep their own limits."""
+        self._powered()
+        self.clock.advance(3.0); self._hb(); self._telemetry()
+        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 3.5)
+        self._tick()
+        self.assertIsNotNone(self.link.lake_id, 'a 3.0 s MotorStatus / 3.5 s SystemStatus gap aborted the run')
+        self.assertEqual(self.link.throttle, 0.2)
 
     def test_one_lost_status_resend_does_not_abort_a_powered_phase(self):
         """Field, 2026-09-06: during a turn nothing in MotorStatus changes, so
@@ -555,12 +567,34 @@ class AbortTest(LakeBase):
         self.assertIsNotNone(self.link.lake_id, 'a 2.0 s MotorStatus gap aborted the run')
         self.assertEqual(self.link.throttle, 0.2)
 
-    def test_systemstatus_stale_after_three_seconds(self):
+    def test_systemstatus_stale_after_four_seconds(self):
         self._powered()
         self._drive(2.5, boat_follows=True)
-        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 3.1)
+        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 4.1)
         self._tick()
         self._assert_aborted('SystemStatus stale')
+
+    def test_the_gate_still_needs_systemstatus_within_three_seconds(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(1.9, boat_follows=False)
+        self.clock.advance(0.2); self._hb()
+        for d in ('telemetry', 'motor_status'):
+            setattr(self.link, d, dict(getattr(self.link, d), last_rx_monotonic=self.clock.t))
+        self.link.system_status = dict(self.link.system_status, last_rx_monotonic=self.clock.t - 3.2)
+        self._tick()
+        r = self._wait_result()
+        self.assertIn('systemstatus_fresh', r['reason'])
+
+    def test_the_limits_in_force_are_written_into_the_summary(self):
+        r = self._run_full()
+        _rows, _events, s = self._files(r['name'])
+        lim = s['settings']['freshness_limits_s']
+        self.assertEqual(lim['motorstatus_gate'], T.LAKE_ID_MOTORSTATUS_MAX_AGE_S)
+        self.assertEqual(lim['motorstatus_powered'], T.LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S)
+        self.assertEqual(lim['systemstatus_gate'], T.LAKE_ID_SYSTEMSTATUS_MAX_AGE_S)
+        self.assertEqual(lim['systemstatus_powered'], T.LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S)
+        self.assertEqual(lim['telemetry'], T.LAKE_ID_TELEM_MAX_AGE_S)
+        self.assertEqual(lim['stop_confirm'], T.LAKE_ID_STOP_CONFIRM_MAX_AGE_S)
 
     def test_imu_unhealthy(self):
         self._powered()
