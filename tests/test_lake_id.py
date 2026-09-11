@@ -1925,3 +1925,106 @@ class WarningFloodTest(LakeBase):
         _rows, _events, summary = self._files(r['name'])
         self.assertEqual(len(summary['live_warnings']), 1)
         self.assertGreaterEqual(list(summary['live_warning_counts'].values())[0], 10)
+
+
+class BoatFailsafeTest(LakeBase):
+    """The boat's own link-loss failsafe: no command heard for 0.4 s -> motors
+    zero, servo rail cut (not latched; a zero command never re-powers it).
+    Bench 2026-09-11: run 013 died at 56.0 s, in the STOP phase, on
+    'servo power lost' -- 4 s from COMPLETE, with the motors already zero."""
+
+    def _to_stop(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(52.5)
+        self.assertEqual(self.link.lake_id['phase'], 'stop')
+
+    def test_failsafe_during_stop_does_not_abort_and_the_run_completes(self):
+        self._to_stop()
+        self._drive(1.0)
+        self._boat(0.0, 0.0, 0.0, servo=False)          # rail cut by the boat, zeros applied
+        self._tick()
+        self.assertIsNotNone(self.link.lake_id, 'the boat failsafe during STOP aborted the run')
+        real = self._boat
+        self._boat = lambda *a, **kw: real(*a, **dict(kw, servo=False))
+        self._drive(5.0)
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'complete')
+        self.assertTrue(r['stop_confirmed'])
+        _rows, events, summary = self._files(r['name'])
+        self.assertIn('boat_failsafe', [e['event'] for e in events])
+        self.assertTrue(any('failsafe' in w for w in summary['live_warnings']), summary['live_warnings'])
+
+    def test_stale_status_during_stop_does_not_abort(self):
+        self._to_stop()
+        self.clock.advance(4.0); self._hb()
+        self.link.telemetry = dict(self.link.telemetry, last_rx_monotonic=self.clock.t - 0.8)
+        self._tick()
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertEqual(self.link.throttle, 0.0)
+
+    def test_failsafe_in_a_powered_phase_still_aborts_and_is_named(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self._boat(0.0, 0.0, 0.0, servo=False)
+        self._tick()
+        r = self._wait_result()
+        self.assertEqual(r['status'], 'aborted')
+        self.assertIn('servo power', r['reason'])
+        self.assertIn('failsafe', r['reason'])
+        _rows, events, _s = self._files(r['name'])
+        self.assertIn('boat_failsafe', [e['event'] for e in events])
+
+    def test_start_powers_the_rail_when_the_boat_reports_it_off(self):
+        raw = []
+        inner = self.link._write_locked
+
+        def capture(payload):
+            raw.append(bytes(payload)); return inner(payload)
+        self.link._write_locked = capture
+        self._boat(0.0, 0.0, 0.0, servo=False)          # rail off after a failsafe
+        ok, err = self._start(); self.assertTrue(ok, err)
+        kinds = []
+        for p in raw:
+            m = self.link.pb2.BoatMessage(); m.ParseFromString(p)
+            kinds.append((m.WhichOneof('payload'), m.servo_power.on if m.WhichOneof('payload') == 'servo_power' else None))
+        self.assertIn(('servo_power', True), kinds)
+        self._writer_idle()
+        ev = [e['event'] for e in csv.DictReader(open(self.tmp / self.link.lake_id['name'] / 'events.csv'))]
+        self.assertIn('servo_rail_power_on_sent', ev)
+        self._boat(0.0, 0.0, 0.0, servo=True)           # the boat re-powers it
+        self._drive(2.2, boat_follows=False)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+
+
+class LakeUplinkLoadTest(LakeBase):
+    """The laptop-to-boat direction is the one the boat's 0.4 s failsafe
+    watches. During a lake run the winch is always zero, so its packet is a
+    third of the uplink for nothing; it is not sent while a lake run owns
+    the controls. Manual driving is untouched."""
+
+    def _run_stream(self, seconds):
+        self.link._stop = threading.Event()
+        self.link.send_hz = 15.0
+        th = threading.Thread(target=self.link._stream_loop, daemon=True)
+        th.start(); time.sleep(seconds); self.link._stop.set(); th.join(2.0)
+
+    def test_no_winch_packet_during_a_lake_run_but_still_without_one(self):
+        kinds = []
+        inner = self.link._write_locked
+
+        def capture(payload):
+            m = self.link.pb2.BoatMessage(); m.ParseFromString(payload)
+            kinds.append(m.WhichOneof('payload')); return inner(payload)
+        self.link._write_locked = capture
+        self.link._now = time.monotonic                 # the real loop uses the real clock
+        self.link.session_last_hb = time.monotonic()
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._run_stream(0.3)
+        self.assertIn('motor', kinds); self.assertIn('steer', kinds)
+        self.assertNotIn('winch', kinds, 'the winch packet was sent during a lake run')
+        with self.link._lock:
+            self.link._abort_lake_id_locked('test')
+        self._wait_result()
+        kinds.clear()
+        self._run_stream(0.3)
+        self.assertIn('winch', kinds, 'manual driving must keep sending the winch keepalive')

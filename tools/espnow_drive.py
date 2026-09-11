@@ -519,9 +519,9 @@ LAKE_ID_SAMPLES_HEADER = (
     '# gps_values_changed is ADVISORY only: lat/lon/speed/course differ from the '
     'previous row. It is not a fix flag, timestamp or sequence and must not be '
     'used for GPS rate, latency or freshness; GPS is 10 Hz under 20 Hz frames',
-    '# mode: Motor P ON and Rudder Assist OFF for the whole run, required and confirmed by '
-    'the boat before any throttle; the tool never toggles a mode during the run',
-    '# the firmware zeroes the Motor P correction while the rudder is deflected (|rudder| > '
+    '# mode: see summary.json mode and settings.raw_throttle_test. Normal runs require '
+    'Motor P ON; raw diagnostic runs require Motor P OFF. Rudder Assist stays OFF',
+    '# in normal firmware the Motor P correction is zero while the rudder is deflected (|rudder| > '
     '0.02) and resumes it when centred, driving, throttle >= 0.15 and |yaw| <= 10 deg/s',
     '# boat_assist_motor_p is the P SWITCH as the boat reports it, not proof of a nonzero '
     'correction; the P correction value and the learned trim c are NOT in field telemetry '
@@ -792,7 +792,11 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
              if isinstance(r.get('boat_applied_right_cmd'), (int, float))
              and isinstance(r.get('boat_applied_left_cmd'), (int, float))]
     straight = {
-        'note': ('straight running with Motor P ON and autotrim live: observed yaw/heading/'
+        'note': ('raw throttle diagnostic: equal requested motor commands, C/P trim and '
+                 'ESC shaping bypassed by the selected firmware; yaw can also reflect '
+                 'hull, rudder, wind or current, not only motor mismatch'
+                 if settings.get('raw_throttle_test') else
+                 'straight running with Motor P ON and autotrim live: observed yaw/heading/'
                  'course bias plus the commanded L/R differential -- NOT a measurement of '
                  'physical motor mismatch, and not P\'s isolated contribution'),
         'yaw': _lake_phase_yaw(rows, windows['straight']),
@@ -1062,6 +1066,13 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
                            'in field telemetry and are not recorded; boat_yaw_filt_dps and '
                            'boat_yaw_target_dps belong to the rudder controller (Assisted Steering), '
                            'not the motor P filter'),
+        } if not settings.get('raw_throttle_test') else {
+            'motor_p': 'OFF', 'rudder_assist': 'OFF',
+            'raw_throttle_test': True,
+            'required': 'Motor P OFF and Rudder Assist OFF, confirmed by MotorStatus',
+            'trim_and_shaping': 'bypassed in CONFIG_ESC_RAW_THROTTLE_TEST firmware',
+            'limitation': 'The launch option identifies the intended build; telemetry '
+                          'does not verify the firmware switch or measure RPM/thrust.',
         },
         'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown',
                            firmware_label_note=LAKE_ID_FIRMWARE_LABEL_NOTE),
@@ -1080,7 +1091,9 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             'it does not demonstrate or prove assisted waypoint steering; it is preparation for it',
             'turn phases measure the rudder response of the operational boat with P gated off by '
             'the firmware during the deflection',
-            'recoveries are recovery with Motor P and autotrim active, not passive hull tests',
+            ('recoveries use raw throttle with motor corrections disabled'
+             if settings.get('raw_throttle_test') else
+             'recoveries are recovery with Motor P and autotrim active, not passive hull tests'),
             'straight bias is not a direct measurement of physical motor mismatch',
             'turn radius is provisional; its inputs and rules are reported with it',
             'the P flag is the switch state, not proof of a nonzero correction; learned c and the '
@@ -1662,8 +1675,9 @@ class BoatLink:
     "first connect ever" special case to get the thread going).
     """
 
-    def __init__(self, boat_pb2, send_hz: float = SEND_HZ):
+    def __init__(self, boat_pb2, send_hz: float = SEND_HZ, raw_throttle_test=False):
         self.pb2 = boat_pb2
+        self.raw_throttle_test = bool(raw_throttle_test)
         self.send_hz = send_hz
         self._lock = threading.Lock()
         self.ser = None
@@ -2382,6 +2396,8 @@ class BoatLink:
         differential-thrust assist, rudder_assist is the RUDDER yaw-rate loop --
         but they ride one message so the boat never sees a moment with both on.
         The firmware refuses that combination too; this just never asks."""
+        if getattr(self, 'raw_throttle_test', False) and (p_on or rudder_assist):
+            return False, 'raw throttle test requires Motor P and Rudder Assist OFF'
         if p_on and rudder_assist:
             return False, 'motor P assist and Assisted Steering are mutually exclusive'
         if not self.connected:
@@ -3051,7 +3067,10 @@ class BoatLink:
             return 'ARM first — the lake test spins the thrusters'
         if self.session_id is None:
             return 'no browser control session — reload the page'
-        if not self.p_assist_on:
+        if getattr(self, 'raw_throttle_test', False):
+            if self.p_assist_on:
+                return 'Motor P must be OFF for the raw throttle test'
+        elif not self.p_assist_on:
             return 'Motor P must be ON — use the P toggle first, then START'
         if self.assist_rudder_on or self._assist_off_pending_locked():
             return 'Rudder Assist must be OFF, confirmed by the boat — turn it off first'
@@ -3078,7 +3097,8 @@ class BoatLink:
         magnitude = min(LAKE_ID_MAGNITUDES, key=lambda m: abs(m - magnitude))
         notes = {k: str((notes or {}).get(k, '') or '')[:500] for k in LAKE_ID_NOTE_FIELDS}
         label = (firmware_label if isinstance(firmware_label, str) and firmware_label.strip()
-                 else LAKE_ID_FIRMWARE_LABEL_DEFAULT)
+                 else ('raw-throttle-test' if getattr(self, 'raw_throttle_test', False)
+                       else LAKE_ID_FIRMWARE_LABEL_DEFAULT))
         # ---- pass 1: validate under the lock; claims nothing ---------------
         with self._lock:
             why = self._lake_id_refusal_locked(command_seq)
@@ -3111,6 +3131,7 @@ class BoatLink:
                 now = self._now()
                 self.lake_id = {
                     't0': now, 'throttle': throttle, 'magnitude': magnitude,
+                    'raw_throttle_test': getattr(self, 'raw_throttle_test', False),
                     'order': order, 'condition': cond, 'index': index, 'name': name,
                     'dir': str(directory),
                     'phases': lake_id_phases(throttle, magnitude, order),
@@ -3123,7 +3144,7 @@ class BoatLink:
                     'ms_seen_rx': None, 'zero_since': None,
                     'stop_entered_at': None, 'stop_confirmed': None, 'teardown_logged': False,
                     'warnings': [], 'warning_counts': {}, 'finalizing': False,
-                    'status_lossy': False,
+                    'status_lossy': False, 'failsafe_logged': False,
                     'notes': notes, 'firmware_label': label, 'provenance': provenance,
                     'imu_nonfinite': False, 'imu_last': None,
                 }
@@ -3135,6 +3156,15 @@ class BoatLink:
                                            % LAKE_ID_PRECHECK_S)
                 self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
                 self.motor_split = False; self.rudder = 0.0
+                # After the boat's failsafe the rail stays OFF until a NON-ZERO
+                # command, and the precheck only ever sends zeros -- so it would
+                # refuse on servo_power every time. Ask once; the gate still
+                # needs the boat's own confirmation.
+                if self.motor_status.get('have') and not self.motor_status.get('servo_power'):
+                    if self._send_servo_power_locked(True):
+                        self._lake_id_event_locked('servo_rail_power_on_sent',
+                                                   'boat reported the servo rail OFF at START: PWR-ON sent '
+                                                   'once; the gate still needs the boat to confirm it')
                 return True, None
         writer.discard()                      # disk work: outside the lock again
         return False, why
@@ -3190,8 +3220,10 @@ class BoatLink:
                                     and abs(pwm - LAKE_ID_RUDDER_NEUTRAL_US) <= LAKE_ID_RUDDER_CENTRE_TOL_US),
             # Both the request AND the boat's own answer, in a fresh MotorStatus:
             # the two can disagree and only the boat's is real.
-            'motor_p_on': (bool(self.p_assist_on) and bool(ms.get('have'))
-                           and bool(ms.get('assist_motor_p'))),
+            ('motor_p_off' if getattr(self, 'raw_throttle_test', False) else 'motor_p_on'):
+                (bool(ms.get('have')) and
+                 bool(self.p_assist_on) == (not getattr(self, 'raw_throttle_test', False)) and
+                 bool(ms.get('assist_motor_p')) == (not getattr(self, 'raw_throttle_test', False))),
             'rudder_assist_off': (not ms.get('assist_rudder') and not self._assist_off_pending_locked()),
             'systemstatus_fresh': ss_age is not None and ss_age <= LAKE_ID_SYSTEMSTATUS_MAX_AGE_S,
             'imu_ok': bool(ss.get('imu_ok')),
@@ -3216,6 +3248,25 @@ class BoatLink:
             return 'recording failed: %s' % self._lake_writer.error
         if rt['imu_nonfinite']:
             return 'non-finite IMU value'
+        # The boat's OWN link-loss failsafe (no command heard for 0.4 s): motors
+        # zeroed, servo rail cut, not latched. It shows up here as the rail
+        # reported OFF with the boat still armed. On the record once per stretch.
+        rail_off = bool(ms.get('have')) and not ms.get('servo_power')
+        if rail_off and not rt['failsafe_logged']:
+            rt['failsafe_logged'] = True
+            self._lake_id_event_locked('boat_failsafe', 'boat cut its servo rail: it stopped hearing '
+                                       'the laptop for 0.4 s (its link-loss failsafe); L=%s R=%s'
+                                       % (ms.get('left_throttle'), ms.get('right_throttle')))
+            self._lake_id_warn_locked('boat link-loss failsafe tripped (it stopped hearing the laptop '
+                                      'for 0.4 s: motors zeroed, servo rail cut)')
+        elif not rail_off:
+            rt['failsafe_logged'] = False
+        if ph is not None and ph[0] == 'stop':
+            # Zeros are already commanded and the STOP confirmation owns what
+            # happens next. A lossy link, the boat's failsafe, a lost mode flag
+            # or a quiet browser cannot make the boat less safe now, and each
+            # would only throw away a finished profile seconds before its record.
+            return None
         tel_age = (now - tel['last_rx_monotonic']) if tel.get('last_rx_monotonic') is not None else None
         if tel_age is None or tel_age > LAKE_ID_TELEM_MAX_AGE_S:
             return 'telemetry stale (%.2f s)' % (tel_age if tel_age is not None else -1)
@@ -3246,10 +3297,14 @@ class BoatLink:
         if int(ms.get('state', 0) or 0) != 2:
             return 'boat not armed (state %s)' % ms.get('state')
         if not ms.get('servo_power'):
-            return 'servo power lost'
+            return ("servo power lost — the boat's link-loss failsafe cut the rail (it heard no "
+                    "command for 0.4 s)")
         if ms.get('assist_rudder') or self.assist_rudder_on:
             return 'mode changed: Rudder Assist reported ON (must stay OFF)'
-        if not ms.get('assist_motor_p') or not self.p_assist_on:
+        if getattr(self, 'raw_throttle_test', False):
+            if ms.get('assist_motor_p') or self.p_assist_on:
+                return 'mode changed: Motor P reported ON (must stay OFF for raw test)'
+        elif not ms.get('assist_motor_p') or not self.p_assist_on:
             return 'mode changed: Motor P reported OFF (must stay ON)'
         if self.session_id is None or (now - self.session_last_hb) > LAKE_ID_SUPERVISION_S:
             return 'browser supervision lost'
@@ -3328,7 +3383,7 @@ class BoatLink:
                                           % self.telemetry.get('satellites'))
             ms = self.motor_status
             self._lake_id_event_locked(
-                'mode_confirmed', 'Motor P ON and Rudder Assist OFF confirmed by MotorStatus '
+                'mode_confirmed', 'Requested Motor P mode and Rudder Assist OFF confirmed by MotorStatus '
                 '(assist_motor_p=%d, assist_rudder=%d, request_id=%s)'
                 % (1 if ms.get('assist_motor_p') else 0, 1 if ms.get('assist_rudder') else 0,
                    ms.get('assist_request_id')))
@@ -3485,6 +3540,7 @@ class BoatLink:
         self._lake_id_event_locked('finalize_started', 'flushing CSVs, writing summary.json')
         rt['finalizing'] = True
         settings = {'throttle': rt['throttle'], 'magnitude': rt['magnitude'], 'order': rt['order'],
+                    'raw_throttle_test': rt.get('raw_throttle_test', False),
                     'condition': rt['condition'], 'index': rt['index'], 'name': rt['name']}
         summary = lake_id_summarize(
             rt['rows'], list(range(rt['events'])), settings, rt['provenance'], status, reason,
@@ -3751,7 +3807,9 @@ class BoatLink:
                 'lake_id_next': self.lake_id_next(),
                 'lake_id_defaults': {'throttles': list(LAKE_ID_THROTTLES),
                                      'magnitudes': list(LAKE_ID_MAGNITUDES),
-                                     'firmware_label': LAKE_ID_FIRMWARE_LABEL_DEFAULT,
+                                     'firmware_label': ('raw-throttle-test' if getattr(self, 'raw_throttle_test', False)
+                                                        else LAKE_ID_FIRMWARE_LABEL_DEFAULT),
+                                     'raw_throttle_test': getattr(self, 'raw_throttle_test', False),
                                      'note_fields': list(LAKE_ID_NOTE_FIELDS)},
                 'rudder_test': ({
                     'active': True,
@@ -3914,7 +3972,11 @@ class BoatLink:
                                 self.rudder_test.get('assisted'):
                             ok = self._send_steer_rate_locked(
                                 self.rudder_test.get('rate_dps', 0.0)) and ok
-                        ok = self._send_winch_locked(self.winch_speed) and ok
+                        # A lake run never moves the winch: its packet is a third
+                        # of the uplink the boat's 0.4 s failsafe watches, for
+                        # nothing. Manual driving keeps the keepalive as before.
+                        if self.winch_speed != 0.0 or getattr(self, 'lake_id', None) is None:
+                            ok = self._send_winch_locked(self.winch_speed) and ok
                         self._rudder_test_after_send_locked(ok)
             # File I/O deliberately outside the lock -- a few ms of CSV write
             # must never sit inside the 15 Hz command loop's critical section.
@@ -4430,6 +4492,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
 </details>
 <details class="card" open id="lake-card">
+  <div id="lake-raw-mode" style="color:var(--warn);"></div>
   <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
   <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts. GPS fix is advisory: without it the run still records yaw and heading, but position, speed, course and the turn radius are unavailable.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
@@ -5077,6 +5140,10 @@ function renderLakeId(s) {
   const li = s.lake_id, lr = s.lake_id_result;
   _lakeNextCache = s.lake_id_next || null;
   if (s.lake_id_defaults) {
+    if (s.lake_id_defaults.raw_throttle_test) {
+      $('lake-raw-mode').textContent = 'RAW THROTTLE TEST: Motor P and Rudder Assist must stay OFF. Use the matching raw-test firmware; linked throttle sends equal linear commands.';
+      $('lake-card').querySelector('summary + div').hidden = true;
+    }
     buildLakeNotes(s.lake_id_defaults.note_fields);
     if (!_lakeFwPrefilled && !$('lake-fw').value) {
       $('lake-fw').value = s.lake_id_defaults.firmware_label;   // prefilled, editable, never silently replaced
@@ -6195,6 +6262,9 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--http-port', type=int, default=8765,
                     help='local port for the control page (default: 8765)')
+    ap.add_argument('--raw-throttle-test', action='store_true',
+                    help='use CONFIG_ESC_RAW_THROTTLE_TEST firmware; lake runs require '
+                         'Motor P OFF and record the raw diagnostic mode')
     ap.add_argument('--hz', type=float, default=SEND_HZ,
                     help=f'command send rate to the boat (default: {SEND_HZ}). '
                          'Diagnostic knob: if the link stalls under sustained '
@@ -6211,7 +6281,7 @@ def main() -> int:
         return 1
 
     boat_pb2 = load_boat_pb2()
-    link = BoatLink(boat_pb2, send_hz=args.hz)
+    link = BoatLink(boat_pb2, send_hz=args.hz, raw_throttle_test=args.raw_throttle_test)
     Handler.link = link
     print(f'Command send rate: {args.hz} Hz')
 
