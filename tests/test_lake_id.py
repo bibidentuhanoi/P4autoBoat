@@ -1114,7 +1114,9 @@ class NextOrderReachesThePageTest(unittest.TestCase):
     def test_a_real_link_has_the_cache_from_construction(self):
         link = T.BoatLink(T.load_boat_pb2())
         nxt = link.lake_id_next()
-        self.assertEqual(sorted(nxt), ['T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
+        # the straight-run indices ride the same cache (STRAIGHT 10s, 2026-09-12)
+        self.assertEqual(sorted(nxt), ['STRAIGHT_T20', 'STRAIGHT_T30',
+                                       'T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
         self.assertIn(nxt['T20_M30']['next_order'], ('LR', 'RL'))
 
     def test_the_websocket_producer_fills_the_cache_too(self):
