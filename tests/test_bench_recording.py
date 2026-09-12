@@ -294,7 +294,12 @@ class BaseLongPipelineTest(unittest.TestCase):
 
     def test_there_is_a_separate_clearly_labelled_button(self):
         self.assertIn('id="bench-base-long"', self.tool)
-        self.assertIn("runBench('both_long', 0)", self.tool)
+        # Since 2026-09-12 the button drives the run from the laptop (the lake
+        # test's machinery, profile 'straight'): the boat's main firmware has no
+        # 10 s bench kind and silently ran a 3 s BASE when sent kind 3.
+        self.assertIn("$('bench-base-long').addEventListener('click', () => runLakeId('straight'));",
+                      self.tool)
+        self.assertNotIn("runBench('both_long', 0)", self.tool)
         # ...and the ordinary BASE button is untouched
         self.assertIn("$('bench-base').addEventListener('click', "
                       "() => runBench('both', 0));", self.tool)

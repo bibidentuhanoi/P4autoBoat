@@ -438,7 +438,9 @@ LAKE_ID_STOP_S = 5.0
 LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
 LAKE_ID_POWERED_S = 50.0
 LAKE_ID_PROFILES = ('full', 'straight')  # the 57 s steering ID, or straight-only
-STRAIGHT_RUN_S = 10.0                    # STRAIGHT 10s: precheck 2 + straight 10 + stop 5 = 17 s
+STRAIGHT_RUN_S = 10.0                    # BASE 10s (laptop-driven): precheck 2 + straight 10 + stop 5 = 17 s
+STRAIGHT_THROTTLE_MIN = 0.05             # the bench card's throttle box, as a fraction
+STRAIGHT_THROTTLE_MAX = 0.60
 LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
 LAKE_ID_TELEM_MAX_AGE_S = 1.0
 LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # gate + STOP confirm: a change publish is due there
@@ -683,8 +685,7 @@ def straight_run_scan(directory):
                 and not summary.get('write_error')):
             c['complete'] += 1
     result = {}
-    for t in LAKE_ID_THROTTLES:
-        cond = straight_run_condition(t)
+    for cond in set(out) | {straight_run_condition(t) for t in LAKE_ID_THROTTLES}:
         c = out.get(cond, {'complete': 0, 'max_index': 0})
         result[cond] = {'complete_runs': c['complete'], 'next_index': c['max_index'] + 1}
     return result
@@ -3365,12 +3366,21 @@ class BoatLink:
             throttle = float(throttle); magnitude = float(magnitude)
         except (TypeError, ValueError):
             return False, 'throttle and magnitude must be numbers'
-        if not any(abs(throttle - t) < 1e-9 for t in LAKE_ID_THROTTLES):
-            return False, 'throttle must be one of %s' % (LAKE_ID_THROTTLES,)
-        throttle = min(LAKE_ID_THROTTLES, key=lambda t: abs(t - throttle))
         if profile == 'straight':
+            # The bench card's throttle box, like the BASE tests this stands in
+            # for: any whole percent in STRAIGHT_THROTTLE_MIN..MAX, refused
+            # outside it and never clamped -- a run starts from the value the
+            # operator chose or not at all.
+            if not (math.isfinite(throttle)
+                    and STRAIGHT_THROTTLE_MIN - 1e-9 <= throttle <= STRAIGHT_THROTTLE_MAX + 1e-9):
+                return False, ('throttle must be between %d%% and %d%% for a straight run'
+                               % (round(STRAIGHT_THROTTLE_MIN * 100), round(STRAIGHT_THROTTLE_MAX * 100)))
+            throttle = round(throttle, 2)
             magnitude = 0.0               # no turns: the rudder stays centred throughout
         else:
+            if not any(abs(throttle - t) < 1e-9 for t in LAKE_ID_THROTTLES):
+                return False, 'throttle must be one of %s' % (LAKE_ID_THROTTLES,)
+            throttle = min(LAKE_ID_THROTTLES, key=lambda t: abs(t - throttle))
             if not any(abs(magnitude - m) < 1e-9 for m in LAKE_ID_MAGNITUDES):
                 return False, 'rudder magnitude must be one of %s' % (LAKE_ID_MAGNITUDES,)
             magnitude = min(LAKE_ID_MAGNITUDES, key=lambda m: abs(m - magnitude))
@@ -3391,7 +3401,7 @@ class BoatLink:
         self._lake_id_next_cache = scan
         if profile == 'straight':
             cond = straight_run_condition(throttle)
-            order, index = 'NA', scan[cond]['next_index']
+            order, index = 'NA', scan.get(cond, {'next_index': 1})['next_index']
             name = '%s_%03d' % (cond, index)
         else:
             cond = lake_id_condition(throttle, magnitude)
@@ -4770,7 +4780,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
     <button id="bench-left" title="port jet commanded stronger, starboard weaker (before trim)">LEFT MOTOR STRONGER</button>
     <button id="bench-right" title="starboard jet commanded stronger, port weaker (before trim)">RIGHT MOTOR STRONGER</button>
     <button id="bench-base" title="both equal -- any turn IS the mismatch; 3 s drive">BASE TEST</button>
-    <button id="bench-base-long" title="the SAME base test, driven 10 s instead of 3 -- for open water, where the trim learner has room to converge. Same throttle, learner, P, aborts and recording; only the duration differs. Files as BASE10_*, never pooled with 3 s BASE runs.">BASE TEST 10s</button>
+    <button id="bench-base-long" title="BASE 10s, driven from this laptop like the lake test (the boat's current firmware only runs its own bench for 3 s): precheck 2 s, both jets at this throttle with the rudder centred for 10 s, stop 5 s. Recorded to STRAIGHT_Txx_NNN (samples, events, summary: yaw per half second, shape, dominant side, link counters). Motor P may be ON or OFF (recorded; a flip aborts); Rudder Assist must be OFF. STOP or any slider aborts. Progress shows on the Lake card.">BASE TEST 10s</button>
   </div>
   <div class="row" style="margin-top:6px;">
     <label style="min-width:auto;">Restart learner at c</label>
@@ -4835,7 +4845,6 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
     <label style="font-size:10px;">rudder</label>
     <select id="lake-mag"><option value="0.30" selected>30%</option><option value="0.60">60%</option></select>
     <button id="lake-start" title="one press runs the whole 57 s profile; STOP aborts">START LAKE TEST</button>
-    <button id="lake-straight" title="STRAIGHT 10s: precheck 2 s, then both jets at the chosen throttle with the rudder centred for 10 s, then stop 5 s -- driven from here at 15 Hz on the boat's current firmware, recorded to STRAIGHT_Txx_NNN (samples, events, summary with yaw per half second, shape, dominant side, link counters). Motor P may be ON or OFF (recorded; a flip aborts); Rudder Assist must be OFF. STOP or any slider aborts.">STRAIGHT 10s</button>
   </div>
   <div class="telem-row"><label>Next order</label><span class="val" id="lake-next">--</span></div>
   <div class="motor-slider-row" style="gap:6px;"><label style="font-size:10px;white-space:nowrap;">firmware label</label>
@@ -5378,7 +5387,10 @@ $('bench-base').addEventListener('click', () => runBench('both', 0));
 // The 10 s variant is a SEPARATE button on purpose: the 3 s BASE stays the
 // default and the safest thing to reach for, and a long run on open water is
 // always a deliberate choice, never a mode the short button can fall into.
-$('bench-base-long').addEventListener('click', () => runBench('both_long', 0));
+// It is driven from THIS laptop, like the lake test, not by the boat's bench:
+// the main firmware does not know the 10 s bench kind and silently ran a 3 s
+// BASE in its place (and filed it as BASE10).
+$('bench-base-long').addEventListener('click', () => runLakeId('straight'));
 
 // The 4.5 s sequence runs on the server's own command loop; this call returns
 // at once and progress arrives through the normal status poll. Nothing here
@@ -5392,7 +5404,6 @@ function setRudderTestLockout(on) {
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
   ['bench-left', 'bench-right', 'bench-base', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start',
-   'lake-straight',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -5441,11 +5452,10 @@ function lakeCondKey() {
 }
 function renderLakeNext() {
   const n = _lakeNextCache && _lakeNextCache[lakeCondKey()];
-  const st = _lakeNextCache && _lakeNextCache['STRAIGHT_' + lakeCondKey().split('_')[0]];
-  $('lake-next').textContent = (n
+  $('lake-next').textContent = n
     ? ((n.next_order === 'LR' ? 'LEFT then RIGHT' : 'RIGHT then LEFT') + '  (run #' + n.next_index
        + ', ' + n.complete_runs + ' complete for ' + lakeCondKey().replace('_', '/') + ')')
-    : '--') + (st ? '   |  straight run #' + st.next_index : '');
+    : '--';
 }
 function buildLakeNotes(fields) {
   if (_lakeNotesBuilt) return;
@@ -5459,20 +5469,22 @@ function buildLakeNotes(fields) {
   });
 }
 async function runLakeId(profile) {
-  if (!connected) { $('lake-msg').textContent = 'not connected'; return; }
-  $('lake-msg').textContent = '';
+  // 'straight' = BASE TEST 10s from the bench card: its throttle box, no rudder.
+  const straight = profile === 'straight';
+  const msg = straight ? $('bench-msg') : $('lake-msg');
+  if (!connected) { msg.textContent = 'not connected'; return; }
+  msg.textContent = '';
   const notes = {};
   LAKE_NOTE_FIELDS.forEach(function (k) { const el = $('lake-note-' + k); notes[k] = el ? el.value : ''; });
   const r = await api('/api/lake_id', 'POST', {
-    throttle: parseFloat($('lake-throttle').value),
-    magnitude: parseFloat($('lake-mag').value),
-    profile: profile === 'straight' ? 'straight' : 'full',
+    throttle: straight ? parseInt($('bench-throttle').value) / 100 : parseFloat($('lake-throttle').value),
+    magnitude: straight ? 0 : parseFloat($('lake-mag').value),
+    profile: straight ? 'straight' : 'full',
     firmware_label: $('lake-fw').value, notes: notes,
     seq: ++winchCommandSeq });
-  if (r && !r.ok) $('lake-msg').textContent = r.error || 'refused';
+  if (r && !r.ok) msg.textContent = r.error || 'refused';
 }
 $('lake-start').addEventListener('click', function () { runLakeId('full'); });
-$('lake-straight').addEventListener('click', function () { runLakeId('straight'); });
 $('lake-throttle').addEventListener('change', renderLakeNext);
 $('lake-mag').addEventListener('change', renderLakeNext);
 function renderLakeId(s) {
@@ -5499,7 +5511,7 @@ function renderLakeId(s) {
       + (li.precheck_unmet && li.precheck_unmet.length ? '  waiting: ' + li.precheck_unmet.join(', ') : '');
     $('lake-elapsed').textContent = li.elapsed_s.toFixed(1) + ' / ' + li.profile_s + ' s';
     $('lake-frames').textContent = li.frames;
-    $('lake-file').textContent = li.name + '  (' + (li.profile === 'straight' ? 'STRAIGHT 10 s'
+    $('lake-file').textContent = li.name + '  (' + (li.profile === 'straight' ? 'BASE 10s, laptop-driven'
       : (li.order === 'LR' ? 'LEFT then RIGHT' : 'RIGHT then LEFT')) + ')';
     $('lake-warn').textContent = (li.warnings || []).join('  |  ')
       + (li.recording_error ? '   RECORDING FAILED: ' + li.recording_error : '');
@@ -5522,13 +5534,12 @@ function renderLakeId(s) {
         + (lr.write_error ? '   WRITE ERROR: ' + lr.write_error : '');
       $('lake-elapsed').textContent = '--';
       $('lake-frames').textContent = lr.frames;
-      $('lake-file').textContent = lr.name + '  (' + (lr.profile === 'straight' ? 'STRAIGHT 10 s' : lr.order) + ')';
+      $('lake-file').textContent = lr.name + '  (' + (lr.profile === 'straight' ? 'BASE 10s, laptop-driven' : lr.order) + ')';
       $('lake-warn').textContent = (lr.summary_warnings || []).concat(lr.warnings || []).join('  |  ');
       $('lake-warn').style.color = lr.write_error ? 'var(--danger)' : 'var(--warn)';
     }
   }
   $('lake-start').disabled = !!(li && li.active) || _rtLockedOut;
-  $('lake-straight').disabled = !!(li && li.active) || _rtLockedOut;
 }
 
 // Runtime mode switch. Raw Manual is the boot mode and stays the default.

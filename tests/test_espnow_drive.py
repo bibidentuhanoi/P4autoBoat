@@ -2078,3 +2078,34 @@ setTimeout(async () => {
         last = out['lastState']
         self.assertEqual((last['throttle'], last['left'], last['right'], last['rudder']),
                          (0, 0, 0, 0))
+
+
+
+class BaseTenSecondsButtonTest(unittest.TestCase):
+    """BASE TEST 10s is driven from this laptop like the lake test. The boat's
+    main firmware does not know the 10 s bench kind and silently runs a 3 s
+    BASE, so the button must NOT go through /api/bench any more."""
+
+    def test_base_10s_starts_the_laptop_driven_straight_run(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+context.applyStatus(CONNECTED_STATUS);
+setTimeout(async () => {
+  elements['bench-throttle'].value = '25';
+  await elements['bench-base-long'].listeners.click();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const lake = calls.filter(c => c.path === '/api/lake_id').map(c => c.body);
+  const bench = calls.filter(c => c.path === '/api/bench').map(c => c.body);
+  console.log(JSON.stringify({ lake, bench }));
+  process.exit(0);
+}, 50);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['bench'], [])
+        self.assertEqual(len(out['lake']), 1)
+        self.assertEqual(out['lake'][0]['profile'], 'straight')
+        self.assertAlmostEqual(out['lake'][0]['throttle'], 0.25)
+        self.assertEqual(out['lake'][0]['magnitude'], 0)

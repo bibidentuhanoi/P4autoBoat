@@ -84,12 +84,32 @@ class StraightRunTest(LakeBase):
         self.assertEqual(self._run_straight()['name'], 'STRAIGHT_T20_001')
         self.assertEqual(self._run_straight()['name'], 'STRAIGHT_T20_002')
         self.assertEqual(self._run_straight(0.30)['name'], 'STRAIGHT_T30_001')
+        # the bench card's throttle box, not the lake test's two-value whitelist
+        self.assertEqual(self._run_straight(0.40)['name'], 'STRAIGHT_T40_001')
+
+    def test_bench_throttle_range_is_accepted_and_the_rest_refused(self):
+        for thr in (0.05, 0.25, 0.60):
+            ok, err = self._start_straight(thr)
+            self.assertTrue(ok, (thr, err))
+            self.assertEqual(self.link.lake_id['throttle'], thr)
+            with self.link._lock:
+                self.link._abort_lake_id_locked('test done')
+            self._wait_result()
+        for thr in (0.0, 0.04, 0.61, 1.0, 'x'):
+            ok, err = self._start_straight(thr)
+            self.assertFalse(ok, thr)
+            self.assertIsNone(self.link.lake_id)
+        # the lake profile keeps its whitelist
+        ok, err = self._start(throttle=0.40)
+        self.assertFalse(ok)
 
     def test_scan_hands_out_the_next_free_index_and_leaves_the_lake_scan_alone(self):
         (self.tmp / 'STRAIGHT_T20_003').mkdir()
+        (self.tmp / 'STRAIGHT_T45_002').mkdir()          # any percent, not only T20/T30
         n = T.straight_run_scan(self.tmp)
         self.assertEqual(n['STRAIGHT_T20']['next_index'], 4)
         self.assertEqual(n['STRAIGHT_T30']['next_index'], 1)
+        self.assertEqual(n['STRAIGHT_T45']['next_index'], 3)
         self.link._lake_id_refresh_next()
         nxt = self.link.lake_id_next()
         self.assertEqual(nxt['STRAIGHT_T20']['next_index'], 4)
