@@ -260,6 +260,17 @@ typedef struct _boat_BenchStatus {
     float elapsed_s;
     float learn_c; /* the trim learner's c right now (0 if compiled out) */
     bool p_on; /* the BOAT's own P-assist state, not the tool's */
+    float heading_target_deg;
+    float heading_error_deg;
+    float yaw_target_dps;
+    float p_term;
+    float i_term;
+    float dynamic_c;
+    float effective_c;
+    float c_limit;
+    bool ctrl_active;
+    bool heading_hold;
+    bool saturated;
 } boat_BenchStatus;
 
 /* Envelope — every message on the wire is a BoatMessage */
@@ -314,7 +325,7 @@ extern "C" {
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_default          {0, 0, 0}
 #define boat_BenchCommand_init_default           {0, 0, 0, 0, 0}
-#define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
@@ -337,7 +348,7 @@ extern "C" {
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_zero             {0, 0, 0}
 #define boat_BenchCommand_init_zero              {0, 0, 0, 0, 0}
-#define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -435,6 +446,17 @@ extern "C" {
 #define boat_BenchStatus_elapsed_s_tag           6
 #define boat_BenchStatus_learn_c_tag             7
 #define boat_BenchStatus_p_on_tag                8
+#define boat_BenchStatus_heading_target_deg_tag  9
+#define boat_BenchStatus_heading_error_deg_tag   10
+#define boat_BenchStatus_yaw_target_dps_tag      11
+#define boat_BenchStatus_p_term_tag              12
+#define boat_BenchStatus_i_term_tag              13
+#define boat_BenchStatus_dynamic_c_tag           14
+#define boat_BenchStatus_effective_c_tag         15
+#define boat_BenchStatus_c_limit_tag             16
+#define boat_BenchStatus_ctrl_active_tag         17
+#define boat_BenchStatus_heading_hold_tag        18
+#define boat_BenchStatus_saturated_tag           19
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
@@ -640,7 +662,18 @@ X(a, STATIC,   SINGULAR, UINT32,   samples,           4) \
 X(a, STATIC,   SINGULAR, UINT32,   file_index,        5) \
 X(a, STATIC,   SINGULAR, FLOAT,    elapsed_s,         6) \
 X(a, STATIC,   SINGULAR, FLOAT,    learn_c,           7) \
-X(a, STATIC,   SINGULAR, BOOL,     p_on,              8)
+X(a, STATIC,   SINGULAR, BOOL,     p_on,              8) \
+X(a, STATIC,   SINGULAR, FLOAT,    heading_target_deg,   9) \
+X(a, STATIC,   SINGULAR, FLOAT,    heading_error_deg,  10) \
+X(a, STATIC,   SINGULAR, FLOAT,    yaw_target_dps,   11) \
+X(a, STATIC,   SINGULAR, FLOAT,    p_term,           12) \
+X(a, STATIC,   SINGULAR, FLOAT,    i_term,           13) \
+X(a, STATIC,   SINGULAR, FLOAT,    dynamic_c,        14) \
+X(a, STATIC,   SINGULAR, FLOAT,    effective_c,      15) \
+X(a, STATIC,   SINGULAR, FLOAT,    c_limit,          16) \
+X(a, STATIC,   SINGULAR, BOOL,     ctrl_active,      17) \
+X(a, STATIC,   SINGULAR, BOOL,     heading_hold,     18) \
+X(a, STATIC,   SINGULAR, BOOL,     saturated,        19)
 #define boat_BenchStatus_CALLBACK NULL
 #define boat_BenchStatus_DEFAULT NULL
 
@@ -738,7 +771,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_ArmCommand_size                     4
 #define boat_AssistCommand_size                  10
 #define boat_BenchCommand_size                   23
-#define boat_BenchStatus_size                    41
+#define boat_BenchStatus_size                    91
 #define boat_BoatMessage_size                    13275
 #define boat_CalibrateCommand_size               4
 #define boat_CalibrateStatus_size                35

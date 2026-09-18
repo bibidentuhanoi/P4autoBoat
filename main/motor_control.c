@@ -716,6 +716,20 @@ static void bench_status_commit(void)
     st.elapsed_s  = s_bench.elapsed_s;
     st.learn_c    = motor_control_trimlearn_c();
     st.p_on       = motor_control_p_assist_on();
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    st.heading_target_deg = s_yaw_heading_out.heading_target_deg;
+    st.heading_error_deg = s_yaw_heading_out.heading_error_deg;
+    st.yaw_target_dps = s_yaw_heading_out.yaw_target_dps;
+    st.p_term = s_yaw_heading_out.p_term;
+    st.i_term = s_yaw_heading_out.i_term;
+    st.dynamic_c = s_yaw_heading_out.dynamic_c;
+    st.effective_c = s_yaw_heading_out.active
+                   ? s_yaw_heading_out.effective_c : s_trim_learn.c;
+    st.c_limit = s_yaw_heading_out.c_limit;
+    st.ctrl_active = s_yaw_heading_out.active;
+    st.heading_hold = s_yaw_heading_out.heading_hold;
+    st.saturated = s_yaw_heading_out.saturated;
+#endif
     portENTER_CRITICAL(&s_status_lock);
     s_bench_status = st;
     s_bench_status_generation++;

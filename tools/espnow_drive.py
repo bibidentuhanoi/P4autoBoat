@@ -437,8 +437,9 @@ LAKE_ID_PHASE_S = 10.0
 LAKE_ID_STOP_S = 5.0
 LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
 LAKE_ID_POWERED_S = 50.0
-LAKE_ID_PROFILES = ('full', 'straight')  # the 57 s steering ID, or straight-only
-STRAIGHT_RUN_S = 10.0                    # BASE 10s (laptop-driven): precheck 2 + straight 10 + stop 5 = 17 s
+LAKE_ID_PROFILES = ('full', 'straight', 'straight30')
+STRAIGHT_RUN_S = 3.0                     # BASE 3s: precheck 2 + straight 3 + stop 5 = 10 s
+STRAIGHT_LONG_RUN_S = 30.0               # BASE 30s: precheck 2 + straight 30 + stop 5 = 37 s
 STRAIGHT_THROTTLE_MIN = 0.05             # the bench card's throttle box, as a fraction
 STRAIGHT_THROTTLE_MAX = 0.60
 LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
@@ -553,14 +554,19 @@ LAKE_ID_STATUS_ABORTED = 'aborted'
 LAKE_ID_STATUS_RECORDING_FAILED = 'incomplete_recording_failed'
 
 
+def lake_id_is_straight_profile(profile):
+    return profile in ('straight', 'straight30')
+
+
 def lake_id_phases(throttle, magnitude, order, profile='full'):
     """(name, duration_s, throttle, rudder) x7 for the full steering ID, x3 for
     the straight-only profile. Canonical rudder: -1 = LEFT."""
     t = float(throttle)
-    if profile == 'straight':
+    if lake_id_is_straight_profile(profile):
+        run_s = STRAIGHT_LONG_RUN_S if profile == 'straight30' else STRAIGHT_RUN_S
         return (
             ('precheck', LAKE_ID_PRECHECK_S, 0.0, 0.0),
-            ('straight', STRAIGHT_RUN_S,     t,   0.0),
+            ('straight', run_s,              t,   0.0),
             ('stop',     LAKE_ID_STOP_S,     0.0, 0.0),
         )
     s = -1.0 if order == 'LR' else 1.0
@@ -598,7 +604,7 @@ def lake_id_phase_windows(phases):
 
 def lake_id_profile_s(phases):
     """Whole profile, seconds. STOP confirmation and teardown clock against
-    this, never a constant: a 17 s run must not be judged by a 57 s one."""
+    this, never a constant: a 10 s run must not be judged by a 57 s one."""
     return float(sum(p[1] for p in phases))
 
 
@@ -1173,7 +1179,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
     }
 
 
-# ---- STRAIGHT 10s: the same machinery, a straight-only profile ---------------
+# ---- STRAIGHT profiles: same machinery, straight-only powered windows --------
 STRAIGHT_BIN_S = 0.5
 STRAIGHT_START_S = 1.0        # 'start' = the first second of the powered window
 STRAIGHT_END_S = 2.0          # 'end'   = its last two seconds
@@ -1293,10 +1299,11 @@ def straight_run_analyze(rows, window):
 def straight_run_summarize(rows, events, settings, provenance, status, reason,
                            abort_phase=None, stop_confirmed=None, notes=None,
                            firmware_label=None, max_gap_s=0.0, rules=None):
-    """Pure. The record of a STRAIGHT 10s run: what was commanded, what the
+    """Pure. The record of a straight-only run: what was commanded, what the
     boat applied, what the link did, and how the yaw went -- in the shape the
     bench question asks: which way, and from when."""
-    phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'], 'straight')
+    phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'],
+                            settings.get('profile', 'straight'))
     windows = lake_id_phase_windows(phases)
     warnings = []
     coverage = {n: lake_id_phase_coverage(rows, windows[n]) for n in windows}
@@ -2095,6 +2102,11 @@ class BoatLink:
             'state': 0, 'kind': 0, 'base': 0.0,
             'samples': 0, 'file_index': 0, 'elapsed_s': 0.0,
             'learn_c': 0.0, 'p_on': False,
+            'heading_target_deg': 0.0, 'heading_error_deg': 0.0,
+            'yaw_target_dps': 0.0, 'p_term': 0.0, 'i_term': 0.0,
+            'dynamic_c': 0.0, 'effective_c': 0.0, 'c_limit': 0.0,
+            'ctrl_active': False, 'heading_hold': False,
+            'saturated': False,
         }
 
     @staticmethod
@@ -3340,7 +3352,7 @@ class BoatLink:
             return 'ARM first — the lake test spins the thrusters'
         if self.session_id is None:
             return 'no browser control session — reload the page'
-        if profile == 'straight':
+        if lake_id_is_straight_profile(profile):
             pass                          # Motor P ON or OFF: recorded, and it must not flip mid-run
         elif getattr(self, 'raw_throttle_test', False):
             if self.p_assist_on:
@@ -3366,7 +3378,7 @@ class BoatLink:
             throttle = float(throttle); magnitude = float(magnitude)
         except (TypeError, ValueError):
             return False, 'throttle and magnitude must be numbers'
-        if profile == 'straight':
+        if lake_id_is_straight_profile(profile):
             # The bench card's throttle box, like the BASE tests this stands in
             # for: any whole percent in STRAIGHT_THROTTLE_MIN..MAX, refused
             # outside it and never clamped -- a run starts from the value the
@@ -3399,7 +3411,7 @@ class BoatLink:
         scan = dict(lake_id_scan(base_dir))
         scan.update(straight_run_scan(base_dir))
         self._lake_id_next_cache = scan
-        if profile == 'straight':
+        if lake_id_is_straight_profile(profile):
             cond = straight_run_condition(throttle)
             order, index = 'NA', scan.get(cond, {'next_index': 1})['next_index']
             name = '%s_%03d' % (cond, index)
@@ -3498,7 +3510,7 @@ class BoatLink:
         reports it. Straight run: either state, but the boat's report must
         match the switch -- what gets recorded must be what actually ran."""
         rt = getattr(self, 'lake_id', None)
-        if rt is not None and rt.get('profile') == 'straight':
+        if rt is not None and lake_id_is_straight_profile(rt.get('profile')):
             return {'motor_p_consistent': (bool(ms.get('have')) and
                                            bool(ms.get('assist_motor_p')) == bool(self.p_assist_on))}
         want_on = not getattr(self, 'raw_throttle_test', False)
@@ -3611,7 +3623,7 @@ class BoatLink:
                     "command for 0.4 s)")
         if ms.get('assist_rudder') or self.assist_rudder_on:
             return 'mode changed: Rudder Assist reported ON (must stay OFF)'
-        if rt.get('profile') == 'straight':
+        if lake_id_is_straight_profile(rt.get('profile')):
             want = rt.get('p_at_start')
             if want is not None and (bool(ms.get('assist_motor_p')) != want
                                      or bool(self.p_assist_on) != want):
@@ -3871,7 +3883,7 @@ class BoatLink:
                     'raw_throttle_test': rt.get('raw_throttle_test', False),
                     'condition': rt['condition'], 'index': rt['index'], 'name': rt['name'],
                     'profile': rt['profile'], 'p_at_start': rt['p_at_start']}
-        summarize = straight_run_summarize if rt['profile'] == 'straight' else lake_id_summarize
+        summarize = straight_run_summarize if lake_id_is_straight_profile(rt['profile']) else lake_id_summarize
         summary = summarize(
             rt['rows'], list(range(rt['events'])), settings, rt['provenance'], status, reason,
             abort_phase=rt['phase'], stop_confirmed=rt['stop_confirmed'], notes=rt['notes'],
@@ -3891,7 +3903,7 @@ class BoatLink:
                    'max_gap_s': round(rt['max_gap_s'], 3),
                    'stop_confirmed': rt['stop_confirmed'], 'warnings': list(rt['warnings']),
                    'summary_warnings': list(summary['warnings'])}
-        if rt['profile'] == 'straight':
+        if lake_id_is_straight_profile(rt['profile']):
             st = summary['straight']
             pending.update(shape=st['shape'], dominant_side=st['dominant_side'],
                            total_turn_deg=st['total_turn_deg'])
@@ -3981,8 +3993,8 @@ class BoatLink:
         self.telemetry inside it, and this has to see the same bench state they
         were decoded against.
 
-        Bounded: a run is 3 s of ~20 Hz telemetry (~60 frames), or 10 s for
-        a BASE10 (~200), so a cap well above either costs nothing and stops a
+        Bounded: a firmware bench run is 3 s of ~20 Hz telemetry (~60 frames),
+        or 10 s for a BASE10 (~200), so a cap well above either costs nothing and stops a
         stuck 'driving' state (a lost
         terminal packet, say) growing this without limit for the whole
         session."""
@@ -4042,6 +4054,17 @@ class BoatLink:
                 # The BOAT's own answer, not what this tool asked for. If the
                 # two disagree the A/B is void, so it has to be visible.
                 'p_on': bool(bs.p_on),
+                'heading_target_deg': float(bs.heading_target_deg),
+                'heading_error_deg': float(bs.heading_error_deg),
+                'yaw_target_dps': float(bs.yaw_target_dps),
+                'p_term': float(bs.p_term),
+                'i_term': float(bs.i_term),
+                'dynamic_c': float(bs.dynamic_c),
+                'effective_c': float(bs.effective_c),
+                'c_limit': float(bs.c_limit),
+                'ctrl_active': bool(bs.ctrl_active),
+                'heading_hold': bool(bs.heading_hold),
+                'saturated': bool(bs.saturated),
             }
             now_driving = (int(bs.state) == BENCH_STATE_RUN)
             # Collect only across the DRIVE phase. The boat's own state is what
@@ -4779,8 +4802,9 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
          measure it. Do not rename to LEFT TURN / RIGHT TURN until it has. -->
     <button id="bench-left" title="port jet commanded stronger, starboard weaker (before trim)">LEFT MOTOR STRONGER</button>
     <button id="bench-right" title="starboard jet commanded stronger, port weaker (before trim)">RIGHT MOTOR STRONGER</button>
-    <button id="bench-base" title="both equal -- any turn IS the mismatch; 3 s drive">BASE TEST</button>
-    <button id="bench-base-long" title="BASE 10s, driven from this laptop like the lake test (the boat's current firmware only runs its own bench for 3 s): precheck 2 s, both jets at this throttle with the rudder centred for 10 s, stop 5 s. Recorded to STRAIGHT_Txx_NNN (samples, events, summary: yaw per half second, shape, dominant side, link counters). Motor P may be ON or OFF (recorded; a flip aborts); Rudder Assist must be OFF. STOP or any slider aborts. Progress shows on the Lake card.">BASE TEST 10s</button>
+    <button id="bench-base" title="boat-owned 3 s BASE recording on its SD card">BOAT BASE 3s</button>
+    <button id="bench-base-short" title="laptop-recorded normal-drive check: precheck 2 s, centred rudder at this throttle for 3 s, stop 5 s. Motor P may be ON or OFF and its confirmed switch state is recorded.">BASE TEST 3s</button>
+    <button id="bench-base-long" title="laptop-recorded normal-drive check: precheck 2 s, centred rudder at this throttle for 30 s, stop 5 s. Motor P may be ON or OFF and its confirmed switch state is recorded.">BASE TEST 30s</button>
   </div>
   <div class="row" style="margin-top:6px;">
     <label style="min-width:auto;">Restart learner at c</label>
@@ -4836,8 +4860,8 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <div style="font-size:10px;color:var(--dim);">Laptop/radio-observed, ~20&nbsp;Hz &mdash; not the boat's 100&nbsp;Hz SD recording. ARM first; STOP or DISARM aborts.</div>
 </details>
 <details class="card" open id="lake-card">
-  <div id="lake-raw-mode" style="color:var(--warn);"></div>
   <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
+  <div id="lake-raw-mode" style="color:var(--warn);"></div>
   <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts. GPS fix is advisory: without it the run still records yaw and heading, but position, speed, course and the turn radius are unavailable.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
     <label style="font-size:10px;">throttle</label>
@@ -5384,13 +5408,10 @@ async function runBench(kind, resetC) {
 $('bench-left').addEventListener('click', () => runBench('left', 0));
 $('bench-right').addEventListener('click', () => runBench('right', 0));
 $('bench-base').addEventListener('click', () => runBench('both', 0));
-// The 10 s variant is a SEPARATE button on purpose: the 3 s BASE stays the
-// default and the safest thing to reach for, and a long run on open water is
-// always a deliberate choice, never a mode the short button can fall into.
-// It is driven from THIS laptop, like the lake test, not by the boat's bench:
-// the main firmware does not know the 10 s bench kind and silently ran a 3 s
-// BASE in its place (and filed it as BASE10).
-$('bench-base-long').addEventListener('click', () => runLakeId('straight'));
+// The laptop-recorded normal-drive checks are separate deliberate durations.
+// Both take the ordinary motor path so the selected P mode participates.
+$('bench-base-short').addEventListener('click', () => runLakeId('straight'));
+$('bench-base-long').addEventListener('click', () => runLakeId('straight30'));
 
 // The 4.5 s sequence runs on the server's own command loop; this call returns
 // at once and progress arrives through the normal status poll. Nothing here
@@ -5403,7 +5424,7 @@ function setRudderTestLockout(on) {
   on = on || _lakeActive;              // a lake run locks the same controls
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
-  ['bench-left', 'bench-right', 'bench-base', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start',
+  ['bench-left', 'bench-right', 'bench-base', 'bench-base-short', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -5469,8 +5490,8 @@ function buildLakeNotes(fields) {
   });
 }
 async function runLakeId(profile) {
-  // 'straight' = BASE TEST 10s from the bench card: its throttle box, no rudder.
-  const straight = profile === 'straight';
+  // Straight profiles use the bench card's throttle box and keep rudder centred.
+  const straight = profile === 'straight' || profile === 'straight30';
   const msg = straight ? $('bench-msg') : $('lake-msg');
   if (!connected) { msg.textContent = 'not connected'; return; }
   msg.textContent = '';
@@ -5479,7 +5500,7 @@ async function runLakeId(profile) {
   const r = await api('/api/lake_id', 'POST', {
     throttle: straight ? parseInt($('bench-throttle').value) / 100 : parseFloat($('lake-throttle').value),
     magnitude: straight ? 0 : parseFloat($('lake-mag').value),
-    profile: straight ? 'straight' : 'full',
+    profile: straight ? profile : 'full',
     firmware_label: $('lake-fw').value, notes: notes,
     seq: ++winchCommandSeq });
   if (r && !r.ok) msg.textContent = r.error || 'refused';
@@ -5493,7 +5514,7 @@ function renderLakeId(s) {
   if (s.lake_id_defaults) {
     if (s.lake_id_defaults.raw_throttle_test) {
       $('lake-raw-mode').textContent = 'RAW THROTTLE TEST: Motor P and Rudder Assist must stay OFF. Use the matching raw-test firmware; linked throttle sends equal linear commands.';
-      $('lake-card').querySelector('summary + div').hidden = true;
+      $('lake-raw-mode').nextElementSibling.hidden = true;
     }
     buildLakeNotes(s.lake_id_defaults.note_fields);
     if (!_lakeFwPrefilled && !$('lake-fw').value) {
@@ -5511,7 +5532,8 @@ function renderLakeId(s) {
       + (li.precheck_unmet && li.precheck_unmet.length ? '  waiting: ' + li.precheck_unmet.join(', ') : '');
     $('lake-elapsed').textContent = li.elapsed_s.toFixed(1) + ' / ' + li.profile_s + ' s';
     $('lake-frames').textContent = li.frames;
-    $('lake-file').textContent = li.name + '  (' + (li.profile === 'straight' ? 'BASE 10s, laptop-driven'
+    $('lake-file').textContent = li.name + '  (' + (li.profile === 'straight30' ? 'BASE 30s, laptop-driven'
+      : li.profile === 'straight' ? 'BASE 3s, laptop-driven'
       : (li.order === 'LR' ? 'LEFT then RIGHT' : 'RIGHT then LEFT')) + ')';
     $('lake-warn').textContent = (li.warnings || []).join('  |  ')
       + (li.recording_error ? '   RECORDING FAILED: ' + li.recording_error : '');
@@ -5527,14 +5549,16 @@ function renderLakeId(s) {
     if (lr) {
       $('lake-phase').textContent = lr.status.toUpperCase().replace(/_/g, ' ')
         + (lr.reason ? ':  ' + lr.reason : '')
-        + (lr.profile === 'straight' && lr.shape
+        + ((lr.profile === 'straight' || lr.profile === 'straight30') && lr.shape
            ? '   ' + lr.shape + '  |  dominant: ' + lr.dominant_side
              + (lr.total_turn_deg == null ? '' : '  |  total turn ' + lr.total_turn_deg.toFixed(1) + ' deg')
            : '')
         + (lr.write_error ? '   WRITE ERROR: ' + lr.write_error : '');
       $('lake-elapsed').textContent = '--';
       $('lake-frames').textContent = lr.frames;
-      $('lake-file').textContent = lr.name + '  (' + (lr.profile === 'straight' ? 'BASE 10s, laptop-driven' : lr.order) + ')';
+      $('lake-file').textContent = lr.name + '  ('
+        + (lr.profile === 'straight30' ? 'BASE 30s, laptop-driven'
+           : lr.profile === 'straight' ? 'BASE 3s, laptop-driven' : lr.order) + ')';
       $('lake-warn').textContent = (lr.summary_warnings || []).concat(lr.warnings || []).join('  |  ');
       $('lake-warn').style.color = lr.write_error ? 'var(--danger)' : 'var(--warn)';
     }

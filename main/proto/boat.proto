@@ -244,6 +244,17 @@ message BenchStatus {
   float  elapsed_s  = 6;
   float  learn_c    = 7;  // the trim learner's c right now (0 if compiled out)
   bool   p_on       = 8;  // the BOAT's own P-assist state, not the tool's
+  float  heading_target_deg = 9;
+  float  heading_error_deg  = 10;
+  float  yaw_target_dps     = 11;
+  float  p_term             = 12;
+  float  i_term             = 13;
+  float  dynamic_c          = 14;
+  float  effective_c        = 15;
+  float  c_limit            = 16;
+  bool   ctrl_active        = 17;
+  bool   heading_hold       = 18;
+  bool   saturated          = 19;
 }
 
 // Envelope — every message on the wire is a BoatMessage

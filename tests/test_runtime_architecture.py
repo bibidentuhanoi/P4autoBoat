@@ -191,8 +191,8 @@ typedef struct { uint32_t state; float left_throttle; float right_throttle; floa
 #define boat_MotorStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 #define boat_CalibrateStatus_init_zero {0, 0, 0, 0, 0, 0, 0}
-typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; } boat_BenchStatus;
-#define boat_BenchStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0}
+typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; float heading_target_deg; float heading_error_deg; float yaw_target_dps; float p_term; float i_term; float dynamic_c; float effective_c; float c_limit; bool ctrl_active; bool heading_hold; bool saturated; } boat_BenchStatus;
+#define boat_BenchStatus_init_zero {0}
 typedef struct { uint32_t kind; float base; float delta; float reset_c;
     bool abort; } boat_BenchCommand;
 typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
@@ -1035,7 +1035,7 @@ typedef struct {
  * provides it, so a hardcoded literal cannot creep back in. */
 #define boat_MotorStatus_size 56
 #define boat_CalibrateStatus_size 35
-#define boat_BenchStatus_size 44
+#define boat_BenchStatus_size 91
 #define boat_BoatMessage_fields NULL
 typedef esp_err_t (*transport_send_fn)(const uint8_t *, size_t, void *);
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
