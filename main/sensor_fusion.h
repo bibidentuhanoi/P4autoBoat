@@ -2,6 +2,7 @@
 #define SENSOR_FUSION_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "common.h"
 #include "imu_sample.h"
@@ -11,6 +12,7 @@ typedef struct {
     float pitch;
     float roll;
     float heading;
+    bool heading_valid; /* fused yaw has been initialized from accepted mag data */
     float yaw_rate;   /* deg/s about vertical axis, from gyro-Z (mag-independent) */
     uint32_t sequence; /* published sample sequence; use to detect fusion stalls */
     uint64_t captured_us; /* IMU sample timestamp this result was derived from */

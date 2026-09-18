@@ -5,6 +5,7 @@
 #include "bench_run.h"
 #include "trim_learn.h"
 #include "trim_assist.h"
+#include "yaw_heading_control.h"
 #include "file_system.h"
 #include "drivers/esc_driver.h"
 #include "drivers/winch_driver.h"
@@ -196,8 +197,11 @@ static bool s_trim_moved = false;
  * s_p_assist_on is a RUNTIME switch (default off) so the A and B arms of the
  * experiment run the same firmware -- a rebuild between arms would let a
  * compiler or config difference masquerade as a result. */
-static trim_assist_t s_trim_assist;
-static trim_assist_cfg_t s_trim_assist_cfg;
+static yaw_heading_control_t s_yaw_heading;
+static yaw_heading_cfg_t s_yaw_heading_cfg;
+static yaw_heading_output_t s_yaw_heading_out;
+static uint32_t s_yaw_last_sequence;
+static uint64_t s_yaw_last_capture_us;
 static bool s_p_assist_on = false;
 static float s_p_correction = 0.0f;
 /* Set by the RX task, consumed by the control task. The control task is the
@@ -1132,7 +1136,10 @@ static void trim_learn_tick(const control_decision_t *decision)
     if (req_pending && req != s_p_assist_on) {
         s_p_assist_on = req;
         if (!req) {                     /* OFF returns to the exact pre-P path */
-            trim_assist_reset(&s_trim_assist);
+            yaw_heading_control_reset(&s_yaw_heading);
+            s_yaw_heading_out = (yaw_heading_output_t){0};
+            s_yaw_last_sequence = 0;
+            s_yaw_last_capture_us = 0;
             if (s_p_correction != 0.0f) s_p_moved = true;
             s_p_correction = 0.0f;
         }
@@ -1167,7 +1174,10 @@ static void trim_learn_tick(const control_decision_t *decision)
          * perturbation the test is applying. */
         if (s_p_correction != 0.0f) s_p_moved = true;   /* never overwrite:
                                  * a pending OFF this same tick already set it */
-        trim_assist_reset(&s_trim_assist);
+        yaw_heading_control_reset(&s_yaw_heading);
+        s_yaw_heading_out = (yaw_heading_output_t){0};
+        s_yaw_last_sequence = 0;
+        s_yaw_last_capture_us = 0;
         s_p_correction = 0.0f;
         /* Forget when the last sample was. Otherwise the first sample after a
          * 5 s bench run carries dt = 5 s, and the step is proportional to dt.
@@ -1251,27 +1261,49 @@ static void trim_learn_tick(const control_decision_t *decision)
     const float yaw = f.yaw_rate;
 
     uint32_t before = s_trim_learn.last_seq;
-    bool fresh_sample = (f.sequence != before);
+    bool fresh_sample = (f.sequence != s_yaw_last_sequence);
     s_trim_moved = trim_learn_update(&s_trim_learn, &s_trim_learn_cfg,
                                      f.sequence, dt_s, yaw,
-                                     thr, steering, healthy);
+                                     thr, steering, healthy && !s_p_assist_on);
     if (s_trim_learn.last_seq != before) s_trim_last_capture_us = f.captured_us;
 
-    /* --- the fast P correction, on the SAME sample the learner just used ---
-     *
-     * Every gate the learner has, plus the switch and the impact threshold.
-     * A false gate RESETS rather than decays: the correction must not survive
-     * a pause, so that OFF and "gated off" are the same state, and so the A
-     * arm of the experiment is bit-identical to the pre-P firmware. */
+    /* Cascaded heading / yaw-rate PI.  One update per FUSION sample: the
+     * control task ticks twice as fast and must not integrate a sample twice. */
     const float p_prev = s_p_correction;
-    bool p_gate = s_p_assist_on && healthy && driving && !steering &&
-                  (thr >= s_trim_learn_cfg.min_throttle) &&
-                  (fabsf(yaw) <= TRIM_LEARN_REJECT_DPS);
     if (fresh_sample) {
-        s_p_correction = trim_assist_update(&s_trim_assist, &s_trim_assist_cfg,
-                                            dt_s, yaw, p_gate);
-    } else if (!p_gate) {
-        trim_assist_reset(&s_trim_assist);
+        float yaw_dt_s = 0.02f;
+        if (s_yaw_last_capture_us != 0 && f.captured_us > s_yaw_last_capture_us) {
+            yaw_dt_s = (float)(f.captured_us - s_yaw_last_capture_us) / 1000000.0f;
+        }
+        s_yaw_last_sequence = f.sequence;
+        s_yaw_last_capture_us = f.captured_us;
+        const yaw_heading_input_t input = {
+            .dt_s = yaw_dt_s,
+            .yaw_rate_dps = yaw,
+            .heading_deg = f.heading,
+            .throttle = thr,
+            .feedforward_c = s_trim_learn.c,
+            .steering = steering ? 1.0f : 0.0f,
+            .enabled = s_p_assist_on,
+            .driving = driving,
+            .gyro_fresh = healthy,
+            .heading_valid = f.heading_valid,
+            .base_capture_now = bench_learning && !s_yaw_heading.initialized,
+        };
+        s_yaw_heading_out = yaw_heading_control_update(
+            &s_yaw_heading, &s_yaw_heading_cfg, &input);
+        s_p_correction = s_yaw_heading_out.dynamic_c;
+    } else if (!s_p_assist_on || !healthy || !driving ||
+               thr < s_yaw_heading_cfg.min_throttle) {
+        yaw_heading_control_reset(&s_yaw_heading);
+        s_yaw_heading_out = (yaw_heading_output_t){0};
+        s_p_correction = 0.0f;
+    } else if (steering) {
+        /* Do not wait up to one fusion period to stop fighting a manual turn.
+         * The next fresh sample records the suspended state and freezes I. */
+        s_yaw_heading_out.active = false;
+        s_yaw_heading_out.heading_hold = false;
+        s_yaw_heading_out.dynamic_c = 0.0f;
         s_p_correction = 0.0f;
     }
     /* A changed correction must reach the ESCs even with no new pilot command,
@@ -1281,6 +1313,7 @@ static void trim_learn_tick(const control_decision_t *decision)
     s_trim_why = !healthy   ? "gyro stale"
                : steering   ? "steering"
                : !driving   ? "disarmed"
+               : s_p_assist_on ? "yaw PI owns integral"
                : s_trim_learn.faulted ? "FAULTED at the clamp"
                : (thr < s_trim_learn_cfg.min_throttle) ? "throttle too low"
                : NULL;                      /* NULL == actually learning */
@@ -1291,15 +1324,18 @@ static void trim_learn_tick(const control_decision_t *decision)
 }
 
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
-/* The value the mixer actually uses: learned c plus the temporary P
- * correction, inside the learner's own bounds. The learned c is untouched --
- * only this sum reaches the mixer, and only the I learner may move c itself.
- * Both call sites are inside the same #if, so this is too. */
-static float effective_trim_c(float learned_c)
+/* Learned c is feed-forward.  While the runtime assist is active, the pure
+ * controller has already applied throttle-dependent physical headroom. */
+static float effective_trim_c(float learned_c, float throttle)
 {
-    return trim_assist_effective_c(learned_c, s_p_correction,
-                                   s_trim_learn_cfg.c_min,
-                                   s_trim_learn_cfg.c_max);
+    if (s_p_assist_on && s_yaw_heading_out.active) {
+        const float t = clampf(throttle, 0.0f, 1.0f);
+        const float c_limit = (t > 0.0f)
+                            ? clampf((1.0f / t) - 1.0f, 0.0f, 1.0f)
+                            : 0.0f;
+        return clampf(learned_c + s_p_correction, -c_limit, c_limit);
+    }
+    return learned_c;
 }
 #endif
 
@@ -1453,7 +1489,8 @@ static void control_apply_decision(control_decision_t *decision)
                  * twice the split (left -= t/2, right += t/2). */
                 EscTrimPoint learned = {
                     .throttle_frac = 1.0f,
-                    .trim_diff = 2.0f * effective_trim_c(s_trim_learn.c)
+                    .trim_diff = 2.0f * effective_trim_c(s_trim_learn.c,
+                                                         decision->throttle)
                                      * clampf(decision->throttle, 0.0f, 1.0f),
                 };
                 pts = &learned;
@@ -1854,10 +1891,11 @@ void motor_control_trimlearn_log(void)
 
     if (s_p_log_pending) {
         s_p_log_pending = false;
-        ESP_LOGW(TAG, "P-ASSIST %s (kp=%.3f tau=%.2f cap=%.3f)",
+        ESP_LOGW(TAG, "YAW-PI %s (rate_kp=%.3f rate_ki=%.3f yaw_tau=%.2f)",
                  s_p_assist_on ? "ON" : "OFF",
-                 (double)s_trim_assist_cfg.kp, (double)s_trim_assist_cfg.tau_s,
-                 (double)s_trim_assist_cfg.cap);
+                 (double)s_yaw_heading_cfg.rate_kp,
+                 (double)s_yaw_heading_cfg.rate_ki,
+                 (double)s_yaw_heading_cfg.yaw_tau_s);
     }
     if (s_trim_why) {
         ESP_LOGI(TAG, "TRIMLEARN,hold,c=%.3f,yaw=%+.2f,thr=%.2f,why=%s",
@@ -1929,6 +1967,16 @@ static void bench_tick(int64_t now_us)
             if (bench_start(&s_bench, (bench_kind_t)kind, base, delta, now_us)) {
                 s_bench_active = true;
                 s_bench_file_index = 0;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+                /* Every BASE captures its own starting course.  A controller
+                 * left active by ordinary driving must not carry an older
+                 * heading target into this run. */
+                yaw_heading_control_reset(&s_yaw_heading);
+                s_yaw_heading_out = (yaw_heading_output_t){0};
+                s_yaw_last_sequence = 0;
+                s_yaw_last_capture_us = 0;
+                s_p_correction = 0.0f;
+#endif
                 /* Inside the accepted branch on purpose: a rejected start must
                  * leave the learner exactly as it was, or a refused button
                  * press would silently discard everything it had learned. */
@@ -1937,7 +1985,8 @@ static void bench_tick(int64_t now_us)
                     if (trim_learn_reset(&s_trim_learn, &s_trim_learn_cfg,
                                          reset_c)) {
                         s_trim_last_capture_us = 0;
-                        trim_assist_reset(&s_trim_assist);
+                        yaw_heading_control_reset(&s_yaw_heading);
+                        s_yaw_heading_out = (yaw_heading_output_t){0};
                         s_p_correction = 0.0f;
                         ESP_LOGW(TAG, "BENCH,trimlearn_reset,c=%.3f",
                                  (double)reset_c);
@@ -1974,18 +2023,20 @@ static void bench_tick(int64_t now_us)
      * LEFT/RIGHT runs and calibration), so the correction reaches the jets
      * during the run and the per-sample c column records it moving. */
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
-    const float bench_trim = 2.0f * effective_trim_c(s_trim_learn.c) * s_bench.base;
+    const float bench_trim = 2.0f * effective_trim_c(s_trim_learn.c,
+                                                     s_bench.base)
+                           * s_bench.base;
 #else
     const float bench_trim = esc_trim_lookup(s_esc_trim, s_esc_trim_count,
                                              s_bench.base);
 #endif
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
     const bench_assist_t bench_pa = {
-        .yaw_filt   = s_trim_assist.yaw_filt,
+        .yaw_filt   = s_yaw_heading_out.yaw_filt_dps,
         .correction = s_p_correction,
         .learned_c  = s_trim_learn.c,
         .on         = s_p_assist_on,
-        .at_cap     = s_trim_assist.at_cap,
+        .at_cap     = s_yaw_heading_out.saturated,
     };
     const bench_assist_t *pa = &bench_pa;
 #else
@@ -2300,15 +2351,28 @@ esp_err_t motor_control_init(void)
         .min_throttle = parse_cfg_float(CONFIG_STABILITY_TRIMLEARN_MIN_THROTTLE, 0.15f, 0.0f, 1.0f),
         .reject_dps = TRIM_LEARN_REJECT_DPS,
     };
-    s_trim_assist_cfg = (trim_assist_cfg_t){
-        .kp    = parse_cfg_float(CONFIG_STABILITY_PASSIST_KP, 0.020f, 0.0f, 0.20f),
-        .tau_s = parse_cfg_float(CONFIG_STABILITY_PASSIST_TAU_S, 0.50f, 0.02f, 5.0f),
-        .cap   = parse_cfg_float(CONFIG_STABILITY_PASSIST_CAP, 0.030f, 0.0f, 0.20f),
+    s_yaw_heading_cfg = (yaw_heading_cfg_t){
+        .yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_YAW_TAU_S, 0.15f, 0.02f, 2.0f),
+        .rate_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KP, 0.050f, 0.0f, 0.20f),
+        .rate_ki = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KI, 0.020f, 0.0f, 0.20f),
+        .heading_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_TAU_S, 0.35f, 0.0f, 5.0f),
+        .heading_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_KP, 0.80f, 0.0f, 5.0f),
+        .max_yaw_target_dps = parse_cfg_float(CONFIG_STABILITY_YAW_PI_MAX_RATE_DPS, 8.0f, 0.0f, 90.0f),
+        .min_throttle = s_trim_learn_cfg.min_throttle,
+        .steering_deadband = 0.02f,
+        .recapture_delay_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RECAPTURE_S, 0.50f, 0.0f, 3.0f),
     };
-    trim_assist_reset(&s_trim_assist);
-    ESP_LOGI(TAG, "P-assist built in (default OFF): kp=%.3f tau=%.2fs cap=%.3f",
-             (double)s_trim_assist_cfg.kp, (double)s_trim_assist_cfg.tau_s,
-             (double)s_trim_assist_cfg.cap);
+    yaw_heading_control_init(&s_yaw_heading);
+    s_yaw_heading_out = (yaw_heading_output_t){0};
+    s_yaw_last_sequence = 0;
+    s_yaw_last_capture_us = 0;
+    ESP_LOGI(TAG, "Yaw PI + heading hold built in (default OFF): rate_kp=%.3f "
+                  "rate_ki=%.3f yaw_tau=%.2fs heading_kp=%.2f max_rate=%.1f",
+             (double)s_yaw_heading_cfg.rate_kp,
+             (double)s_yaw_heading_cfg.rate_ki,
+             (double)s_yaw_heading_cfg.yaw_tau_s,
+             (double)s_yaw_heading_cfg.heading_kp,
+             (double)s_yaw_heading_cfg.max_yaw_target_dps);
     trim_learn_init(&s_trim_learn, &s_trim_learn_cfg);
     ESP_LOGI(TAG, "TrimLearn ON: c=%.3f deadband=%.2f deg/s step=%.4f/s "
                   "min_thr=%.2f reject=%.0f deg/s",

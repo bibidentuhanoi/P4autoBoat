@@ -174,9 +174,8 @@ menu "Board Configuration"
 
                 It moves the motors on its own, so the bounds matter: c is held
                 to [0.10, 0.35] and may move at most 0.005/s, and touching
-                either bound is treated as a FAULT that latches and stops --
-                wrong sign, blocked jet or bad gyro all land there rather than
-                sitting on the rail pretending to work.
+                either bound raises a FAULT indication and blocks further
+                outward motion. A later yaw reversal may recover inward.
 
                 Starts at ESC_TRIM_C, so switching it off changes nothing until
                 it has learned something. The drift-to-correction SIGN is not a
@@ -264,6 +263,41 @@ menu "Board Configuration"
                 further to 0.100 or removing it entirely still gives -24%, so
                 past 0.075 the cap costs nothing and protects less.
 
+        config STABILITY_YAW_PI_YAW_TAU_S
+            string "Yaw PI: gyro low-pass time constant (s)"
+            default "0.15"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_RATE_KP
+            string "Yaw PI: rate P gain, c per deg/s"
+            default "0.050"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_RATE_KI
+            string "Yaw PI: rate I gain, c per deg/s/s"
+            default "0.020"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_HEADING_TAU_S
+            string "Yaw PI: heading-error low-pass time constant (s)"
+            default "0.35"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_HEADING_KP
+            string "Yaw PI: heading outer-loop gain"
+            default "0.80"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_MAX_RATE_DPS
+            string "Yaw PI: maximum heading-requested yaw rate (deg/s)"
+            default "8.0"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
+        config STABILITY_YAW_PI_RECAPTURE_S
+            string "Yaw PI: heading recapture delay after steering (s)"
+            default "0.50"
+            depends on STABILITY_TRIMLEARN_ENABLE
+
         config STABILITY_TRIMLEARN_DEADBAND_DPS
             string "TrimLearn: ignore drift below this (deg/s)"
             default "0.5"
@@ -281,7 +315,7 @@ menu "Board Configuration"
 
         config ESC_TRIM_C
             string "L/R trim as a FRACTION of throttle (the one number)"
-            default "0.17"
+            default "0.21"
             help
                 split = c * throttle, so left = T*(1-c) and right = T*(1+c).
                 POSITIVE gives the RIGHT motor more.
@@ -296,8 +330,12 @@ menu "Board Configuration"
                 and verified at T30/T40/T45, then read +8.4 deg/s at T10 --
                 over-corrected by 4x because a fixed number does not rescale.
 
-                0.17 +/- 0.035, and that error bar is real -- it is the
-                measurement limit, not a slicing choice.
+                The lake build starts at 0.21. The latest clean T40 BASE runs
+                bracketed the raw-yaw sign change between c=0.118 (-5.864
+                deg/s) and c=0.260 (+3.555 deg/s), placing the crossing near
+                c=0.206. Starting at 0.21 puts the fast correction near that
+                measured balance point while the learner remains free to move
+                in either direction.
 
                 Found by bracketing the SIGN FLIP, no line fitted: bin all 63
                 adaptive runs by the c they ran with, and find the pair of bins
@@ -311,8 +349,8 @@ menu "Board Configuration"
                 3.0-10 s gives 0.168.
 
                 Note the band contains both 0.16 and 0.20, so this data cannot
-                tell those apart. It CAN say the answer is near 0.17 and that
-                0.24 and above is measurably too much. Per throttle it is
+                tell those apart. It CAN place the useful starting region near
+                0.20. Per throttle the older adaptive estimate was
                 0.162 / 0.203 / 0.145 at T20 / T30 / T40 -- no trend, which is
                 what the one-number model predicts.
 
@@ -342,16 +380,17 @@ menu "Board Configuration"
             default 5
             range 0 95
             help
-                Measured left-jet dead-band. Zero remains off; positive throttle
-                begins at this fraction of the usable ESC pulse span.
+                After ESC recalibration, the left motor begins turning at
+                1050 us: 5% of the 1000..2000 us usable pulse span. Zero
+                remains off.
 
         config ESC_MIN_THR_RIGHT_PCT
             int "Right ESC minimum-thrust floor (% throttle where the RIGHT jet just starts)"
-            default 19
+            default 5
             range 0 95
             help
-                Measured right-jet dead-band. Tune each motor in water so equal
-                normalized commands produce comparable thrust.
+                After ESC recalibration, the right motor also begins turning at
+                1050 us: the same 5% floor as the left motor.
 
     endmenu
 

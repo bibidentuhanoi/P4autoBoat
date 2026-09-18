@@ -26,6 +26,7 @@ typedef struct {
     atomic_uint pitch_bits;
     atomic_uint roll_bits;
     atomic_uint heading_bits;
+    atomic_bool heading_valid;
     atomic_uint yaw_rate_bits;
     atomic_uint captured_us_lo;
     atomic_uint captured_us_hi;
@@ -76,6 +77,7 @@ static void fusion_result_snapshot_init(void)
         atomic_init(&slot->pitch_bits, float_bits(0.0f));
         atomic_init(&slot->roll_bits, float_bits(0.0f));
         atomic_init(&slot->heading_bits, float_bits(0.0f));
+        atomic_init(&slot->heading_valid, false);
         atomic_init(&slot->yaw_rate_bits, float_bits(0.0f));
         atomic_init(&slot->captured_us_lo, 0);
         atomic_init(&slot->captured_us_hi, 0);
@@ -91,6 +93,7 @@ static void fusion_publish_result(uint32_t sequence, const FusionResult *result)
     atomic_store_explicit(&slot->pitch_bits, float_bits(result->pitch), memory_order_relaxed);
     atomic_store_explicit(&slot->roll_bits, float_bits(result->roll), memory_order_relaxed);
     atomic_store_explicit(&slot->heading_bits, float_bits(result->heading), memory_order_relaxed);
+    atomic_store_explicit(&slot->heading_valid, result->heading_valid, memory_order_relaxed);
     atomic_store_explicit(&slot->yaw_rate_bits, float_bits(result->yaw_rate), memory_order_relaxed);
     atomic_store_explicit(&slot->captured_us_lo,
                           (uint32_t)(result->captured_us & 0xFFFFFFFFu), memory_order_relaxed);
@@ -136,6 +139,7 @@ void fusion_get_result(FusionResult *res)
             .pitch = bits_float((uint32_t)atomic_load_explicit(&slot->pitch_bits, memory_order_relaxed)),
             .roll = bits_float((uint32_t)atomic_load_explicit(&slot->roll_bits, memory_order_relaxed)),
             .heading = bits_float((uint32_t)atomic_load_explicit(&slot->heading_bits, memory_order_relaxed)),
+            .heading_valid = atomic_load_explicit(&slot->heading_valid, memory_order_relaxed),
             .yaw_rate = bits_float((uint32_t)atomic_load_explicit(&slot->yaw_rate_bits, memory_order_relaxed)),
             .sequence = sequence,
             .captured_us = captured_us,
@@ -214,6 +218,7 @@ void fusion_update_sample(const imu_sample_t *sample)
         .roll = roll - calib->roll_tare,
         .pitch = pitch - calib->pitch_tare,
         .heading = heading,
+        .heading_valid = yaw_init,
         .yaw_rate = gz_rate,
         .captured_us = sample->captured_us,
     });

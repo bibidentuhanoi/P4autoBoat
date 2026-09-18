@@ -1660,8 +1660,8 @@ def test_ordinary_forward_driving_is_not_bench_only():
     # 3. and those are the values actually handed over.
     assert ("s_trim_moved = trim_learn_update(&s_trim_learn, &s_trim_learn_cfg,\n"
             "                                     f.sequence, dt_s, yaw,\n"
-            "                                     thr, steering, healthy);") in tick, (
-        "the learner call no longer passes (thr, steering, healthy) -- the "
+            "                                     thr, steering, healthy && !s_p_assist_on);") in tick, (
+        "the learner call no longer freezes while yaw PI owns integral action -- the "
         "ordinary-driving mirror in test_normal_driving_learns.c is now wrong")
 
     # 4. the bench override is scoped to a bench run and nothing else, so it
@@ -1700,8 +1700,38 @@ def test_every_way_of_steering_the_boat_freezes_the_learner():
 
     # Both consumers must key off the same flag, or the slow and fast loops
     # would disagree about whether the boat is being steered.
-    assert "thr, steering, healthy);" in tick, "the learner is not given `steering`"
-    assert "!steering" in tick, "the P gate no longer excludes steering"
+    assert "thr, steering, healthy && !s_p_assist_on);" in tick, (
+        "the learner is not given `steering`")
+    assert ".steering = steering ? 1.0f : 0.0f" in tick, (
+        "the yaw PI input no longer receives the shared steering gate")
+
+
+def test_motor_yaw_pi_owns_dynamic_trim_and_freezes_slow_learner():
+    src = (ROOT / "main" / "motor_control.c").read_text()
+    tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
+    apply_body = _function_body(src, "static float effective_trim_c(float learned_c, float throttle)")
+
+    assert "yaw_heading_control_update(" in tick
+    assert "&s_yaw_heading, &s_yaw_heading_cfg, &input" in tick
+    assert "fabsf(f.yaw_rate) <=" not in tick
+    assert "healthy && !s_p_assist_on" in tick
+    assert "learned_c + s_p_correction" in apply_body
+    assert "s_p_moved = true" in tick
+
+
+def test_motor_yaw_pi_gets_heading_quality_and_every_safety_gate():
+    src = (ROOT / "main" / "motor_control.c").read_text()
+    tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
+    fusion_h = (ROOT / "main" / "sensor_fusion.h").read_text()
+    fusion_c = (ROOT / "main" / "sensor_fusion.c").read_text()
+
+    assert "bool heading_valid;" in fusion_h
+    assert ".heading_valid =" in fusion_c
+    assert ".heading_valid = f.heading_valid" in tick
+    assert ".gyro_fresh = healthy" in tick
+    assert ".steering = steering ? 1.0f : 0.0f" in tick
+    assert ".base_capture_now = bench_learning && !s_yaw_heading.initialized" in tick
+    assert "yaw_heading_control_reset(&s_yaw_heading)" in tick
 
 
 def test_a_left_or_right_run_never_teaches_the_learner():
@@ -1742,10 +1772,10 @@ def test_a_left_or_right_run_never_teaches_the_learner():
     # ...and the freeze must forget when the last sample was. The step is
     # proportional to dt, so a remembered timestamp turns the pause itself into
     # a correction: 0.15 of c after a 30 s calibration -- into the clamp,
-    # latched faulted, feature dead.
+    # faulted at the clamp, with a large false correction to unwind.
     freeze = tick.split(
         "if (s_calibrating || (s_bench_active && !bench_learning)) {",
-        1)[1].split("}", 1)[0]
+        1)[1].split("return;", 1)[0]
     assert "s_trim_last_capture_us = 0;" in freeze, (
         "the learner keeps a stale sample timestamp across the freeze, so the "
         "first sample afterwards carries the whole pause as dt")
@@ -1769,7 +1799,7 @@ def test_a_base_run_keeps_the_learner_live_and_feeds_it_the_bench_throttle():
     # and the correction has to actually reach the jets during the run: it is
     # bench_tick that owns the ESCs then, so it must read c every tick
     bench = _function_body(src, "static void bench_tick(int64_t now_us)")
-    assert "effective_trim_c(s_trim_learn.c)" in bench
+    assert "effective_trim_c(s_trim_learn.c," in bench
 
 
 def test_a_base_run_stays_comparable_with_every_earlier_run():
@@ -1817,7 +1847,7 @@ def test_a_bench_run_measures_the_trim_the_boat_is_actually_running():
     into the CSV per sample so the file shows it moving."""
     src = (ROOT / "main" / "motor_control.c").read_text()
     tick = _function_body(src, "static void bench_tick(int64_t now_us)")
-    assert "effective_trim_c(s_trim_learn.c)" in tick, (
+    assert "effective_trim_c(s_trim_learn.c," in tick, (
         "a bench run would test the flashed trim while the boat drives the "
         "learned one")
     assert "esc_trim_lookup(s_esc_trim, s_esc_trim_count," in tick, (
@@ -1924,31 +1954,31 @@ def test_the_learner_c_is_reported_back():
     assert "bench-learn-c" in tool
 
 
-def test_the_p_assist_is_gated_on_every_condition_the_learner_uses():
-    """The fast P correction must be as conservative as the slow learner about
-    when it is allowed to act: armed, above minimum throttle, stick centred,
-    gyro healthy, and the yaw below the impact-rejection threshold. A gate that
-    is open wider than the learner's would let P act on samples the learner has
-    already judged untrustworthy."""
+def test_the_motor_yaw_controller_uses_safety_and_pilot_intent_gates():
+    """Yaw PI requires an armed, healthy, moving boat and receives the shared
+    steering gate. Yaw magnitude is deliberately absent."""
     src = (ROOT / "main" / "motor_control.c").read_text()
     tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
-    for cond in ("s_p_assist_on", "healthy", "driving", "!steering",
-                 "thr >= s_trim_learn_cfg.min_throttle",
-                 "fabsf(yaw) <= TRIM_LEARN_REJECT_DPS"):
-        assert cond in tick, "P gate is missing: %s" % cond
-    # a closed gate must RESET, not decay -- otherwise OFF and gated-off differ
-    assert "trim_assist_reset(&s_trim_assist);" in tick
+    for assignment in (".enabled = s_p_assist_on", ".driving = driving",
+                       ".gyro_fresh = healthy",
+                       ".steering = steering ? 1.0f : 0.0f",
+                       ".throttle = thr"):
+        assert assignment in tick, "yaw PI input is missing: %s" % assignment
+    assert "fabsf(f.yaw_rate) <=" not in tick
+    assert "yaw_heading_control_reset(&s_yaw_heading);" in tick
 
 
-def test_the_p_correction_never_touches_the_learned_c():
+def test_the_dynamic_correction_never_touches_the_learned_c():
     """c is the boat's measured property and only the I learner may move it.
     P is added downstream, per sample, and is gone the moment its gate shuts."""
     src = (ROOT / "main" / "motor_control.c").read_text()
     # the only writes to the learner's own c
     assert src.count("trim_learn_reset(&s_trim_learn") == 1
     assert src.count("trim_learn_init(&s_trim_learn") == 1
-    # P reaches the mixer only through the sum
-    assert "trim_assist_effective_c(learned_c, s_p_correction" in src
+    # PI reaches the mixer through its bounded output; learned c remains input.
+    apply_body = _function_body(src, "static float effective_trim_c(float learned_c, float throttle)")
+    assert "learned_c + s_p_correction" in apply_body
+    assert "return learned_c;" in apply_body
     tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
     assert "s_trim_learn.c =" not in tick, "P is writing the learned c directly"
 
@@ -1970,7 +2000,7 @@ def test_a_base_run_applies_p_but_a_split_run_does_not():
     the perturbation the test is applying."""
     src = (ROOT / "main" / "motor_control.c").read_text()
     bench = _function_body(src, "static void bench_tick(int64_t now_us)")
-    assert "effective_trim_c(s_trim_learn.c)" in bench, (
+    assert "effective_trim_c(s_trim_learn.c," in bench, (
         "a BASE run drives the learned c without P")
     # P's gate rides on the learner's, which already bails for LEFT/RIGHT
     tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
@@ -1997,7 +2027,8 @@ def test_turning_p_off_returns_exactly_to_the_pre_p_path():
     # ...and the control task applies it, clearing and remixing on an OFF
     tick = _function_body(src, "static void trim_learn_tick(const control_decision_t *decision)")
     assert "s_p_assist_req_pending = false;" in tick
-    assert "trim_assist_reset(&s_trim_assist);" in tick
+    assert "yaw_heading_control_reset(&s_yaw_heading);" in tick
+    assert "s_yaw_heading_out = (yaw_heading_output_t){0};" in tick
     assert "if (s_p_correction != 0.0f) s_p_moved = true;" in tick, (
         "turning P off does not push the cleaned value out, so the boat would "
         "keep the last correction until the next pilot command")
@@ -2014,8 +2045,8 @@ def test_p_is_cleared_on_every_path_that_takes_the_motors_away():
     early = tick.split('s_trim_why = "bench/cal owns the motors";', 1)
     assert len(early) == 2
     body = early[1].split("return;", 1)[0]
-    assert "trim_assist_reset(&s_trim_assist);" in body, (
-        "P is not cleared when a LEFT/RIGHT run or calibration takes the motors")
+    assert "yaw_heading_control_reset(&s_yaw_heading);" in body, (
+        "yaw PI is not cleared when a LEFT/RIGHT run or calibration takes the motors")
     assert "s_p_correction = 0.0f;" in body
     # Pinned with its CONDITION, not just the assignment: a `if (0)` in front
     # leaves every substring intact while silently dropping the remix.
