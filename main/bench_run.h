@@ -71,10 +71,21 @@ typedef struct {
  * motor commands alone. NULL to bench_step means "no assist compiled/active",
  * which records as p_on=0 and zeroes. */
 typedef struct {
+    float heading_deg;
+    float heading_target_deg;
+    float heading_error_deg;
+    float yaw_target_dps;
     float yaw_filt;      /* the P loop's own fast-filtered yaw (deg/s) */
+    float rate_error_dps;
+    float p_term;
+    float i_term;
     float correction;    /* c units, already capped */
+    float effective_c;
+    float c_limit;
     float learned_c;     /* the I learner's c, before P is added */
     bool on;
+    bool active;
+    bool heading_hold;
     bool at_cap;
 } bench_assist_t;
 
@@ -89,6 +100,15 @@ typedef struct {
                           * derived: c - p_corr only holds while neither hits a
                           * clamp, and both can. */
     uint8_t p_flags;     /* bit0 = P on, bit1 = at cap */
+    float heading_deg;
+    float heading_target_deg;
+    float heading_error_deg;
+    float yaw_target_dps;
+    float rate_error_dps;
+    float p_term;
+    float i_term;
+    float effective_c;
+    float c_limit;
     float c;               /* the trim in force AT THIS SAMPLE, as a fraction
                             * of throttle. Recorded per sample, not per run:
                             * during a BASE run the learner is live, so this is
@@ -135,8 +155,14 @@ bench_out_t bench_step(bench_t *b, const bench_cfg_t *cfg, int64_t now_us,
                        float yaw_rate_dps, bool armed, float trim,
                        const bench_assist_t *assist);
 
-#define BENCH_P_ON     0x01u
-#define BENCH_P_AT_CAP 0x02u
+#define BENCH_CTRL_ON           0x01u
+#define BENCH_CTRL_SATURATED    0x02u
+#define BENCH_CTRL_HEADING_HOLD 0x04u
+#define BENCH_CTRL_ACTIVE       0x08u
+/* Historical names remain aliases because the first twelve CSV columns keep
+ * their established meaning for old analysis scripts. */
+#define BENCH_P_ON     BENCH_CTRL_ON
+#define BENCH_P_AT_CAP BENCH_CTRL_SATURATED
 
 /* (left, right) commands for a kind -- clamped at 0, the jets never reverse. */
 void bench_commands(bench_kind_t kind, float base, float delta,

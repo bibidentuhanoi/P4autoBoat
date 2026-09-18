@@ -2054,14 +2054,21 @@ def test_p_is_cleared_on_every_path_that_takes_the_motors_away():
         _strip_c_comments(body), "the cleared value is never remixed"
 
 
-def test_the_bench_csv_records_what_p_did():
+def test_the_bench_csv_records_complete_yaw_controller_state():
     """An A/B file has to be self-describing: whether P was on, what it saw,
     what it contributed and whether it was against its cap. None of that is
     recoverable from the motor commands alone."""
     src = (ROOT / "main" / "motor_control.c").read_text()
-    assert "t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,split,at_cap" in src
+    expected = (
+        "t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,split,at_cap,"
+        "heading_deg,heading_target_deg,heading_error_deg,yaw_target_dps,"
+        "rate_error_dps,p_term,i_term,effective_c,c_limit,ctrl_active,"
+        "heading_hold,saturated")
+    assert expected in src
     write = _function_body(src, "static void bench_write_csv(void)")
     assert "smp->c_learn" in write, (
         "learned c is derived rather than logged -- c - p_corr only holds "
         "while neither the learner nor P is against a clamp, and both can be")
-    assert "BENCH_P_AT_CAP" in write
+    assert "BENCH_CTRL_SATURATED" in write
+    assert "smp->heading_target_deg" in write
+    assert "smp->i_term" in write

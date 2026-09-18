@@ -137,9 +137,20 @@ bench_out_t bench_step(bench_t *b, const bench_cfg_t *cfg, int64_t now_us,
         b->samples[b->count].p_yaw  = assist ? assist->yaw_filt : 0.0f;
         b->samples[b->count].p_corr = assist ? assist->correction : 0.0f;
         b->samples[b->count].c_learn = assist ? assist->learned_c : 0.0f;
+        b->samples[b->count].heading_deg = assist ? assist->heading_deg : 0.0f;
+        b->samples[b->count].heading_target_deg = assist ? assist->heading_target_deg : 0.0f;
+        b->samples[b->count].heading_error_deg = assist ? assist->heading_error_deg : 0.0f;
+        b->samples[b->count].yaw_target_dps = assist ? assist->yaw_target_dps : 0.0f;
+        b->samples[b->count].rate_error_dps = assist ? assist->rate_error_dps : 0.0f;
+        b->samples[b->count].p_term = assist ? assist->p_term : 0.0f;
+        b->samples[b->count].i_term = assist ? assist->i_term : 0.0f;
+        b->samples[b->count].effective_c = assist ? assist->effective_c : 0.0f;
+        b->samples[b->count].c_limit = assist ? assist->c_limit : 0.0f;
         b->samples[b->count].p_flags =
-            (uint8_t)(((assist && assist->on) ? BENCH_P_ON : 0u) |
-                      ((assist && assist->at_cap) ? BENCH_P_AT_CAP : 0u));
+            (uint8_t)(((assist && assist->on) ? BENCH_CTRL_ON : 0u) |
+                      ((assist && assist->at_cap) ? BENCH_CTRL_SATURATED : 0u) |
+                      ((assist && assist->heading_hold) ? BENCH_CTRL_HEADING_HOLD : 0u) |
+                      ((assist && assist->active) ? BENCH_CTRL_ACTIVE : 0u));
         b->count++;
     } else {
         b->overflow = true;                 /* stop recording, never overrun */

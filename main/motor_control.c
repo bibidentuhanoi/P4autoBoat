@@ -1794,7 +1794,7 @@ static void bench_write_csv(void)
      * run is ~48 KB; at 1 KB a flush that is ~48 of them, roughly a second of
      * silence. 4 KB brings it to ~12, fewer than the old short runs took. */
     static char chunk[8192];
-    int n = snprintf(chunk, sizeof(chunk), "t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,split,at_cap\n");
+    int n = snprintf(chunk, sizeof(chunk), "t_s,phase,yaw_dps,left,right,c,p_on,p_yaw,c_learn,p_corr,split,at_cap,heading_deg,heading_target_deg,heading_error_deg,yaw_target_dps,rate_error_dps,p_term,i_term,effective_c,c_limit,ctrl_active,heading_hold,saturated\n");
     if (n <= 0 || fs_sdcard_write(name, chunk, (size_t)n) != ESP_OK) {
         ESP_LOGE(TAG, "BENCH,save_failed,%s", name);
         s_bench.state = BENCH_FAILED;
@@ -1807,7 +1807,7 @@ static void bench_write_csv(void)
     n = 0;
     uint16_t i = 0;
     for (; i < s_bench.count; ++i) {
-        if ((size_t)n > sizeof(chunk) - 96u) {      /* flush before it can truncate */
+        if ((size_t)n > sizeof(chunk) - 256u) {     /* flush before it can truncate */
             /* Every append is checked. A card that fails mid-file used to
              * leave a truncated CSV on disk and a SAVED status pointing at
              * it -- the worst possible outcome, a partial run that passes for
@@ -1820,7 +1820,8 @@ static void bench_write_csv(void)
                        : ((smp->t_s < run_s) ? "run" : "coast");
         int w = snprintf(chunk + n, sizeof(chunk) - (size_t)n,
                          "%.3f,%s,%.3f,%.3f,%.3f,%.4f,"
-                         "%u,%.3f,%.4f,%.4f,%.4f,%u\n",
+                         "%u,%.3f,%.4f,%.4f,%.4f,%u,"
+                         "%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u,%u\n",
                          (double)smp->t_s, ph, (double)smp->yaw_rate_dps,
                          (double)smp->left, (double)smp->right, (double)smp->c,
                          (unsigned)((smp->p_flags & BENCH_P_ON) ? 1u : 0u),
@@ -1828,7 +1829,19 @@ static void bench_write_csv(void)
                          (double)smp->c_learn,
                          (double)smp->p_corr,
                          (double)(0.5f * (smp->right - smp->left)),
-                         (unsigned)((smp->p_flags & BENCH_P_AT_CAP) ? 1u : 0u));
+                         (unsigned)((smp->p_flags & BENCH_P_AT_CAP) ? 1u : 0u),
+                         (double)smp->heading_deg,
+                         (double)smp->heading_target_deg,
+                         (double)smp->heading_error_deg,
+                         (double)smp->yaw_target_dps,
+                         (double)smp->rate_error_dps,
+                         (double)smp->p_term,
+                         (double)smp->i_term,
+                         (double)smp->effective_c,
+                         (double)smp->c_limit,
+                         (unsigned)((smp->p_flags & BENCH_CTRL_ACTIVE) ? 1u : 0u),
+                         (unsigned)((smp->p_flags & BENCH_CTRL_HEADING_HOLD) ? 1u : 0u),
+                         (unsigned)((smp->p_flags & BENCH_CTRL_SATURATED) ? 1u : 0u));
         if (w < 0 || (size_t)w >= sizeof(chunk) - (size_t)n) goto fail;
         n += w;
     }
@@ -2032,10 +2045,21 @@ static void bench_tick(int64_t now_us)
 #endif
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
     const bench_assist_t bench_pa = {
+        .heading_deg = fusion.heading,
+        .heading_target_deg = s_yaw_heading_out.heading_target_deg,
+        .heading_error_deg = s_yaw_heading_out.heading_error_deg,
+        .yaw_target_dps = s_yaw_heading_out.yaw_target_dps,
         .yaw_filt   = s_yaw_heading_out.yaw_filt_dps,
+        .rate_error_dps = s_yaw_heading_out.rate_error_dps,
+        .p_term = s_yaw_heading_out.p_term,
+        .i_term = s_yaw_heading_out.i_term,
         .correction = s_p_correction,
+        .effective_c = effective_trim_c(s_trim_learn.c, s_bench.base),
+        .c_limit = s_yaw_heading_out.c_limit,
         .learned_c  = s_trim_learn.c,
         .on         = s_p_assist_on,
+        .active     = s_yaw_heading_out.active,
+        .heading_hold = s_yaw_heading_out.heading_hold,
         .at_cap     = s_yaw_heading_out.saturated,
     };
     const bench_assist_t *pa = &bench_pa;

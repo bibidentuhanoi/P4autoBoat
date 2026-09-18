@@ -392,8 +392,15 @@ static void trim_and_p_are_recorded_across_the_long_drive(void)
     bench_cfg_t c = cfg_long();
     bench_t b; bench_init(&b);
     assert(bench_start(&b, BENCH_KIND_BASE_LONG, 0.20f, 0.0f, 0));
-    bench_assist_t a = { .yaw_filt = 1.5f, .correction = 0.02f,
-                         .learned_c = 0.19f, .on = true, .at_cap = false };
+    bench_assist_t a = {
+        .heading_deg = 181.0f, .heading_target_deg = 180.0f,
+        .heading_error_deg = -1.0f, .yaw_target_dps = -0.8f,
+        .yaw_filt = 1.5f, .rate_error_dps = -2.3f,
+        .p_term = -0.115f, .i_term = 0.035f,
+        .correction = -0.08f, .effective_c = 0.11f, .c_limit = 1.0f,
+        .learned_c = 0.19f, .on = true, .heading_hold = true,
+        .at_cap = false,
+    };
     bool finished = false;
     for (int i = 0; i < 1300 && !finished; ++i) {
         bench_out_t o = bench_step(&b, &c, (int64_t)i * 10000, 1.0f, true,
@@ -412,8 +419,18 @@ static void trim_and_p_are_recorded_across_the_long_drive(void)
     assert(late != NULL);
     assert(late->p_flags & BENCH_P_ON);
     assert(fabsf(late->p_yaw - 1.5f) < 1e-6f);
-    assert(fabsf(late->p_corr - 0.02f) < 1e-6f);
+    assert(fabsf(late->p_corr - (-0.08f)) < 1e-6f);
     assert(fabsf(late->c_learn - 0.19f) < 1e-6f);
+    assert(fabsf(late->heading_deg - 181.0f) < 1e-6f);
+    assert(fabsf(late->heading_target_deg - 180.0f) < 1e-6f);
+    assert(fabsf(late->heading_error_deg - (-1.0f)) < 1e-6f);
+    assert(fabsf(late->yaw_target_dps - (-0.8f)) < 1e-6f);
+    assert(fabsf(late->rate_error_dps - (-2.3f)) < 1e-6f);
+    assert(fabsf(late->p_term - (-0.115f)) < 1e-6f);
+    assert(fabsf(late->i_term - 0.035f) < 1e-6f);
+    assert(fabsf(late->effective_c - 0.11f) < 1e-6f);
+    assert(fabsf(late->c_limit - 1.0f) < 1e-6f);
+    assert(late->p_flags & BENCH_CTRL_HEADING_HOLD);
     /* trim really reached the commands that were recorded */
     assert(late->left < late->right);
     assert(fabsf(late->c - (0.08f / (2.0f * 0.20f))) < 1e-5f);
