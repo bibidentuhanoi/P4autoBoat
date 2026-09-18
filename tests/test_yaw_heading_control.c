@@ -218,6 +218,92 @@ static void safety_gates_reset_dynamic_state(void)
     assert(closef(ctl.integral, 0.0f, 1e-6f));
 }
 
+typedef struct {
+    float final_yaw;
+    float final_heading_error;
+    float final_i;
+    float last_10_abs_yaw_mean;
+    int first_correction_sample;
+    int high_yaw_active_samples;
+    int high_yaw_wrong_sign_samples;
+    int final_10_saturated_samples;
+} sim_result_t;
+
+static sim_result_t run_measured_plant(float duration_s,
+                                       float disturbance_dps,
+                                       float initial_yaw_dps,
+                                       bool controller_on)
+{
+    enum { DELAY_SAMPLES = 15, MAX_SAMPLES = 2000 };
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+    yaw_heading_control_t ctl;
+    yaw_heading_control_init(&ctl);
+    float delay[DELAY_SAMPLES] = {0};
+    int delay_pos = 0;
+    float yaw = initial_yaw_dps;
+    float heading = 100.0f;
+    const float target_heading = heading;
+    const int samples = (int)(duration_s / DT_S);
+    assert(samples <= MAX_SAMPLES);
+    sim_result_t result = {.first_correction_sample = -1};
+    float final_10_abs_sum = 0.0f;
+    int final_10_count = 0;
+
+    for (int n = 0; n < samples; ++n) {
+        yaw_heading_output_t out = tick(&ctl, &cfg, yaw, heading, true,
+                                        0.40f, 0.21f, 0.0f,
+                                        controller_on, true, false);
+        const float requested = controller_on ? out.dynamic_c : 0.0f;
+        if (result.first_correction_sample < 0 && fabsf(requested) > 1e-5f) {
+            result.first_correction_sample = n;
+        }
+        if (fabsf(yaw) > 10.0f) {
+            result.high_yaw_active_samples += out.active ? 1 : 0;
+            if ((yaw < 0.0f && requested <= 0.0f) ||
+                (yaw > 0.0f && requested >= 0.0f)) {
+                result.high_yaw_wrong_sign_samples++;
+            }
+        }
+
+        const float applied = delay[delay_pos];
+        delay[delay_pos] = requested;
+        delay_pos = (delay_pos + 1) % DELAY_SAMPLES;
+        const float steady_yaw = 16.1f * applied + disturbance_dps;
+        yaw += ((steady_yaw - yaw) / 1.10f) * DT_S;
+        heading = fmodf(heading + yaw * DT_S + 360.0f, 360.0f);
+
+        if (n >= samples - 500) {
+            final_10_abs_sum += fabsf(yaw);
+            final_10_count++;
+            result.final_10_saturated_samples += out.saturated ? 1 : 0;
+        }
+        result.final_i = out.i_term;
+    }
+    result.final_yaw = yaw;
+    result.final_heading_error = yaw_heading_wrap_180(target_heading - heading);
+    result.last_10_abs_yaw_mean = final_10_abs_sum / (float)final_10_count;
+    return result;
+}
+
+static void measured_plant_meets_three_second_acceptance(void)
+{
+    const sim_result_t off = run_measured_plant(3.0f, -10.0f, -20.0f, false);
+    const sim_result_t on = run_measured_plant(3.0f, -10.0f, -20.0f, true);
+    assert(on.first_correction_sample >= 0 && on.first_correction_sample <= 1);
+    assert(on.high_yaw_active_samples > 0);
+    assert(on.high_yaw_wrong_sign_samples == 0);
+    assert(fabsf(on.final_yaw) < fabsf(off.final_yaw));
+}
+
+static void measured_plant_meets_thirty_second_acceptance(void)
+{
+    const sim_result_t out = run_measured_plant(30.0f, -3.0f, 0.0f, true);
+    assert(out.last_10_abs_yaw_mean < 0.5f);
+    assert(fabsf(out.final_heading_error) < 1.0f);
+    assert(out.final_10_saturated_samples < 50);
+    assert(fabsf(out.final_i) > 0.01f);
+}
+
 int main(void)
 {
     correction_is_immediate_strong_and_bidirectional();
@@ -226,6 +312,8 @@ int main(void)
     heading_wrap_and_invalid_fallback_are_safe();
     manual_steering_freezes_i_then_recaptures();
     safety_gates_reset_dynamic_state();
+    measured_plant_meets_three_second_acceptance();
+    measured_plant_meets_thirty_second_acceptance();
     puts("yaw heading controller tests passed");
     return 0;
 }
