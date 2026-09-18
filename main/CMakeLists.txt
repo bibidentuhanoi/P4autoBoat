@@ -19,6 +19,7 @@ idf_component_register(
         "bench_run.c"
         "trim_learn.c"
         "trim_assist.c"
+        "yaw_heading_control.c"
         "stability_control.c"
         "calibration.c"
         "drivers/imu_driver.c"
