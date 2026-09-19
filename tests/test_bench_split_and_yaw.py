@@ -617,13 +617,14 @@ class UnchangedContractTest(unittest.TestCase):
         self.assertIn('UI-observed / approximate', self.src)
         self.assertIn('authoritative', self.src)
 
-    def test_no_firmware_or_proto_field_was_invented(self):
-        """The summary is derived from telemetry already on the wire. If this
-        ever needed a new BenchStatus field it would be a proto change, which
-        this work explicitly excludes."""
-        self.assertNotIn('bs.yaw', self.src)
-        self.assertNotIn('bench.yaw', self.src)
-        self.assertNotIn('msg.bench.yaw', self.src)
+    def test_controller_diagnostics_use_explicit_proto_fields(self):
+        """The upgraded controller is diagnosable over the existing
+        BenchStatus message rather than inferred from sparse yaw samples."""
+        for field in ('heading_target_deg', 'heading_error_deg',
+                      'yaw_target_dps', 'p_term', 'i_term', 'dynamic_c',
+                      'effective_c', 'c_limit', 'ctrl_active',
+                      'heading_hold', 'saturated'):
+            self.assertIn("getattr(bs, '%s'" % field, self.src)
 
     def test_the_drive_phase_length_mirrors_the_firmware(self):
         fw = (ROOT / 'main' / 'motor_control.c').read_text()

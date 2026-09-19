@@ -4132,17 +4132,20 @@ class BoatLink:
                 # The BOAT's own answer, not what this tool asked for. If the
                 # two disagree the A/B is void, so it has to be visible.
                 'p_on': bool(bs.p_on),
-                'heading_target_deg': float(bs.heading_target_deg),
-                'heading_error_deg': float(bs.heading_error_deg),
-                'yaw_target_dps': float(bs.yaw_target_dps),
-                'p_term': float(bs.p_term),
-                'i_term': float(bs.i_term),
-                'dynamic_c': float(bs.dynamic_c),
-                'effective_c': float(bs.effective_c),
-                'c_limit': float(bs.c_limit),
-                'ctrl_active': bool(bs.ctrl_active),
-                'heading_hold': bool(bs.heading_hold),
-                'saturated': bool(bs.saturated),
+                # getattr keeps old test fixtures and legacy adapters valid;
+                # a protobuf decoded with the new schema supplies the same
+                # zero defaults when these fields were absent on the wire.
+                'heading_target_deg': float(getattr(bs, 'heading_target_deg', 0.0)),
+                'heading_error_deg': float(getattr(bs, 'heading_error_deg', 0.0)),
+                'yaw_target_dps': float(getattr(bs, 'yaw_target_dps', 0.0)),
+                'p_term': float(getattr(bs, 'p_term', 0.0)),
+                'i_term': float(getattr(bs, 'i_term', 0.0)),
+                'dynamic_c': float(getattr(bs, 'dynamic_c', 0.0)),
+                'effective_c': float(getattr(bs, 'effective_c', 0.0)),
+                'c_limit': float(getattr(bs, 'c_limit', 0.0)),
+                'ctrl_active': bool(getattr(bs, 'ctrl_active', False)),
+                'heading_hold': bool(getattr(bs, 'heading_hold', False)),
+                'saturated': bool(getattr(bs, 'saturated', False)),
             }
             now_driving = (int(bs.state) == BENCH_STATE_RUN)
             # Collect only across the DRIVE phase. The boat's own state is what
