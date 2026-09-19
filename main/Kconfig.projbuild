@@ -265,32 +265,32 @@ menu "Board Configuration"
 
         config STABILITY_YAW_PI_YAW_TAU_S
             string "Yaw PI: gyro low-pass time constant (s)"
-            default "0.15"
+            default "0.08"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_RATE_KP
             string "Yaw PI: rate P gain, c per deg/s"
-            default "0.050"
+            default "0.100"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_RATE_KI
             string "Yaw PI: rate I gain, c per deg/s/s"
-            default "0.020"
+            default "0.080"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_HEADING_TAU_S
             string "Yaw PI: heading-error low-pass time constant (s)"
-            default "0.35"
+            default "0.10"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_HEADING_KP
             string "Yaw PI: heading outer-loop gain"
-            default "0.80"
+            default "1.50"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_MAX_RATE_DPS
             string "Yaw PI: maximum heading-requested yaw rate (deg/s)"
-            default "8.0"
+            default "15.0"
             depends on STABILITY_TRIMLEARN_ENABLE
 
         config STABILITY_YAW_PI_RECAPTURE_S

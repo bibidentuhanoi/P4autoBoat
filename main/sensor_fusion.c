@@ -195,7 +195,10 @@ void fusion_update_sample(const imu_sample_t *sample)
         heading_yaw = mag_hdg;
         yaw_init = true;
     } else if (yaw_init) {
-        heading_yaw += gz_rate * dt;
+        /* Positive installed gyro yaw is left/counter-clockwise. Compass
+         * heading increases clockwise, so the gyro prediction has the
+         * opposite sign. */
+        heading_yaw -= gz_rate * dt;
         if (sample->mag_valid) {
             float error = mag_hdg - heading_yaw;
             while (error > 180.0f) error -= 360.0f;

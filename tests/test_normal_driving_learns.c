@@ -43,9 +43,9 @@ static trim_learn_cfg_t shipped_cfg(void)
 static yaw_heading_cfg_t shipped_assist_cfg(void)
 {
     yaw_heading_cfg_t c = {
-        .yaw_tau_s = 0.15f, .rate_kp = 0.050f, .rate_ki = 0.020f,
-        .heading_tau_s = 0.35f, .heading_kp = 0.80f,
-        .max_yaw_target_dps = 8.0f, .min_throttle = 0.15f,
+        .yaw_tau_s = 0.08f, .rate_kp = 0.100f, .rate_ki = 0.080f,
+        .heading_tau_s = 0.10f, .heading_kp = 1.50f,
+        .max_yaw_target_dps = 15.0f, .min_throttle = 0.15f,
         .steering_deadband = 0.02f, .recapture_delay_s = 0.50f,
     };
     return c;

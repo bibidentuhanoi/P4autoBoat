@@ -160,7 +160,10 @@ yaw_heading_output_t yaw_heading_control_update(
         const float filter_delta = yaw_heading_wrap_180(raw_error - ctl->heading_error_filt);
         ctl->heading_error_filt = yaw_heading_wrap_180(
             ctl->heading_error_filt + heading_alpha * filter_delta);
-        yaw_target = clampf(cfg->heading_kp * ctl->heading_error_filt,
+        /* Installed convention: positive gyro yaw is a left turn, while the
+         * compass heading decreases to the left.  A positive target-current
+         * heading error therefore requires a negative (right-turn) yaw rate. */
+        yaw_target = clampf(-cfg->heading_kp * ctl->heading_error_filt,
                             -cfg->max_yaw_target_dps,
                             cfg->max_yaw_target_dps);
     }

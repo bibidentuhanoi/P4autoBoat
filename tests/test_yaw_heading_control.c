@@ -15,12 +15,12 @@ static bool closef(float a, float b, float eps)
 static yaw_heading_cfg_t shipped_cfg(void)
 {
     return (yaw_heading_cfg_t){
-        .yaw_tau_s = 0.15f,
-        .rate_kp = 0.050f,
-        .rate_ki = 0.020f,
-        .heading_tau_s = 0.35f,
-        .heading_kp = 0.80f,
-        .max_yaw_target_dps = 8.0f,
+        .yaw_tau_s = 0.08f,
+        .rate_kp = 0.100f,
+        .rate_ki = 0.080f,
+        .heading_tau_s = 0.10f,
+        .heading_kp = 1.50f,
+        .max_yaw_target_dps = 15.0f,
         .min_throttle = 0.15f,
         .steering_deadband = 0.02f,
         .recapture_delay_s = 0.50f,
@@ -137,12 +137,12 @@ static void saturation_recovery_never_reverses_a_remaining_rate_error(void)
         yaw_heading_output_t out = {0};
 
         for (int i = 0; i < 25; ++i) {
-            heading += -50.0f * DT_S;
+            heading -= -50.0f * DT_S;
             out = tick(&ctl, &cfg, -50.0f, heading, heading_case != 0,
                        0.40f, 0.21f, 0.0f, true, true, false);
         }
         for (int i = 0; i < 50; ++i) {
-            heading += -5.0f * DT_S;
+            heading -= -5.0f * DT_S;
             out = tick(&ctl, &cfg, -5.0f, heading, heading_case != 0,
                        0.40f, 0.21f, 0.0f, true, true, false);
         }
@@ -198,7 +198,9 @@ static void long_sample_gap_does_not_create_a_large_integral_step(void)
     out = yaw_heading_control_update(&ctl, &cfg, &delayed);
 
     assert(out.i_term > before);
-    assert(out.i_term - before < 0.005f);
+    /* dt is capped at 0.1 s, so even the stronger shipped I gain may only
+     * take one bounded 0.008-c step after a long scheduling gap. */
+    assert(out.i_term - before < 0.009f);
 }
 
 static void invalid_heading_still_allows_gyro_rate_damping(void)
@@ -243,7 +245,10 @@ static void heading_wrap_and_invalid_fallback_are_safe(void)
                    0.40f, 0.21f, 0.0f, true, true, false);
     }
     assert(out.heading_error_deg < 0.0f);
-    assert(out.yaw_target_dps < 0.0f);
+    /* This boat reports positive yaw for a left turn, while compass heading
+     * decreases to the left.  Current=1 with target=359 therefore needs a
+     * positive/left yaw request. */
+    assert(out.yaw_target_dps > 0.0f);
     assert(fabsf(out.heading_error_deg) < 3.0f);
 
     out = tick(&ctl, &cfg, -2.0f, 90.0f, false,
@@ -257,6 +262,28 @@ static void heading_wrap_and_invalid_fallback_are_safe(void)
                0.40f, 0.21f, 0.0f, true, true, false);
     assert(out.heading_hold);
     assert(closef(out.heading_target_deg, 90.0f, 1e-5f));
+}
+
+static void heading_error_commands_a_fast_physical_return(void)
+{
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+    yaw_heading_control_t ctl;
+    yaw_heading_control_init(&ctl);
+
+    /* Capture 160 degrees, then simulate a left drift to 150.  Positive yaw
+     * is left on the installed IMU, so recovery must request negative yaw and
+     * reduce c (left motor stronger). */
+    (void)tick(&ctl, &cfg, 0.0f, 160.0f, true,
+               0.40f, 0.21f, 0.0f, true, true, false);
+    yaw_heading_output_t out = {0};
+    for (int i = 0; i < 10; ++i) {
+        out = tick(&ctl, &cfg, 0.0f, 150.0f, true,
+                   0.40f, 0.21f, 0.0f, true, true, false);
+    }
+    assert(out.heading_error_deg > 8.0f);
+    assert(out.yaw_target_dps < -12.0f);
+    assert(out.dynamic_c < -0.75f);
+    assert(out.effective_c < -0.50f);
 }
 
 static void manual_steering_freezes_i_then_recaptures(void)
@@ -369,7 +396,8 @@ static sim_result_t run_measured_plant(float duration_s,
         delay_pos = (delay_pos + 1) % DELAY_SAMPLES;
         const float steady_yaw = 16.1f * applied + disturbance_dps;
         yaw += ((steady_yaw - yaw) / 1.10f) * DT_S;
-        heading = fmodf(heading + yaw * DT_S + 360.0f, 360.0f);
+        /* Installed convention: positive/left yaw decreases compass heading. */
+        heading = fmodf(heading - yaw * DT_S + 360.0f, 360.0f);
 
         if (n >= samples - 500) {
             final_10_abs_sum += fabsf(yaw);
@@ -413,6 +441,7 @@ int main(void)
     long_sample_gap_does_not_create_a_large_integral_step();
     invalid_heading_still_allows_gyro_rate_damping();
     heading_wrap_and_invalid_fallback_are_safe();
+    heading_error_commands_a_fast_physical_return();
     manual_steering_freezes_i_then_recaptures();
     safety_gates_reset_dynamic_state();
     measured_plant_meets_three_second_acceptance();

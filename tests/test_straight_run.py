@@ -100,6 +100,26 @@ class StraightRunTest(LakeBase):
         self.assertFalse(self.link.motor_split)
         self.assertEqual((self.link.motor_left, self.link.motor_right), (0.0, 0.0))
 
+    def test_start_waits_until_the_boat_confirms_the_requested_p_mode(self):
+        ok, err = self.link.send_assist(True)
+        self.assertTrue(ok, err)
+        req = self.link._assist_off_req_id
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, assist_motor_p=False,
+            assist_rudder=False, assist_request_id=req,
+            last_rx_monotonic=self.clock.t)
+
+        ok, err = self._start_straight(0.30)
+        self.assertFalse(ok)
+        self.assertIn('confirm Motor P ON', err)
+        self.assertIsNone(self.link.lake_id)
+
+        self.link.motor_status['assist_motor_p'] = True
+        with self.link._lock:
+            self.link._assist_off_tick_locked(self.clock.t)
+        ok, err = self._start_straight(0.30)
+        self.assertTrue(ok, err)
+
     def test_runs_are_numbered_per_throttle(self):
         self.assertEqual(self._run_straight()['name'], 'STRAIGHT_T20_001')
         self.assertEqual(self._run_straight()['name'], 'STRAIGHT_T20_002')

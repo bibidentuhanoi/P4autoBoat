@@ -2426,12 +2426,12 @@ esp_err_t motor_control_init(void)
         .reject_dps = TRIM_LEARN_REJECT_DPS,
     };
     s_yaw_heading_cfg = (yaw_heading_cfg_t){
-        .yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_YAW_TAU_S, 0.15f, 0.02f, 2.0f),
-        .rate_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KP, 0.050f, 0.0f, 0.20f),
-        .rate_ki = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KI, 0.020f, 0.0f, 0.20f),
-        .heading_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_TAU_S, 0.35f, 0.0f, 5.0f),
-        .heading_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_KP, 0.80f, 0.0f, 5.0f),
-        .max_yaw_target_dps = parse_cfg_float(CONFIG_STABILITY_YAW_PI_MAX_RATE_DPS, 8.0f, 0.0f, 90.0f),
+        .yaw_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_YAW_TAU_S, 0.08f, 0.02f, 2.0f),
+        .rate_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KP, 0.100f, 0.0f, 0.20f),
+        .rate_ki = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RATE_KI, 0.080f, 0.0f, 0.20f),
+        .heading_tau_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_TAU_S, 0.10f, 0.0f, 5.0f),
+        .heading_kp = parse_cfg_float(CONFIG_STABILITY_YAW_PI_HEADING_KP, 1.50f, 0.0f, 5.0f),
+        .max_yaw_target_dps = parse_cfg_float(CONFIG_STABILITY_YAW_PI_MAX_RATE_DPS, 15.0f, 0.0f, 90.0f),
         .min_throttle = s_trim_learn_cfg.min_throttle,
         .steering_deadband = 0.02f,
         .recapture_delay_s = parse_cfg_float(CONFIG_STABILITY_YAW_PI_RECAPTURE_S, 0.50f, 0.0f, 3.0f),

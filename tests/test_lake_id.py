@@ -64,6 +64,7 @@ class LakeBase(unittest.TestCase):
                          calibrating=False, servo_rail_cut=None, p_assist_on=True,
                          assist_rudder_on=False, assist_request_id=0, _assist_req_seq=0,
                          _assist_off_req_id=None, _assist_off_next_retry=0.0,
+                         _assist_pending_p_on=False, _assist_pending_rudder=False,
                          _assist_off_started=0.0, _last_hb_state=None,
                          session_id='sess', session_seq=0, session_last_hb=self.clock.t,
                          lease_expired_at=None, bench_yaw_samples=[], bench_yaw=None,

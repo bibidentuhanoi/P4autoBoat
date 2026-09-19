@@ -75,6 +75,42 @@ static void test_fusion_uses_sample_timestamp_and_ignores_mag_only_sample(void)
     assert(float_bits(after_partial.heading) == float_bits(before_partial.heading));
 }
 
+static float heading_delta(float after, float before)
+{
+    float delta = after - before;
+    while (delta > 180.0f) delta -= 360.0f;
+    while (delta < -180.0f) delta += 360.0f;
+    return delta;
+}
+
+static void test_positive_left_yaw_decreases_compass_heading_prediction(void)
+{
+    CalibrationData calib = calibration();
+    fusion_init(&calib);
+
+    imu_sample_t first = make_sample(1);
+    first.gx = 0;
+    first.gy = 0;
+    first.gz = 0;
+    first.captured_us = 1000;
+    fusion_update_sample(&first);
+    FusionResult before;
+    fusion_get_result(&before);
+
+    imu_sample_t turning = first;
+    turning.sequence = 2;
+    turning.gz = 1310;             /* +10 deg/s: installed left-turn sign */
+    turning.mag_valid = false;     /* isolate gyro prediction */
+    turning.captured_us = 101000;  /* 0.1 s -> about one degree */
+    fusion_update_sample(&turning);
+    FusionResult after;
+    fusion_get_result(&after);
+
+    const float delta = heading_delta(after.heading, before.heading);
+    assert(delta < -0.9f && delta > -1.1f);
+    assert(after.yaw_rate > 9.9f && after.yaw_rate < 10.1f);
+}
+
 enum { FUSION_STRESS_SAMPLES = 2048 };
 
 typedef struct {
@@ -149,6 +185,7 @@ static void test_result_reader_observes_only_complete_fusion_generations(void)
 int main(void)
 {
     test_fusion_uses_sample_timestamp_and_ignores_mag_only_sample();
+    test_positive_left_yaw_decreases_compass_heading_prediction();
     test_result_reader_observes_only_complete_fusion_generations();
     return 0;
 }

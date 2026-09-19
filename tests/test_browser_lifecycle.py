@@ -56,6 +56,8 @@ class BrowserHttpTest(unittest.TestCase):
         link._assist_req_seq = 0
         link._assist_off_req_id = None
         link._assist_off_next_retry = 0.0
+        link._assist_pending_p_on = False
+        link._assist_pending_rudder = False
         link.session_id = None
         link.session_seq = 0
         link.session_last_hb = 0.0
@@ -656,3 +658,26 @@ class AssistOffCannotStrandTheOperatorTest(BrowserHttpTest):
             self.link.motor_status, have=True, assist_rudder=True,
             assist_request_id=0, last_rx_monotonic=self.link._now())
         self.assertEqual(self.hb(sid, 1, throttle=0.3, split=False)[0], 409)
+
+    def test_motor_p_request_is_pending_until_the_matching_state_is_confirmed(self):
+        ok, err = self.link.send_assist(True)
+        self.assertTrue(ok, err)
+        req = self.link._assist_off_req_id
+
+        self.link.motor_status = dict(
+            self.link.motor_status, have=True, assist_rudder=False,
+            assist_motor_p=False, assist_request_id=req,
+            last_rx_monotonic=self.link._now())
+        with self.link._lock:
+            self.link._assist_off_tick_locked(self.link._now())
+        self.assertEqual(self.link._assist_off_req_id, req,
+                         'request id alone falsely confirmed Motor P ON')
+
+        self.link.motor_status['assist_motor_p'] = True
+        with self.link._lock:
+            self.link._assist_off_tick_locked(self.link._now())
+        self.assertIsNone(self.link._assist_off_req_id)
+
+    def test_page_waits_for_boat_confirmation_before_showing_p_on(self):
+        self.assertNotIn('pAssistOn = want;', D.PAGE)
+        self.assertIn('WAITING FOR BOAT', D.PAGE)

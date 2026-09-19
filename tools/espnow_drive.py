@@ -2089,6 +2089,8 @@ class BoatLink:
         self._assist_off_req_id = None
         self._assist_off_next_retry = 0.0
         self._assist_off_started = 0.0
+        self._assist_pending_p_on = False
+        self._assist_pending_rudder = False
         # The previous heartbeat's control values, so a repeated one can be
         # told from the operator actually moving something.
         self._last_hb_state = None
@@ -2682,17 +2684,22 @@ class BoatLink:
         if req is None:
             return
         ms = self.motor_status
-        if (ms.get('have') and not ms.get('assist_rudder')
+        want_p = bool(getattr(self, '_assist_pending_p_on', self.p_assist_on))
+        want_rudder = bool(getattr(self, '_assist_pending_rudder', False))
+        if (ms.get('have')
+                and bool(ms.get('assist_motor_p')) == want_p
+                and bool(ms.get('assist_rudder')) == want_rudder
                 and ms.get('assist_request_id') == req):
             self._assist_off_req_id = None
             self._assist_off_next_retry = 0.0
-            self.assist_rudder_on = False
+            self.p_assist_on = want_p
+            self.assist_rudder_on = want_rudder
             return
         if now >= self._assist_off_next_retry and self.connected:
             self._assist_off_next_retry = now + ASSIST_OFF_RETRY_S
             msg = self.pb2.BoatMessage()
-            msg.assist.p_on = bool(self.p_assist_on)
-            msg.assist.rudder_assist = False
+            msg.assist.p_on = want_p
+            msg.assist.rudder_assist = want_rudder
             msg.assist.request_id = req
             self._write_locked(msg.SerializeToString())
 
@@ -2748,6 +2755,8 @@ class BoatLink:
             self._assist_off_req_id = req_id
             self._assist_off_started = self._now()
             self._assist_off_next_retry = self._now() + ASSIST_OFF_RETRY_S
+            self._assist_pending_p_on = bool(p_on)
+            self._assist_pending_rudder = False
         else:
             self._assist_off_req_id = None
         msg = self.pb2.BoatMessage()
@@ -3337,7 +3346,8 @@ class BoatLink:
                _r3(controller.get('peak_abs_p')),
                _r3(controller.get('peak_abs_i')),
                _r3(controller.get('final_i'))),
-            'controller signs: positive yaw and heading error are LEFT; p_term, i_term, '
+            'controller signs: positive yaw is LEFT; positive heading error means target '
+            'is clockwise/right of current; p_term, i_term, '
             'dynamic_c, effective_c and c_limit are motor-command fractions',
         ]
         if result['aborted']:
@@ -3421,7 +3431,12 @@ class BoatLink:
         if self.session_id is None:
             return 'no browser control session — reload the page'
         if lake_id_is_straight_profile(profile):
-            pass                          # Motor P ON or OFF: recorded, and it must not flip mid-run
+            # Motor P ON or OFF is valid for a BASE comparison, but the state
+            # must be the one the BOAT acknowledged.  A successful serial
+            # write only proves the request left this process.
+            if self._assist_off_req_id is not None:
+                want = 'ON' if getattr(self, '_assist_pending_p_on', False) else 'OFF'
+                return 'wait for the boat to confirm Motor P %s before BASE' % want
         elif getattr(self, 'raw_throttle_test', False):
             if self.p_assist_on:
                 return 'Motor P must be OFF for the raw throttle test'
@@ -4292,6 +4307,9 @@ class BoatLink:
                     'name': self.rudder_test['name'],
                 } if self.rudder_test else None),
                 'assist_rudder_on': self.assist_rudder_on,
+                'assist_mode_pending': getattr(self, '_assist_off_req_id', None) is not None,
+                'assist_mode_want_p': bool(getattr(self, '_assist_pending_p_on',
+                                                   getattr(self, 'p_assist_on', False))),
                 'rudder_test_result': (dict(self.rudder_test_result)
                                        if self.rudder_test_result else None),
                 'motor_status': self._with_age(self.motor_status, TELEMETRY_STALE_S),
@@ -5780,14 +5798,16 @@ $('bench-delta').addEventListener('input', refreshBenchPreview);
 refreshBenchPreview();
 // Runtime switch, deliberately not a rebuild: both arms of the A/B must run
 // the same binary. OFF is the control arm and the default.
-var pAssistOn = false;
+var pAssistOn = false;       // confirmed boat state, never merely requested state
+var pAssistPending = false;
 $('p-assist').addEventListener('click', async () => {
+  if (pAssistPending) return;
   const want = !pAssistOn;
   const r = await api('/api/assist', 'POST', { p_on: want });
   if (r && r.ok) {
-    pAssistOn = want;
-    $('p-assist').textContent = 'P ASSIST: ' + (want ? 'ON' : 'OFF');
-    $('p-assist').classList.toggle('up', want);
+    pAssistPending = true;
+    $('p-assist').disabled = true;
+    $('p-assist').textContent = 'P ASSIST: WAITING FOR BOAT ' + (want ? 'ON' : 'OFF');
   } else if (r) {
     $('bench-msg').textContent = r.error || 'refused';
   }
@@ -5951,6 +5971,19 @@ function applyStatus(s) {
       servoEl.classList.toggle('warn', !mst.servo_power);
     }
 
+    // The button follows MotorStatus, not HTTP success. HTTP success means the
+    // laptop wrote a request; only the echoed request/state proves the boat
+    // applied it.
+    pAssistPending = !!s.assist_mode_pending;
+    if (mst && mst.have && !mst.stale) pAssistOn = !!mst.assist_motor_p;
+    const pButton = $('p-assist');
+    const pWant = pAssistPending ? !!s.assist_mode_want_p : pAssistOn;
+    pButton.disabled = pAssistPending;
+    pButton.textContent = pAssistPending
+      ? 'P ASSIST: WAITING FOR BOAT ' + (pWant ? 'ON' : 'OFF')
+      : 'P ASSIST: ' + (pAssistOn ? 'ON' : 'OFF');
+    pButton.classList.toggle('up', pAssistOn && !pAssistPending);
+
     // The BOAT runs the test and writes the file; this just shows its progress
     // and which file number it saved as. Read the runs with tools/bench_analyze.py.
     var bn = s.bench;
@@ -5975,7 +6008,7 @@ function applyStatus(s) {
       // What the BOAT reports, next to what we asked for. A mismatch voids
       // the A/B, so it is shown rather than assumed.
       if (bn.have) {
-        var bp = !!bn.p_on;
+        var bp = (mst && mst.have && !mst.stale) ? !!mst.assist_motor_p : !!bn.p_on;
         $('p-confirm').textContent = 'boat: ' + (bp ? 'ON' : 'OFF');
         $('p-confirm').classList.toggle('up', bp);
         $('p-confirm').classList.toggle('warn', bp !== pAssistOn);
