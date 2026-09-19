@@ -16,7 +16,7 @@ bool trim_learn_reset(trim_learn_t *s, const trim_learn_cfg_t *cfg, float c)
     if (!isfinite(c) || c < cfg->c_min || c > cfg->c_max) return false;
     s->c = c;
     s->initialized = false;     /* the old yaw estimate described another trim */
-    s->faulted = false;         /* a deliberate restart clears the latch */
+    s->faulted = false;         /* a deliberate restart clears the clamp flag */
     s->yaw_filt = 0.0f;
     return true;
 }
@@ -65,7 +65,6 @@ bool trim_learn_update(trim_learn_t *s, const trim_learn_cfg_t *cfg,
     }
     s->yaw_filt += (dt_s / (cfg->yaw_tau_s + dt_s)) * (yaw_rate_dps - s->yaw_filt);
 
-    if (s->faulted) return false;
     if (throttle < cfg->min_throttle) return false;   /* floors dominate below */
 
     /* Deadband: once the boat is straight, the sign of the residual is just
@@ -79,9 +78,11 @@ bool trim_learn_update(trim_learn_t *s, const trim_learn_cfg_t *cfg,
     const float step = cfg->step_per_s * dt_s;
     s->c += (s->yaw_filt < 0.0f) ? step : -step;
 
-    /* A clamp hit is a FAULT, not a limit: wrong sign, blocked jet, battery
-     * sag or bad gyro all land here. Latch it and stop rather than sit on the
-     * rail pretending to work. */
+    /* Flag a clamp hit and block further movement into the rail. A later yaw
+     * reversal is useful evidence, though, so let it move c back inward and
+     * clear the flag. This avoids permanently disabling learning after one
+     * transient or a deliberately low/high lake-ID starting point. */
+    s->faulted = false;
     if (s->c <= cfg->c_min) { s->c = cfg->c_min; s->faulted = true; }
     else if (s->c >= cfg->c_max) { s->c = cfg->c_max; s->faulted = true; }
 

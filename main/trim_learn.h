@@ -26,7 +26,7 @@
 
 typedef struct {
     float c_init;          /* seeded from the bench measurement (~0.20) */
-    float c_min, c_max;    /* clamp; a hit is treated as a FAULT, not a limit */
+    float c_min, c_max;    /* clamp; blocks outward motion but permits recovery */
     float deadband_dps;    /* below this filtered drift, change nothing */
     float step_per_s;      /* how fast c may move (units of c per second) */
     float yaw_tau_s;       /* low-pass time constant on the measured yaw rate */
@@ -40,7 +40,7 @@ typedef struct {
     float yaw_filt;
     bool initialized;
     uint32_t last_seq;     /* fusion sample already consumed */
-    bool faulted;          /* clamp was hit: stop adapting, flag it */
+    bool faulted;          /* at a clamp; clears when yaw drives c inward */
 } trim_learn_t;
 
 /* Longest gap between fusion samples that still counts as continuous. Fusion
@@ -49,7 +49,7 @@ typedef struct {
  * run or an ESC calibration -- and the elapsed wall time is NOT integration
  * time. Without this bound the step (step_per_s * dt) scales with however long
  * the pause lasted: a 30 s calibration would move c by 0.15 in a single
- * sample, slamming it into a clamp and latching the fault. */
+ * sample, slamming it into a clamp and raising the fault flag. */
 #define TRIM_LEARN_MAX_DT_S 0.25f
 
 /* Yaw above this is not a trim error -- it is the hull hitting something.
@@ -66,8 +66,8 @@ typedef struct {
 void trim_learn_init(trim_learn_t *s, const trim_learn_cfg_t *cfg);
 
 /* Put the learner at a known c and wipe what it thought it knew: the yaw
- * estimate is dropped (it described a different trim) and any latched clamp
- * fault is cleared.
+ * estimate is dropped (it described a different trim) and any clamp flag is
+ * cleared.
  *
  * This exists for ONE experiment: start low, start high, and see whether both
  * ends walk to the same place. Nothing else may call it -- c carrying over

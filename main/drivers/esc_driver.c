@@ -16,7 +16,7 @@
 #define CONFIG_ESC_MIN_THR_LEFT_PCT 5
 #endif
 #ifndef CONFIG_ESC_MIN_THR_RIGHT_PCT
-#define CONFIG_ESC_MIN_THR_RIGHT_PCT 20
+#define CONFIG_ESC_MIN_THR_RIGHT_PCT 5
 #endif
 
 static const char *TAG = "ESC";

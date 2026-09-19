@@ -84,9 +84,9 @@ static void a_repeated_sample_is_ignored(void)
     assert(fabsf(s.c - after_first) < 1e-9f);
 }
 
-/* Hitting the clamp is a FAULT (wrong sign, blocked jet, bad gyro), not just a
- * limit: latch it and stop adapting rather than sitting on the rail. */
-static void clamp_latches_a_fault_and_stops(void)
+/* The clamp must block further motion into the rail, but a later yaw reversal
+ * is evidence that the learned value should come back toward the interior. */
+static void clamp_blocks_outward_motion_but_allows_recovery(void)
 {
     trim_learn_cfg_t c = cfg(); trim_learn_t s;
     trim_learn_init(&s, &c);
@@ -95,7 +95,11 @@ static void clamp_latches_a_fault_and_stops(void)
     assert(s.faulted);
     float held = s.c;
     feed(&s, &c, -20.0f, 0.40f, false, 500);
-    assert(fabsf(s.c - held) < 1e-9f);           /* stays put once faulted */
+    assert(fabsf(s.c - held) < 1e-9f);           /* cannot push farther out */
+
+    feed(&s, &c, +20.0f, 0.40f, false, 500);
+    assert(s.c < held);                          /* can recover inward */
+    assert(!s.faulted);
 }
 
 static void unhealthy_gyro_freezes_learning(void)
@@ -149,7 +153,7 @@ static void update_reports_whether_c_changed(void)
 /* The learner is frozen through a bench run and through an ESC calibration. If
  * that gap counted as integration time, the first sample afterwards would move
  * c by step_per_s * gap -- 0.0225 after a 4.5 s bench run, 0.15 after a 30 s
- * calibration, straight into the clamp and latched faulted. */
+ * calibration, straight into the clamp and marked faulted. */
 static void a_long_freeze_is_not_a_giant_correction(void)
 {
     trim_learn_cfg_t c = cfg(); trim_learn_t s;
@@ -233,14 +237,14 @@ static void an_impact_is_rejected_not_learned_from(void)
 /* The reset exists for ONE experiment: start low, start high, and see whether
  * both ends walk to the same c. It must put the learner at exactly the asked-for
  * value and wipe what it thought it knew -- a yaw estimate built under a
- * different trim is worse than no estimate, and a latched clamp fault would
- * make the whole run a no-op. */
+ * different trim is worse than no estimate, and the clamp indication belongs
+ * to the old starting point. */
 static void reset_sets_c_and_wipes_what_it_knew(void)
 {
     trim_learn_cfg_t c = cfg(); trim_learn_t s;
     trim_learn_init(&s, &c);
 
-    /* drive it into a latched clamp fault with a filter full of history */
+    /* drive it to a clamp with a filter full of history */
     uint32_t seq = 1;
     for (int i = 0; i < 4000; ++i)
         trim_learn_update(&s, &c, seq++, 0.02f, -8.0f, 0.40f, false, true);
@@ -250,7 +254,7 @@ static void reset_sets_c_and_wipes_what_it_knew(void)
 
     assert(trim_learn_reset(&s, &c, 0.12f));
     assert(fabsf(s.c - 0.12f) < 1e-9f);      /* exactly what was asked for */
-    assert(!s.faulted);                       /* latch cleared */
+    assert(!s.faulted);                       /* clamp flag cleared */
     assert(!s.initialized);                   /* estimate dropped */
 
     /* and it learns again afterwards, from the new starting point */
@@ -305,7 +309,7 @@ int main(void)
     steering_freezes_learning();
     low_throttle_freezes_learning();
     a_repeated_sample_is_ignored();
-    clamp_latches_a_fault_and_stops();
+    clamp_blocks_outward_motion_but_allows_recovery();
     unhealthy_gyro_freezes_learning();
     nonfinite_input_is_rejected();
     update_reports_whether_c_changed();

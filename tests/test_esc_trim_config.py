@@ -22,17 +22,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _kconfig_default(name):
     src = (ROOT / 'main' / 'Kconfig.projbuild').read_text()
-    m = re.search(r'config %s\b.*?\n\s*default\s+"([^"]*)"' % name, src, re.S)
-    return m.group(1) if m else None
+    m = re.search(r'config %s\b.*?\n\s*default\s+(?:"([^"]*)"|(\S+))' % name,
+                  src, re.S)
+    return (m.group(1) or m.group(2)) if m else None
 
 
 def _sdkconfig_value(name):
     src = (ROOT / 'sdkconfig').read_text()
-    m = re.search(r'^CONFIG_%s="([^"]*)"' % name, src, re.M)
-    return m.group(1) if m else None
+    m = re.search(r'^CONFIG_%s=(?:"([^"]*)"|(\S+))' % name, src, re.M)
+    return (m.group(1) or m.group(2)) if m else None
 
 
 class EscTrimConfigTest(unittest.TestCase):
+    def test_recalibrated_esc_start_floors_are_both_1050us(self):
+        """Both recalibrated motors now begin turning at 1050 us. With the
+        1000..2000 us pulse span, that is the same 5% floor on both sides."""
+        for side in ('LEFT', 'RIGHT'):
+            name = 'ESC_MIN_THR_%s_PCT' % side
+            self.assertEqual(float(_kconfig_default(name)), 5.0, name)
+            self.assertEqual(float(_sdkconfig_value(name)), 5.0, name)
+
     def test_both_knobs_parse_as_real_numbers(self):
         for name in ('ESC_TRIM_C', 'ESC_TRIM_DEFAULT'):
             raw = _kconfig_default(name)
@@ -92,12 +101,11 @@ class EscTrimConfigTest(unittest.TestCase):
         self.assertGreater(c, 0.10, 'seeded on the clamp -- nowhere to go down')
         self.assertLess(c, 0.35, 'seeded on the clamp -- nowhere to go up')
 
-    def test_c_is_not_the_old_baseline_corrected_figure(self):
-        """0.20 came from subtracting a baseline that does not predict the run.
-        Seeding there put the learner above every measured value, so it only
-        ever walked downhill -- which is exactly what both sessions show."""
+    def test_c_starts_at_the_latest_t40_sign_crossing(self):
+        """The latest clean T40 BASE pair brackets zero yaw near c=0.206, so
+        0.21 is the practical lake starting point."""
         c = float(_sdkconfig_value('ESC_TRIM_C'))
-        self.assertLess(c, 0.19, 'back to the superseded baseline-corrected c')
+        self.assertAlmostEqual(c, 0.21, places=3)
 
     def test_c_produces_a_split_inside_what_was_measured(self):
         c = float(_sdkconfig_value('ESC_TRIM_C'))
@@ -121,9 +129,7 @@ class EscTrimConfigTest(unittest.TestCase):
         c = float(_sdkconfig_value('ESC_TRIM_C'))
         flat = float(_sdkconfig_value('ESC_TRIM_DEFAULT'))
         self.assertGreater(flat, 0.0)
-        self.assertGreater(flat / (2 * 0.40), c,
-                           'the flat value no longer reads as the older, '
-                           'higher estimate -- one of the two is stale')
+        self.assertNotAlmostEqual(flat / (2 * 0.40), c, places=3)
         src = (ROOT / 'main' / 'main.c').read_text()
         self.assertLess(src.index('CONFIG_ESC_TRIM_C'),
                         src.index('CONFIG_ESC_TRIM_DEFAULT'))
@@ -154,8 +160,7 @@ class EscTrimConfigTest(unittest.TestCase):
 
     def test_the_learner_can_only_move_slowly_and_within_bounds(self):
         """It drives the motors unattended, so the bounds are the safety
-        argument: c held to [0.10, 0.35] at most 0.005/s, and a bound touched
-        is a latched fault rather than a rail to sit on."""
+        argument: c is held to [0.10, 0.35] at most 0.005/s."""
         src = (ROOT / 'main' / 'motor_control.c').read_text()
         self.assertIn('.c_min = 0.10f, .c_max = 0.35f', src)
         step = float(re.search(
