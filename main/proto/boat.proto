@@ -131,6 +131,23 @@ message MotorStatus {
   // has merely received: the RX task only queues a request, and echoing at
   // receipt would acknowledge a mode the boat is not yet in.
   uint32 assist_request_id = 13;
+  // Live motor-yaw controller diagnostics. These belong on MotorStatus because
+  // that message is refreshed during ordinary laptop driving; BenchStatus is
+  // only the state of an on-boat bench run.
+  float  heading_target_deg = 14;
+  float  heading_error_deg  = 15;
+  float  p_term             = 16;
+  float  i_term             = 17;
+  float  dynamic_c          = 18;
+  float  effective_c        = 19;
+  float  c_limit            = 20;
+  bool   ctrl_active        = 21;
+  bool   heading_hold       = 22;
+  bool   saturated          = 23;
+  uint32 fusion_age_ms      = 24;
+  float  rate_error_dps     = 25;
+  float  motor_yaw_target_dps = 26;
+  float  motor_yaw_filt_dps   = 27;
 }
 
 message ArmCommand {

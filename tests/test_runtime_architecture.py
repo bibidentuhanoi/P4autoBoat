@@ -187,8 +187,8 @@ typedef struct { float throttle; float rudder; float left; float right; } boat_M
 typedef struct { float speed; } boat_WinchCommand;
 typedef struct { float left; float right; } boat_SteerCommand;
 typedef struct { uint32_t pulse_us; } boat_SteerRawCommand;
-typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; } boat_MotorStatus;
-#define boat_MotorStatus_init_zero {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+typedef struct { uint32_t state; float left_throttle; float right_throttle; float winch_speed; bool servo_power; float rudder_cmd; uint32_t rudder_pulse_us; bool rudder_saturated; bool assist_rudder; bool assist_motor_p; float yaw_target_dps; float yaw_filt_dps; uint32_t assist_request_id; float heading_target_deg; float heading_error_deg; float p_term; float i_term; float dynamic_c; float effective_c; float c_limit; bool ctrl_active; bool heading_hold; bool saturated; uint32_t fusion_age_ms; float rate_error_dps; float motor_yaw_target_dps; float motor_yaw_filt_dps; } boat_MotorStatus;
+#define boat_MotorStatus_init_zero {0}
 typedef struct { uint32_t state; uint32_t level_index; float level_throttle; float trim_diff; float yaw_avg_dps; bool making_way; uint32_t points_done; } boat_CalibrateStatus;
 #define boat_CalibrateStatus_init_zero {0, 0, 0, 0, 0, 0, 0}
 typedef struct { uint32_t state; uint32_t kind; float base; uint32_t samples; uint32_t file_index; float elapsed_s; float learn_c; bool p_on; float heading_target_deg; float heading_error_deg; float yaw_target_dps; float p_term; float i_term; float dynamic_c; float effective_c; float c_limit; bool ctrl_active; bool heading_hold; bool saturated; } boat_BenchStatus;

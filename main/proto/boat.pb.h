@@ -151,6 +151,23 @@ typedef struct _boat_MotorStatus {
  has merely received: the RX task only queues a request, and echoing at
  receipt would acknowledge a mode the boat is not yet in. */
     uint32_t assist_request_id;
+    /* Live motor-yaw controller diagnostics. These belong on MotorStatus because
+ that message is refreshed during ordinary laptop driving; BenchStatus is
+ only the state of an on-boat bench run. */
+    float heading_target_deg;
+    float heading_error_deg;
+    float p_term;
+    float i_term;
+    float dynamic_c;
+    float effective_c;
+    float c_limit;
+    bool ctrl_active;
+    bool heading_hold;
+    bool saturated;
+    uint32_t fusion_age_ms;
+    float rate_error_dps;
+    float motor_yaw_target_dps;
+    float motor_yaw_filt_dps;
 } boat_MotorStatus;
 
 typedef struct _boat_ArmCommand {
@@ -317,7 +334,7 @@ extern "C" {
 #define boat_SteerCommand_init_default           {0, 0}
 #define boat_SteerRawCommand_init_default        {0}
 #define boat_SteerRateCommand_init_default       {0}
-#define boat_MotorStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MotorStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_default             {0, 0}
 #define boat_ServoPowerCommand_init_default      {0}
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -340,7 +357,7 @@ extern "C" {
 #define boat_SteerCommand_init_zero              {0, 0}
 #define boat_SteerRawCommand_init_zero           {0}
 #define boat_SteerRateCommand_init_zero          {0}
-#define boat_MotorStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MotorStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_ArmCommand_init_zero                {0, 0}
 #define boat_ServoPowerCommand_init_zero         {0}
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -407,6 +424,20 @@ extern "C" {
 #define boat_MotorStatus_yaw_target_dps_tag      11
 #define boat_MotorStatus_yaw_filt_dps_tag        12
 #define boat_MotorStatus_assist_request_id_tag   13
+#define boat_MotorStatus_heading_target_deg_tag  14
+#define boat_MotorStatus_heading_error_deg_tag   15
+#define boat_MotorStatus_p_term_tag              16
+#define boat_MotorStatus_i_term_tag              17
+#define boat_MotorStatus_dynamic_c_tag           18
+#define boat_MotorStatus_effective_c_tag         19
+#define boat_MotorStatus_c_limit_tag             20
+#define boat_MotorStatus_ctrl_active_tag         21
+#define boat_MotorStatus_heading_hold_tag        22
+#define boat_MotorStatus_saturated_tag           23
+#define boat_MotorStatus_fusion_age_ms_tag       24
+#define boat_MotorStatus_rate_error_dps_tag      25
+#define boat_MotorStatus_motor_yaw_target_dps_tag 26
+#define boat_MotorStatus_motor_yaw_filt_dps_tag  27
 #define boat_ArmCommand_arm_tag                  1
 #define boat_ArmCommand_force_tag                2
 #define boat_ServoPowerCommand_on_tag            1
@@ -591,7 +622,21 @@ X(a, STATIC,   SINGULAR, BOOL,     assist_rudder,     9) \
 X(a, STATIC,   SINGULAR, BOOL,     assist_motor_p,   10) \
 X(a, STATIC,   SINGULAR, FLOAT,    yaw_target_dps,   11) \
 X(a, STATIC,   SINGULAR, FLOAT,    yaw_filt_dps,     12) \
-X(a, STATIC,   SINGULAR, UINT32,   assist_request_id,  13)
+X(a, STATIC,   SINGULAR, UINT32,   assist_request_id,  13) \
+X(a, STATIC,   SINGULAR, FLOAT,    heading_target_deg,  14) \
+X(a, STATIC,   SINGULAR, FLOAT,    heading_error_deg,  15) \
+X(a, STATIC,   SINGULAR, FLOAT,    p_term,           16) \
+X(a, STATIC,   SINGULAR, FLOAT,    i_term,           17) \
+X(a, STATIC,   SINGULAR, FLOAT,    dynamic_c,        18) \
+X(a, STATIC,   SINGULAR, FLOAT,    effective_c,      19) \
+X(a, STATIC,   SINGULAR, FLOAT,    c_limit,          20) \
+X(a, STATIC,   SINGULAR, BOOL,     ctrl_active,      21) \
+X(a, STATIC,   SINGULAR, BOOL,     heading_hold,     22) \
+X(a, STATIC,   SINGULAR, BOOL,     saturated,        23) \
+X(a, STATIC,   SINGULAR, UINT32,   fusion_age_ms,    24) \
+X(a, STATIC,   SINGULAR, FLOAT,    rate_error_dps,   25) \
+X(a, STATIC,   SINGULAR, FLOAT,    motor_yaw_target_dps,  26) \
+X(a, STATIC,   SINGULAR, FLOAT,    motor_yaw_filt_dps,  27)
 #define boat_MotorStatus_CALLBACK NULL
 #define boat_MotorStatus_DEFAULT NULL
 
@@ -781,7 +826,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_GpsFix_size                         63
 #define boat_IMUData_size                        20
 #define boat_MotorCommand_size                   20
-#define boat_MotorStatus_size                    56
+#define boat_MotorStatus_size                    130
 #define boat_SensorSnapshot_size                 13272
 #define boat_ServoPowerCommand_size              2
 #define boat_SteerCommand_size                   10

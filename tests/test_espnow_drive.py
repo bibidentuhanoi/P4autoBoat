@@ -324,6 +324,11 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         msg.motor_status.left_throttle = 0.30
         msg.motor_status.right_throttle = 0.25
         msg.motor_status.servo_power = True
+        msg.motor_status.p_term = 0.31
+        msg.motor_status.i_term = 0.12
+        msg.motor_status.effective_c = 0.43
+        msg.motor_status.ctrl_active = True
+        msg.motor_status.fusion_age_ms = 8
         frame = espnow_drive.build_frame(espnow_drive.MSG_MOTOR_STATUS,
                                          msg.SerializeToString(), seq=4)
         self.link._handle_incoming_frame(frame[:-1])
@@ -332,6 +337,11 @@ class CalibrateStatusDecodeTest(unittest.TestCase):
         self.assertEqual(m['state'], 2)
         self.assertAlmostEqual(m['left_throttle'], 0.30, places=5)
         self.assertTrue(m['servo_power'])
+        self.assertAlmostEqual(m['p_term'], 0.31, places=5)
+        self.assertAlmostEqual(m['i_term'], 0.12, places=5)
+        self.assertAlmostEqual(m['effective_c'], 0.43, places=5)
+        self.assertTrue(m['ctrl_active'])
+        self.assertEqual(m['fusion_age_ms'], 8)
         self.assertFalse(self.link.telemetry['have'])   # not mistaken for telemetry
 
     def test_sensor_frame_still_decodes(self):

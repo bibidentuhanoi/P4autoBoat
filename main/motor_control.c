@@ -600,7 +600,21 @@ static bool motor_status_continuous_equal(const boat_MotorStatus *a,
            a->rudder_pulse_us == b->rudder_pulse_us &&
            a->rudder_saturated == b->rudder_saturated &&
            a->yaw_target_dps == b->yaw_target_dps &&
-           a->yaw_filt_dps == b->yaw_filt_dps;
+           a->yaw_filt_dps == b->yaw_filt_dps &&
+           a->heading_target_deg == b->heading_target_deg &&
+           a->heading_error_deg == b->heading_error_deg &&
+           a->p_term == b->p_term &&
+           a->i_term == b->i_term &&
+           a->dynamic_c == b->dynamic_c &&
+           a->effective_c == b->effective_c &&
+           a->c_limit == b->c_limit &&
+           a->ctrl_active == b->ctrl_active &&
+           a->heading_hold == b->heading_hold &&
+           a->saturated == b->saturated &&
+           a->fusion_age_ms == b->fusion_age_ms &&
+           a->rate_error_dps == b->rate_error_dps &&
+           a->motor_yaw_target_dps == b->motor_yaw_target_dps &&
+           a->motor_yaw_filt_dps == b->motor_yaw_filt_dps;
 }
 
 /* 10 Hz. Comfortably finer than the ~20 Hz telemetry the CSV samples against,
@@ -628,6 +642,28 @@ static void status_commit_current(bool force)
 #endif
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
     status.assist_motor_p = s_p_assist_on;
+    status.heading_target_deg = s_yaw_heading_out.heading_target_deg;
+    status.heading_error_deg = s_yaw_heading_out.heading_error_deg;
+    status.p_term = s_yaw_heading_out.p_term;
+    status.i_term = s_yaw_heading_out.i_term;
+    status.dynamic_c = s_yaw_heading_out.dynamic_c;
+    status.effective_c = s_yaw_heading_out.active
+                       ? s_yaw_heading_out.effective_c : s_trim_learn.c;
+    status.c_limit = s_yaw_heading_out.c_limit;
+    status.ctrl_active = s_yaw_heading_out.active;
+    status.heading_hold = s_yaw_heading_out.heading_hold;
+    status.saturated = s_yaw_heading_out.saturated;
+    status.rate_error_dps = s_yaw_heading_out.rate_error_dps;
+    status.motor_yaw_target_dps = s_yaw_heading_out.yaw_target_dps;
+    status.motor_yaw_filt_dps = s_yaw_heading_out.yaw_filt_dps;
+    if (s_yaw_last_capture_us == 0) {
+        status.fusion_age_ms = UINT32_MAX;
+    } else {
+        int64_t age_us = esp_timer_get_time() - (int64_t)s_yaw_last_capture_us;
+        if (age_us < 0) age_us = 0;
+        uint64_t age_ms = (uint64_t)age_us / 1000U;
+        status.fusion_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+    }
 #endif
 
     portENTER_CRITICAL(&s_status_lock);

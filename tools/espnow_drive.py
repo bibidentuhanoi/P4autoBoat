@@ -515,10 +515,11 @@ LAKE_ID_CSV_COLUMNS = (
     'boat_state', 'boat_servo_power', 'boat_assist_motor_p', 'boat_assist_rudder',
     'boat_yaw_target_dps', 'boat_yaw_filt_dps', 'boat_saturated',
     'imu_ok', 'mag_ok', 'gps_ok', 'tof_a_ok', 'tof_b_ok', 'camera_ok',
-    'telem_age_s', 'motor_status_age_s', 'system_status_age_s', 'gap_s',
+    'telem_age_s', 'motor_status_age_s', 'fusion_age_ms', 'system_status_age_s', 'gap_s',
     'tool_send_age_s', 'bridge_age_s', 'bridge_uplink_rssi_dbm', 'bridge_espnow_pkts',
     'bridge_frames_out', 'bridge_reasm_drops', 'bench_learn_c_last', 'bench_status_age_s',
-    'heading_target_deg', 'heading_error_deg', 'yaw_target_dps',
+    'heading_target_deg', 'heading_error_deg', 'yaw_target_dps', 'yaw_filt_dps',
+    'rate_error_dps',
     'p_term', 'i_term', 'dynamic_c', 'effective_c', 'c_limit',
     'ctrl_active', 'heading_hold', 'saturated',
 )
@@ -539,7 +540,8 @@ LAKE_ID_SAMPLES_HEADER = (
     '# boat_assist_motor_p is the enable switch as reported by the boat, not proof of a nonzero '
     'correction; ctrl_active reports whether the yaw controller is applying output',
     '# heading_target_deg through saturated are the latest coherent controller snapshot from '
-    'BenchStatus; bench_status_age_s states its age. p_term/i_term/dynamic_c/effective_c/c_limit '
+    'MotorStatus; motor_status_age_s states its radio age and fusion_age_ms is the age of the '
+    'fusion sample at the firmware control tick. p_term/i_term/dynamic_c/effective_c/c_limit '
     'are dimensionless motor-command fractions',
     '# boat_yaw_filt_dps / boat_yaw_target_dps belong to the RUDDER controller (Assisted '
     'Steering), not the motor yaw controller; with Rudder Assist OFF they read 0',
@@ -550,8 +552,8 @@ LAKE_ID_SAMPLES_HEADER = (
     '# link columns: tool_send_age_s = seconds since THIS tool last wrote a motor frame to the '
     'bridge; bridge_* = the S3 bridge\'s own counters (packets heard on air, frames forwarded '
     'to USB, reassembly drops) and the uplink RSSI it reports; the bridge does not report '
-    'uplink send failures. bench_learn_c_last and the controller fields come from the latest '
-    'BenchStatus; bench_status_age_s records how old that coherent snapshot is',
+    'uplink send failures. bench_learn_c_last comes from the latest BenchStatus; live controller '
+    'fields come from MotorStatus',
 )
 LAKE_ID_STATUS_COMPLETE = 'complete'
 LAKE_ID_STATUS_STOP_UNCONFIRMED = 'incomplete_stop_unconfirmed'
@@ -2135,6 +2137,12 @@ class BoatLink:
             'assist_rudder': False, 'assist_motor_p': False,
             'yaw_target_dps': 0.0, 'yaw_filt_dps': 0.0,
             'assist_request_id': 0,
+            'heading_target_deg': 0.0, 'heading_error_deg': 0.0,
+            'p_term': 0.0, 'i_term': 0.0, 'dynamic_c': 0.0,
+            'effective_c': 0.0, 'c_limit': 0.0,
+            'ctrl_active': False, 'heading_hold': False, 'saturated': False,
+            'fusion_age_ms': 0, 'rate_error_dps': 0.0,
+            'motor_yaw_target_dps': 0.0, 'motor_yaw_filt_dps': 0.0,
         }
 
     @staticmethod
@@ -3871,7 +3879,9 @@ class BoatLink:
             'tof_a_ok': (1 if ss.get('tof_a_ok') else 0) if ss.get('have') else '',
             'tof_b_ok': (1 if ss.get('tof_b_ok') else 0) if ss.get('have') else '',
             'camera_ok': (1 if ss.get('camera_ok') else 0) if ss.get('have') else '',
-            'telem_age_s': age(tel), 'motor_status_age_s': age(ms), 'system_status_age_s': age(ss),
+            'telem_age_s': age(tel), 'motor_status_age_s': age(ms),
+            'fusion_age_ms': ms.get('fusion_age_ms') if ms.get('have') else '',
+            'system_status_age_s': age(ss),
             'gap_s': round(gap, 4),
             # The link, from this side: who went quiet is answerable after the fact.
             'tool_send_age_s': (round(now - self._last_send_mono, 4)
@@ -3883,17 +3893,19 @@ class BoatLink:
             'bridge_reasm_drops': bs.get('reasm_drops') if bs.get('have') else '',
             'bench_learn_c_last': bench.get('learn_c') if bench.get('have') else '',
             'bench_status_age_s': age(bench),
-            'heading_target_deg': bench.get('heading_target_deg') if bench.get('have') else '',
-            'heading_error_deg': bench.get('heading_error_deg') if bench.get('have') else '',
-            'yaw_target_dps': bench.get('yaw_target_dps') if bench.get('have') else '',
-            'p_term': bench.get('p_term') if bench.get('have') else '',
-            'i_term': bench.get('i_term') if bench.get('have') else '',
-            'dynamic_c': bench.get('dynamic_c') if bench.get('have') else '',
-            'effective_c': bench.get('effective_c') if bench.get('have') else '',
-            'c_limit': bench.get('c_limit') if bench.get('have') else '',
-            'ctrl_active': (1 if bench.get('ctrl_active') else 0) if bench.get('have') else '',
-            'heading_hold': (1 if bench.get('heading_hold') else 0) if bench.get('have') else '',
-            'saturated': (1 if bench.get('saturated') else 0) if bench.get('have') else '',
+            'heading_target_deg': ms.get('heading_target_deg') if ms.get('have') else '',
+            'heading_error_deg': ms.get('heading_error_deg') if ms.get('have') else '',
+            'yaw_target_dps': ms.get('motor_yaw_target_dps') if ms.get('have') else '',
+            'yaw_filt_dps': ms.get('motor_yaw_filt_dps') if ms.get('have') else '',
+            'rate_error_dps': ms.get('rate_error_dps') if ms.get('have') else '',
+            'p_term': ms.get('p_term') if ms.get('have') else '',
+            'i_term': ms.get('i_term') if ms.get('have') else '',
+            'dynamic_c': ms.get('dynamic_c') if ms.get('have') else '',
+            'effective_c': ms.get('effective_c') if ms.get('have') else '',
+            'c_limit': ms.get('c_limit') if ms.get('have') else '',
+            'ctrl_active': (1 if ms.get('ctrl_active') else 0) if ms.get('have') else '',
+            'heading_hold': (1 if ms.get('heading_hold') else 0) if ms.get('have') else '',
+            'saturated': (1 if ms.get('saturated') else 0) if ms.get('have') else '',
         }
         if len(rt['rows']) < LAKE_ID_MAX_ROWS:
             rt['rows'].append(row)
@@ -4317,6 +4329,20 @@ class BoatLink:
                 'yaw_target_dps': float(ms.yaw_target_dps),
                 'yaw_filt_dps': float(ms.yaw_filt_dps),
                 'assist_request_id': int(ms.assist_request_id),
+                'heading_target_deg': float(getattr(ms, 'heading_target_deg', 0.0)),
+                'heading_error_deg': float(getattr(ms, 'heading_error_deg', 0.0)),
+                'p_term': float(getattr(ms, 'p_term', 0.0)),
+                'i_term': float(getattr(ms, 'i_term', 0.0)),
+                'dynamic_c': float(getattr(ms, 'dynamic_c', 0.0)),
+                'effective_c': float(getattr(ms, 'effective_c', 0.0)),
+                'c_limit': float(getattr(ms, 'c_limit', 0.0)),
+                'ctrl_active': bool(getattr(ms, 'ctrl_active', False)),
+                'heading_hold': bool(getattr(ms, 'heading_hold', False)),
+                'saturated': bool(getattr(ms, 'saturated', False)),
+                'fusion_age_ms': int(getattr(ms, 'fusion_age_ms', 0)),
+                'rate_error_dps': float(getattr(ms, 'rate_error_dps', 0.0)),
+                'motor_yaw_target_dps': float(getattr(ms, 'motor_yaw_target_dps', 0.0)),
+                'motor_yaw_filt_dps': float(getattr(ms, 'motor_yaw_filt_dps', 0.0)),
             }
 
     def _handle_calibrate_status(self, cs):

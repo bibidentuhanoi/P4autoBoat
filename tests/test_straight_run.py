@@ -364,7 +364,16 @@ class StraightRecordingTest(LakeBase):
             'dynamic_c': 0.16, 'effective_c': 0.20, 'c_limit': 1.0,
             'ctrl_active': True, 'heading_hold': True, 'saturated': False,
         }
-        self._bench_c(**diagnostic)
+        self._bench_c()
+        self.link.motor_status = dict(
+            self.link.motor_status,
+            have=True,
+            last_rx_monotonic=self.clock.t,
+            motor_yaw_target_dps=diagnostic['yaw_target_dps'],
+            motor_yaw_filt_dps=0.3,
+            **{name: value for name, value in diagnostic.items()
+               if name != 'yaw_target_dps'},
+        )
         ok, err = self.link.start_lake_id(
             0.2, 0.0, self.link.winch_command_seq + 1, profile='straight')
         self.assertTrue(ok, err)

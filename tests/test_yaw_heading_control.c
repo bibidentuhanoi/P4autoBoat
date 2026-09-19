@@ -120,12 +120,111 @@ static void anti_windup_stops_outward_growth_and_allows_unwind(void)
         out = tick(&ctl, &cfg, +5.0f, 0.0f, false,
                    0.80f, 0.21f, 0.0f, true, true, false);
     }
-    /* Back-calculation releases the stored upper-limit cancellation as the P
-     * term crosses through zero.  The requested correction must reverse; the
-     * numerical I value rises because held_i was negative while cancelling a
-     * large positive P term. */
-    assert(out.i_term > held_i);
+    /* Once the error reverses, I is allowed to move negative and support the
+     * newly requested correction. */
+    assert(out.i_term < held_i);
     assert(out.dynamic_c < 0.0f);
+}
+
+static void saturation_recovery_never_reverses_a_remaining_rate_error(void)
+{
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+
+    for (int heading_case = 0; heading_case < 2; ++heading_case) {
+        yaw_heading_control_t ctl;
+        yaw_heading_control_init(&ctl);
+        float heading = 0.0f;
+        yaw_heading_output_t out = {0};
+
+        for (int i = 0; i < 25; ++i) {
+            heading += -50.0f * DT_S;
+            out = tick(&ctl, &cfg, -50.0f, heading, heading_case != 0,
+                       0.40f, 0.21f, 0.0f, true, true, false);
+        }
+        for (int i = 0; i < 50; ++i) {
+            heading += -5.0f * DT_S;
+            out = tick(&ctl, &cfg, -5.0f, heading, heading_case != 0,
+                       0.40f, 0.21f, 0.0f, true, true, false);
+        }
+
+        /* Negative measured yaw with a zero-or-positive target requires a
+         * positive correction (right motor stronger).  Saturation history
+         * must never make the controller reinforce the remaining turn. */
+        assert(out.rate_error_dps > 0.0f);
+        assert(out.effective_c > 0.0f);
+    }
+}
+
+static void integral_can_reach_full_authority_against_feedforward(void)
+{
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+    yaw_heading_control_t ctl;
+    yaw_heading_control_init(&ctl);
+    yaw_heading_output_t out = {0};
+
+    for (int i = 0; i < 4000; ++i) {
+        out = tick(&ctl, &cfg, +1.0f, 0.0f, false,
+                   0.40f, 0.21f, 0.0f, true, true, false);
+    }
+
+    /* I corrects the total command, including an opposing learned baseline.
+     * It must be able to reach the physical mixer limit in either direction. */
+    assert(out.c_limit > 0.99f);
+    assert(out.effective_c < -0.99f);
+}
+
+static void long_sample_gap_does_not_create_a_large_integral_step(void)
+{
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+    yaw_heading_control_t ctl;
+    yaw_heading_control_init(&ctl);
+
+    yaw_heading_output_t out = tick(&ctl, &cfg, -1.0f, 0.0f, false,
+                                    0.40f, 0.21f, 0.0f, true, true, false);
+    const float before = out.i_term;
+    const yaw_heading_input_t delayed = {
+        .dt_s = 2.0f,
+        .yaw_rate_dps = -1.0f,
+        .heading_deg = 0.0f,
+        .throttle = 0.40f,
+        .feedforward_c = 0.21f,
+        .steering = 0.0f,
+        .enabled = true,
+        .driving = true,
+        .gyro_fresh = true,
+        .heading_valid = false,
+        .base_capture_now = false,
+    };
+    out = yaw_heading_control_update(&ctl, &cfg, &delayed);
+
+    assert(out.i_term > before);
+    assert(out.i_term - before < 0.005f);
+}
+
+static void invalid_heading_still_allows_gyro_rate_damping(void)
+{
+    const yaw_heading_cfg_t cfg = shipped_cfg();
+    yaw_heading_control_t ctl;
+    yaw_heading_control_init(&ctl);
+    const yaw_heading_input_t in = {
+        .dt_s = DT_S,
+        .yaw_rate_dps = -4.0f,
+        .heading_deg = NAN,
+        .throttle = 0.40f,
+        .feedforward_c = 0.21f,
+        .steering = 0.0f,
+        .enabled = true,
+        .driving = true,
+        .gyro_fresh = true,
+        .heading_valid = false,
+        .base_capture_now = false,
+    };
+
+    yaw_heading_output_t out = yaw_heading_control_update(&ctl, &cfg, &in);
+    assert(out.active);
+    assert(!out.heading_hold);
+    assert(out.rate_error_dps > 0.0f);
+    assert(out.effective_c > 0.0f);
 }
 
 static void heading_wrap_and_invalid_fallback_are_safe(void)
@@ -309,6 +408,10 @@ int main(void)
     correction_is_immediate_strong_and_bidirectional();
     integral_cancels_a_persistent_rate_error();
     anti_windup_stops_outward_growth_and_allows_unwind();
+    saturation_recovery_never_reverses_a_remaining_rate_error();
+    integral_can_reach_full_authority_against_feedforward();
+    long_sample_gap_does_not_create_a_large_integral_step();
+    invalid_heading_still_allows_gyro_rate_damping();
     heading_wrap_and_invalid_fallback_are_safe();
     manual_steering_freezes_i_then_recaptures();
     safety_gates_reset_dynamic_state();

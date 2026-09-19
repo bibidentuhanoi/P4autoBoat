@@ -87,12 +87,18 @@ yaw_heading_output_t yaw_heading_control_update(
     yaw_heading_output_t out = inactive_output(in);
     if (ctl == NULL || !config_valid(cfg) || in == NULL ||
         !isfinite(in->dt_s) || in->dt_s <= 0.0f ||
-        !isfinite(in->yaw_rate_dps) || !isfinite(in->heading_deg) ||
+        !isfinite(in->yaw_rate_dps) ||
+        (in->heading_valid && !isfinite(in->heading_deg)) ||
         !isfinite(in->throttle) || !isfinite(in->feedforward_c) ||
         !isfinite(in->steering)) {
         yaw_heading_control_reset(ctl);
         return out;
     }
+
+    /* A newly fresh sample after an I2C/fusion stall can otherwise apply the
+     * entire outage as one filter/integrator step. Fusion uses the same cap;
+     * the controller remains immediately responsive without storing a jump. */
+    const float dt_s = fminf(in->dt_s, 0.1f);
 
     const bool hard_gate = in->enabled && in->driving && in->gyro_fresh &&
                            in->throttle >= cfg->min_throttle;
@@ -125,7 +131,7 @@ yaw_heading_output_t yaw_heading_control_update(
         /* Resume rate damping immediately without carrying turn-rate history. */
         ctl->yaw_filt = in->yaw_rate_dps;
     } else {
-        const float yaw_alpha = lowpass_alpha(in->dt_s, cfg->yaw_tau_s);
+        const float yaw_alpha = lowpass_alpha(dt_s, cfg->yaw_tau_s);
         ctl->yaw_filt += yaw_alpha * (in->yaw_rate_dps - ctl->yaw_filt);
     }
 
@@ -137,7 +143,7 @@ yaw_heading_output_t yaw_heading_control_update(
         capture_heading(ctl, in->heading_deg);
         ctl->steering_suspended = false;
     } else if (ctl->steering_suspended) {
-        ctl->recapture_elapsed_s += in->dt_s;
+        ctl->recapture_elapsed_s += dt_s;
         if (ctl->recapture_elapsed_s + 1e-6f >= cfg->recapture_delay_s) {
             capture_heading(ctl, in->heading_deg);
             ctl->steering_suspended = false;
@@ -150,7 +156,7 @@ yaw_heading_output_t yaw_heading_control_update(
     float yaw_target = 0.0f;
     if (ctl->heading_hold) {
         const float raw_error = yaw_heading_wrap_180(ctl->heading_target - in->heading_deg);
-        const float heading_alpha = lowpass_alpha(in->dt_s, cfg->heading_tau_s);
+        const float heading_alpha = lowpass_alpha(dt_s, cfg->heading_tau_s);
         const float filter_delta = yaw_heading_wrap_180(raw_error - ctl->heading_error_filt);
         ctl->heading_error_filt = yaw_heading_wrap_180(
             ctl->heading_error_filt + heading_alpha * filter_delta);
@@ -171,8 +177,14 @@ yaw_heading_output_t yaw_heading_control_update(
 
     const float dynamic_min = -out.c_limit - in->feedforward_c;
     const float dynamic_max = +out.c_limit - in->feedforward_c;
-    const float candidate_i = ctl->integral +
-                              cfg->rate_ki * out.rate_error_dps * in->dt_s;
+    /* Keep integral state independent of the instantaneous P term.  Clamping
+     * I to (actuator_limit - P) stores an equal-and-opposite transient when P
+     * saturates, which can reverse the correction as the measured rate falls. */
+    const float integral_min = -1.0f - in->feedforward_c;
+    const float integral_max = +1.0f - in->feedforward_c;
+    const float candidate_i = clampf(
+        ctl->integral + cfg->rate_ki * out.rate_error_dps * dt_s,
+        integral_min, integral_max);
     const float candidate_dynamic = out.p_term + candidate_i;
     const bool above = candidate_dynamic > dynamic_max;
     const bool below = candidate_dynamic < dynamic_min;
@@ -182,10 +194,6 @@ yaw_heading_output_t yaw_heading_control_update(
         ctl->integral = candidate_i;
     }
 
-    /* Back-calculate to a realizable I state at the current throttle. */
-    ctl->integral = clampf(ctl->integral,
-                           dynamic_min - out.p_term,
-                           dynamic_max - out.p_term);
     const float unsaturated = out.p_term + ctl->integral;
     out.dynamic_c = clampf(unsaturated, dynamic_min, dynamic_max);
     out.saturated = above || below || fabsf(out.dynamic_c - unsaturated) > 1e-6f;
@@ -194,4 +202,3 @@ yaw_heading_output_t yaw_heading_control_update(
                              -out.c_limit, out.c_limit);
     return out;
 }
-
