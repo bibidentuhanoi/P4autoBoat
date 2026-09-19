@@ -435,6 +435,10 @@ LAKE_ID_DIR = RUDDER_TEST_DIR
 LAKE_ID_THROTTLES = (0.20, 0.30)        # never auto-increased; server whitelist
 LAKE_ID_MAGNITUDES = (0.30, 0.60)
 LAKE_ID_PRECHECK_S = 2.0
+# PWR-ON is idempotent and the firmware still applies every arm/link safety
+# gate. Retry within the zero-throttle precheck so one lost uplink frame after
+# a link-loss rail cut cannot cancel a 30-second run before it starts.
+LAKE_ID_SERVO_POWER_RETRY_S = 0.25
 LAKE_ID_PHASE_S = 10.0
 LAKE_ID_STOP_S = 5.0
 LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
@@ -3521,6 +3525,7 @@ class BoatLink:
                     'status_lossy': False, 'failsafe_logged': False,
                     'notes': notes, 'firmware_label': label, 'provenance': provenance,
                     'imu_nonfinite': False, 'imu_last': None,
+                    'servo_power_retry_at': now, 'servo_power_attempts': 0,
                 }
                 self._lake_writer = writer
                 self.lake_id_result = None
@@ -3533,13 +3538,15 @@ class BoatLink:
                 self.motor_split = False; self.rudder = 0.0
                 # After the boat's failsafe the rail stays OFF until a NON-ZERO
                 # command, and the precheck only ever sends zeros -- so it would
-                # refuse on servo_power every time. Ask once; the gate still
-                # needs the boat's own confirmation.
+                # refuse on servo_power every time. Ask now and retry inside the
+                # bounded precheck; the gate still needs the boat's confirmation.
                 if self.motor_status.get('have') and not self.motor_status.get('servo_power'):
                     if self._send_servo_power_locked(True):
+                        self.lake_id['servo_power_attempts'] = 1
+                        self.lake_id['servo_power_retry_at'] = now + LAKE_ID_SERVO_POWER_RETRY_S
                         self._lake_id_event_locked('servo_rail_power_on_sent',
                                                    'boat reported the servo rail OFF at START: PWR-ON sent '
-                                                   'once; the gate still needs the boat to confirm it')
+                                                   '(attempt 1); the gate still needs the boat to confirm it')
                 return True, None
         writer.discard()                      # disk work: outside the lock again
         return False, why
@@ -3744,6 +3751,15 @@ class BoatLink:
         if ph is not None and ph[0] == 'precheck':
             self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
             self.motor_split = False; self.rudder = 0.0
+            if (not self.motor_status.get('servo_power')
+                    and now >= rt['servo_power_retry_at']):
+                rt['servo_power_retry_at'] = now + LAKE_ID_SERVO_POWER_RETRY_S
+                if self._send_servo_power_locked(True):
+                    rt['servo_power_attempts'] += 1
+                    self._lake_id_event_locked(
+                        'servo_rail_power_on_retry',
+                        'PWR-ON attempt %d; throttle and rudder remain zero'
+                        % rt['servo_power_attempts'])
             conds = self._lake_id_precheck_locked(now)
             for k, v in conds.items():
                 if rt['precheck'].get(k) != v:

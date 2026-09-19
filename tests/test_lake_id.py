@@ -967,11 +967,13 @@ class GuardTest(unittest.TestCase):
     trim-control implementation and configuration files."""
 
     BASELINE = 'e7abc06'      # the reconstructed A+B firmware the boat matches
-    PATHS = ['main/', 'proto/', 'partitions.csv',
+    PATHS = ['CMakeLists.txt', 'main/', 'proto/', 'partitions.csv',
              ':(glob)**/Kconfig*', ':(glob)**/sdkconfig*']
     APPROVED = {
-        'main/CMakeLists.txt', 'main/Kconfig.projbuild', 'main/bench_run.c',
+        'CMakeLists.txt', 'main/CMakeLists.txt', 'main/Kconfig.projbuild',
+        'main/bench_run.c',
         'main/bench_run.h', 'main/dashboard.html', 'main/drivers/esc_driver.c',
+        'main/drivers/vl53l5cx_platform.c',
         'main/motor_control.c', 'main/proto/boat.pb.h', 'main/proto/boat.proto',
         'main/sensor_fusion.c', 'main/sensor_fusion.h', 'main/trim_learn.c',
         'main/trim_learn.h', 'main/yaw_heading_control.c',
@@ -2008,6 +2010,37 @@ class BoatFailsafeTest(LakeBase):
         self.assertIn('servo_rail_power_on_sent', ev)
         self._boat(0.0, 0.0, 0.0, servo=True)           # the boat re-powers it
         self._drive(2.2, boat_follows=False)
+        self.assertEqual(self.link.lake_id['phase'], 'straight')
+
+    def test_precheck_retries_power_on_until_the_boat_confirms_the_rail(self):
+        raw = []
+        inner = self.link._write_locked
+
+        def capture(payload):
+            raw.append(bytes(payload)); return inner(payload)
+        self.link._write_locked = capture
+        self._boat(0.0, 0.0, 0.0, servo=False)
+        ok, err = self._start(); self.assertTrue(ok, err)
+
+        # Keep reporting the rail off for most of precheck. A single lost
+        # PWR-ON must not make the 30-second run abort before propulsion.
+        self._drive(1.1, boat_follows=False)
+        power_on = []
+        nonzero_motor = []
+        for payload in raw:
+            message = self.link.pb2.BoatMessage(); message.ParseFromString(payload)
+            kind = message.WhichOneof('payload')
+            if kind == 'servo_power' and message.servo_power.on:
+                power_on.append(message)
+            if kind == 'motor' and (message.motor.throttle != 0.0
+                                    or message.motor.left != 0.0
+                                    or message.motor.right != 0.0):
+                nonzero_motor.append(message)
+        self.assertGreaterEqual(len(power_on), 4)
+        self.assertFalse(nonzero_motor)
+
+        self._boat(0.0, 0.0, 0.0, servo=True)
+        self._drive(1.2, boat_follows=False)
         self.assertEqual(self.link.lake_id['phase'], 'straight')
 
 
