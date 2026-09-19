@@ -923,8 +923,9 @@ class ActuatorApiSafetyTest(unittest.TestCase):
 
 
 class BenchRunPageTest(unittest.TestCase):
-    def test_page_exposes_the_three_bench_buttons(self):
+    def test_page_exposes_the_short_long_and_normal_drive_buttons(self):
         for el in ('bench-left', 'bench-right', 'bench-base',
+                   'bench-base-short', 'bench-base-long',
                    'bench-throttle', 'bench-delta'):
             self.assertIn('id="%s"' % el, espnow_drive.PAGE)
         self.assertIn('/api/bench', espnow_drive.PAGE)
@@ -1007,7 +1008,7 @@ class BenchRunLinkTest(unittest.TestCase):
 
     def test_each_button_sends_its_own_kind_to_the_boat(self):
         for seq, (kind, wire) in enumerate(
-                (('both', 0), ('left', 1), ('right', 2)), start=1):
+                (('both', 0), ('left', 1), ('right', 2), ('both_long', 3)), start=1):
             self.sent.clear()
             self.link.bench_status = espnow_drive.BoatLink._blank_bench_status()
             ok, err = self.link.send_bench(kind, 0.20, 0.04, seq)
@@ -2081,12 +2082,10 @@ setTimeout(async () => {
 
 
 
-class BaseTenSecondsButtonTest(unittest.TestCase):
-    """BASE TEST 10s is driven from this laptop like the lake test. The boat's
-    main firmware does not know the 10 s bench kind and silently runs a 3 s
-    BASE, so the button must NOT go through /api/bench any more."""
+class BaseDurationButtonTest(unittest.TestCase):
+    """Both laptop-driven normal-drive durations remain available."""
 
-    def test_base_10s_starts_the_laptop_driven_straight_run(self):
+    def test_base_30s_starts_the_laptop_long_straight_profile(self):
         result = run_page_js(r"""
 replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
 vm.createContext(context);
@@ -2095,6 +2094,30 @@ context.applyStatus(CONNECTED_STATUS);
 setTimeout(async () => {
   elements['bench-throttle'].value = '25';
   await elements['bench-base-long'].listeners.click();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const lake = calls.filter(c => c.path === '/api/lake_id').map(c => c.body);
+  const bench = calls.filter(c => c.path === '/api/bench').map(c => c.body);
+  console.log(JSON.stringify({ lake, bench }));
+  process.exit(0);
+}, 50);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['bench'], [])
+        self.assertEqual(len(out['lake']), 1)
+        self.assertEqual(out['lake'][0]['profile'], 'straight30')
+        self.assertAlmostEqual(out['lake'][0]['throttle'], 0.25)
+        self.assertEqual(out['lake'][0]['magnitude'], 0)
+
+    def test_normal_drive_3s_starts_the_laptop_straight_profile(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+context.applyStatus(CONNECTED_STATUS);
+setTimeout(async () => {
+  elements['bench-throttle'].value = '25';
+  await elements['bench-base-short'].listeners.click();
   await new Promise(resolve => setTimeout(resolve, 30));
   const lake = calls.filter(c => c.path === '/api/lake_id').map(c => c.body);
   const bench = calls.filter(c => c.path === '/api/bench').map(c => c.body);

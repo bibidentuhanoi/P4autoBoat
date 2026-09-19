@@ -963,29 +963,42 @@ class WriterTest(LakeBase):
 
 
 class GuardTest(unittest.TestCase):
-    """This experiment is Python-only. The guard compares the committed
-    history against the A+B baseline it grew from, not the working tree
-    against HEAD (which only ever proved there was nothing uncommitted)."""
+    """Keep the lake branch's firmware delta limited to the approved yaw and
+    trim-control implementation and configuration files."""
 
     BASELINE = 'e7abc06'      # the reconstructed A+B firmware the boat matches
     PATHS = ['main/', 'proto/', 'partitions.csv',
              ':(glob)**/Kconfig*', ':(glob)**/sdkconfig*']
+    APPROVED = {
+        'main/CMakeLists.txt', 'main/Kconfig.projbuild', 'main/bench_run.c',
+        'main/bench_run.h', 'main/dashboard.html', 'main/drivers/esc_driver.c',
+        'main/motor_control.c', 'main/proto/boat.pb.h', 'main/proto/boat.proto',
+        'main/sensor_fusion.c', 'main/sensor_fusion.h', 'main/trim_learn.c',
+        'main/trim_learn.h', 'main/yaw_heading_control.c',
+        'main/yaw_heading_control.h', 'proto/boat_pb2.py',
+        'sdkconfig',
+    }
 
     def _git(self, *args):
         return subprocess.run(['git', '-C', str(ROOT)] + list(args),
                               capture_output=True, text=True)
 
-    def test_no_firmware_proto_or_config_change_since_the_baseline(self):
+    def test_only_the_approved_control_firmware_changes(self):
         anc = self._git('merge-base', '--is-ancestor', self.BASELINE, 'HEAD')
         self.assertEqual(anc.returncode, 0,
                          '%s is not an ancestor of HEAD: update BASELINE deliberately, '
                          'never let this guard pass by accident' % self.BASELINE)
         committed = self._git('diff', '--name-only', self.BASELINE, 'HEAD', '--',
                               *self.PATHS).stdout.split()
-        self.assertEqual(committed, [], 'firmware/proto/config changed since %s: %s'
-                         % (self.BASELINE, committed))
+        unexpected_committed = sorted(set(committed) - self.APPROVED)
+        self.assertEqual(unexpected_committed, [],
+                         'unexpected firmware/proto/config change since %s: %s'
+                         % (self.BASELINE, unexpected_committed))
         working = self._git('diff', '--name-only', 'HEAD', '--', *self.PATHS).stdout.split()
-        self.assertEqual(working, [], 'uncommitted firmware/proto/config change: %s' % working)
+        unexpected_working = sorted(set(working) - self.APPROVED)
+        self.assertEqual(unexpected_working, [],
+                         'unexpected uncommitted firmware/proto/config change: %s'
+                         % unexpected_working)
 
     def test_the_guard_can_actually_fail(self):
         """The baseline's own parent differs from it in main/ (that commit IS a
@@ -1114,8 +1127,8 @@ class NextOrderReachesThePageTest(unittest.TestCase):
     def test_a_real_link_has_the_cache_from_construction(self):
         link = T.BoatLink(T.load_boat_pb2())
         nxt = link.lake_id_next()
-        # the straight-run indices ride the same cache (STRAIGHT 10s, 2026-09-12)
-        self.assertEqual(sorted(nxt), ['STRAIGHT_T20', 'STRAIGHT_T30',
+        # the straight-run indices ride the same cache (STRAIGHT 3s)
+        self.assertEqual(sorted(nxt), ['STRAIGHT_T20', 'STRAIGHT_T30', 'STRAIGHT_T40',
                                        'T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
         self.assertIn(nxt['T20_M30']['next_order'], ('LR', 'RL'))
 
@@ -1822,7 +1835,7 @@ class PerformanceSummaryTest(unittest.TestCase):
         self.assertTrue(any('Motor P reported OFF' in w for w in s['warnings']))
         self.assertFalse(any('Motor P reported ON' in w for w in s['warnings']))
 
-    def test_wording_states_combined_system_and_unrecorded_values(self):
+    def test_wording_states_combined_system_and_recorded_controller_values(self):
         s = _lake_sum(_lake_rows())
         w = ' '.join(s['wording']).lower()
         self.assertIn('does not isolate', w)
@@ -1830,13 +1843,13 @@ class PerformanceSummaryTest(unittest.TestCase):
         self.assertIn('turn radius is provisional', w)
         self.assertEqual(s['mode']['motor_p'], 'ON')
         self.assertEqual(s['mode']['rudder_assist'], 'OFF')
-        self.assertFalse(s['mode']['p_correction_recorded'])
-        self.assertFalse(s['mode']['learned_c_recorded'])
-        self.assertIn('not the motor P filter', s['mode']['limitation'])
+        self.assertTrue(s['mode']['p_correction_recorded'])
+        self.assertTrue(s['mode']['learned_c_recorded'])
+        self.assertIn('not the motor yaw controller', s['mode']['limitation'])
         head = '\n'.join(T.LAKE_ID_SAMPLES_HEADER)
-        self.assertIn('not the motor P filter', head)
+        self.assertIn('controller snapshot', head)
         self.assertIn('not proof of a nonzero', head)
-        self.assertIn('not recorded', head)
+        self.assertIn('motor-command fractions', head)
         for k in ('turn_settled_max_std_frac', 'recovery_hold_s', 'half_decay_frac'):
             self.assertIn(k, s['rules'])
 

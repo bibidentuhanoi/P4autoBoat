@@ -76,11 +76,11 @@ class BenchRecordingTest(unittest.TestCase):
     # ---- helpers --------------------------------------------------------
 
     def _status(self, state, kind=0, base=0.20, samples=0, elapsed=0.0,
-                learn_c=0.20, p_on=False, file_index=0):
+                learn_c=0.20, p_on=False, file_index=0, **controller):
         msg = self.link.pb2.BenchStatus(
             state=state, kind=kind, base=base, samples=samples,
             file_index=file_index, elapsed_s=elapsed, learn_c=learn_c,
-            p_on=p_on)
+            p_on=p_on, **controller)
         self.link._handle_bench_status(msg)
 
     def _frame(self, yaw, heading=10.0, left=0.20, right=0.20):
@@ -142,6 +142,54 @@ class BenchRecordingTest(unittest.TestCase):
         self.assertAlmostEqual(float(rows[0]['boat_right']), 0.14, places=3)
         self.assertEqual(rows[0]['boat_state'], '2')
         self.assertEqual(rows[0]['boat_servo_power'], '1')
+
+    def test_it_records_one_coherent_yaw_controller_snapshot(self):
+        diagnostic = {
+            'heading_target_deg': 12.5, 'heading_error_deg': 2.25,
+            'yaw_target_dps': 1.8, 'p_term': 0.11, 'i_term': 0.07,
+            'dynamic_c': 0.18, 'effective_c': 0.21, 'c_limit': 1.0,
+            'ctrl_active': True, 'heading_hold': True, 'saturated': False,
+        }
+        self._status(D.BENCH_STATE_RUN, kind=0, p_on=True, **diagnostic)
+        self.clock.advance(0.05)
+        self._frame(-0.75, heading=10.0)
+        self._status(D.BENCH_STATE_SAVED, kind=0, samples=1, file_index=3,
+                     **diagnostic)
+        self.link._flush_bench_write()
+
+        row = self._rows(self._written()[0])[0]
+        for name, value in diagnostic.items():
+            expected = 1 if value is True else 0 if value is False else value
+            self.assertAlmostEqual(float(row[name]), expected, places=4, msg=name)
+
+    def test_legacy_zero_diagnostics_still_make_a_valid_row(self):
+        self._run(kind=0, yaws=(0.5,))
+        row = self._rows(self._written()[0])[0]
+        for name in ('heading_target_deg', 'heading_error_deg', 'yaw_target_dps',
+                     'p_term', 'i_term', 'dynamic_c', 'effective_c', 'c_limit',
+                     'ctrl_active', 'heading_hold', 'saturated'):
+            self.assertEqual(float(row[name]), 0.0, name)
+
+    def test_header_summarizes_controller_effort_over_drive_rows(self):
+        self._status(D.BENCH_STATE_RUN, kind=0, p_on=True, ctrl_active=True,
+                     heading_hold=True, p_term=-0.10, i_term=0.03)
+        self.clock.advance(0.05)
+        self._frame(-2.0, heading=359.0)
+        self._status(D.BENCH_STATE_RUN, kind=0, samples=1, elapsed=0.05,
+                     p_on=True, ctrl_active=True, heading_hold=True,
+                     saturated=True, p_term=0.25, i_term=0.08)
+        self.clock.advance(0.05)
+        self._frame(1.0, heading=1.0)
+        self._status(D.BENCH_STATE_SAVED, kind=0, samples=2, file_index=4)
+        self.link._flush_bench_write()
+
+        text = (self.dir / self._written()[0]).read_text()
+        self.assertIn('heading_change_deg=2.0', text)
+        self.assertIn('active_fraction=1.0', text)
+        self.assertIn('saturated_fraction=0.5', text)
+        self.assertIn('peak_abs_p=0.25', text)
+        self.assertIn('peak_abs_i=0.08', text)
+        self.assertIn('final_i=0.08', text)
 
     def test_the_three_kinds_never_pool_under_one_glob(self):
         """BASE, LEFT and RIGHT are different experiments."""
@@ -293,11 +341,13 @@ class BaseLongPipelineTest(unittest.TestCase):
         self.assertIn("'both_long': 3", self.tool)
 
     def test_there_is_a_separate_clearly_labelled_button(self):
+        self.assertIn('id="bench-base-short"', self.tool)
         self.assertIn('id="bench-base-long"', self.tool)
-        # Since 2026-09-12 the button drives the run from the laptop (the lake
-        # test's machinery, profile 'straight'): the boat's main firmware has no
-        # 10 s bench kind and silently ran a 3 s BASE when sent kind 3.
-        self.assertIn("$('bench-base-long').addEventListener('click', () => runLakeId('straight'));",
+        self.assertIn('>BASE TEST 3s</button>', self.tool)
+        self.assertIn('>BASE TEST 30s</button>', self.tool)
+        self.assertIn("$('bench-base-short').addEventListener('click', () => runLakeId('straight'));",
+                      self.tool)
+        self.assertIn("$('bench-base-long').addEventListener('click', () => runLakeId('straight30'));",
                       self.tool)
         self.assertNotIn("runBench('both_long', 0)", self.tool)
         # ...and the ordinary BASE button is untouched

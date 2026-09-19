@@ -384,6 +384,9 @@ BENCH_CSV_COLUMNS = (
     'bench_state', 'bench_elapsed_s', 'bench_samples',
     'learn_c',           # the trim learner's c, as the BOAT reports it
     'boat_p_on',         # the boat's own P-assist state; a mismatch voids an A/B
+    'heading_target_deg', 'heading_error_deg', 'yaw_target_dps',
+    'p_term', 'i_term', 'dynamic_c', 'effective_c', 'c_limit',
+    'ctrl_active', 'heading_hold', 'saturated',
     'telem_age_s', 'gap_s',
 )
 
@@ -422,11 +425,10 @@ RUDDER_TEST_CSV_COLUMNS = (
 # SCIENTIFIC WORDING, deliberately repeated wherever the data is written:
 #   - MotorStatus carries boat-APPLIED software commands (throttle, rudder,
 #     PWM). There is no RPM, thrust or servo-angle feedback on this boat.
-#   - Autotrim is live while the rudder is centred (STRAIGHT and both RECOVER
-#     phases) and frozen during the two TURN phases. So the turns identify the
-#     rudder response of the OPERATIONAL, TRIMMED boat, and the recoveries are
-#     operational recovery under active autotrim -- not a passive hull test.
-#     The learner's c is NOT in field telemetry and is not recorded.
+#   - The yaw PI is active while the rudder is centred (STRAIGHT and both
+#     RECOVER phases), and suspended during the two TURN phases. The slow trim
+#     learner stays frozen while PI is enabled; its stored c remains the
+#     feed-forward baseline. BenchStatus records both c and PI effort.
 #   - "Straight bias" is observed yaw/heading/course bias plus the commanded
 #     L/R differential; it is not a measurement of physical motor mismatch.
 LAKE_ID_DIR = RUDDER_TEST_DIR
@@ -516,6 +518,9 @@ LAKE_ID_CSV_COLUMNS = (
     'telem_age_s', 'motor_status_age_s', 'system_status_age_s', 'gap_s',
     'tool_send_age_s', 'bridge_age_s', 'bridge_uplink_rssi_dbm', 'bridge_espnow_pkts',
     'bridge_frames_out', 'bridge_reasm_drops', 'bench_learn_c_last', 'bench_status_age_s',
+    'heading_target_deg', 'heading_error_deg', 'yaw_target_dps',
+    'p_term', 'i_term', 'dynamic_c', 'effective_c', 'c_limit',
+    'ctrl_active', 'heading_hold', 'saturated',
 )
 LAKE_ID_EVENT_COLUMNS = ('t_utc', 't_mono', 'elapsed_s', 'phase', 'event', 'detail')
 LAKE_ID_SAMPLES_HEADER = (
@@ -528,23 +533,25 @@ LAKE_ID_SAMPLES_HEADER = (
     'used for GPS rate, latency or freshness; GPS is 10 Hz under 20 Hz frames',
     '# mode: see summary.json mode and settings.raw_throttle_test. Normal runs require '
     'Motor P ON; raw diagnostic runs require Motor P OFF. Rudder Assist stays OFF',
-    '# in normal firmware the Motor P correction is zero while the rudder is deflected (|rudder| > '
-    '0.02) and resumes it when centred, driving, throttle >= 0.15 and |yaw| <= 10 deg/s',
-    '# boat_assist_motor_p is the P SWITCH as the boat reports it, not proof of a nonzero '
-    'correction; the P correction value and the learned trim c are NOT in field telemetry '
-    'and are not recorded',
+    '# in normal firmware the legacy Motor P switch enables heading hold plus yaw-rate PI. '
+    'Manual rudder (|rudder| > 0.02) suspends its output and freezes I; after 0.5 s centred it '
+    'recaptures the current heading. Positive yaw/heading error is LEFT, negative is RIGHT',
+    '# boat_assist_motor_p is the enable switch as reported by the boat, not proof of a nonzero '
+    'correction; ctrl_active reports whether the yaw controller is applying output',
+    '# heading_target_deg through saturated are the latest coherent controller snapshot from '
+    'BenchStatus; bench_status_age_s states its age. p_term/i_term/dynamic_c/effective_c/c_limit '
+    'are dimensionless motor-command fractions',
     '# boat_yaw_filt_dps / boat_yaw_target_dps belong to the RUDDER controller (Assisted '
-    'Steering), not the motor P filter; with Rudder Assist OFF they read 0',
-    '# autotrim: live while rudder is centred (straight/recover), frozen during '
-    'turns; its c is not in field telemetry and is not recorded',
+    'Steering), not the motor yaw controller; with Rudder Assist OFF they read 0',
+    '# autotrim: the slow learned c is frozen while the yaw PI controller is enabled; dynamic_c '
+    'is the fast PI correction and effective_c is the total correction actually requested',
     '# GPS fix is ADVISORY, not a gate: without it lat/lon/speed/course carry no fix '
     'and the turn radius is unavailable; yaw and heading metrics are unaffected',
     '# link columns: tool_send_age_s = seconds since THIS tool last wrote a motor frame to the '
     'bridge; bridge_* = the S3 bridge\'s own counters (packets heard on air, frames forwarded '
     'to USB, reassembly drops) and the uplink RSSI it reports; the bridge does not report '
-    'uplink send failures. bench_learn_c_last = the trim learner\'s c from the LAST BenchStatus '
-    'the boat sent (bench_status_age_s old): the learner keeps moving c during this run and '
-    'that movement is NOT recorded',
+    'uplink send failures. bench_learn_c_last and the controller fields come from the latest '
+    'BenchStatus; bench_status_age_s records how old that coherent snapshot is',
 )
 LAKE_ID_STATUS_COMPLETE = 'complete'
 LAKE_ID_STATUS_STOP_UNCONFIRMED = 'incomplete_stop_unconfirmed'
@@ -769,6 +776,43 @@ def _lake_fnum(v, nd=4):
     return round(v, nd) if isinstance(v, (int, float)) and math.isfinite(v) else None
 
 
+def yaw_controller_summary(rows):
+    """Reduce controller diagnostics from exactly the supplied drive rows.
+
+    Callers choose the phase before calling this function. Missing telemetry
+    stays missing: an empty or old-protobuf run must never look like a perfect
+    zero-effort controller run.
+    """
+    def numbers(name):
+        return [float(r[name]) for r in rows
+                if isinstance(r.get(name), (int, float))
+                and not isinstance(r.get(name), bool)
+                and math.isfinite(r[name])]
+
+    def flags(name):
+        return [1.0 if bool(r[name]) else 0.0 for r in rows
+                if isinstance(r.get(name), (bool, int, float))
+                and math.isfinite(float(r[name]))]
+
+    yaws = numbers('yaw_dps')
+    headings = numbers('heading_deg')
+    active = flags('ctrl_active')
+    saturated = flags('saturated')
+    p_terms = numbers('p_term')
+    i_terms = numbers('i_term')
+    return {
+        'frames': len(rows),
+        'heading_change_deg': _lake_fnum(_lake_integrate_wrapped(headings)),
+        'mean_yaw_dps': _lake_fnum(_lake_mean(yaws)),
+        'peak_yaw_dps': _lake_fnum(max(yaws, key=abs)) if yaws else None,
+        'active_fraction': _lake_fnum(_lake_mean(active)) if active else None,
+        'saturated_fraction': _lake_fnum(_lake_mean(saturated)) if saturated else None,
+        'peak_abs_p': _lake_fnum(max((abs(v) for v in p_terms), default=None)),
+        'peak_abs_i': _lake_fnum(max((abs(v) for v in i_terms), default=None)),
+        'final_i': _lake_fnum(i_terms[-1]) if i_terms else None,
+    }
+
+
 def lake_id_phase_coverage(rows, window):
     """The rudder-test coverage rule, per phase: where the frames sit inside
     the window, not just how many there are."""
@@ -869,7 +913,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
                  'ESC shaping bypassed by the selected firmware; yaw can also reflect '
                  'hull, rudder, wind or current, not only motor mismatch'
                  if settings.get('raw_throttle_test') else
-                 'straight running with Motor P ON and autotrim live: observed yaw/heading/'
+                 'straight running with heading/yaw-rate PI ON: observed yaw/heading/'
                  'course bias plus the commanded L/R differential -- NOT a measurement of '
                  'physical motor mismatch, and not P\'s isolated contribution'),
         'yaw': _lake_phase_yaw(rows, windows['straight']),
@@ -881,6 +925,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'commanded_lr_diff_start': _lake_fnum(diffs[0]) if diffs else None,
         'commanded_lr_diff_end': _lake_fnum(diffs[-1]) if diffs else None,
         'commanded_lr_diff_range': _lake_fnum(max(diffs) - min(diffs)) if diffs else None,
+        'controller': yaw_controller_summary(sr),
     }
 
     # ---- per-phase commanded differential drift (autotrim + P moving) ---
@@ -1128,17 +1173,17 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             'motor_p': 'ON', 'rudder_assist': 'OFF',
             'required': ('Motor P ON and Rudder Assist OFF for the whole run, confirmed by the '
                          'boat before any throttle; the tool never toggles a mode during the run'),
-            'p_gating_note': ('the firmware zeroes the P correction while the rudder is deflected '
-                              '(|rudder| > 0.02) and resumes it when centred, driving, throttle >= '
-                              '0.15 and |yaw| <= 10 deg/s; autotrim keeps its learned value, frozen '
-                              'during turns'),
-            'p_correction_recorded': False,
-            'learned_c_recorded': False,
+            'p_gating_note': ('the heading/yaw-rate PI output is suspended while the rudder is '
+                              'deflected (|rudder| > 0.02); after 0.5 s centred it recaptures the '
+                              'current heading and resumes. The I term and slow trim learner freeze '
+                              'while manual steering has authority'),
+            'p_correction_recorded': True,
+            'learned_c_recorded': True,
             'limitation': ('boat_assist_motor_p is the P switch as reported by the boat, not proof '
-                           'of a nonzero correction; the correction value and the learned c are not '
-                           'in field telemetry and are not recorded; boat_yaw_filt_dps and '
+                           'of a nonzero correction; controller fields are the latest BenchStatus '
+                           'snapshot and bench_status_age_s reports its age; boat_yaw_filt_dps and '
                            'boat_yaw_target_dps belong to the rudder controller (Assisted Steering), '
-                           'not the motor P filter'),
+                           'not the motor yaw controller'),
         } if not settings.get('raw_throttle_test') else {
             'motor_p': 'OFF', 'rudder_assist': 'OFF',
             'raw_throttle_test': True,
@@ -1160,18 +1205,18 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'rules': rules,
         'wording': [
             'MotorStatus values are boat-applied software commands, not measured RPM, thrust or servo angle',
-            'this recording measures the COMBINED system -- raw rudder, Motor P and autotrim '
+            'this recording measures the COMBINED system -- raw rudder, yaw PI and learned trim '
             'together; it does not isolate P\'s contribution',
             'it does not demonstrate or prove assisted waypoint steering; it is preparation for it',
-            'turn phases measure the rudder response of the operational boat with P gated off by '
+            'turn phases measure the rudder response of the operational boat with yaw PI suspended by '
             'the firmware during the deflection',
             ('recoveries use raw throttle with motor corrections disabled'
              if settings.get('raw_throttle_test') else
-             'recoveries are recovery with Motor P and autotrim active, not passive hull tests'),
+             'recoveries use heading/yaw-rate PI with learned trim feed-forward, not passive hull tests'),
             'straight bias is not a direct measurement of physical motor mismatch',
             'turn radius is provisional; its inputs and rules are reported with it',
-            'the P flag is the switch state, not proof of a nonzero correction; learned c and the '
-            'P correction are not recorded',
+            'the P flag is the switch state, not proof of a nonzero correction; BenchStatus '
+            'records the latest learned c and controller terms with their age',
             'a phase with insufficient coverage, no clear or unsettled response, or a recovery '
             'that did not settle reports no gain or time for it, by rule',
         ],
@@ -1326,6 +1371,7 @@ def straight_run_summarize(rows, events, settings, provenance, status, reason,
         'applied_right_mean': _lake_fnum(_lake_mean(rights)) if rights else None,
         'applied_lr_diff_mean': _lake_fnum(_lake_mean(diffs)) if diffs else None,
         'applied_lr_diff_range': _lake_fnum(max(diffs) - min(diffs)) if diffs else None,
+        'controller': yaw_controller_summary(sr),
     })
     p_state = settings.get('p_at_start')
     for k in LAKE_ID_NOTE_FIELDS:
@@ -1354,12 +1400,11 @@ def straight_run_summarize(rows, events, settings, provenance, status, reason,
             'rudder_assist': 'OFF',
             'required': ('Rudder Assist OFF for the whole run; Motor P either way, recorded at the '
                          'gate, and the run aborts if it flips'),
-            'p_correction_recorded': False,
-            'learned_c_recorded': False,
+            'p_correction_recorded': True,
+            'learned_c_recorded': True,
             'limitation': ('boat_assist_motor_p is the P switch as reported by the boat, not proof '
-                           'of a nonzero correction; the correction value and the learned c are not '
-                           'in field telemetry; bench_learn_c_last is the c from the last BenchStatus '
-                           'the boat sent, which may be minutes old'),
+                           'of a nonzero correction; controller values and learned c come from the '
+                           'latest BenchStatus snapshot, whose age is recorded per row'),
         },
         'provenance': dict(provenance or {}, firmware_label=firmware_label or 'unknown',
                            firmware_label_note=LAKE_ID_FIRMWARE_LABEL_NOTE),
@@ -3257,6 +3302,7 @@ class BoatLink:
         self._bench_write = None
         run, result = pending
         s = result['summary'] or {}
+        controller = yaw_controller_summary(run['rows'])
         head = [
             # Provenance first. It must be impossible to mistake this for the
             # boat's own 100 Hz SD recording of the same run.
@@ -3271,6 +3317,16 @@ class BoatLink:
             % (len(run['rows']), _r3(s.get('mean_yaw_dps')),
                _r3(s.get('peak_yaw_dps')), _r3(s.get('span_s')),
                _r3(s.get('max_gap_s'))),
+            'heading_change_deg=%s active_fraction=%s saturated_fraction=%s '
+            'peak_abs_p=%s peak_abs_i=%s final_i=%s'
+            % (_r3(s.get('heading_change_deg')),
+               _r3(controller.get('active_fraction')),
+               _r3(controller.get('saturated_fraction')),
+               _r3(controller.get('peak_abs_p')),
+               _r3(controller.get('peak_abs_i')),
+               _r3(controller.get('final_i'))),
+            'controller signs: positive yaw and heading error are LEFT; p_term, i_term, '
+            'dynamic_c, effective_c and c_limit are motor-command fractions',
         ]
         if result['aborted']:
             # A tidy-looking summary of a run that never happened is the worst
@@ -3827,6 +3883,17 @@ class BoatLink:
             'bridge_reasm_drops': bs.get('reasm_drops') if bs.get('have') else '',
             'bench_learn_c_last': bench.get('learn_c') if bench.get('have') else '',
             'bench_status_age_s': age(bench),
+            'heading_target_deg': bench.get('heading_target_deg') if bench.get('have') else '',
+            'heading_error_deg': bench.get('heading_error_deg') if bench.get('have') else '',
+            'yaw_target_dps': bench.get('yaw_target_dps') if bench.get('have') else '',
+            'p_term': bench.get('p_term') if bench.get('have') else '',
+            'i_term': bench.get('i_term') if bench.get('have') else '',
+            'dynamic_c': bench.get('dynamic_c') if bench.get('have') else '',
+            'effective_c': bench.get('effective_c') if bench.get('have') else '',
+            'c_limit': bench.get('c_limit') if bench.get('have') else '',
+            'ctrl_active': (1 if bench.get('ctrl_active') else 0) if bench.get('have') else '',
+            'heading_hold': (1 if bench.get('heading_hold') else 0) if bench.get('have') else '',
+            'saturated': (1 if bench.get('saturated') else 0) if bench.get('have') else '',
         }
         if len(rt['rows']) < LAKE_ID_MAX_ROWS:
             rt['rows'].append(row)
@@ -4034,6 +4101,17 @@ class BoatLink:
             # of noise that look like precision and are not.
             'learn_c': round(bs.get('learn_c', 0.0), 6),
             'boat_p_on': 1 if bs.get('p_on') else 0,
+            'heading_target_deg': round(bs.get('heading_target_deg', 0.0), 4),
+            'heading_error_deg': round(bs.get('heading_error_deg', 0.0), 4),
+            'yaw_target_dps': round(bs.get('yaw_target_dps', 0.0), 4),
+            'p_term': round(bs.get('p_term', 0.0), 6),
+            'i_term': round(bs.get('i_term', 0.0), 6),
+            'dynamic_c': round(bs.get('dynamic_c', 0.0), 6),
+            'effective_c': round(bs.get('effective_c', 0.0), 6),
+            'c_limit': round(bs.get('c_limit', 0.0), 6),
+            'ctrl_active': 1 if bs.get('ctrl_active') else 0,
+            'heading_hold': 1 if bs.get('heading_hold') else 0,
+            'saturated': 1 if bs.get('saturated') else 0,
             'telem_age_s': round(now - tel_last, 4) if tel_last else '',
             'gap_s': round(gap, 4),
         })
