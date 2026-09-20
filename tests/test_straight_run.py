@@ -4,6 +4,7 @@ precheck 2 s -> straight 3 s at the chosen throttle, rudder centred -> stop
 5 s. Same gate, stream, abort table and recorder as the lake steering test;
 its own folder name, its own summary, and Motor P not forced.
 """
+import csv
 import functools
 import sys
 import unittest
@@ -97,8 +98,8 @@ class StraightRunTest(LakeBase):
         self.assertEqual(self.link.lake_id['phase'], 'straight')
         self.assertEqual(self.link.throttle, 0.3)
         self.assertEqual(self.link.rudder, 0.0)
-        self.assertFalse(self.link.motor_split)
-        self.assertEqual((self.link.motor_left, self.link.motor_right), (0.0, 0.0))
+        self.assertTrue(self.link.motor_split)
+        self.assertEqual((self.link.motor_left, self.link.motor_right), (0.3, 0.3))
 
     def test_start_waits_until_the_boat_confirms_the_requested_p_mode(self):
         ok, err = self.link.send_assist(True)
@@ -206,16 +207,15 @@ class StraightRunTest(LakeBase):
         self.assertEqual(r['status'], 'aborted')
         self.assertIn('Motor P flipped', r['reason'])
 
-    def test_rail_loss_mid_run_aborts_with_the_failsafe_reason(self):
+    def test_rail_loss_mid_run_is_recorded_without_ending_motor_test(self):
         ok, err = self._start_straight()
         self.assertTrue(ok, err)
         self._drive(4.0)
         self._boat(0.0, 0.0, 0.0, servo=False)
         self._tick()
-        r = self._wait_result()
-        self.assertEqual(r['status'], 'aborted')
-        self.assertIn('servo power lost', r['reason'])
-        _rows, events, _summary = self._files(r['name'])
+        self.assertIsNotNone(self.link.lake_id)
+        self._writer_idle()
+        events = list(csv.DictReader(open(self.tmp / self.link.lake_id['name'] / 'events.csv')))
         self.assertTrue(any(e['event'] == 'boat_failsafe' for e in events))
 
     def test_manual_input_aborts(self):

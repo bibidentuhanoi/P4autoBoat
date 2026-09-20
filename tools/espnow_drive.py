@@ -435,21 +435,21 @@ LAKE_ID_DIR = RUDDER_TEST_DIR
 LAKE_ID_THROTTLES = (0.20, 0.30)        # never auto-increased; server whitelist
 LAKE_ID_MAGNITUDES = (0.30, 0.60)
 LAKE_ID_PRECHECK_S = 2.0
-# PWR-ON is idempotent and the firmware still applies every arm/link safety
-# gate. Retry within the zero-throttle precheck so one lost uplink frame after
-# a link-loss rail cut cannot cancel a 30-second run before it starts.
-LAKE_ID_SERVO_POWER_RETRY_S = 0.25
 LAKE_ID_PHASE_S = 10.0
 LAKE_ID_STOP_S = 5.0
 LAKE_ID_PROFILE_S = 57.0                # 2 + 5*10 + 5
 LAKE_ID_POWERED_S = 50.0
-LAKE_ID_PROFILES = ('full', 'straight', 'straight30')
+LAKE_ID_PROFILES = ('full', 'straight', 'straight30', 'yawpulse')
+YAW_PULSE_STRAIGHT_S = 20.0
+YAW_PULSE_TURN_S = 2.0
+YAW_PULSE_RECOVER_S = 10.0
 STRAIGHT_RUN_S = 3.0                     # BASE 3s: precheck 2 + straight 3 + stop 5 = 10 s
 STRAIGHT_LONG_RUN_S = 30.0               # BASE 30s: precheck 2 + straight 30 + stop 5 = 37 s
 STRAIGHT_THROTTLE_MIN = 0.05             # the bench card's throttle box, as a fraction
 STRAIGHT_THROTTLE_MAX = 0.60
 LAKE_ID_TEARDOWN_MAX_S = 2.0            # 57 -> 59 at most, zeros throughout
 LAKE_ID_TELEM_MAX_AGE_S = 1.0
+LAKE_ID_TELEM_POWERED_MAX_AGE_S = 5.0  # finish through short downlink fades; mark the gap
 LAKE_ID_MOTORSTATUS_MAX_AGE_S = 1.5     # gate + STOP confirm: a change publish is due there
 # Powered phases: during a turn nothing in MotorStatus changes, so the boat only
 # re-sends it once a second, and each lost packet is another 1 s of age. Two runs
@@ -539,7 +539,7 @@ LAKE_ID_SAMPLES_HEADER = (
     '# mode: see summary.json mode and settings.raw_throttle_test. Normal runs require '
     'Motor P ON; raw diagnostic runs require Motor P OFF. Rudder Assist stays OFF',
     '# in normal firmware the legacy Motor P switch enables heading hold plus yaw-rate PI. '
-    'Manual rudder (|rudder| > 0.02) suspends its output and freezes I; after 0.5 s centred it '
+    'A commanded motor differential suspends its output and freezes I; after 0.5 s equal motors it '
     'recaptures the current heading. Positive yaw/heading error is LEFT, negative is RIGHT',
     '# boat_assist_motor_p is the enable switch as reported by the boat, not proof of a nonzero '
     'correction; ctrl_active reports whether the yaw controller is applying output',
@@ -581,6 +581,18 @@ def lake_id_phases(throttle, magnitude, order, profile='full'):
             ('precheck', LAKE_ID_PRECHECK_S, 0.0, 0.0),
             ('straight', run_s,              t,   0.0),
             ('stop',     LAKE_ID_STOP_S,     0.0, 0.0),
+        )
+    if profile == 'yawpulse':
+        s = -1.0 if order == 'LR' else 1.0
+        m = abs(float(magnitude))
+        return (
+            ('precheck',  LAKE_ID_PRECHECK_S,       0.0, 0.0),
+            ('straight',  YAW_PULSE_STRAIGHT_S,       t, 0.0),
+            ('turn_a',    YAW_PULSE_TURN_S,           t, s * m),
+            ('recover_a', YAW_PULSE_RECOVER_S,        t, 0.0),
+            ('turn_b',    YAW_PULSE_TURN_S,           t, -s * m),
+            ('recover_b', YAW_PULSE_RECOVER_S,        t, 0.0),
+            ('stop',      LAKE_ID_STOP_S,            0.0, 0.0),
         )
     s = -1.0 if order == 'LR' else 1.0
     m = abs(float(magnitude))
@@ -3472,6 +3484,13 @@ class BoatLink:
                                % (round(STRAIGHT_THROTTLE_MIN * 100), round(STRAIGHT_THROTTLE_MAX * 100)))
             throttle = round(throttle, 2)
             magnitude = 0.0               # no turns: the rudder stays centred throughout
+        elif profile == 'yawpulse':
+            if not (math.isfinite(throttle) and 0.20 <= throttle <= 0.60):
+                return False, 'yaw-pulse throttle must be between 20% and 60%'
+            if not (math.isfinite(magnitude) and 0.05 <= magnitude <= 0.20
+                    and magnitude < throttle):
+                return False, 'yaw-pulse motor half-difference must be 5% to 20% and below throttle'
+            throttle, magnitude = round(throttle, 2), round(magnitude, 2)
         else:
             if not any(abs(throttle - t) < 1e-9 for t in LAKE_ID_THROTTLES):
                 return False, 'throttle must be one of %s' % (LAKE_ID_THROTTLES,)
@@ -3498,6 +3517,11 @@ class BoatLink:
             cond = straight_run_condition(throttle)
             order, index = 'NA', scan.get(cond, {'next_index': 1})['next_index']
             name = '%s_%03d' % (cond, index)
+        elif profile == 'yawpulse':
+            cond = 'YAW_T%02d_D%02d' % (round(throttle * 100), round(magnitude * 100))
+            index = 1 + len(list(base_dir.glob(cond + '_*_???')))
+            order = 'LR' if index % 2 else 'RL'
+            name = '%s_%s_%03d' % (cond, order, index)
         else:
             cond = lake_id_condition(throttle, magnitude)
             order, index = scan[cond]['next_order'], scan[cond]['next_index']
@@ -3540,7 +3564,6 @@ class BoatLink:
                     'status_lossy': False, 'failsafe_logged': False,
                     'notes': notes, 'firmware_label': label, 'provenance': provenance,
                     'imu_nonfinite': False, 'imu_last': None,
-                    'servo_power_retry_at': now, 'servo_power_attempts': 0,
                 }
                 self._lake_writer = writer
                 self.lake_id_result = None
@@ -3551,17 +3574,6 @@ class BoatLink:
                                            % LAKE_ID_PRECHECK_S)
                 self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
                 self.motor_split = False; self.rudder = 0.0
-                # After the boat's failsafe the rail stays OFF until a NON-ZERO
-                # command, and the precheck only ever sends zeros -- so it would
-                # refuse on servo_power every time. Ask now and retry inside the
-                # bounded precheck; the gate still needs the boat's confirmation.
-                if self.motor_status.get('have') and not self.motor_status.get('servo_power'):
-                    if self._send_servo_power_locked(True):
-                        self.lake_id['servo_power_attempts'] = 1
-                        self.lake_id['servo_power_retry_at'] = now + LAKE_ID_SERVO_POWER_RETRY_S
-                        self._lake_id_event_locked('servo_rail_power_on_sent',
-                                                   'boat reported the servo rail OFF at START: PWR-ON sent '
-                                                   '(attempt 1); the gate still needs the boat to confirm it')
                 return True, None
         writer.discard()                      # disk work: outside the lock again
         return False, why
@@ -3623,7 +3635,6 @@ class BoatLink:
             'imu_finite': bool(tel.get('have')) and finite,
             'motorstatus_fresh': ms_age is not None and ms_age <= LAKE_ID_MOTORSTATUS_MAX_AGE_S,
             'boat_armed': int(ms.get('state', 0) or 0) == 2,
-            'servo_power': bool(ms.get('servo_power')),
             'boat_zero_throttle': (ms.get('have') and ms.get('left_throttle') == 0.0
                                    and ms.get('right_throttle') == 0.0),
             'boat_rudder_centred': (ms.get('have') and ms.get('rudder_cmd') == 0.0
@@ -3676,7 +3687,10 @@ class BoatLink:
             # would only throw away a finished profile seconds before its record.
             return None
         tel_age = (now - tel['last_rx_monotonic']) if tel.get('last_rx_monotonic') is not None else None
-        if tel_age is None or tel_age > LAKE_ID_TELEM_MAX_AGE_S:
+        if tel_age is not None and tel_age > LAKE_ID_TELEM_MAX_AGE_S:
+            self._lake_id_warn_locked('telemetry gap exceeded %.1f s; affected samples are incomplete'
+                                      % LAKE_ID_TELEM_MAX_AGE_S)
+        if tel_age is None or tel_age > LAKE_ID_TELEM_POWERED_MAX_AGE_S:
             return 'telemetry stale (%.2f s)' % (tel_age if tel_age is not None else -1)
         alive = tel_age <= LAKE_ID_TELEM_ALIVE_S
         ms_limit = LAKE_ID_STATUS_ALIVE_CAP_S if alive else LAKE_ID_MOTORSTATUS_POWERED_MAX_AGE_S
@@ -3704,9 +3718,6 @@ class BoatLink:
             return 'IMU unhealthy (imu_ok=false)'
         if int(ms.get('state', 0) or 0) != 2:
             return 'boat not armed (state %s)' % ms.get('state')
-        if not ms.get('servo_power'):
-            return ("servo power lost — the boat's link-loss failsafe cut the rail (it heard no "
-                    "command for 0.4 s)")
         if ms.get('assist_rudder') or self.assist_rudder_on:
             return 'mode changed: Rudder Assist reported ON (must stay OFF)'
         if lake_id_is_straight_profile(rt.get('profile')):
@@ -3720,8 +3731,9 @@ class BoatLink:
                 return 'mode changed: Motor P reported ON (must stay OFF for raw test)'
         elif not ms.get('assist_motor_p') or not self.p_assist_on:
             return 'mode changed: Motor P reported OFF (must stay ON)'
-        if self.session_id is None or (now - self.session_last_hb) > LAKE_ID_SUPERVISION_S:
-            return 'browser supervision lost'
+        # The server-side 15 Hz profile owns the controls once started. A
+        # browser reload must not destroy a valid run; STOP and DISARM remain
+        # available, and the boat still has its independent 400 ms watchdog.
         if ph is not None and ph[2] > 0.0:
             # Boat-applied L/R are watched for the WHOLE powered run, not just
             # until the first acknowledgement: the boat's own link-loss failsafe
@@ -3766,15 +3778,6 @@ class BoatLink:
         if ph is not None and ph[0] == 'precheck':
             self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
             self.motor_split = False; self.rudder = 0.0
-            if (not self.motor_status.get('servo_power')
-                    and now >= rt['servo_power_retry_at']):
-                rt['servo_power_retry_at'] = now + LAKE_ID_SERVO_POWER_RETRY_S
-                if self._send_servo_power_locked(True):
-                    rt['servo_power_attempts'] += 1
-                    self._lake_id_event_locked(
-                        'servo_rail_power_on_retry',
-                        'PWR-ON attempt %d; throttle and rudder remain zero'
-                        % rt['servo_power_attempts'])
             conds = self._lake_id_precheck_locked(now)
             for k, v in conds.items():
                 if rt['precheck'].get(k) != v:
@@ -3846,14 +3849,22 @@ class BoatLink:
             return self._abort_lake_id_locked(reason)
         if name != rt['phase']:
             rt['phase'] = name; rt['phase_start'] = rt['t0'] + start
-            self._lake_id_event_locked('phase_enter', '%s: throttle=%.2f rudder=%+.2f' % (name, thr, rud))
+            self._lake_id_event_locked('phase_enter', '%s: throttle=%.2f motor_diff=%+.2f' % (name, thr, rud))
             if name == 'stop':
                 rt['stop_entered_at'] = now
-        self.throttle = thr; self.motor_left = 0.0; self.motor_right = 0.0
-        self.motor_split = False; self.rudder = rud
+        # Lake steering is differential thrust. `rud` is the canonical
+        # half-difference carried by the phase table: negative means the
+        # RIGHT motor is stronger and the boat turns LEFT.
+        self.throttle = thr
+        self.motor_left = max(0.0, min(1.0, thr + rud))
+        self.motor_right = max(0.0, min(1.0, thr - rud))
+        self.motor_split = True
+        self.rudder = 0.0                 # physical rudder/servo is not used
         if rt['cmd_last'] != (thr, rud):
             rt['cmd_last'] = (thr, rud)
-            self._lake_id_event_locked('cmd_sent', 'throttle=%.2f rudder=%+.2f (repeated by the 15 Hz stream)' % (thr, rud))
+            self._lake_id_event_locked(
+                'cmd_sent', 'motor L=%.2f R=%.2f (repeated by the 15 Hz stream)'
+                % (self.motor_left, self.motor_right))
 
     def _collect_lake_id_row_locked(self, yaw_rate, heading, now=None):
         """One row per RECEIVED telemetry frame, from button press to the end.
@@ -3956,14 +3967,15 @@ class BoatLink:
                                           % LAKE_ID_RULES['frozen_imu_s'])
         else:
             rt['imu_last'] = (key, now)
-        if phase in ('turn_a', 'turn_b') and isinstance(yaw_rate, (int, float)) and self.rudder != 0.0:
-            expected_pos = self.rudder < 0.0        # LEFT -> positive yaw hypothesis
+        turn_diff = ph[3] if ph is not None and phase in ('turn_a', 'turn_b') else 0.0
+        if phase in ('turn_a', 'turn_b') and isinstance(yaw_rate, (int, float)) and turn_diff != 0.0:
+            expected_pos = turn_diff < 0.0  # RIGHT motor stronger -> LEFT -> positive yaw
             y = yaw_rate
             if elapsed - phase_start > 3.0 and abs(y) > 0.5 and (y > 0) != expected_pos:
                 # Nothing that changes per frame in the text: one warning per
                 # phase, counted; the event's own timestamp says when it began.
-                self._lake_id_warn_locked('%s: yaw sign opposite to the hypothesis (rudder %+.2f)'
-                                          % (phase, self.rudder))
+                self._lake_id_warn_locked('%s: yaw sign opposite to the hypothesis (motor_diff %+.2f)'
+                                          % (phase, turn_diff))
 
     def _abort_lake_id_locked(self, reason):
         if self.lake_id is None or self.lake_id['finalizing']:
@@ -4440,7 +4452,11 @@ class BoatLink:
             # Recorded into every lake/straight row as tool_send_age_s, so
             # an abort can say whether THIS side went quiet.
             self._last_send_mono = self._now()
-        ok = self._send_steer_locked(self.rudder) and ok
+        # Motor-only lake profiles do not use the physical rudder. Sending a
+        # zero SteerCommand beside every MotorCommand doubles the uplink load
+        # and can keep an old drive proposal alive when a motor frame is lost.
+        if getattr(self, 'lake_id', None) is None:
+            ok = self._send_steer_locked(self.rudder) and ok
         # Only while an assisted run is live: the firmware
         # ignores it otherwise, but there is no reason to put
         # it on the air at all.
@@ -5003,13 +5019,19 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <details class="card" open id="lake-card">
   <summary class="card-title">Lake steering ID <span class="pill" id="lake-pill" style="margin-left:6px;">IDLE</span></summary>
   <div id="lake-raw-mode" style="color:var(--warn);"></div>
-  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">ONE button: precheck 2 s &rarr; straight 10 s &rarr; rudder one side 10 s &rarr; centre 10 s &rarr; other side 10 s &rarr; centre 10 s &rarr; stop 5 s. 57 s, 50 s powered. Motor P must be ON (use the P toggle first; the boat must confirm it before any throttle) and Rudder Assist OFF, for the whole run &mdash; the firmware itself zeroes P while the rudder is deflected. ARM first; STOP or any manual input aborts. GPS fix is advisory: without it the run still records yaw and heading, but position, speed, course and the turn radius are unavailable.</div>
+  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">Motor-only tests: the physical rudder and servo rail are unused, and Rudder Assist OFF is required. YAW PULSE drives straight 20 s, makes the right motor stronger for 2 s (turn left), recovers 10 s, then makes the left motor stronger for 2 s (turn right). Motor P must be ON and boat-confirmed before throttle. GPS fix is advisory.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
     <label style="font-size:10px;">throttle</label>
     <select id="lake-throttle"><option value="0.20" selected>T20</option><option value="0.30">T30</option></select>
-    <label style="font-size:10px;">rudder</label>
+    <label style="font-size:10px;">motor difference</label>
     <select id="lake-mag"><option value="0.30" selected>30%</option><option value="0.60">60%</option></select>
     <button id="lake-start" title="one press runs the whole 57 s profile; STOP aborts">START LAKE TEST</button>
+  </div>
+  <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
+    <label style="font-size:10px;">motor yaw pulse</label>
+    <select id="yaw-throttle"><option value="0.20">T20</option><option value="0.30">T30</option><option value="0.40" selected>T40</option></select>
+    <select id="yaw-diff"><option value="0.05">&plusmn;5%</option><option value="0.10" selected>&plusmn;10%</option><option value="0.15">&plusmn;15%</option></select>
+    <button id="lake-yaw-pulse" title="straight 20 s, right motor stronger 2 s, recover 10 s, left motor stronger 2 s, recover 10 s, stop">YAW PULSE TEST</button>
   </div>
   <div class="telem-row"><label>Next order</label><span class="val" id="lake-next">--</span></div>
   <div class="motor-slider-row" style="gap:6px;"><label style="font-size:10px;white-space:nowrap;">firmware label</label>
@@ -5553,6 +5575,7 @@ $('bench-base').addEventListener('click', () => runBench('both', 0));
 // Both take the ordinary motor path so the selected P mode participates.
 $('bench-base-short').addEventListener('click', () => runLakeId('straight'));
 $('bench-base-long').addEventListener('click', () => runLakeId('straight30'));
+$('lake-yaw-pulse').addEventListener('click', () => runLakeId('yawpulse'));
 
 // The 4.5 s sequence runs on the server's own command loop; this call returns
 // at once and progress arrives through the normal status poll. Nothing here
@@ -5565,7 +5588,7 @@ function setRudderTestLockout(on) {
   on = on || _lakeActive;              // a lake run locks the same controls
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
-  ['bench-left', 'bench-right', 'bench-base', 'bench-base-short', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start',
+  ['bench-left', 'bench-right', 'bench-base', 'bench-base-short', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start', 'lake-yaw-pulse',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -5633,15 +5656,16 @@ function buildLakeNotes(fields) {
 async function runLakeId(profile) {
   // Straight profiles use the bench card's throttle box and keep rudder centred.
   const straight = profile === 'straight' || profile === 'straight30';
+  const yawpulse = profile === 'yawpulse';
   const msg = straight ? $('bench-msg') : $('lake-msg');
   if (!connected) { msg.textContent = 'not connected'; return; }
   msg.textContent = '';
   const notes = {};
   LAKE_NOTE_FIELDS.forEach(function (k) { const el = $('lake-note-' + k); notes[k] = el ? el.value : ''; });
   const r = await api('/api/lake_id', 'POST', {
-    throttle: straight ? parseInt($('bench-throttle').value) / 100 : parseFloat($('lake-throttle').value),
-    magnitude: straight ? 0 : parseFloat($('lake-mag').value),
-    profile: straight ? profile : 'full',
+    throttle: straight ? parseInt($('bench-throttle').value) / 100 : (yawpulse ? parseFloat($('yaw-throttle').value) : parseFloat($('lake-throttle').value)),
+    magnitude: straight ? 0 : (yawpulse ? parseFloat($('yaw-diff').value) : parseFloat($('lake-mag').value)),
+    profile: (straight || yawpulse) ? profile : 'full',
     firmware_label: $('lake-fw').value, notes: notes,
     seq: ++winchCommandSeq });
   if (r && !r.ok) msg.textContent = r.error || 'refused';

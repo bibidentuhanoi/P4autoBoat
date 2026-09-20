@@ -218,6 +218,40 @@ class LakeBase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class PhaseTableTest(unittest.TestCase):
 
+    def test_yaw_pulse_profile_uses_motor_mismatch_with_correct_turn_sign(self):
+        ph = T.lake_id_phases(0.40, 0.10, 'LR', profile='yawpulse')
+        self.assertEqual([p[0] for p in ph],
+                         ['precheck', 'straight', 'turn_a', 'recover_a',
+                          'turn_b', 'recover_b', 'stop'])
+        self.assertEqual([p[1] for p in ph], [2.0, 20.0, 2.0, 10.0, 2.0, 10.0, 5.0])
+        # Canonical differential: negative makes RIGHT motor stronger -> LEFT.
+        left = ph[2]
+        self.assertLess(left[3], 0.0)
+        self.assertAlmostEqual(left[2] + left[3], 0.30)
+        self.assertAlmostEqual(left[2] - left[3], 0.50)
+        right = ph[4]
+        self.assertGreater(right[3], 0.0)
+        self.assertAlmostEqual(right[2] + right[3], 0.50)
+        self.assertAlmostEqual(right[2] - right[3], 0.30)
+
+
+class YawPulseCommandTest(LakeBase):
+    def test_turn_phase_sends_unequal_motors_and_zero_physical_rudder(self):
+        ok, err = self.link.start_lake_id(0.40, 0.10, 1, profile='yawpulse')
+        self.assertTrue(ok, err)
+        self.clock.advance(2.1); self._all_fresh(); self._tick()
+        self.clock.advance(20.1); self._all_fresh(); self._tick()
+        self.assertEqual(self.link.lake_id['phase'], 'turn_a')
+        self.assertTrue(self.link.motor_split)
+        self.assertAlmostEqual(self.link.motor_left, 0.30)
+        self.assertAlmostEqual(self.link.motor_right, 0.50)
+        self.assertEqual(self.link.rudder, 0.0)
+        self.sent.clear()
+        with self.link._lock:
+            self.link._stream_send_locked()
+        self.assertIn(('motor', 0.3, 0.5), self.sent)
+        self.assertFalse(any(x[0] == 'steer' for x in self.sent))
+
     def test_profile_is_exactly_57_seconds_and_50_powered(self):
         for order in ('LR', 'RL'):
             ph = T.lake_id_phases(0.2, 0.3, order)
@@ -301,7 +335,7 @@ class PrecheckWindowTest(LakeBase):
         r = self._wait_result()
         self.assertEqual(r['status'], 'aborted')
         self.assertIn('precheck failed', r['reason'])
-        self.assertIn('servo_power', r['reason'])
+        self.assertNotIn('servo_power', r['reason'])
         self.assertIn('imu_ok', r['reason'])
         self.assertEqual(self.link.throttle, 0.0)
         self.assertNotIn(('motor', 0.2, 0.2), self.sent)
@@ -391,13 +425,14 @@ class SequenceTest(LakeBase):
         while self.link.lake_id is not None:
             self._drive(0.5)
             if self.link.lake_id is not None:
-                seen.setdefault(self.link.lake_id['phase'], (self.link.throttle, self.link.rudder))
-        self.assertEqual(seen['straight'], (0.2, 0.0))
-        self.assertEqual(seen['turn_a'], (0.2, -0.3))
-        self.assertEqual(seen['recover_a'], (0.2, 0.0))
-        self.assertEqual(seen['turn_b'], (0.2, 0.3))
-        self.assertEqual(seen['recover_b'], (0.2, 0.0))
-        self.assertEqual(seen['stop'], (0.0, 0.0))
+                seen.setdefault(self.link.lake_id['phase'],
+                                (self.link.motor_left, self.link.motor_right, self.link.rudder))
+        self.assertEqual(seen['straight'], (0.2, 0.2, 0.0))
+        self.assertEqual(seen['turn_a'], (0.0, 0.5, 0.0))
+        self.assertEqual(seen['recover_a'], (0.2, 0.2, 0.0))
+        self.assertEqual(seen['turn_b'], (0.5, 0.0, 0.0))
+        self.assertEqual(seen['recover_b'], (0.2, 0.2, 0.0))
+        self.assertEqual(seen['stop'], (0.0, 0.0, 0.0))
 
     def test_powered_for_exactly_the_middle_fifty_seconds(self):
         ok, err = self._start(); self.assertTrue(ok, err)
@@ -527,17 +562,19 @@ class AbortTest(LakeBase):
         self._tick()
         self._assert_aborted('disconnected', wire=False)
 
-    def test_servo_power_lost(self):
+    def test_servo_power_lost_is_recorded_but_does_not_abort_motor_test(self):
         self._powered()
         self._boat(0.2, 0.2, 0.0, servo=False); self._tick()
-        self._assert_aborted('servo power')
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertTrue(any('failsafe' in w for w in self.link.lake_id['warnings']))
 
-    def test_telemetry_stale(self):
+    def test_brief_telemetry_loss_does_not_destroy_the_run(self):
         self._powered()
         self.clock.advance(1.2); self._hb()
         self._boat(0.2, 0.2, 0.0); self._system()
         self._tick()
-        self._assert_aborted('telemetry stale')
+        self.assertIsNotNone(self.link.lake_id)
+        self.assertTrue(any('telemetry gap' in w for w in self.link.lake_id['warnings']))
 
     def test_motorstatus_stale_when_telemetry_is_quiet_too(self):
         """3.6 s without MotorStatus AND telemetry 0.8 s old: the boat may be
@@ -647,11 +684,11 @@ class AbortTest(LakeBase):
         self._boat(0.2, 0.2, 0.0, assist_rudder=True); self._tick()
         self._assert_aborted('mode changed')
 
-    def test_browser_supervision_lost_after_two_seconds(self):
+    def test_browser_reload_does_not_destroy_server_owned_profile(self):
         self._powered()
         self.link.session_last_hb = self.clock.t - 2.1
         self._tick()
-        self._assert_aborted('supervision')
+        self.assertIsNotNone(self.link.lake_id)
 
     def test_a_short_heartbeat_gap_does_not_abort(self):
         self._powered()
@@ -1985,19 +2022,17 @@ class BoatFailsafeTest(LakeBase):
         self.assertIsNotNone(self.link.lake_id)
         self.assertEqual(self.link.throttle, 0.0)
 
-    def test_failsafe_in_a_powered_phase_still_aborts_and_is_named(self):
+    def test_failsafe_in_a_powered_phase_is_named_without_destroying_the_run(self):
         ok, err = self._start(); self.assertTrue(ok, err)
         self._drive(5.0)
         self._boat(0.0, 0.0, 0.0, servo=False)
         self._tick()
-        r = self._wait_result()
-        self.assertEqual(r['status'], 'aborted')
-        self.assertIn('servo power', r['reason'])
-        self.assertIn('failsafe', r['reason'])
-        _rows, events, _s = self._files(r['name'])
+        self.assertIsNotNone(self.link.lake_id)
+        self._writer_idle()
+        events = list(csv.DictReader(open(self.tmp / self.link.lake_id['name'] / 'events.csv')))
         self.assertIn('boat_failsafe', [e['event'] for e in events])
 
-    def test_start_powers_the_rail_when_the_boat_reports_it_off(self):
+    def test_start_does_not_touch_unused_servo_rail(self):
         raw = []
         inner = self.link._write_locked
 
@@ -2010,15 +2045,11 @@ class BoatFailsafeTest(LakeBase):
         for p in raw:
             m = self.link.pb2.BoatMessage(); m.ParseFromString(p)
             kinds.append((m.WhichOneof('payload'), m.servo_power.on if m.WhichOneof('payload') == 'servo_power' else None))
-        self.assertIn(('servo_power', True), kinds)
-        self._writer_idle()
-        ev = [e['event'] for e in csv.DictReader(open(self.tmp / self.link.lake_id['name'] / 'events.csv'))]
-        self.assertIn('servo_rail_power_on_sent', ev)
-        self._boat(0.0, 0.0, 0.0, servo=True)           # the boat re-powers it
+        self.assertNotIn(('servo_power', True), kinds)
         self._drive(2.2, boat_follows=False)
         self.assertEqual(self.link.lake_id['phase'], 'straight')
 
-    def test_precheck_retries_power_on_until_the_boat_confirms_the_rail(self):
+    def test_precheck_never_retries_unused_servo_power(self):
         raw = []
         inner = self.link._write_locked
 
@@ -2042,10 +2073,8 @@ class BoatFailsafeTest(LakeBase):
                                     or message.motor.left != 0.0
                                     or message.motor.right != 0.0):
                 nonzero_motor.append(message)
-        self.assertGreaterEqual(len(power_on), 4)
+        self.assertFalse(power_on)
         self.assertFalse(nonzero_motor)
-
-        self._boat(0.0, 0.0, 0.0, servo=True)
         self._drive(1.2, boat_follows=False)
         self.assertEqual(self.link.lake_id['phase'], 'straight')
 
@@ -2074,7 +2103,8 @@ class LakeUplinkLoadTest(LakeBase):
         self.link.session_last_hb = time.monotonic()
         ok, err = self._start(); self.assertTrue(ok, err)
         self._run_stream(0.3)
-        self.assertIn('motor', kinds); self.assertIn('steer', kinds)
+        self.assertIn('motor', kinds)
+        self.assertNotIn('steer', kinds, 'motor-only lake runs must not double radio traffic')
         self.assertNotIn('winch', kinds, 'the winch packet was sent during a lake run')
         with self.link._lock:
             self.link._abort_lake_id_locked('test')
