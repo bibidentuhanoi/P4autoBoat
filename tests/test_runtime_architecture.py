@@ -1111,6 +1111,8 @@ static unsigned detect_calls;
 static unsigned manual_control_calls;
 static unsigned training_log_calls;
 static unsigned calibrate_calls;
+static unsigned encode_calls;
+static unsigned transport_calls;
 
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 void detect_trigger(void) { ++detect_calls; }
@@ -1129,7 +1131,7 @@ pb_istream_t pb_istream_from_buffer(const uint8_t *buffer, size_t size) {
     return (pb_istream_t){.buffer = buffer, .size = size};
 }
 bool pb_encode(pb_ostream_t *stream, const void *fields, const void *src) {
-    (void)fields; (void)src; stream->bytes_written = 1; return true;
+    (void)fields; (void)src; ++encode_calls; stream->bytes_written = 1; return true;
 }
 bool pb_decode(pb_istream_t *stream, const void *fields, void *dest) {
     (void)stream; (void)fields;
@@ -1151,10 +1153,26 @@ static void bench_handler(uint32_t kind, float base, float delta, float reset_c,
     (void)abort; (void)kind; (void)base; (void)delta; (void)reset_c; }
 static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }
 static void steer_rate_handler(float d) { (void)d; }
+static esp_err_t transport_send(const uint8_t *buf, size_t len, void *ctx) {
+    (void)buf; (void)len; (void)ctx; ++transport_calls; return ESP_OK;
+}
 
 int main(void) {
     const uint8_t input[] = {0};
     assert(pipeline_init() == ESP_OK);
+
+    /* With no receiver, publishing must be a true no-op. Encoding the large
+     * SensorSnapshot cost ~39 ms on hardware even though transports=0. */
+    boat_SensorSnapshot snapshot = {0};
+    pipeline_publish_sensors(&snapshot);
+    assert(encode_calls == 0);
+    assert(transport_calls == 0);
+
+    assert(pipeline_register_transport(transport_send, NULL) == ESP_OK);
+    pipeline_publish_sensors(&snapshot);
+    assert(encode_calls == 1);
+    assert(transport_calls == 1);
+
     pipeline_register_motor_handler(motor_handler);
     pipeline_register_arm_handler(arm_handler);
     pipeline_register_winch_handler(winch_handler);

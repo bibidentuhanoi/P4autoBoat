@@ -82,6 +82,13 @@ static SemaphoreHandle_t s_rx_msg_mutex = NULL;
  * the next occurrence names which. */
 static void fanout_locked(uint8_t *buf, size_t bufsize, const char *what)
 {
+    /* A disconnected/no-server boot has no receiver.  Encoding the full
+     * SensorSnapshot is not free: hardware measured ~39 ms here even with
+     * transports=0.  Registration happens during startup, before publishers
+     * run, so a zero count means there is genuinely nowhere to send this
+     * message. */
+    if (s_transport_count == 0) return;
+
     uint64_t t_encode_start = (uint64_t)esp_timer_get_time();
     pb_ostream_t stream = pb_ostream_from_buffer(buf, bufsize);
     if (!pb_encode(&stream, boat_BoatMessage_fields, &s_msg)) {
