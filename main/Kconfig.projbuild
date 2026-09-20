@@ -24,6 +24,15 @@ menu "Board Configuration"
         hex "ToF Sensor B Address"
         default 0x24
 
+    config TOF_I2C_FREQ_HZ
+        int "ToF I2C Clock (Hz)"
+        default 1000000
+        range 400000 1000000
+        help
+            I2C clock used by both VL53L5CX device handles. The sensor supports
+            Fast-mode Plus at 1 MHz. Keep the IMU on its separate 100 kHz
+            device setting; only ToF transfers use this value.
+
     config TOF_RANGING_FREQ_HZ
         int "ToF Ranging Frequency (Hz)"
         default 10

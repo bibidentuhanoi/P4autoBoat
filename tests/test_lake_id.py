@@ -974,13 +974,17 @@ class GuardTest(unittest.TestCase):
         'CMakeLists.txt', 'main/CMakeLists.txt', 'main/Kconfig.projbuild',
         'main/bench_run.c',
         'main/bench_run.h', 'main/dashboard.html', 'main/drivers/esc_driver.c',
+        'main/drivers/tof_driver.c',
         'main/drivers/vl53l5cx_platform.c',
+        'main/include/timing_log_gate.h',
         'main/motor_control.c', 'main/pipeline.c',
         'main/proto/boat.pb.h', 'main/proto/boat.proto',
+        'main/runtime_schedule.c', 'main/sensor_schedule.c',
+        'main/sensor_task.c',
         'main/sensor_fusion.c', 'main/sensor_fusion.h', 'main/trim_learn.c',
         'main/trim_learn.h', 'main/yaw_heading_control.c',
         'main/yaw_heading_control.h', 'proto/boat_pb2.py',
-        'sdkconfig',
+        'sdkconfig', 'sdkconfig.defaults',
     }
 
     def _git(self, *args):
@@ -1132,7 +1136,7 @@ class NextOrderReachesThePageTest(unittest.TestCase):
         link = T.BoatLink(T.load_boat_pb2())
         nxt = link.lake_id_next()
         # the straight-run indices ride the same cache (STRAIGHT 3s)
-        self.assertEqual(sorted(nxt), ['STRAIGHT_T20', 'STRAIGHT_T30', 'STRAIGHT_T40',
+        self.assertEqual(sorted(nxt), ['STRAIGHT_T15', 'STRAIGHT_T20', 'STRAIGHT_T30', 'STRAIGHT_T40',
                                        'T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
         self.assertIn(nxt['T20_M30']['next_order'], ('LR', 'RL'))
 

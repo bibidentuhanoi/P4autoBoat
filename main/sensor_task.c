@@ -24,6 +24,7 @@
 #include "esp_timer.h"
 #include "runtime_metrics.h"
 #include "sensor_schedule.h"
+#include "timing_log_gate.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -56,9 +57,9 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
  * ToF frames/s reaching the ground station.
  *
  * SensorBusTask used to own all runtime I2C (IMU + ToF) on one 20ms tick, but
- * a single VL53L5CX read genuinely takes ~33ms (confirmed on hardware
- * 2026-08-11 -- transferring the enabled result fields at NB_TARGET_PER_ZONE=4
- * over I2C, not a fault) -- longer than SensorBus's own period, so
+ * a single VL53L5CX read at the old 400kHz setting took ~33ms (confirmed on
+ * hardware 2026-08-11 -- transferring the enabled result fields at
+ * NB_TARGET_PER_ZONE=4 over I2C, not a fault) -- longer than SensorBus's own period, so
  * interleaving it there guaranteed a deadline miss on every cycle ToF was
  * selected (~38% sustained SensorBus miss rate). Split into task_tof_read(),
  * its own lower-priority task (see runtime_schedule.c) -- IMU keeps its tight
@@ -83,10 +84,9 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
  * coupling to IMU timing SensorBus used to need. A no-op tick (nothing due)
  * costs microseconds, so ticking this often is cheap. */
 #define TOF_READ_POLL_MS       20
-/* A single ToF read taking ~33ms is now expected, not diagnostic-worthy --
- * logging every one would just be the same noise, differently attributed.
- * This threshold is for genuine anomalies: something well beyond the normal
- * ~33ms (e.g. a real bus fault), worth a look. */
+/* At 1MHz a four-target frame should finish well below this. This threshold
+ * catches contention or a real bus fault; repeated warnings are aggregated so
+ * UART output cannot amplify the timing problem. */
 #define TOF_READ_ANOMALY_US    50000U
 #define TOF_STALE_US   (1000 * 1000)  /* cached grid older than this = not valid */
 
@@ -123,6 +123,8 @@ static tof_result_channel_t s_tof_results_a, s_tof_results_b;
 static _Atomic(TaskHandle_t) s_fusion_task;
 static _Atomic(TaskHandle_t) s_tof_processor_task;
 static uint32_t s_imu_sequence = 0;
+static timing_log_gate_t s_imu_timing_log;
+static timing_log_gate_t s_tof_timing_log[3];
 
 /* Apply per-slot gating + 3-frame median, then publish into the cache. */
 static void tof_cache_store(tof_grid_cache_t *cache,
@@ -208,14 +210,17 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
     int64_t mag_read_us = esp_timer_get_time() - mag_t0;
 
     if (ag_read_us > SENSOR_BUS_SLOW_OP_US || mag_read_us > SENSOR_BUS_SLOW_OP_US) {
-        /* One combined line, not two separate ones: shows both durations
-         * together so a single cycle where accel/gyro AND mag each collide
-         * with a ToF chunk (stacking toward a much larger total) is visible
-         * directly, instead of having to correlate two disjoint log lines. */
-        ESP_LOGW(TAG, "SensorBus: IMU read ag=%lldus(%s) mag=%lldus(%s) total=%lldus",
-                 (long long)ag_read_us, esp_err_to_name(ag_err),
-                 (long long)mag_read_us, esp_err_to_name(mag_err),
-                 (long long)(ag_read_us + mag_read_us));
+        uint32_t slow_count, max_total_us;
+        uint32_t total_us = (uint32_t)(ag_read_us + mag_read_us);
+        if (timing_log_gate_record(&s_imu_timing_log, esp_timer_get_time(),
+                                   total_us, &slow_count, &max_total_us)) {
+            ESP_LOGW(TAG, "SensorBus: IMU slow cycles=%lu max_total=%luus "
+                     "latest ag=%lldus(%s) mag=%lldus(%s) total=%luus",
+                     (unsigned long)slow_count, (unsigned long)max_total_us,
+                     (long long)ag_read_us, esp_err_to_name(ag_err),
+                     (long long)mag_read_us, esp_err_to_name(mag_err),
+                     (unsigned long)total_us);
+        }
     }
 
     sample->accel_gyro_valid = (ag_err == ESP_OK);
@@ -514,8 +519,16 @@ void task_tof_read(void *pvParameters)
                     tof_read_grid(device, &channel->buffers[slot], tof_label);
                 uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_started);
                 if (read_us > TOF_READ_ANOMALY_US) {
-                    ESP_LOGW(TAG, "ToFRead: ToF-%s read took %luus (%s) -- well beyond the normal ~33ms",
-                             tof_label, (unsigned long)read_us, esp_err_to_name(result));
+                    uint32_t slow_count, max_read_us;
+                    if (timing_log_gate_record(&s_tof_timing_log[selected],
+                                               esp_timer_get_time(), read_us,
+                                               &slow_count, &max_read_us)) {
+                        ESP_LOGW(TAG, "ToFRead: ToF-%s slow reads=%lu max=%luus "
+                                 "latest=%luus (%s)",
+                                 tof_label, (unsigned long)slow_count,
+                                 (unsigned long)max_read_us,
+                                 (unsigned long)read_us, esp_err_to_name(result));
+                    }
                 }
                 if (result == ESP_OK) {
                     atomic_store_explicit(&channel->generation, generation,

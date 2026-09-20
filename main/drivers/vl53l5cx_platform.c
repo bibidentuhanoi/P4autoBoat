@@ -20,12 +20,16 @@
 #define VL53L5CX_I2C_TIMEOUT CONFIG_VL53L5CX_I2C_TIMEOUT_VALUE
 #endif
 
-/* The 8x8/four-target result block is about 1.4KB.  Sending that as one
- * 400kHz transaction owns the shared sensor bus for roughly 25-32ms, longer
- * than the IMU task's entire 20ms period.  Bound each transaction so the
- * ESP-IDF bus lock is released between chunks and the higher-priority IMU
- * task can run.  64 bytes is about 1.5ms of wire time at 400kHz. */
+/* The 8x8/four-target result block is about 1.4KB. Bound each transaction so
+ * the ESP-IDF bus lock is released between chunks and the higher-priority IMU
+ * task can run. At the default 1MHz, 128 bytes is about 1.2ms of wire time,
+ * no longer than the old 64-byte chunk at 400kHz. Keep the old chunk size if
+ * a build deliberately selects a slower ToF bus. */
+#if CONFIG_TOF_I2C_FREQ_HZ >= 800000
+#define VL53L5CX_I2C_READ_CHUNK_SIZE 128U
+#else
 #define VL53L5CX_I2C_READ_CHUNK_SIZE 64U
+#endif
 
 //Define the reset scheme
 #ifdef CONFIG_VL53L5CX_RESET_PIN_HIGH

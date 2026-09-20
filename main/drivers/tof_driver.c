@@ -65,7 +65,7 @@ static bool tof_probe_at(i2c_master_bus_handle_t bus, VL53L5CX_Configuration *de
     i2c_device_config_t cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = addr,
-        .scl_speed_hz    = 400000,
+        .scl_speed_hz    = CONFIG_TOF_I2C_FREQ_HZ,
     };
     if (i2c_master_bus_add_device(bus, &cfg, &dev->platform.handle) != ESP_OK) {
         dev->platform.handle = NULL;
@@ -165,8 +165,9 @@ esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
     vTaskDelay(pdMS_TO_TICKS(10));
     devices->b_ok = tof_init_one(bus_handle, &devices->dev_b, TOF_B_ADDR, "xtalk_b", "B");
 
-    ESP_LOGI(TAG, "ToF init: A=%s B=%s",
-             devices->a_ok ? "OK" : "absent", devices->b_ok ? "OK" : "absent");
+    ESP_LOGI(TAG, "ToF init: A=%s B=%s I2C=%dHz targets/zone=%d",
+             devices->a_ok ? "OK" : "absent", devices->b_ok ? "OK" : "absent",
+             CONFIG_TOF_I2C_FREQ_HZ, VL53L5CX_NB_TARGET_PER_ZONE);
 
     // Always OK — a missing sensor is non-fatal; presence is reported via a_ok/b_ok.
     return ESP_OK;
@@ -184,9 +185,8 @@ esp_err_t tof_read_grid(VL53L5CX_Configuration* dev, VL53L5CX_ResultsData* resul
         return ESP_FAIL;
     }
 
-    /* Chunk-boundary tear check: the chunked read takes ~35-45ms against a
-     * 100ms ranging period, so under normal timing the next frame cannot be
-     * ready yet. If it already is, this read took long enough that it may
+    /* Chunk-boundary tear check: a read should finish comfortably inside the
+     * 100ms ranging period. If another frame is already ready, the read may
      * have straddled a frame boundary (some zones stale, some fresh). */
     uint8_t frame_advanced = 0;
     if (vl53l5cx_check_data_ready(dev, &frame_advanced) == 0 && frame_advanced) {

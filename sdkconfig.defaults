@@ -1,5 +1,6 @@
 CONFIG_IDF_TARGET="esp32p4"
 CONFIG_VL53L5CX_NB_TARGET_PER_ZONE=4
+CONFIG_TOF_I2C_FREQ_HZ=1000000
 # --- ToF: transfer only the fields this architecture actually uses ---
 # ARCHITECTURE DECISION (Kiet, 2026-08-08): ML trains on CAMERA IMAGES ONLY
 # (PicoDet). ToF is NOT a training input -- it is a RUNTIME distance
