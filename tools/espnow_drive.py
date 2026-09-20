@@ -3485,11 +3485,11 @@ class BoatLink:
             throttle = round(throttle, 2)
             magnitude = 0.0               # no turns: the rudder stays centred throughout
         elif profile == 'yawpulse':
-            if not (math.isfinite(throttle) and 0.20 <= throttle <= 0.60):
-                return False, 'yaw-pulse throttle must be between 20% and 60%'
+            if not (math.isfinite(throttle) and 0.15 <= throttle <= 0.50):
+                return False, 'yaw-pulse throttle must be between 15% and 50%'
             if not (math.isfinite(magnitude) and 0.05 <= magnitude <= 0.20
-                    and magnitude < throttle):
-                return False, 'yaw-pulse motor half-difference must be 5% to 20% and below throttle'
+                    and magnitude <= throttle):
+                return False, 'yaw-pulse motor half-difference must be 5% to 20% and not exceed throttle'
             throttle, magnitude = round(throttle, 2), round(magnitude, 2)
         else:
             if not any(abs(throttle - t) < 1e-9 for t in LAKE_ID_THROTTLES):
@@ -5029,7 +5029,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
     <label style="font-size:10px;">motor yaw pulse</label>
-    <select id="yaw-throttle"><option value="0.20">T20</option><option value="0.30">T30</option><option value="0.40" selected>T40</option></select>
+    <select id="yaw-throttle"><option value="0.15">T15</option><option value="0.20">T20</option><option value="0.25">T25</option><option value="0.30">T30</option><option value="0.35">T35</option><option value="0.40" selected>T40</option><option value="0.45">T45</option><option value="0.50">T50</option></select>
     <select id="yaw-diff"><option value="0.05">&plusmn;5%</option><option value="0.10" selected>&plusmn;10%</option><option value="0.15">&plusmn;15%</option></select>
     <button id="lake-yaw-pulse" title="straight 20 s, right motor stronger 2 s, recover 10 s, left motor stronger 2 s, recover 10 s, stop">YAW PULSE TEST</button>
   </div>

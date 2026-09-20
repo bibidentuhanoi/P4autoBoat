@@ -236,6 +236,22 @@ class PhaseTableTest(unittest.TestCase):
 
 
 class YawPulseCommandTest(LakeBase):
+    def test_yaw_pulse_accepts_t15_and_t50_endpoints(self):
+        ok, err = self.link.start_lake_id(0.15, 0.05, 1, profile='yawpulse')
+        self.assertTrue(ok, err)
+        with self.link._lock:
+            self.link._abort_lake_id_locked('endpoint check')
+        self._wait_result()
+        ok, err = self.link.start_lake_id(0.50, 0.15, 2, profile='yawpulse')
+        self.assertTrue(ok, err)
+
+    def test_page_offers_every_five_percent_from_t15_through_t50(self):
+        src = TOOL.read_text()
+        i = src.index('id="yaw-throttle"')
+        select = src[i:src.index('</select>', i)]
+        for value in range(15, 51, 5):
+            self.assertIn('T%d' % value, select)
+
     def test_turn_phase_sends_unequal_motors_and_zero_physical_rudder(self):
         ok, err = self.link.start_lake_id(0.40, 0.10, 1, profile='yawpulse')
         self.assertTrue(ok, err)
