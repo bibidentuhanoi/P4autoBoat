@@ -2041,6 +2041,101 @@ process.exit(0);
         self.assertIn('loading', out['note'])
 
 
+class BrowserHeartbeatTest(unittest.TestCase):
+    def test_a_slow_state_response_does_not_block_the_next_heartbeat(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+setTimeout(async () => {
+  await context.openSession();
+  context.stopHeartbeat();
+  const sent = [];
+  let finishFirst;
+  context.fetch = (path, opts = {}) => {
+    if (path === '/api/state') {
+      sent.push(JSON.parse(opts.body));
+      if (sent.length === 1) return new Promise(resolve => { finishFirst = resolve; });
+    }
+    return Promise.resolve({ json: async () => ({ ok: true }) });
+  };
+  const first = context.sendHeartbeat();
+  context.ctrl.throttle = 0.4;
+  const second = context.sendHeartbeat();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const beforeFirstResponse = sent.slice();
+  finishFirst({ json: async () => ({ ok: true }) });
+  await Promise.all([first, second]);
+  console.log(JSON.stringify({ beforeFirstResponse }));
+  process.exit(0);
+}, 0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sent = json.loads(result.stdout.strip().splitlines()[-1])['beforeFirstResponse']
+        self.assertEqual(len(sent), 2)
+        self.assertEqual([s['seq'] for s in sent], [1, 2])
+        self.assertEqual(sent[1]['throttle'], 0.4)
+
+    def test_old_heartbeat_response_cannot_drop_a_new_session(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+setTimeout(async () => {
+  await context.openSession();
+  context.stopHeartbeat();
+  let finishOld;
+  context.fetch = (path, opts = {}) => {
+    if (path === '/api/state') return new Promise(resolve => { finishOld = resolve; });
+    return Promise.resolve({ json: async () => replies[path] || { ok: true } });
+  };
+  const old = context.sendHeartbeat();
+  replies['/api/session'] = { ok: true, session_id: 's2', heartbeat_hz: 12 };
+  await context.openSession();
+  context.stopHeartbeat();
+  finishOld({ json: async () => ({ ok: false, code: 'wrong_session' }) });
+  await old;
+  console.log(JSON.stringify({ sessionId: context.sessionId,
+                               hbInFlight: context.hbInFlight }));
+  process.exit(0);
+}, 0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out, {'sessionId': 's2', 'hbInFlight': 0})
+
+    def test_unresponsive_server_has_a_bounded_heartbeat_queue(self):
+        result = run_page_js(r"""
+replies['/api/session'] = { ok: true, session_id: 's1', heartbeat_hz: 12 };
+vm.createContext(context);
+vm.runInContext(script, context);
+setTimeout(async () => {
+  await context.openSession();
+  context.stopHeartbeat();
+  const sent = [], finish = [];
+  context.fetch = (path, opts = {}) => {
+    if (path === '/api/state') {
+      sent.push(JSON.parse(opts.body));
+      return new Promise(resolve => finish.push(resolve));
+    }
+    return Promise.resolve({ json: async () => ({ ok: true }) });
+  };
+  for (let i = 0; i < 20; i++) context.sendHeartbeat();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const before = sent.length;
+  finish[0]({ json: async () => ({ ok: true }) });
+  await new Promise(resolve => setTimeout(resolve, 20));
+  console.log(JSON.stringify({ before, after: sent.length,
+                               max: context.MAX_HB_IN_FLIGHT }));
+  process.exit(0);
+}, 0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['before'], 4)
+        self.assertEqual(out['after'], 5)
+
+
 class StopResetsEverySliderTest(unittest.TestCase):
     """Per-motor mode: STOP must put the Left/Right sliders back to 0 as well,
     and the next heartbeat must carry zeros. The boat IS at zero after STOP, so

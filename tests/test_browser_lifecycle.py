@@ -387,21 +387,6 @@ class ReorderedResponsesTest(BrowserHttpTest):
         after = body.split("r.code === 'no_session'", 1)[1]
         self.assertIn('sessionId = null', after)
 
-    def test_heartbeats_are_serialized_and_coalesced(self):
-        """One request outstanding at a time; anything asked for meanwhile
-        collapses into a single follow-up carrying the LATEST state. Full-state
-        heartbeats are what make coalescing safe."""
-        src = TOOL.read_text()
-        m = re.search(r'async function sendHeartbeat\(\) \{(.*?)\n\}', src, re.S)
-        body = m.group(1)
-        self.assertIn('if (hbInFlight) { hbPending = true; return; }', body)
-        self.assertIn('hbInFlight = true;', body)
-        self.assertIn('finally', body)
-        self.assertIn('hbInFlight = false;', body)
-        self.assertIn('if (hbPending) { hbPending = false; sendHeartbeat(); }',
-                      body)
-
-
 class DashboardSliderReleaseTest(unittest.TestCase):
     """THE named case, on the other UI.
 

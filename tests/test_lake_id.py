@@ -1215,6 +1215,44 @@ class KeepaliveTest(LakeBase):
     """A repeated heartbeat is a keepalive, not a command, while a test owns
     the controls."""
 
+    def test_page_hide_and_new_session_do_not_zero_an_active_lake_run(self):
+        ok, err = self._start(); self.assertTrue(ok, err)
+        self._drive(5.0)
+        self.assertEqual(self.link.throttle, 0.2)
+        self.sent.clear()
+        self.link.release_control_session()
+        self.assertEqual(self.link.throttle, 0.2)
+        self.assertFalse(any(x == ('motor', 0.0, 0.0) for x in self.sent))
+        self.assertIsNone(self.link.session_id)
+        self.link.open_control_session()
+        self.assertEqual(self.link.throttle, 0.2)
+        self.assertFalse(any(x == ('motor', 0.0, 0.0) for x in self.sent))
+        self.assertIsNotNone(self.link.lake_id)
+
+    def test_page_hide_still_zeroes_manual_drive(self):
+        self.link.throttle = 0.4
+        self.link.motor_left = 0.4
+        self.link.motor_right = 0.4
+        self.link.release_control_session()
+        self.assertEqual((self.link.throttle, self.link.motor_left, self.link.motor_right),
+                         (0.0, 0.0, 0.0))
+        self.assertIn(('motor', 0.0, 0.0), self.sent)
+        self.assertIsNone(self.link.session_id)
+
+    def test_late_older_heartbeat_cannot_restore_an_old_motor_command(self):
+        ok, err = self.link.control_heartbeat('sess', 2, throttle=0.4, rudder=0.0,
+                                              left=0.0, right=0.0, split=False)
+        self.assertTrue(ok, err)
+        self.assertEqual(self.link.throttle, 0.4)
+        last_good = self.link.session_last_hb
+        self.clock.advance(0.1)
+        ok, err = self.link.control_heartbeat('sess', 1, throttle=0.1, rudder=0.0,
+                                              left=0.0, right=0.0, split=False)
+        self.assertFalse(ok)
+        self.assertEqual(err[1], 'stale_seq')
+        self.assertEqual(self.link.throttle, 0.4)
+        self.assertEqual(self.link.session_last_hb, last_good)
+
     def test_an_unchanged_heartbeat_does_not_overwrite_the_running_command(self):
         ok, err = self._start(); self.assertTrue(ok, err)
         self._drive(5.0)

@@ -2560,13 +2560,17 @@ class BoatLink:
 
     def open_control_session(self):
         """Claim control. Supersedes any existing session, and starts from a
-        stopped boat: taking over must never inherit somebody else's throttle.
+        stopped MANUAL drive: taking over must never inherit somebody else's
+        throttle. A server-owned test keeps its own command authority.
 
         Random id, not a counter, for the same reason the assist request id is
         random -- a reload must not be able to reuse the previous session's
         identity and have delayed requests from it accepted."""
         with self._lock:
-            self._zero_controls_locked()
+            automated = (getattr(self, 'rudder_test', None) is not None
+                         or getattr(self, 'lake_id', None) is not None)
+            if not automated:
+                self._zero_controls_locked()
             self.session_id = '%08x%08x' % (random.getrandbits(32),
                                             random.getrandbits(32))
             self.session_seq = 0
@@ -2576,20 +2580,23 @@ class BoatLink:
             # page's first heartbeat is recognised as "unchanged" rather than
             # as the operator grabbing a control.
             self._last_hb_state = (0.0, 0.0, 0.0, 0.0, False)
-            if self.connected:
+            if self.connected and not automated:
                 self._transmit_zeros_locked()
             return self.session_id
 
     def release_control_session(self):
-        """Give up control deliberately: zero, transmit, drop the session.
+        """Give up manual control deliberately: zero, transmit, drop the session.
 
         Distinct from stop() because that also aborts a calibration, and a tab
         being hidden must not do that. Distinct from letting the lease expire
         because this is immediate and unambiguous."""
         with self._lock:
-            self._zero_controls_locked()
-            if self.connected:
-                self._transmit_zeros_locked()
+            automated = (getattr(self, 'rudder_test', None) is not None
+                         or getattr(self, 'lake_id', None) is not None)
+            if not automated:
+                self._zero_controls_locked()
+                if self.connected:
+                    self._transmit_zeros_locked()
             self.session_id = None
             self.session_seq = 0
 
@@ -4503,13 +4510,13 @@ class BoatLink:
                         and self._anything_commanded_locked()):
                     if self.lease_expired_at is None:
                         self.lease_expired_at = now_mono
-                        print('[lease] no browser heartbeat for %.2fs — '
-                              'zeroing. The page claims a control session on '
-                              'connect and heartbeats at %d Hz; if you are '
-                              'seeing this while driving, RELOAD the page '
-                              '(Ctrl-Shift-R) so it runs the current JS.'
-                              % (CONTROL_LEASE_S, CONTROL_HEARTBEAT_HZ),
-                              flush=True)
+                        age = now_mono - self.session_last_hb
+                        reason = ('no active control session' if self.session_id is None else
+                                  'last browser heartbeat %.2fs ago' % age)
+                        print('[lease] %s (limit %.2fs) — zeroing manual controls. '
+                              'Keep the control tab visible; if this repeats while visible, '
+                              'check browser/HTTP responsiveness.'
+                              % (reason, CONTROL_LEASE_S), flush=True)
                     self._zero_controls_locked()
                     self._transmit_zeros_locked()
                 if self.connected:
@@ -5310,19 +5317,19 @@ async function openSession() {
     // first heartbeat cannot re-assert a stale slider position.
     zeroDriveUI();
     stopHeartbeat();
-    hbInFlight = false;
     hbTimer = setInterval(sendHeartbeat, Math.round(1000 / (r.heartbeat_hz || 12)));
   }
   return r;
 }
 
-// SERIALIZED and COALESCED. Two heartbeats in flight at once can be answered
-// out of order, and the loser is then judged against a sequence the winner has
-// already advanced -- a self-inflicted stale_seq storm. Only one request is
-// ever outstanding; anything asked for while it is in flight collapses into a
-// single follow-up carrying the LATEST state, which is what full-state
-// heartbeats make safe to do.
-var hbInFlight = false, hbPending = false;
+// A single slow HTTP response must not prevent the next full-state heartbeat
+// from reaching the server before its 300 ms lease expires. Allow a FEW
+// overlapping requests: sequence numbers reject a late older command, while
+// the cap prevents an unresponsive server from accumulating unlimited fetches.
+// Epochs keep a delayed response from a released/old session from touching a
+// new session. Full-state requests make a dropped or stale one harmless.
+const MAX_HB_IN_FLIGHT = 4;
+var hbInFlight = 0, hbPending = false, hbEpoch = 0;
 
 // SESSION WATCHDOG. A session can be missing for several unrelated reasons --
 // the page was reloaded while already connected (the connect button never
@@ -5344,11 +5351,12 @@ setInterval(ensureSession, 500);
 
 async function sendHeartbeat() {
   if (!sessionId) return;
-  if (hbInFlight) { hbPending = true; return; }
-  hbInFlight = true;
+  if (hbInFlight >= MAX_HB_IN_FLIGHT) { hbPending = true; return; }
+  const sentSession = sessionId, epoch = hbEpoch;
+  hbInFlight++;
   try {
     const r = await api('/api/state', 'POST', {
-      session_id: sessionId, seq: ++ctrlSeq,
+      session_id: sentSession, seq: ++ctrlSeq,
       throttle: ctrl.throttle, rudder: ctrl.rudder,
       left: ctrl.left, right: ctrl.right, split: ctrl.split });
     if (r && !r.ok) {
@@ -5356,7 +5364,8 @@ async function sendHeartbeat() {
       // arrived out of order, and assist_off_pending means the boat is
       // mid-transition -- in both cases the session is healthy and the lease
       // was refreshed, so dropping it would stop the boat for no reason.
-      if (r.code === 'no_session' || r.code === 'wrong_session') {
+      if ((r.code === 'no_session' || r.code === 'wrong_session')
+          && epoch === hbEpoch && sessionId === sentSession) {
         // Give this one up, and let the watchdog claim a fresh one. NOT a
         // dead end: going quiet here is what made the UI unrecoverable.
         stopHeartbeat();
@@ -5364,14 +5373,22 @@ async function sendHeartbeat() {
         ensureSession();
       }
     }
+  } catch (_e) {
+    // If no state reaches the server, its unchanged lease still stops motion.
   } finally {
-    hbInFlight = false;
-    if (hbPending) { hbPending = false; sendHeartbeat(); }
+    if (epoch !== hbEpoch) return;  // old session's response
+    hbInFlight--;
+    if (hbPending && hbInFlight < MAX_HB_IN_FLIGHT) {
+      hbPending = false;
+      sendHeartbeat();
+    }
   }
 }
 
 function stopHeartbeat() {
   if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  hbEpoch++;
+  hbInFlight = 0;
   hbPending = false;
 }
 
