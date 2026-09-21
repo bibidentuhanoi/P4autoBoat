@@ -499,10 +499,9 @@ LAKE_ID_RULES = {
     'recovery_hold_s': 2.0,             # must STAY inside the band this long to count as recovered
     'half_decay_frac': 0.5,             # time for |yaw - bias| to first fall to this * the turn's steady
 }
-# The boat's firmware was built from main with no recorded SHA; the label says
-# so. It is operator-supplied and BELIEVED -- the tool cannot read the flash.
-LAKE_ID_FIRMWARE_LABEL_DEFAULT = ('main-branch build / exact firmware SHA unknown / '
-                                  'rudder max believed 1805 / flashed 2026-09-05')
+# The tool cannot read the P4 flash. The operator should copy the actual App
+# version shown in the boat boot log after flashing; never prefill an old date.
+LAKE_ID_FIRMWARE_LABEL_DEFAULT = 'unknown / enter boat App version from boot log'
 LAKE_ID_FIRMWARE_LABEL_NOTE = ('operator-supplied / believed; not verified against the '
                                'flashed binary (the tool cannot read it)')
 LAKE_ID_NOTE_FIELDS = ('battery', 'payload_load', 'mechanical_config', 'wind',
@@ -513,7 +512,7 @@ LAKE_ID_CSV_COLUMNS = (
     'yaw_dps', 'heading_deg', 'pitch_deg', 'roll_deg',
     'gps_valid', 'lat', 'lon', 'speed_mps', 'course_deg', 'satellites', 'hdop',
     'gps_values_changed',
-    'cmd_throttle', 'cmd_rudder',
+    'cmd_throttle', 'cmd_rudder', 'cmd_left', 'cmd_right',
     'boat_applied_left_cmd', 'boat_applied_right_cmd',
     'boat_applied_rudder_cmd', 'boat_applied_rudder_pwm_us',
     'boat_state', 'boat_servo_power', 'boat_assist_motor_p', 'boat_assist_rudder',
@@ -533,6 +532,8 @@ LAKE_ID_SAMPLES_HEADER = (
     'ESP-NOW field-telemetry frames (~20 Hz), NOT the boat SD card',
     '# boat_applied_* are boat-APPLIED SOFTWARE COMMANDS from MotorStatus: not '
     'measured RPM, thrust or servo angle -- no actuator feedback exists',
+    '# cmd_left/cmd_right are the explicit motor commands sent by this tool; '
+    'cmd_rudder is the PHYSICAL rudder command and remains zero in motor-only profiles',
     '# gps_values_changed is ADVISORY only: lat/lon/speed/course differ from the '
     'previous row. It is not a fix flag, timestamp or sequence and must not be '
     'used for GPS rate, latency or freshness; GPS is 10 Hz under 20 Hz frames',
@@ -894,7 +895,13 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
     number (poor coverage, an unsettled response, a recovery that never
     settles) it says so instead of reporting a misleading gain or time."""
     rules = dict(LAKE_ID_RULES if rules is None else rules)
-    phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'])
+    profile = settings.get('profile', 'full')
+    if profile == 'yawpulse':
+        # A 4 s steady window would swallow both seconds of a pulse, including
+        # its startup. Use the final second and still require the settled test.
+        rules['steady_window_s'] = min(rules['steady_window_s'], 1.0)
+    phases = lake_id_phases(settings['throttle'], settings['magnitude'], settings['order'],
+                            profile=profile)
     windows = lake_id_phase_windows(phases)
     warnings = []
 
@@ -998,11 +1005,12 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         a, b = windows[name]
         pr = rows_in(name)
         yawblk = _lake_phase_yaw(rows, windows[name])
-        out = {'rudder_cmd': rudder_cmd, 'side': 'LEFT' if rudder_cmd < 0 else 'RIGHT',
+        out = {'rudder_cmd': rudder_cmd, 'motor_half_difference': rudder_cmd,
+               'side': 'LEFT' if rudder_cmd < 0 else 'RIGHT',
                'expected_yaw_sign_hypothesis': '+' if rudder_cmd < 0 else '-',
-               'note': ('rudder response of the operational boat: Motor P is ON but the firmware '
-                        'zeroes its correction while the rudder is deflected, and autotrim is '
-                        'frozen -- the combined system, not an isolated rudder'),
+               'note': ('motor differential response of the operational boat: negative half-difference '
+                        'makes the right motor stronger and turns LEFT. Motor P remains enabled but '
+                        'its correction is suspended during deliberate motor mismatch'),
                'yaw': yawblk, 'peak_yaw_dps': yawblk['peak_yaw_dps'],
                'settled': None, 'unavailable_reason': None,
                'steady_yaw_dps': None, 'steady_yaw_minus_bias_dps': None, 'steady_yaw_std_dps': None,
@@ -1059,7 +1067,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             out['rise_time_s'] = _lake_fnum(t_hi - t_lo) if (t_lo is not None and t_hi is not None) else None
         expected = -1.0 if rudder_cmd < 0 else 1.0        # LEFT -> positive yaw
         if rel != 0 and (rel > 0) != (expected < 0):
-            warnings.append('%s: steady yaw sign %s disagrees with the hypothesis (%s rudder -> %s yaw)'
+            warnings.append('%s: steady yaw sign %s disagrees with the hypothesis (%s motor split -> %s yaw)'
                             % (name, '+' if rel > 0 else '-', out['side'], out['expected_yaw_sign_hypothesis']))
         out['turn_radius'] = radius_block(name, pr, b, True)
         return out
@@ -1068,8 +1076,8 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         pts = yaw_in(name)
         a, b = windows[name]
         yawblk = _lake_phase_yaw(rows, windows[name])
-        out = {'note': ('recovery with Motor P and autotrim active -- the combined system returning '
-                        'to straight after the rudder is centred; not a passive hull time constant'),
+        out = {'note': ('recovery after equal motor commands: heading/yaw-rate PI resumes after its '
+                        'centred delay and recaptures the current heading; not a passive hull time constant'),
                'yaw': yawblk, 'recovery_time_s': None, 'half_decay_time_s': None,
                'recovery_band_dps': None, 'overshoot_dps': None, 'residual_yaw_dps': None,
                'unavailable_reason': None,
@@ -1174,7 +1182,7 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'status': status, 'reason': reason, 'abort_phase': abort_phase,
         'stop_confirmed': stop_confirmed,
         'settings': dict(settings, phases=[list(p) for p in phases],
-                         profile_s=LAKE_ID_PROFILE_S, powered_s=LAKE_ID_POWERED_S,
+                          profile_s=lake_id_profile_s(phases), powered_s=lake_id_powered_s(phases),
                          # The freshness limits that were in force: a run's record
                          # must say how tolerant it was of a lossy link.
                          freshness_limits_s={
@@ -1191,8 +1199,8 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             'motor_p': 'ON', 'rudder_assist': 'OFF',
             'required': ('Motor P ON and Rudder Assist OFF for the whole run, confirmed by the '
                          'boat before any throttle; the tool never toggles a mode during the run'),
-            'p_gating_note': ('the heading/yaw-rate PI output is suspended while the rudder is '
-                              'deflected (|rudder| > 0.02); after 0.5 s centred it recaptures the '
+            'p_gating_note': ('the heading/yaw-rate PI output is suspended while the requested '
+                              'motor half-difference exceeds 0.02; after 0.5 s equal motors it recaptures the '
                               'current heading and resumes. The I term and slow trim learner freeze '
                               'while manual steering has authority'),
             'p_correction_recorded': True,
@@ -1223,11 +1231,11 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
         'rules': rules,
         'wording': [
             'MotorStatus values are boat-applied software commands, not measured RPM, thrust or servo angle',
-            'this recording measures the COMBINED system -- raw rudder, yaw PI and learned trim '
-            'together; it does not isolate P\'s contribution',
+            'this recording measures the COMBINED system -- motor differential, yaw PI and learned trim '
+             'together; it does not isolate P\'s contribution',
             'it does not demonstrate or prove assisted waypoint steering; it is preparation for it',
-            'turn phases measure the rudder response of the operational boat with yaw PI suspended by '
-            'the firmware during the deflection',
+            'turn phases measure the motor differential response of the operational boat with yaw PI '
+            'suspended by the firmware during deliberate motor mismatch',
             ('recoveries use raw throttle with motor corrections disabled'
              if settings.get('raw_throttle_test') else
              'recoveries use heading/yaw-rate PI with learned trim feed-forward, not passive hull tests'),
@@ -1237,6 +1245,9 @@ def lake_id_summarize(rows, events, settings, provenance, status, reason,
             'records the latest learned c and controller terms with their age',
             'a phase with insufficient coverage, no clear or unsettled response, or a recovery '
             'that did not settle reports no gain or time for it, by rule',
+            *(['for 2 s yaw pulses, steady yaw is estimated from the final 1 s only; inspect '
+               'settled and the raw samples before using it as a turn-rate value']
+              if profile == 'yawpulse' else []),
         ],
         'warnings': warnings,
     }
@@ -3904,6 +3915,7 @@ class BoatLink:
             'course_deg': tel.get('course_deg'), 'satellites': tel.get('satellites'),
             'hdop': tel.get('hdop'), 'gps_values_changed': changed,
             'cmd_throttle': self.throttle, 'cmd_rudder': self.rudder,
+            'cmd_left': self.motor_left, 'cmd_right': self.motor_right,
             'boat_applied_left_cmd': ms.get('left_throttle') if ms.get('have') else '',
             'boat_applied_right_cmd': ms.get('right_throttle') if ms.get('have') else '',
             'boat_applied_rudder_cmd': ms.get('rudder_cmd') if ms.get('have') else '',

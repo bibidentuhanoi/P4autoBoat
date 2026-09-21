@@ -236,6 +236,24 @@ class PhaseTableTest(unittest.TestCase):
 
 
 class YawPulseCommandTest(LakeBase):
+    def test_complete_yaw_pulse_writes_identifiable_dataout_files(self):
+        ok, err = self.link.start_lake_id(0.40, 0.10, 1, profile='yawpulse')
+        self.assertTrue(ok, err)
+        self._drive(53.0)
+        result = self._wait_result()
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['name'], 'YAW_T40_D10_LR_001')
+        rows, events, summary = self._files(result['name'])
+        self.assertGreater(len(rows), 500)
+        self.assertTrue(any(r['phase'] == 'turn_a' for r in rows))
+        self.assertTrue(any(r['phase'] == 'turn_b' for r in rows))
+        self.assertTrue(any(e['event'] == 'complete' for e in events))
+        self.assertEqual(summary['settings']['profile'], 'yawpulse')
+        self.assertEqual(summary['settings']['profile_s'], 51.0)
+        self.assertEqual(summary['settings']['powered_s'], 44.0)
+        self.assertTrue(summary['t_utc_end'])
+        self.assertEqual(summary['recording']['sample_rows_written'], len(rows))
+
     def test_yaw_pulse_accepts_t15_and_t50_endpoints(self):
         ok, err = self.link.start_lake_id(0.15, 0.05, 1, profile='yawpulse')
         self.assertTrue(ok, err)
@@ -262,6 +280,11 @@ class YawPulseCommandTest(LakeBase):
         self.assertAlmostEqual(self.link.motor_left, 0.30)
         self.assertAlmostEqual(self.link.motor_right, 0.50)
         self.assertEqual(self.link.rudder, 0.0)
+        self._frame(yaw=5.0)
+        row = self.link.lake_id['rows'][-1]
+        self.assertAlmostEqual(row['cmd_left'], 0.30)
+        self.assertAlmostEqual(row['cmd_right'], 0.50)
+        self.assertEqual(row['cmd_rudder'], 0.0)
         self.sent.clear()
         with self.link._lock:
             self.link._stream_send_locked()
@@ -834,6 +857,39 @@ class RowsAndEventsTest(LakeBase):
 class SummaryTest(unittest.TestCase):
     """Pure: synthetic rows with known answers."""
 
+    def test_yaw_pulse_summary_uses_its_actual_phase_windows(self):
+        phases = T.lake_id_phases(0.40, 0.10, 'LR', profile='yawpulse')
+        rows = []
+        heading = 90.0
+        for i in range(1020):
+            t = round(i * 0.05, 3)
+            phase = T.lake_id_phase_at(phases, t)[0]
+            yaw = 10.0 if phase == 'turn_a' else -10.0 if phase == 'turn_b' else 0.0
+            heading = (heading + yaw * 0.05) % 360.0
+            rows.append({'elapsed_s': t, 'phase': phase, 'yaw_dps': yaw,
+                         'heading_deg': heading, 'pitch_deg': 1.0, 'roll_deg': 0.0,
+                         'gps_valid': 1, 'speed_mps': 1.5, 'course_deg': heading,
+                         'satellites': 9, 'hdop': 1.0,
+                         'boat_applied_left_cmd': 0.4, 'boat_applied_right_cmd': 0.4,
+                         'boat_assist_motor_p': 1, 'boat_assist_rudder': 0})
+        settings = {'throttle': 0.40, 'magnitude': 0.10, 'order': 'LR',
+                    'profile': 'yawpulse', 'condition': 'YAW_T40_D10',
+                    'index': 1, 'name': 'YAW_T40_D10_LR_001'}
+        summary = T.lake_id_summarize(
+            rows, [], settings, {}, 'complete', None, stop_confirmed=True,
+            notes={k: 'ok' for k in T.LAKE_ID_NOTE_FIELDS})
+        self.assertEqual(summary['settings']['profile_s'], 51.0)
+        self.assertEqual(summary['settings']['powered_s'], 44.0)
+        self.assertEqual([p[1] for p in summary['settings']['phases']],
+                         [2.0, 20.0, 2.0, 10.0, 2.0, 10.0, 5.0])
+        self.assertEqual(summary['rules']['steady_window_s'], 1.0)
+        self.assertGreater(summary['turn_a']['heading_change_deg'], 15.0)
+        self.assertLess(summary['turn_b']['heading_change_deg'], -15.0)
+        self.assertTrue(summary['phase_coverage']['turn_a']['coverage_ok'])
+        self.assertTrue(summary['phase_coverage']['turn_b']['coverage_ok'])
+        self.assertIn('motor differential', summary['turn_a']['note'])
+        self.assertNotIn('rudder is deflected', summary['mode']['p_gating_note'])
+
     def _rows(self, order='LR', bias=0.5, gain=8.0, tau=1.0, speed=1.5, gps=True):
         ph = T.lake_id_phases(0.2, 0.3, order)
         rows, yaw, heading, t = [], bias, 90.0, 0.0
@@ -877,7 +933,7 @@ class SummaryTest(unittest.TestCase):
         ra = s['recover_a']
         self.assertGreater(ra['recovery_time_s'], 0.5)
         self.assertLess(ra['recovery_time_s'], 4.0)
-        self.assertIn('autotrim', ra['note'])
+        self.assertIn('recaptures the current heading', ra['note'])
         self.assertIn('not a direct measurement', s['straight']['note'].replace('NOT a measurement', 'not a direct measurement'))
 
     def test_turn_radius_is_provisional_with_inputs_and_rules(self):
@@ -939,7 +995,7 @@ class MetadataTest(LakeBase):
         r = self._run_full()
         _r, _e, s = self._files(r['name'])
         self.assertEqual(s['provenance']['firmware_label'], T.LAKE_ID_FIRMWARE_LABEL_DEFAULT)
-        self.assertIn('1805', T.LAKE_ID_FIRMWARE_LABEL_DEFAULT)
+        self.assertIn('App version', T.LAKE_ID_FIRMWARE_LABEL_DEFAULT)
         r2 = self._run_full(label='my build')
         _r, _e, s2 = self._files(r2['name'])
         self.assertEqual(s2['provenance']['firmware_label'], 'my build')
@@ -1668,8 +1724,8 @@ class FirmwareLabelTest(LakeBase):
         d = T.LAKE_ID_FIRMWARE_LABEL_DEFAULT
         self.assertNotIn('4e81341b', d)
         self.assertIn('unknown', d)
-        self.assertIn('believed', d)
-        self.assertIn('1805', d)
+        self.assertIn('App version', d)
+        self.assertNotIn('2026-09-05', d)
         r = self._run_full()
         _r, _e, s = self._files(r['name'])
         self.assertEqual(s['provenance']['firmware_label'], d)
@@ -1874,7 +1930,7 @@ class PerformanceSummaryTest(unittest.TestCase):
         self.assertIsNone(ra['recovery_time_s'])
         self.assertIsNone(ra['half_decay_time_s'])
         self.assertIn('settle', ra['unavailable_reason'])
-        self.assertIn('Motor P and autotrim active', ra['note'])
+        self.assertIn('equal motor commands', ra['note'])
         self.assertAlmostEqual(ra['yaw']['mean_abs_yaw_dps'], 2.9, places=1)
         self.assertTrue(any('recover_a' in w for w in s['warnings']))
 
