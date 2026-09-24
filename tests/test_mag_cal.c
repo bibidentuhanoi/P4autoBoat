@@ -108,7 +108,7 @@ static void test_fit_removes_offset_and_squash(void)
     assert(mag_circle_complete(&c));
 
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  symmetric: verdict=%s ratio=%.3f rms=%.4f bins=%d scale=%.4f dev=%.2f\n",
            mag_cal_verdict_text(v), fit.axis_ratio, fit.rms, fit.bins,
            fit.gyro_scale, fit.gyro_dev_deg);
@@ -162,7 +162,7 @@ static void test_rotated_squash_leaves_only_a_constant_offset(void)
     mag_circle_init(&c, bx, by, bt, CAP);
     spin(&c, &d, 2.0f, 0.0f);
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_PASS);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_PASS);
     float e0 = 0.0f, lo = 1e9f, hi = -1e9f;
     for (float psi = 0.0f; psi < 360.0f; psi += 5.0f) {
         float mx, my, x, y;
@@ -187,7 +187,7 @@ static void test_gyro_disagreement_fails_the_calibration(void)
     spin(&c, &SYMMETRIC, 2.0f, 0.0f);
     for (int i = 0; i < c.n; i++) bt[i] *= 1.5f;
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_FAIL_GYRO);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_GYRO);
     assert(fit.gyro_scale < MAG_CAL_GYRO_SCALE_MIN);
 }
 
@@ -208,7 +208,7 @@ static void test_missing_part_of_the_circle_is_not_complete(void)
     assert(c.turn_deg >= MAG_CAL_MIN_TURN_DEG);
     assert(!mag_circle_complete(&c));
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     assert(v != MAG_CAL_PASS);
 }
 
@@ -231,7 +231,7 @@ static void test_scattered_readings_fail_as_noisy(void)
     mag_circle_init(&c, bx, by, bt, CAP);
     spin(&c, &d, 2.0f, 0.0f);
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  noisy: verdict=%s rms=%.3f\n", mag_cal_verdict_text(v), fit.rms);
     assert(v == MAG_CAL_FAIL_NOISY || v == MAG_CAL_FAIL_GYRO);
 }
@@ -254,7 +254,7 @@ static void test_pulsing_field_strength_fails_as_noisy(void)
         psi -= 0.4f;
     }
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  pulsing: verdict=%s rms=%.3f dev=%.2f\n", mag_cal_verdict_text(v),
            fit.rms, fit.gyro_dev_deg);
     assert(v == MAG_CAL_FAIL_NOISY);
@@ -273,7 +273,7 @@ static void test_single_partial_sweep_fails_as_coverage(void)
         psi -= 0.4f;
     }
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  partial: verdict=%s bins=%d\n", mag_cal_verdict_text(v), fit.bins);
     assert(v == MAG_CAL_FAIL_COVERAGE);
 }
@@ -294,11 +294,44 @@ static void test_heading_error_the_ellipse_cannot_fix_fails(void)
         psi -= 0.4f;
     }
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  wobble: verdict=%s scale=%.3f dev=%.2f\n", mag_cal_verdict_text(v),
            fit.gyro_scale, fit.gyro_dev_deg);
     assert(v == MAG_CAL_FAIL_GYRO);
     assert(fit.gyro_scale > MAG_CAL_GYRO_SCALE_MIN && fit.gyro_scale < MAG_CAL_GYRO_SCALE_MAX);
+}
+
+static void test_tolerance_setting_decides_the_gyro_gate_only(void)
+{
+    /* The heading-wobble case disagrees with the gyro by ~9 deg: refused on
+     * Strict (5), accepted on Normal (10) and Relaxed (25). */
+    mag_circle_t c;
+    mag_circle_init(&c, bx, by, bt, CAP);
+    float psi = 0.0f;
+    for (int i = 0; i < 1800; i++) {
+        float mx, my;
+        raw_for(&SYMMETRIC, psi, &mx, &my);
+        float wobble = 1.0f + 0.3f * sinf(2.0f * RAD(psi));
+        mag_circle_add(&c, mx, my, 20.0f * wobble, 0.02f);
+        psi -= 0.4f;
+    }
+    mag_fit_t fit;
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_GYRO);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_NORMAL, &fit) == MAG_CAL_PASS);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_RELAXED, &fit) == MAG_CAL_PASS);
+    /* a loose setting never rescues a broken circle */
+    distortion_t noisy = SYMMETRIC;
+    noisy.noise = 700.0f;
+    mag_circle_init(&c, bx, by, bt, CAP);
+    spin(&c, &noisy, 2.0f, 0.0f);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_MAX, &fit) != MAG_CAL_PASS);
+    /* requested values are made safe */
+    assert(mag_cal_tolerance_deg(0.0f) == MAG_CAL_GYRO_DEV_RELAXED);
+    assert(mag_cal_tolerance_deg(NAN) == MAG_CAL_GYRO_DEV_RELAXED);
+    assert(mag_cal_tolerance_deg(-4.0f) == MAG_CAL_GYRO_DEV_RELAXED);
+    assert(mag_cal_tolerance_deg(1.0f) == MAG_CAL_GYRO_DEV_MIN);
+    assert(mag_cal_tolerance_deg(90.0f) == MAG_CAL_GYRO_DEV_MAX);
+    assert(mag_cal_tolerance_deg(10.0f) == 10.0f);
 }
 
 static void test_heavily_squashed_field_fails_as_distorted(void)
@@ -309,7 +342,7 @@ static void test_heavily_squashed_field_fails_as_distorted(void)
     mag_circle_init(&c, bx, by, bt, CAP);
     spin(&c, &d, 2.0f, 0.0f);
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_FAIL_DISTORTED);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_DISTORTED);
 }
 
 static void test_weak_field_fails_as_not_earth_like(void)
@@ -320,19 +353,19 @@ static void test_weak_field_fails_as_not_earth_like(void)
     mag_circle_init(&c, bx, by, bt, CAP);
     spin(&c, &d, 2.0f, 0.0f);
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_FAIL_FIELD);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_FIELD);
 }
 
 static void test_degenerate_data_fails_without_crashing(void)
 {
     for (int i = 0; i < 300; i++) { bx[i] = 100.0f; by[i] = 200.0f; bt[i] = (float)i; }
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, 300, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, 300, MAG_CAL_GYRO_DEV_STRICT, &fit);
     assert(v == MAG_CAL_FAIL_FIT);
     for (int i = 0; i < 300; i++) { bx[i] = (float)i; by[i] = 2.0f * (float)i; }
-    v = mag_cal_fit_and_judge(bx, by, bt, 300, &fit);
+    v = mag_cal_fit_and_judge(bx, by, bt, 300, MAG_CAL_GYRO_DEV_STRICT, &fit);
     assert(v == MAG_CAL_FAIL_FIT);
-    assert(mag_cal_fit_and_judge(bx, by, bt, 10, &fit) == MAG_CAL_FAIL_TOO_FEW);
+    assert(mag_cal_fit_and_judge(bx, by, bt, 10, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_TOO_FEW);
 }
 
 static void test_missing_compass_readings_still_count_the_turn(void)
@@ -358,7 +391,7 @@ static void test_buffer_thinning_keeps_order_and_capacity(void)
     for (int i = 1; i < c.n; i++) assert(t[i] > t[i - 1]);   /* time order kept */
     assert(fabsf(c.turn_deg - 720.0f) < 1.0f);
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(x, y, t, c.n, &fit) == MAG_CAL_PASS);
+    assert(mag_cal_fit_and_judge(x, y, t, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_PASS);
 }
 
 static void test_uneven_hand_spin_with_pause_and_gyro_drift_passes(void)
@@ -381,7 +414,7 @@ static void test_uneven_hand_spin_with_pause_and_gyro_drift_passes(void)
     }
     assert(mag_circle_complete(&c));
     mag_fit_t fit;
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, &fit);
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit);
     printf("  hand spin: %.0f s, verdict=%s scale=%.4f dev=%.2f deg\n",
            t, mag_cal_verdict_text(v), fit.gyro_scale, fit.gyro_dev_deg);
     assert(v == MAG_CAL_PASS);
@@ -401,7 +434,7 @@ static void test_right_hand_spin_passes_too(void)
     }
     assert(mag_circle_complete(&c));
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_PASS);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_PASS);
     assert(fabsf(fit.gyro_scale - 1.0f) < 0.02f);
 }
 
@@ -420,7 +453,7 @@ static void test_heading_that_runs_backwards_fails(void)
         psi += 0.4f;                                /* ...compass says right */
     }
     mag_fit_t fit;
-    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, &fit) == MAG_CAL_FAIL_GYRO);
+    assert(mag_cal_fit_and_judge(bx, by, bt, c.n, MAG_CAL_GYRO_DEV_STRICT, &fit) == MAG_CAL_FAIL_GYRO);
     assert(fit.gyro_scale < 0.0f);
 }
 
@@ -508,6 +541,7 @@ int main(void)
     test_pulsing_field_strength_fails_as_noisy();
     test_single_partial_sweep_fails_as_coverage();
     test_heading_error_the_ellipse_cannot_fix_fails();
+    test_tolerance_setting_decides_the_gyro_gate_only();
     test_heavily_squashed_field_fails_as_distorted();
     test_weak_field_fails_as_not_earth_like();
     test_degenerate_data_fails_without_crashing();

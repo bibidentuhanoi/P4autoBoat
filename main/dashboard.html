@@ -411,6 +411,12 @@
       <div class="ccal-actions">
         <button class="btn-pwr" id="ccal-start" disabled
                 title="Hold still, then spin the boat flat about two circles. Refused while the motors are armed.">Calibrate</button>
+        <select id="ccal-tol" title="How closely the compass must follow the gyro during the spin (like ArduPilot's COMPASS_CAL_FIT). Relaxed for indoors by hand; Strict outdoors or on the water."
+                style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:10px;padding:2px;">
+          <option value="25" selected>Relaxed 25°</option>
+          <option value="10">Normal 10°</option>
+          <option value="5">Strict 5°</option>
+        </select>
         <button class="btn-pwr" id="ccal-cancel" disabled style="display:none;"
                 title="Stop the calibration. The compass calibration in use is not changed.">Cancel</button>
         <span id="ccal-hint"></span>
@@ -543,8 +549,8 @@ message ServoPowerCommand { bool on = 1; }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; bool gps_ok = 9; uint32 gps_detected_baud = 16; bool gps_baud_confirmed = 17; }
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
-message CompassCalCommand { bool start = 1; bool cancel = 2; }
-message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; uint32 run_id = 15; uint32 last_state = 16; uint32 last_reason = 17; bool gyro_level_saved = 18; bool tilted = 19; uint32 tilt_skipped = 20; }
+message CompassCalCommand { bool start = 1; bool cancel = 2; float tolerance_deg = 3; }
+message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; uint32 run_id = 15; uint32 last_state = 16; uint32 last_reason = 17; bool gyro_level_saved = 18; bool tilted = 19; uint32 tilt_skipped = 20; float tolerance_deg = 21; float saved_dev_deg = 22; float saved_tolerance_deg = 23; }
 message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
 message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; bool abort = 5; }
 message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; float heading_target_deg = 9; float heading_error_deg = 10; float yaw_target_dps = 11; float p_term = 12; float i_term = 13; float dynamic_c = 14; float effective_c = 15; float c_limit = 16; bool ctrl_active = 17; bool heading_hold = 18; bool saturated = 19; }
@@ -2254,11 +2260,28 @@ const CCAL_REASONS = {
 let _ccalLast = 0, _ccalShownState = 0, _ccalState = 0, _ccalPressedAt = 0,
     _ccalRunId = 0, _ccalPressRun = -1;
 
+function ccalTolerance() {
+  const v = parseFloat(($('ccal-tol') || {}).value);
+  return isFinite(v) && v > 0 ? v : 25;
+}
+const TOL_NAMES = { 5: 'strict', 10: 'normal', 25: 'relaxed' };
+function tolName(d) { return TOL_NAMES[Math.round(d)] || `${Math.round(d)}°`; }
+
 function sendCompassCal(start, cancel) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-  ws.send(BoatMessage.encode(BoatMessage.create({ compassCal: { start, cancel } })).finish());
+  const msg = { start, cancel };
+  if (start) msg.toleranceDeg = ccalTolerance();
+  ws.send(BoatMessage.encode(BoatMessage.create({ compassCal: msg })).finish());
   return true;
 }
+// Remember the operator's tolerance between visits (per-browser convenience).
+try {
+  const saved = localStorage.getItem('ccalTol');
+  if (saved && $('ccal-tol') && [...$('ccal-tol').options].some(o => o.value === saved)) $('ccal-tol').value = saved;
+} catch (e) {}
+if ($('ccal-tol')) $('ccal-tol').addEventListener('change', () => {
+  try { localStorage.setItem('ccalTol', $('ccal-tol').value); } catch (e) {}
+});
 
 // Buttons follow the boat's own answer, never a local guess: Calibrate while
 // connected, idle and disarmed; Cancel while a calibration is running.
@@ -2270,6 +2293,8 @@ function updateCcalButtons() {
   if (!start) return;
   start.disabled = !open || running || waiting || motorArmed;
   start.style.display = running ? 'none' : '';
+  const tol = $('ccal-tol');
+  if (tol) { tol.disabled = running; tol.style.display = running ? 'none' : ''; }
   cancel.style.display = running ? '' : 'none';
   cancel.disabled = !open || !running;
   hint.textContent = !open ? 'not connected' : motorArmed ? 'DISARM first'
@@ -2309,7 +2334,9 @@ function updateCompassCal(cc) {
   const hdg = (cc.headingDeg != null && cc.headingDeg >= 0) ? `${cc.headingDeg.toFixed(1)}°` : '—';
   const metrics = () => `squash ${(cc.axisRatio || 0).toFixed(2)} · spread ${((cc.fitRms || 0) * 100).toFixed(1)}% · `
     + `gyro agree ${(cc.gyroScale || 0).toFixed(3)} · worst ${(cc.gyroDevDeg || 0).toFixed(1)}° · field ${Math.round(cc.radius || 0)}`;
-  badge.textContent = cc.calibrated ? 'calibrated' : 'NOT calibrated';
+  badge.textContent = cc.calibrated
+    ? `calibrated · ${tolName(cc.savedToleranceDeg || 0)} · gyro ${(cc.savedDevDeg || 0).toFixed(0)}°`
+    : 'NOT calibrated';
   badge.style.color = cc.calibrated ? 'var(--green)' : 'var(--warn)';
   step.style.color = 'var(--text)';
   let mask = cc.coverageMask || 0, active = false;
@@ -2335,7 +2362,7 @@ function updateCompassCal(cc) {
     step.textContent = 'Checking…';
     det.textContent = 'Fitting the circle and comparing it with the gyro.';
   } else if (state === 4) {
-    step.textContent = 'PASS — saved and in use';
+    step.textContent = `PASS (${tolName(cc.toleranceDeg || 0)}) — saved and in use`;
     step.style.color = 'var(--green)';
     det.textContent = `${metrics()} · heading ${hdg}`;
   } else if (state === 5) {
@@ -2344,7 +2371,9 @@ function updateCompassCal(cc) {
     det.textContent = (cc.gyroLevelSaved
         ? 'Gyro drift + level were saved; the compass is still NOT calibrated.'
         : 'Compass calibration not changed.')
-      + ' Press Calibrate to try again.'
+      + ((cc.reason === 17 && (cc.toleranceDeg || 0) < 25)
+          ? ` Limit was ${Math.round(cc.toleranceDeg)}° — indoors by hand, try Relaxed.`
+          : ' Press Calibrate to try again.')
       + ((cc.reason || 0) >= 10 ? ` (${metrics()})` : '');
   } else {
     const fr = cc.fieldRatio || 0;

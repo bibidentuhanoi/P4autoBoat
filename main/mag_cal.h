@@ -36,7 +36,15 @@
 #define MAG_CAL_RADIUS_MAX_LSB     20000.0f
 #define MAG_CAL_GYRO_SCALE_MIN     0.90f   /* compass turn / gyro turn */
 #define MAG_CAL_GYRO_SCALE_MAX     1.10f
-#define MAG_CAL_MAX_GYRO_DEV_DEG   5.0f    /* worst heading disagreement with the gyro */
+/* Worst heading disagreement with the gyro: a setting, like ArduPilot's
+ * COMPASS_CAL_FIT.  Indoors, spun by hand, the boat shifts a little through
+ * the building's uneven field and the compass disagrees with the gyro more
+ * than it would outdoors, though the boat's own magnetism is still found. */
+#define MAG_CAL_GYRO_DEV_STRICT    5.0f    /* outdoors / on the water */
+#define MAG_CAL_GYRO_DEV_NORMAL    10.0f   /* a clean indoor spot */
+#define MAG_CAL_GYRO_DEV_RELAXED   25.0f   /* indoors, spun by hand */
+#define MAG_CAL_GYRO_DEV_MIN       3.0f    /* settings are clamped to this range */
+#define MAG_CAL_GYRO_DEV_MAX       30.0f
 
 typedef struct {
     float center[2];   /* hard iron, raw counts (x, y) */
@@ -138,5 +146,8 @@ typedef struct {
  * that failed; `out` is filled as far as the fit got. */
 mag_cal_verdict_t mag_cal_fit_and_judge(const float *x, const float *y,
                                         const float *turn, int n,
-                                        mag_fit_t *out);
+                                        float max_gyro_dev_deg, mag_fit_t *out);
+/* A requested gyro-disagreement limit made safe: non-finite or <= 0 gives
+ * RELAXED (the indoor default), anything else is clamped to MIN..MAX. */
+float mag_cal_tolerance_deg(float requested);
 const char *mag_cal_verdict_text(mag_cal_verdict_t v);

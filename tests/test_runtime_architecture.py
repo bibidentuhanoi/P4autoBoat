@@ -1044,7 +1044,7 @@ typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
 typedef struct { uint32_t state; uint32_t reason; float still_progress; uint32_t coverage_mask; float turn_deg; float elapsed_s; float axis_ratio; float fit_rms; float gyro_scale; float gyro_dev_deg; float radius; bool calibrated; float field_ratio; float heading_deg; } boat_CompassCalStatus;
 #define boat_BoatMessage_compass_cal_status_tag 19
-typedef struct { bool start; bool cancel; } boat_CompassCalCommand;
+typedef struct { bool start; bool cancel; float tolerance_deg; } boat_CompassCalCommand;
 #define boat_BoatMessage_compass_cal_tag 20
 typedef struct {
     int which_payload;
@@ -1115,7 +1115,7 @@ void pipeline_register_steer_handler(steer_command_handler_fn handler);
 void pipeline_register_servo_power_handler(servo_power_handler_fn handler);
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
-typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel);
+typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel, float tolerance_deg);
 void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler);
 void pipeline_register_bench_handler(bench_command_handler_fn handler);
 void pipeline_register_assist_handler(assist_command_handler_fn handler);
@@ -1209,7 +1209,7 @@ static void power_handler(bool on) { (void)on; ++manual_control_calls; }
 static void raw_handler(const boat_SteerRawCommand *command) { (void)command; ++manual_control_calls; }
 static void calibrate_handler(bool start, bool average) { (void)start; (void)average; ++calibrate_calls; }
 static unsigned compass_cal_calls;
-static void compass_cal_handler(bool start, bool cancel) { (void)start; (void)cancel; ++compass_cal_calls; }
+static void compass_cal_handler(bool start, bool cancel, float tol) { (void)start; (void)cancel; (void)tol; ++compass_cal_calls; }
 static void bench_handler(uint32_t kind, float base, float delta, float reset_c, bool abort) {
     (void)abort; (void)kind; (void)base; (void)delta; (void)reset_c; }
 static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }

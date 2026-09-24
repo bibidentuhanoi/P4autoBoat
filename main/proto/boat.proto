@@ -205,8 +205,9 @@ message CalibrateStatus {
 // Dashboard -> boat: start or cancel the compass + IMU calibration.  The boat
 // refuses a start while the motors are armed (answered in CompassCalStatus).
 message CompassCalCommand {
-  bool start  = 1;
-  bool cancel = 2;
+  bool  start         = 1;
+  bool  cancel        = 2;
+  float tolerance_deg = 3;   // compass-vs-gyro limit: 5 strict, 10 normal, 25 relaxed; 0 = relaxed
 }
 
 // Compass + IMU calibration (hold still, then spin the boat flat), and the
@@ -233,6 +234,9 @@ message CompassCalStatus {
   bool   gyro_level_saved = 18; // last FAIL still saved step 1 (nothing valid was stored)
   bool   tilted         = 19;  // spin: a reading was just skipped, boat tilted > 3 deg
   uint32 tilt_skipped   = 20;  // spin: compass readings skipped for tilt so far
+  float  tolerance_deg  = 21;  // compass-vs-gyro limit used by the current/last run
+  float  saved_dev_deg  = 22;  // the calibration IN USE: its compass-vs-gyro disagreement
+  float  saved_tolerance_deg = 23; // ...and the limit it passed with (0 = none in use)
 }
 
 // Runtime switch for the temporary proportional yaw assist. Runtime, not

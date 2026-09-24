@@ -376,10 +376,19 @@ static void gyro_check(const mag_cal_2d_t *cal, const float *x, const float *y,
     *dev_max = worst;
 }
 
+float mag_cal_tolerance_deg(float requested)
+{
+    if (!isfinite(requested) || requested <= 0.0f) return MAG_CAL_GYRO_DEV_RELAXED;
+    if (requested < MAG_CAL_GYRO_DEV_MIN) return MAG_CAL_GYRO_DEV_MIN;
+    if (requested > MAG_CAL_GYRO_DEV_MAX) return MAG_CAL_GYRO_DEV_MAX;
+    return requested;
+}
+
 mag_cal_verdict_t mag_cal_fit_and_judge(const float *x, const float *y,
                                         const float *turn, int n,
-                                        mag_fit_t *out)
+                                        float max_gyro_dev_deg, mag_fit_t *out)
 {
+    const float max_dev = mag_cal_tolerance_deg(max_gyro_dev_deg);
     memset(out, 0, sizeof(*out));
     mag_cal_identity(&out->cal);
     if (!x || !y || !turn || n < MAG_CAL_MIN_SAMPLES) return MAG_CAL_FAIL_TOO_FEW;
@@ -409,7 +418,7 @@ mag_cal_verdict_t mag_cal_fit_and_judge(const float *x, const float *y,
     if (out->bins < MAG_CAL_MIN_BINS) return MAG_CAL_FAIL_COVERAGE;
     if (!(out->gyro_scale >= MAG_CAL_GYRO_SCALE_MIN &&
           out->gyro_scale <= MAG_CAL_GYRO_SCALE_MAX) ||
-        !(out->gyro_dev_deg <= MAG_CAL_MAX_GYRO_DEV_DEG)) return MAG_CAL_FAIL_GYRO;
+        !(out->gyro_dev_deg <= max_dev)) return MAG_CAL_FAIL_GYRO;
     return MAG_CAL_PASS;
 }
 

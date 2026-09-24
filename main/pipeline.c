@@ -449,7 +449,8 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
                  s_rx_msg.payload.compass_cal.cancel ? "CANCEL" : "");
         if (s_compass_cal_handler) {
             s_compass_cal_handler(s_rx_msg.payload.compass_cal.start,
-                                  s_rx_msg.payload.compass_cal.cancel);
+                                  s_rx_msg.payload.compass_cal.cancel,
+                                  s_rx_msg.payload.compass_cal.tolerance_deg);
         } else {
             ESP_LOGW(TAG, "Compass calibration command received but no handler registered");
         }

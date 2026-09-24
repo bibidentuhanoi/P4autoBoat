@@ -50,6 +50,10 @@ static atomic_bool s_active;
 /* Dashboard requests, set from the pipeline's receive path. */
 static atomic_bool s_start_requested;
 static atomic_bool s_cancel_requested;
+/* Compass-vs-gyro limit for the next run, float bits (written before the
+ * start flag, read after it).  The run itself uses s_tolerance_deg. */
+static atomic_uint s_requested_tolerance_bits;
+static float s_tolerance_deg = MAG_CAL_GYRO_DEV_RELAXED;
 static boat_CompassCalStatus s_status;   /* owned by the CompassCal task */
 
 bool compass_cal_active(void)
@@ -60,6 +64,8 @@ bool compass_cal_active(void)
 static void publish(void)
 {
     s_status.calibrated = s_live && s_live->mag_calibrated;
+    s_status.saved_dev_deg = s_status.calibrated ? s_live->mag_gyro_dev_deg : 0.0f;
+    s_status.saved_tolerance_deg = s_status.calibrated ? s_live->mag_tolerance_deg : 0.0f;
     s_status.field_ratio = fusion_get_field_ratio();
     FusionResult r;
     fusion_get_result(&r);
@@ -175,12 +181,12 @@ static void write_spin_csv(const spin_raw_t *raw, int n, const float gyro_bias[3
     if (!buf) return;
     int len = snprintf(buf, cap,
         "# BoatEspP4 compass spin. verdict=%s centre=%.1f,%.1f radius=%.1f ratio=%.4f "
-        "rms=%.4f slices=%d gyro_scale=%.4f worst_dev_deg=%.2f\n"
+        "rms=%.4f slices=%d gyro_scale=%.4f worst_dev_deg=%.2f limit_deg=%.1f\n"
         "# gyro_bias=%.2f,%.2f,%.2f counts  level_ref_accel=%.1f,%.1f,%.1f  max_tilt_deg=%.1f\n"
         "t_ms,mx,my,mz,ax,ay,az,gz,mag_valid,stored\n",
         verdict, fit->cal.center[0], fit->cal.center[1], fit->cal.radius,
         fit->axis_ratio, fit->rms, fit->bins, fit->gyro_scale, fit->gyro_dev_deg,
-        gyro_bias[0], gyro_bias[1], gyro_bias[2],
+        s_tolerance_deg, gyro_bias[0], gyro_bias[1], gyro_bias[2],
         accel_ref[0], accel_ref[1], accel_ref[2], SPIN_MAX_TILT_DEG);
     esp_err_t err = fs_sdcard_write(SPIN_CSV, buf, (size_t)len);
     for (int i = 0; i < n && err == ESP_OK; ) {
@@ -300,7 +306,7 @@ static bool spin_and_fit(const float gyro_bias[3], const float accel_ref[3], mag
 
     enter(COMPASS_CAL_CHECKING);
     publish();
-    v = mag_cal_fit_and_judge(bx, by, bt, circle.n, fit);
+    v = mag_cal_fit_and_judge(bx, by, bt, circle.n, s_tolerance_deg, fit);
 
     s_status.axis_ratio = fit->axis_ratio;
     s_status.fit_rms = fit->rms;
@@ -309,10 +315,10 @@ static bool spin_and_fit(const float gyro_bias[3], const float accel_ref[3], mag
     s_status.radius = fit->cal.radius;
     s_status.coverage_mask = fit->mask;
     ESP_LOGI(TAG, "  fit: %s -- centre {%.0f, %.0f} radius %.0f ratio %.3f rms %.4f "
-                  "slices %d/32 gyro scale %.3f worst dev %.2f deg (%d samples)",
+                  "slices %d/32 gyro scale %.3f worst dev %.2f deg (limit %.0f, %d samples)",
              mag_cal_verdict_text(v), fit->cal.center[0], fit->cal.center[1],
              fit->cal.radius, fit->axis_ratio, fit->rms, fit->bins,
-             fit->gyro_scale, fit->gyro_dev_deg, circle.n);
+             fit->gyro_scale, fit->gyro_dev_deg, s_tolerance_deg, circle.n);
     write_spin_csv(raw, n_raw, gyro_bias, accel_ref, mag_cal_verdict_text(v), fit);
     if (v != MAG_CAL_PASS) {
         fail((compass_cal_reason_t)(COMPASS_CAL_REASON_FIT_BASE + (int)v));
@@ -369,6 +375,8 @@ static void run_calibration(void)
             memcpy(next.mag_soft, (float[4]){1.0f, 0.0f, 0.0f, 1.0f}, sizeof(next.mag_soft));
             next.mag_radius = 0.0f;
             next.mag_calibrated = 0;
+            next.mag_gyro_dev_deg = 0.0f;
+            next.mag_tolerance_deg = 0.0f;
             if (apply(&next)) {
                 s_status.gyro_level_saved = true;
                 ESP_LOGW(TAG, "No stored calibration: gyro drift + level saved, "
@@ -383,6 +391,8 @@ static void run_calibration(void)
     memcpy(next.mag_soft, fit.cal.soft, sizeof(next.mag_soft));
     next.mag_radius = fit.cal.radius;
     next.mag_calibrated = 1;
+    next.mag_gyro_dev_deg = fit.gyro_dev_deg;
+    next.mag_tolerance_deg = s_tolerance_deg;
 
     if (!apply(&next)) {
         fail(COMPASS_CAL_REASON_SAVE_FAILED);
@@ -392,7 +402,8 @@ static void run_calibration(void)
     enter(COMPASS_CAL_PASS);
     s_status.reason = COMPASS_CAL_REASON_NONE;
     status_led_set(STATUS_LED_CAL_DONE_OK);
-    ESP_LOGI(TAG, "Calibration PASSED -- saved and in use (level p=%.2f r=%.2f)",
+    ESP_LOGI(TAG, "Calibration PASSED -- saved and in use (gyro %.1f deg, limit %.0f, "
+                  "level p=%.2f r=%.2f)", next.mag_gyro_dev_deg, next.mag_tolerance_deg,
              next.pitch_tare, next.roll_tare);
 }
 
@@ -410,6 +421,7 @@ static void run_once(void)
     uint32_t last_state = s_status.last_state, last_reason = s_status.last_reason;
     s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;   /* fresh run */
     s_status.run_id = ++s_run_id;
+    s_status.tolerance_deg = s_tolerance_deg;
     s_status.last_state = last_state;
     s_status.last_reason = last_reason;
     run_calibration();
@@ -450,6 +462,8 @@ static void start_checked(const char *source)
 static void task_compass_cal(void *arg)
 {
     (void)arg;
+    /* Power-on runs are the indoor, by-hand case: relaxed. */
+    s_tolerance_deg = MAG_CAL_GYRO_DEV_RELAXED;
     if (s_run_now) start_checked("power-on");
 
     /* Stay alive: the runtime metrics keep this task's handle, the dashboard
@@ -458,6 +472,10 @@ static void task_compass_cal(void *arg)
     for (;;) {
         if (atomic_exchange_explicit(&s_start_requested, false, memory_order_acq_rel)) {
             atomic_store_explicit(&s_active, true, memory_order_release);
+            uint32_t bits = atomic_load_explicit(&s_requested_tolerance_bits, memory_order_acquire);
+            float requested;
+            memcpy(&requested, &bits, sizeof(requested));
+            s_tolerance_deg = mag_cal_tolerance_deg(requested);
             start_checked("dashboard");
             last_pub = esp_timer_get_time();
         }
@@ -475,7 +493,7 @@ static void task_compass_cal(void *arg)
     }
 }
 
-static void on_dashboard_command(bool start, bool cancel)
+static void on_dashboard_command(bool start, bool cancel, float tolerance_deg)
 {
     if (cancel) {
         /* Only meaningful while a run is in progress; ignored otherwise. */
@@ -485,6 +503,9 @@ static void on_dashboard_command(bool start, bool cancel)
         return;
     }
     if (start && !compass_cal_active()) {
+        uint32_t bits;
+        memcpy(&bits, &tolerance_deg, sizeof(bits));
+        atomic_store_explicit(&s_requested_tolerance_bits, bits, memory_order_release);
         atomic_store_explicit(&s_start_requested, true, memory_order_release);
     }
 }

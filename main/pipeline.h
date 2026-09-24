@@ -112,7 +112,8 @@ typedef void (*calibrate_command_handler_fn)(bool start, bool average_into_exist
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
 
 /* Dashboard -> boat compass + IMU calibration start/cancel. */
-typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel);
+typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel,
+                                               float tolerance_deg);
 void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler);
 
 /* Bench throttle-mismatch test: the boat runs the profile and records to its

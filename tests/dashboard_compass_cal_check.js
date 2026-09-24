@@ -11,7 +11,7 @@ updateCompassCal({state:0,calibrated:true,fieldRatio:1.0,headingDeg:10,runId:0})
 assert.strictEqual(el('ccal-start').disabled,false); assert.strictEqual(el('ccal-cancel').style.display,'none');
 // press -> waiting until the boat answers with a new run id
 el('ccal-start').listeners.click();
-assert.deepStrictEqual(sent.pop(),{compassCal:{start:true,cancel:false}});
+assert.deepStrictEqual(sent.pop(),{compassCal:{start:true,cancel:false,toleranceDeg:25}});
 assert.strictEqual(el('ccal-start').disabled,true); assert.match(el('ccal-hint').textContent,/asking/);
 updateCompassCal({state:0,calibrated:true,runId:0});           // old idle status: still waiting
 assert.strictEqual(el('ccal-start').disabled,true);
@@ -41,4 +41,15 @@ updateCompassCal({state:5,reason:7,gyroLevelSaved:true,runId:3,lastState:5,lastR
 assert.match(el('ccal-detail').textContent,/Gyro drift \+ level were saved/);
 updateCompassCal({state:0,calibrated:false,runId:3,lastState:5,lastReason:7,headingDeg:-1});
 assert.match(el('ccal-detail').textContent,/last calibration: FAIL \(spin never started/);
+// tolerance: Strict chosen -> sent; a gyro FAIL on Strict suggests Relaxed
+el('ccal-tol').value='5';
+updateCompassCal({state:0,calibrated:true,runId:3,savedDevDeg:4.2,savedToleranceDeg:5});
+assert.match(el('ccal-badge').textContent,/calibrated · strict · gyro 4°/);
+el('ccal-start').listeners.click();
+assert.deepStrictEqual(sent.pop(),{compassCal:{start:true,cancel:false,toleranceDeg:5}});
+updateCompassCal({state:5,reason:17,runId:4,toleranceDeg:5,gyroDevDeg:18,radius:3600});
+assert.match(el('ccal-detail').textContent,/try Relaxed/);
+updateCompassCal({state:4,runId:5,toleranceDeg:25,calibrated:true,savedDevDeg:18,savedToleranceDeg:25});
+assert.match(el('ccal-step').textContent,/PASS \(relaxed\)/);
+assert.match(el('ccal-badge').textContent,/relaxed · gyro 18°/);
 console.log('dashboard logic: all checks passed');

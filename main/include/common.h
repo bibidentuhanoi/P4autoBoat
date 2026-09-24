@@ -33,8 +33,8 @@ extern volatile bool g_field_mode;
 #endif
 
 /* v2 (2026-09-24): flat compass calibration.  A new value, not just a new
- * size, so an old record can never be read as this one. */
-#define CALIB_MAGIC_WORD    0xCA11B002
+ * size, so an old record can never be read as this one.  v3: + tolerance. */
+#define CALIB_MAGIC_WORD    0xCA11B003   /* v3: + gyro disagreement and tolerance */
 
 // Calibration Data Structure (Strictly packed for NVS safety)
 typedef struct __attribute__((packed)) {
@@ -48,6 +48,8 @@ typedef struct __attribute__((packed)) {
     float mag_soft[4];      /* soft iron, row-major 2x2 */
     float mag_radius;       /* corrected field strength, raw counts; 0 = never calibrated */
     uint32_t mag_calibrated;/* 1 once a compass calibration has PASSED */
+    float mag_gyro_dev_deg;   /* its worst compass-vs-gyro disagreement, deg */
+    float mag_tolerance_deg;  /* the limit it passed with (5 strict .. 25 relaxed) */
 } CalibrationData;
 
 #endif // COMMON_H

@@ -139,6 +139,11 @@ bool fs_calibration_sane(const CalibrationData* calib) {
     /* A PASSed compass calibration always carries a real field strength. */
     if (calib->mag_calibrated > 1U) return false;
     if (calib->mag_calibrated && !(calib->mag_radius >= MAG_CAL_RADIUS_MIN_LSB)) return false;
+    if (!isfinite(calib->mag_gyro_dev_deg) || calib->mag_gyro_dev_deg < 0.0f ||
+        calib->mag_gyro_dev_deg > 180.0f) return false;
+    if (!isfinite(calib->mag_tolerance_deg) || calib->mag_tolerance_deg < 0.0f ||
+        calib->mag_tolerance_deg > MAG_CAL_GYRO_DEV_MAX) return false;
+    if (calib->mag_calibrated && calib->mag_gyro_dev_deg > calib->mag_tolerance_deg) return false;
     return true;
 }
 
@@ -214,8 +219,10 @@ bool fs_load_calibration(CalibrationData* calib) {
     ESP_LOGI(TAG, "Loaded calibration: gyro bias {%.1f, %.1f, %.1f}  level p=%.2f r=%.2f",
              calib->g_bias[0], calib->g_bias[1], calib->g_bias[2],
              calib->pitch_tare, calib->roll_tare);
-    ESP_LOGI(TAG, "  compass %s: centre {%.0f, %.0f}  soft {%.4f %.4f; %.4f %.4f}  radius %.0f",
+    ESP_LOGI(TAG, "  compass %s (gyro %.1f deg, limit %.0f): centre {%.0f, %.0f}  "
+                  "soft {%.4f %.4f; %.4f %.4f}  radius %.0f",
              calib->mag_calibrated ? "calibrated" : "NOT calibrated",
+             calib->mag_gyro_dev_deg, calib->mag_tolerance_deg,
              calib->mag_center[0], calib->mag_center[1],
              calib->mag_soft[0], calib->mag_soft[1], calib->mag_soft[2], calib->mag_soft[3],
              calib->mag_radius);

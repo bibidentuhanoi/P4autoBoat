@@ -223,6 +223,7 @@ typedef struct _boat_CalibrateStatus {
 typedef struct _boat_CompassCalCommand {
     bool start;
     bool cancel;
+    float tolerance_deg; /* compass-vs-gyro limit: 5 strict, 10 normal, 25 relaxed; 0 = relaxed */
 } boat_CompassCalCommand;
 
 /* Compass + IMU calibration (hold still, then spin the boat flat), and the
@@ -249,6 +250,9 @@ typedef struct _boat_CompassCalStatus {
     bool gyro_level_saved; /* last FAIL still saved step 1 (nothing valid was stored) */
     bool tilted; /* spin: a reading was just skipped, boat tilted > 3 deg */
     uint32_t tilt_skipped; /* spin: compass readings skipped for tilt so far */
+    float tolerance_deg; /* compass-vs-gyro limit used by the current/last run */
+    float saved_dev_deg; /* the calibration IN USE: its compass-vs-gyro disagreement */
+    float saved_tolerance_deg; /* ...and the limit it passed with (0 = none in use) */
 } boat_CompassCalStatus;
 
 /* Runtime switch for the temporary proportional yaw assist. Runtime, not
@@ -375,8 +379,8 @@ extern "C" {
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_default       {0, 0}
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
-#define boat_CompassCalCommand_init_default      {0, 0}
-#define boat_CompassCalStatus_init_default       {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_CompassCalCommand_init_default      {0, 0, 0}
+#define boat_CompassCalStatus_init_default       {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_default          {0, 0, 0}
 #define boat_BenchCommand_init_default           {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -400,8 +404,8 @@ extern "C" {
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_zero          {0, 0}
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
-#define boat_CompassCalCommand_init_zero         {0, 0}
-#define boat_CompassCalStatus_init_zero          {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_CompassCalCommand_init_zero         {0, 0, 0}
+#define boat_CompassCalStatus_init_zero          {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_zero             {0, 0, 0}
 #define boat_BenchCommand_init_zero              {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -502,6 +506,7 @@ extern "C" {
 #define boat_CalibrateStatus_points_done_tag     7
 #define boat_CompassCalCommand_start_tag         1
 #define boat_CompassCalCommand_cancel_tag        2
+#define boat_CompassCalCommand_tolerance_deg_tag 3
 #define boat_CompassCalStatus_state_tag          1
 #define boat_CompassCalStatus_reason_tag         2
 #define boat_CompassCalStatus_still_progress_tag 3
@@ -522,6 +527,9 @@ extern "C" {
 #define boat_CompassCalStatus_gyro_level_saved_tag 18
 #define boat_CompassCalStatus_tilted_tag         19
 #define boat_CompassCalStatus_tilt_skipped_tag   20
+#define boat_CompassCalStatus_tolerance_deg_tag  21
+#define boat_CompassCalStatus_saved_dev_deg_tag  22
+#define boat_CompassCalStatus_saved_tolerance_deg_tag 23
 #define boat_AssistCommand_p_on_tag              1
 #define boat_AssistCommand_rudder_assist_tag     2
 #define boat_AssistCommand_request_id_tag        3
@@ -748,7 +756,8 @@ X(a, STATIC,   SINGULAR, UINT32,   points_done,       7)
 
 #define boat_CompassCalCommand_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, BOOL,     start,             1) \
-X(a, STATIC,   SINGULAR, BOOL,     cancel,            2)
+X(a, STATIC,   SINGULAR, BOOL,     cancel,            2) \
+X(a, STATIC,   SINGULAR, FLOAT,    tolerance_deg,     3)
 #define boat_CompassCalCommand_CALLBACK NULL
 #define boat_CompassCalCommand_DEFAULT NULL
 
@@ -772,7 +781,10 @@ X(a, STATIC,   SINGULAR, UINT32,   last_state,       16) \
 X(a, STATIC,   SINGULAR, UINT32,   last_reason,      17) \
 X(a, STATIC,   SINGULAR, BOOL,     gyro_level_saved,  18) \
 X(a, STATIC,   SINGULAR, BOOL,     tilted,           19) \
-X(a, STATIC,   SINGULAR, UINT32,   tilt_skipped,     20)
+X(a, STATIC,   SINGULAR, UINT32,   tilt_skipped,     20) \
+X(a, STATIC,   SINGULAR, FLOAT,    tolerance_deg,    21) \
+X(a, STATIC,   SINGULAR, FLOAT,    saved_dev_deg,    22) \
+X(a, STATIC,   SINGULAR, FLOAT,    saved_tolerance_deg,  23)
 #define boat_CompassCalStatus_CALLBACK NULL
 #define boat_CompassCalStatus_DEFAULT NULL
 
@@ -921,8 +933,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_BoatMessage_size                    13275
 #define boat_CalibrateCommand_size               4
 #define boat_CalibrateStatus_size                35
-#define boat_CompassCalCommand_size              4
-#define boat_CompassCalStatus_size               103
+#define boat_CompassCalCommand_size              9
+#define boat_CompassCalStatus_size               121
 #define boat_DetectCommand_size                  0
 #define boat_Detection_size                      60
 #define boat_GpsCoordinate_size                  18
