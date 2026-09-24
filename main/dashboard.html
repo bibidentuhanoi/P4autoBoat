@@ -2232,7 +2232,7 @@ function updateCalibrateButton() {
 const CCAL_REASONS = {
   1: 'never held still (60 s)', 2: 'gyro drift too large — was it moving?',
   3: 'circle not finished in 3 min', 4: 'out of memory', 5: 'could not save to flash',
-  6: 'no IMU readings', 11: 'not enough compass readings',
+  6: 'no IMU readings', 7: 'spin never started (30 s) — cancelled', 11: 'not enough compass readings',
   12: 'readings do not form a circle', 13: 'field too squashed — metal too close',
   14: 'readings too scattered', 15: 'field strength not Earth-like',
   16: 'part of the circle missing', 17: 'compass turn disagrees with gyro',
@@ -2284,7 +2284,7 @@ function updateCompassCal(cc) {
   } else if (state === 5) {
     step.textContent = `FAIL — ${CCAL_REASONS[cc.reason] || ('reason ' + cc.reason)}`;
     step.style.color = 'var(--danger)';
-    det.textContent = 'Previous calibration kept. Power on again holding BOOT to retry.'
+    det.textContent = 'Compass calibration not changed. Power on again holding BOOT to retry.'
       + (cc.radius ? ` (${metrics()})` : '');
   } else {
     const fr = cc.fieldRatio || 0;

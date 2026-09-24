@@ -61,6 +61,7 @@ static CalibrationData calib_data = {
     .mag_calibrated = 0,
 };
 static bool s_calibrate_at_boot;
+static bool s_stored_calibration_valid;
 
 static tof_devices_t tof_devs;
 volatile bool g_camera_ok = false;
@@ -181,6 +182,7 @@ void app_main(void) {
     /* The calibration itself runs later, once WiFi and the sensor tasks are
      * up, so the dashboard can show it (compass_cal_start below). Until then
      * the boat should simply stay still: the LED says so. */
+    s_stored_calibration_valid = nvs_load_success;
     s_calibrate_at_boot = force_calib_via_button || !nvs_load_success || DO_CALIBRATE_DEFAULT;
     if (s_calibrate_at_boot) {
         ESP_LOGI(TAG, "Calibration requested (%s) -- runs once the dashboard is up",
@@ -434,7 +436,8 @@ void app_main(void) {
 
     // IMU + compass calibration (if requested above), then a 1 Hz health
     // report for the dashboard. Needs the sensor bus and fusion running.
-    esp_err_t cal_ret = compass_cal_start(&calib_data, s_calibrate_at_boot);
+    esp_err_t cal_ret = compass_cal_start(&calib_data, s_calibrate_at_boot,
+                                          s_stored_calibration_valid);
     if (cal_ret != ESP_OK) {
         ESP_LOGE(TAG, "Compass calibration task failed to start (%s)",
                  esp_err_to_name(cal_ret));

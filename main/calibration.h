@@ -37,13 +37,16 @@ typedef enum {
     COMPASS_CAL_REASON_NO_MEMORY = 4,
     COMPASS_CAL_REASON_SAVE_FAILED = 5,     /* flash write failed: not applied */
     COMPASS_CAL_REASON_NO_IMU = 6,          /* no IMU readings at all */
+    COMPASS_CAL_REASON_SPIN_NOT_STARTED = 7,/* no turning within 30 s: cancelled */
     COMPASS_CAL_REASON_FIT_BASE = 10,
 } compass_cal_reason_t;
 
 /* Starts the CompassCal task.  With run_now it walks through the steps above;
  * either way it afterwards reports the calibration's health once a second
- * (WiFi mode only).  On PASS `live` is updated to the new calibration. */
-esp_err_t compass_cal_start(CalibrationData *live, bool run_now);
+ * (WiFi mode only).  On PASS `live` is updated to the new calibration.
+ * stored_valid: `live` came from flash.  When false and only the spin fails,
+ * the step-1 gyro drift + level are still saved (compass NOT calibrated). */
+esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_valid);
 
 /* True from compass_cal_start(run_now=true) until PASS/FAIL. */
 bool compass_cal_active(void);

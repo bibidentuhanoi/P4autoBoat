@@ -23,13 +23,18 @@ static const char *TAG = "CALIB";
 /* Step 1: hold still.  Samples arrive at the 50 Hz IMU rate. */
 #define STILL_WINDOW          50        /* ~1 s per stillness decision */
 #define STILL_COLLECT         150       /* ~3 s of still samples averaged */
-#define STILL_ACCEL_STD_MAX   90.0f     /* counts at +/-2 g (~5.5 mg) */
-#define STILL_GYRO_STD_MAX    65.0f     /* counts at 131/dps (0.5 deg/s) */
+#define STILL_ACCEL_STD_MAX   250.0f    /* counts at +/-2 g (~15 mg); the gyro does the fine work */
+#define STILL_GYRO_STD_MAX    80.0f     /* counts, 0.6 deg/s; measured floor at rest 0.135 deg/s */
 #define STILL_TIMEOUT_US      (60LL * 1000000LL)
 #define GYRO_BIAS_SANITY_MAX  2000.0f   /* counts; larger = moved, or a bad IMU */
 
 /* Step 2: spin. */
 #define SPIN_TIMEOUT_US       (180LL * 1000000LL)
+/* Nobody spinning (e.g. the automatic first-boot calibration on a boat
+ * that was just set down): give up quickly so arming is not locked for
+ * the whole timeout.  The previous calibration stays in use. */
+#define SPIN_START_TIMEOUT_US (30LL * 1000000LL)
+#define SPIN_START_MIN_DEG    45.0f
 #define SPIN_CAPACITY         4000      /* samples kept; thinned beyond that */
 
 #define POLL_MS               10
@@ -38,6 +43,7 @@ static const char *TAG = "CALIB";
 
 static CalibrationData *s_live;
 static bool s_run_now;
+static bool s_stored_valid;   /* a valid calibration was loaded from flash */
 static atomic_bool s_active;
 static boat_CompassCalStatus s_status;   /* owned by the CompassCal task */
 
@@ -135,9 +141,11 @@ static bool hold_still(float gyro_bias[3], float accel_mean[3])
 static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
 {
     size_t bytes = SPIN_CAPACITY * sizeof(float);
-    float *bx = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    float *by = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    float *bt = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* 3 x 16 KB, only for the length of the spin.  PSRAM first; internal RAM
+     * if PSRAM is short, so a busy moment is never a false FAIL. */
+    float *bx = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+    float *by = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+    float *bt = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
     if (!bx || !by || !bt) {
         heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
         fail(COMPASS_CAL_REASON_NO_MEMORY);
@@ -177,6 +185,13 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
             last_pub = now;
         }
         if (mag_circle_complete(&circle)) { complete = true; break; }
+        if (now - t0 > SPIN_START_TIMEOUT_US &&
+            fabsf(circle.turn_deg) < SPIN_START_MIN_DEG) {
+            ESP_LOGW(TAG, "  spin: never started (%.0f deg in 30 s)", circle.turn_deg);
+            heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+            fail(COMPASS_CAL_REASON_SPIN_NOT_STARTED);
+            return false;
+        }
         if (now - t0 > SPIN_TIMEOUT_US) break;
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
@@ -213,11 +228,27 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
     return true;
 }
 
+static bool apply(const CalibrationData *next)
+{
+    /* Saved first: a calibration that would vanish at the next power-on is
+     * not applied either, so what runs always matches what is stored. */
+    if (!fs_save_calibration(next)) return false;
+    int tries = 0;
+    while (!fusion_set_calibration(next) && ++tries < 200) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+    }
+    if (tries >= 200) {
+        ESP_LOGE(TAG, "Fusion did not take the new calibration; it applies after reboot");
+    }
+    *s_live = *next;
+    return true;
+}
+
 static void run_calibration(void)
 {
     float gyro_bias[3], accel[3];
     mag_fit_t fit;
-    if (!hold_still(gyro_bias, accel) || !spin_and_fit(gyro_bias, &fit)) return;
+    if (!hold_still(gyro_bias, accel)) return;
 
     CalibrationData next = *s_live;
     next.magic_word = CALIB_MAGIC_WORD;
@@ -225,25 +256,33 @@ static void run_calibration(void)
     next.roll_tare = atan2f(accel[1], accel[2]) * RAD_TO_DEG;
     next.pitch_tare = atan2f(-accel[0], sqrtf(accel[1] * accel[1] + accel[2] * accel[2])) *
                       RAD_TO_DEG;
+
+    if (!spin_and_fit(gyro_bias, &fit)) {
+        /* With a good calibration stored, a FAIL changes nothing.  With none
+         * (first boot after a flash), keep the fresh gyro drift + level from
+         * step 1 rather than run the heading hold on an uncorrected gyro;
+         * the compass stays marked NOT calibrated. */
+        if (!s_stored_valid) {
+            memcpy(next.mag_center, (float[2]){0.0f, 0.0f}, sizeof(next.mag_center));
+            memcpy(next.mag_soft, (float[4]){1.0f, 0.0f, 0.0f, 1.0f}, sizeof(next.mag_soft));
+            next.mag_radius = 0.0f;
+            next.mag_calibrated = 0;
+            if (apply(&next)) {
+                ESP_LOGW(TAG, "No stored calibration: gyro drift + level saved, "
+                              "compass still NOT calibrated");
+            }
+        }
+        return;
+    }
     memcpy(next.mag_center, fit.cal.center, sizeof(next.mag_center));
     memcpy(next.mag_soft, fit.cal.soft, sizeof(next.mag_soft));
     next.mag_radius = fit.cal.radius;
     next.mag_calibrated = 1;
 
-    /* Saved first: a calibration that would vanish at the next power-on is
-     * not applied either, so what runs always matches what is stored. */
-    if (!fs_save_calibration(&next)) {
+    if (!apply(&next)) {
         fail(COMPASS_CAL_REASON_SAVE_FAILED);
         return;
     }
-    int tries = 0;
-    while (!fusion_set_calibration(&next) && ++tries < 200) {
-        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
-    }
-    if (tries >= 200) {
-        ESP_LOGE(TAG, "Fusion did not take the new calibration; it applies after reboot");
-    }
-    *s_live = next;
 
     enter(COMPASS_CAL_PASS);
     s_status.reason = COMPASS_CAL_REASON_NONE;
@@ -267,11 +306,12 @@ static void task_compass_cal(void *arg)
     }
 }
 
-esp_err_t compass_cal_start(CalibrationData *live, bool run_now)
+esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_valid)
 {
     if (!live) return ESP_ERR_INVALID_ARG;
     s_live = live;
     s_run_now = run_now;
+    s_stored_valid = stored_valid;
     s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;
     s_status.state = COMPASS_CAL_IDLE;
     /* Lock arming before the task even exists. */
