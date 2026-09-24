@@ -12,6 +12,9 @@
 #define REG_BANK_SEL        0x7F
 #define USER_CTRL           0x03
 #define PWR_MGMT_1          0x06
+#define PWR_MGMT_2          0x07   /* bank 0: accel/gyro axis disables (reset 0x00) */
+#define LP_CONFIG           0x05   /* bank 0: duty-cycle modes (reset 0x40) */
+#define TEMP_OUT_H          0x39   /* bank 0: die temperature, 2 bytes */
 #define ACCEL_XOUT_H        0x2D
 #define GYRO_XOUT_H         0x33
 #define GYRO_CONFIG_1       0x01   /* bank 2. 0x1B was the MPU-9250 address — wrong chip */
@@ -27,6 +30,13 @@ esp_err_t imu_read_mag(int16_t* mx, int16_t* my, int16_t* mz);
 /* Re-apply chip config after a lost-connection recovery (see imu_driver.c). */
 esp_err_t imu_reinit_mag(void);
 esp_err_t imu_reinit_accel_gyro(void);
+/* Full ICM20948 device reset (PWR_MGMT_1.DEVICE_RESET), then the verified
+ * wake of imu_reinit_accel_gyro.  For a chip that ACKs and reads back its
+ * config correctly but still returns frozen data. */
+esp_err_t imu_reset_accel_gyro(void);
+/* Log the ICM20948 power/config registers and die temperature, to tell a
+ * configuration fault from an unpowered sensing core (temperature 0 too). */
+void imu_log_accel_gyro_diag(const char *why);
 
 /* Gently re-arm QMC continuous mode (no soft reset) — for when the mag ACKs but
  * sits in standby returning frozen data. Verifies the mode reg read-back. Call

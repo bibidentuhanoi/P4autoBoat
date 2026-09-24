@@ -1107,6 +1107,7 @@ class GuardTest(unittest.TestCase):
         # 2026-09-24 first WiFi-mode hw boot: torn WebSocket frames (send
         # buffer reused mid-send) and an ICM20948 left asleep at boot.
         'main/transports/ws_transport.c', 'main/drivers/imu_driver.c',
+        'main/drivers/imu_driver.h',
         'main/imu_freeze.h',
     }
 

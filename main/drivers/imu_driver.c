@@ -196,10 +196,11 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         imu_read_accel_gyro(&ax1, &ay1, &az1, &g, &g, &g);
         /* Not measuring: wake it again (verified) and re-check, a few times,
          * instead of only reporting it. */
+        if (ax0 == ax1 && ay0 == ay1 && az0 == az1) imu_log_accel_gyro_diag("boot, not measuring");
         for (int retry = 0; retry < 3 && ax0 == ax1 && ay0 == ay1 && az0 == az1; retry++) {
-            ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) -- re-waking (%d/3)",
-                     ax0, ay0, az0, retry + 1);
-            imu_reinit_accel_gyro();
+            ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) -- %s (%d/3)",
+                     ax0, ay0, az0, retry == 0 ? "re-waking" : "full device reset", retry + 1);
+            if (retry == 0) imu_reinit_accel_gyro(); else imu_reset_accel_gyro();
             vTaskDelay(pdMS_TO_TICKS(60));
             imu_read_accel_gyro(&ax0, &ay0, &az0, &g, &g, &g);
             vTaskDelay(pdMS_TO_TICKS(60));
@@ -208,6 +209,7 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         if (ax0 == ax1 && ay0 == ay1 && az0 == az1) {
             ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) — chip asleep/not measuring "
                           "(wiring), pitch/roll WILL be frozen until the sensor task wakes it", ax0, ay0, az0);
+            imu_log_accel_gyro_diag("boot, after resets");
         } else {
             ESP_LOGI(TAG, "ICM20948 live: accel moving (%d,%d,%d)->(%d,%d,%d) — sensor+wiring good",
                      ax0, ay0, az0, ax1, ay1, az1);
@@ -271,6 +273,35 @@ esp_err_t imu_reinit_accel_gyro(void) {
                       "GYRO_CONFIG_1=0x%02X BANK=0x%02X", attempt + 1, pwr, gyro_cfg, bank);
     }
     return ESP_FAIL;
+}
+
+esp_err_t imu_reset_accel_gyro(void) {
+    if (!h_icm) return ESP_ERR_INVALID_STATE;
+    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+    i2c_write_byte(h_icm, PWR_MGMT_1, 0x80);        /* DEVICE_RESET: all registers to defaults */
+    vTaskDelay(pdMS_TO_TICKS(100));                  /* reset + boot of the chip */
+    return imu_reinit_accel_gyro();
+}
+
+void imu_log_accel_gyro_diag(const char *why) {
+    if (!h_icm) {
+        ESP_LOGW(TAG, "ICM20948 diag (%s): no device handle", why);
+        return;
+    }
+    uint8_t pwr1 = 0xFF, pwr2 = 0xFF, lp = 0xFF, uc = 0xFF, bank = 0xFF, t[2] = {0xFF, 0xFF};
+    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+    i2c_read_bytes(h_icm, REG_BANK_SEL, &bank, 1);
+    i2c_read_bytes(h_icm, PWR_MGMT_1, &pwr1, 1);
+    i2c_read_bytes(h_icm, PWR_MGMT_2, &pwr2, 1);
+    i2c_read_bytes(h_icm, LP_CONFIG, &lp, 1);
+    i2c_read_bytes(h_icm, USER_CTRL, &uc, 1);
+    i2c_read_bytes(h_icm, TEMP_OUT_H, t, 2);
+    int16_t raw_t = (int16_t)((t[0] << 8) | t[1]);
+    /* datasheet: T = raw / 333.87 + 21 C */
+    ESP_LOGW(TAG, "ICM20948 diag (%s): PWR_MGMT_1=0x%02X PWR_MGMT_2=0x%02X LP_CONFIG=0x%02X "
+                  "USER_CTRL=0x%02X BANK=0x%02X TEMP raw=%d (%.1f C)%s",
+             why, pwr1, pwr2, lp, uc, bank, raw_t, raw_t / 333.87 + 21.0,
+             raw_t == 0 ? " -- temperature 0: sensing core not running (power/wiring)" : "");
 }
 
 /* Full recovery for a fully-unresponsive ICM20948 (sustained NACK). The

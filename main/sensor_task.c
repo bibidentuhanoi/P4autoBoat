@@ -360,7 +360,12 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
         case IMU_FREEZE_STILL_FROZEN:
             sample->accel_gyro_valid = false;
             if ((s_ag_frozen_samples++ % IMU_FREEZE_LIMIT) == 0) {
-                esp_err_t rw = imu_reinit_accel_gyro();
+                /* Plain re-wake every 0.5 s; a full device reset every 5 s
+                 * (a chip that reads back its config but still sends frozen
+                 * data needs the reset), with a register/temperature dump. */
+                bool full = (s_ag_frozen_samples % (IMU_FREEZE_LIMIT * 10)) == 1;
+                if (full) imu_log_accel_gyro_diag("frozen at runtime");
+                esp_err_t rw = full ? imu_reset_accel_gyro() : imu_reinit_accel_gyro();
                 if ((s_ag_frozen_samples % (IMU_FREEZE_LIMIT * 20)) == 1) {
                     ESP_LOGW(TAG, "ICM20948 re-wake %s (frozen %lu samples)",
                              rw == ESP_OK ? "confirmed" : "NOT confirmed",
