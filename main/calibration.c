@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "drivers/esc_driver.h"
 #include "drivers/status_led.h"
 #include "file_system.h"
 #include "mag_cal.h"
@@ -45,6 +46,9 @@ static CalibrationData *s_live;
 static bool s_run_now;
 static bool s_stored_valid;   /* a valid calibration was loaded from flash */
 static atomic_bool s_active;
+/* Dashboard requests, set from the pipeline's receive path. */
+static atomic_bool s_start_requested;
+static atomic_bool s_cancel_requested;
 static boat_CompassCalStatus s_status;   /* owned by the CompassCal task */
 
 bool compass_cal_active(void)
@@ -78,6 +82,11 @@ static bool next_sample(uint32_t *last_seq, imu_sample_t *out)
     }
     *last_seq = out->sequence;
     return true;
+}
+
+static bool cancelled(void)
+{
+    return atomic_load_explicit(&s_cancel_requested, memory_order_acquire);
 }
 
 static void fail(compass_cal_reason_t reason)
@@ -116,6 +125,10 @@ static bool hold_still(float gyro_bias[3], float accel_mean[3])
         s_status.still_progress = mag_still_progress(&still);
         s_status.elapsed_s = (float)(now - t0) / 1e6f;
         if (still.state == MAG_STILL_DONE) break;
+        if (cancelled()) {
+            fail(COMPASS_CAL_REASON_CANCELLED);
+            return false;
+        }
         if (now - t0 > STILL_TIMEOUT_US) {
             fail(valid ? COMPASS_CAL_REASON_STILL_TIMEOUT : COMPASS_CAL_REASON_NO_IMU);
             return false;
@@ -185,6 +198,11 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
             last_pub = now;
         }
         if (mag_circle_complete(&circle)) { complete = true; break; }
+        if (cancelled()) {
+            heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+            fail(COMPASS_CAL_REASON_CANCELLED);
+            return false;
+        }
         if (now - t0 > SPIN_START_TIMEOUT_US &&
             fabsf(circle.turn_deg) < SPIN_START_MIN_DEG) {
             ESP_LOGW(TAG, "  spin: never started (%.0f deg in 30 s)", circle.turn_deg);
@@ -233,6 +251,7 @@ static bool apply(const CalibrationData *next)
     /* Saved first: a calibration that would vanish at the next power-on is
      * not applied either, so what runs always matches what is stored. */
     if (!fs_save_calibration(next)) return false;
+    s_stored_valid = true;          /* flash now holds a valid record */
     int tries = 0;
     while (!fusion_set_calibration(next) && ++tries < 200) {
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
@@ -291,18 +310,67 @@ static void run_calibration(void)
              next.pitch_tare, next.roll_tare);
 }
 
+/* One full run.  s_active must already be set (arming locked). */
+static void run_once(void)
+{
+    atomic_store_explicit(&s_cancel_requested, false, memory_order_release);
+    s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;   /* fresh run */
+    run_calibration();
+    atomic_store_explicit(&s_active, false, memory_order_release);
+    publish();
+}
+
+/* Dashboard START: refused while the motors are armed or arming.  s_active
+ * is set BEFORE the check, so an arm step arriving in between is refused by
+ * motor_control's lock rather than racing past it. */
+static void start_from_dashboard(void)
+{
+    atomic_store_explicit(&s_active, true, memory_order_release);
+    if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+        atomic_store_explicit(&s_active, false, memory_order_release);
+        enter(COMPASS_CAL_FAIL);
+        s_status.reason = COMPASS_CAL_REASON_ARMED;
+        ESP_LOGW(TAG, "Calibration refused: motors armed -- disarm first");
+        publish();
+        return;
+    }
+    ESP_LOGI(TAG, "Calibration started from the dashboard");
+    run_once();
+}
+
 static void task_compass_cal(void *arg)
 {
     (void)arg;
-    if (s_run_now) {
-        run_calibration();
-        atomic_store_explicit(&s_active, false, memory_order_release);
-    }
-    /* Stay alive: the runtime metrics keep this task's handle, and the
-     * dashboard needs the calibration's health after a reboot too. */
+    if (s_run_now) run_once();        /* s_active was set by compass_cal_start */
+
+    /* Stay alive: the runtime metrics keep this task's handle, the dashboard
+     * can start a calibration at any time, and it shows the health. */
+    int64_t last_pub = 0;
     for (;;) {
-        publish();
-        vTaskDelay(pdMS_TO_TICKS(PUBLISH_IDLE_US / 1000));
+        if (atomic_exchange_explicit(&s_start_requested, false, memory_order_acq_rel)) {
+            start_from_dashboard();
+            last_pub = esp_timer_get_time();
+        }
+        int64_t now = esp_timer_get_time();
+        if (now - last_pub >= PUBLISH_IDLE_US) {
+            publish();
+            last_pub = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void on_dashboard_command(bool start, bool cancel)
+{
+    if (cancel) {
+        /* Only meaningful while a run is in progress; ignored otherwise. */
+        if (compass_cal_active()) {
+            atomic_store_explicit(&s_cancel_requested, true, memory_order_release);
+        }
+        return;
+    }
+    if (start && !compass_cal_active()) {
+        atomic_store_explicit(&s_start_requested, true, memory_order_release);
     }
 }
 
@@ -316,10 +384,14 @@ esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_val
     s_status.state = COMPASS_CAL_IDLE;
     /* Lock arming before the task even exists. */
     atomic_store_explicit(&s_active, run_now, memory_order_release);
+    atomic_store_explicit(&s_start_requested, false, memory_order_release);
+    atomic_store_explicit(&s_cancel_requested, false, memory_order_release);
     esp_err_t err = runtime_task_create(RUNTIME_TASK_COMPASS_CAL, task_compass_cal,
                                         NULL, NULL);
     if (err != ESP_OK) {
         atomic_store_explicit(&s_active, false, memory_order_release);
+        return err;
     }
-    return err;
+    pipeline_register_compass_cal_handler(on_dashboard_command);
+    return ESP_OK;
 }

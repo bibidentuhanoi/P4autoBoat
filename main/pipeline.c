@@ -40,6 +40,7 @@ static steer_command_handler_fn s_steer_handler = NULL;
 static servo_power_handler_fn s_servo_power_handler = NULL;
 static steer_raw_command_handler_fn s_steer_raw_handler = NULL;
 static calibrate_command_handler_fn s_calibrate_handler = NULL;
+static compass_cal_command_handler_fn s_compass_cal_handler = NULL;
 static bench_command_handler_fn s_bench_handler = NULL;
 static assist_command_handler_fn s_assist_handler = NULL;
 static steer_rate_command_handler_fn s_steer_rate_handler = NULL;
@@ -128,6 +129,7 @@ esp_err_t pipeline_init(void)
     s_servo_power_handler = NULL;
     s_steer_raw_handler = NULL;
     s_calibrate_handler = NULL;
+    s_compass_cal_handler = NULL;
     s_bench_handler = NULL;
     s_assist_handler = NULL;
     s_steer_rate_handler = NULL;
@@ -214,6 +216,11 @@ void pipeline_register_bench_handler(bench_command_handler_fn handler)
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler)
 {
     s_calibrate_handler = handler;
+}
+
+void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler)
+{
+    s_compass_cal_handler = handler;
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
@@ -434,6 +441,17 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
                                 s_rx_msg.payload.calibrate.average_into_existing);
         } else {
             ESP_LOGW(TAG, "Calibrate command received but no handler registered");
+        }
+        break;
+    case boat_BoatMessage_compass_cal_tag:
+        ESP_LOGI(TAG, "Compass calibration command: %s%s",
+                 s_rx_msg.payload.compass_cal.start ? "START" : "",
+                 s_rx_msg.payload.compass_cal.cancel ? "CANCEL" : "");
+        if (s_compass_cal_handler) {
+            s_compass_cal_handler(s_rx_msg.payload.compass_cal.start,
+                                  s_rx_msg.payload.compass_cal.cancel);
+        } else {
+            ESP_LOGW(TAG, "Compass calibration command received but no handler registered");
         }
         break;
     default:

@@ -202,6 +202,13 @@ message CalibrateStatus {
   uint32 points_done    = 7;
 }
 
+// Dashboard -> boat: start or cancel the compass + IMU calibration.  The boat
+// refuses a start while the motors are armed (answered in CompassCalStatus).
+message CompassCalCommand {
+  bool start  = 1;
+  bool cancel = 2;
+}
+
 // Compass + IMU calibration (hold still, then spin the boat flat), and the
 // live health of the calibration in use.  Published only on the WiFi link:
 // ~5 Hz while a calibration runs, 1 Hz otherwise.  Enums are in calibration.h.
@@ -316,5 +323,6 @@ message BoatMessage {
     AssistCommand  assist       = 17;
     SteerRateCommand steer_rate = 18;
     CompassCalStatus compass_cal_status = 19;
+    CompassCalCommand compass_cal = 20;
   }
 }

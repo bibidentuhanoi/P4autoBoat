@@ -74,6 +74,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "=== SYSTEM BOOT ===");
     runtime_metrics_init();
 
+    // User LED (GPIO3) first of all: a heartbeat blink from power-on until
+    // the system is running says "powered, alive, still booting".
+    status_led_init();
+    status_led_set(STATUS_LED_BOOTING);
+
     // 1. Initialize NVS
     ESP_LOGI(TAG, "Initializing NVS...");
     fs_init();
@@ -161,7 +166,6 @@ void app_main(void) {
 
     // User LED (GPIO3): blink through the button window so the operator knows —
     // without a serial terminal — that pressing BOOT now forces recalibration.
-    status_led_init();
     status_led_set(STATUS_LED_CAL_WINDOW);
 
     bool force_calib_via_button = false;
@@ -181,17 +185,17 @@ void app_main(void) {
 
     /* The calibration itself runs later, once WiFi and the sensor tasks are
      * up, so the dashboard can show it (compass_cal_start below). Until then
-     * the boat should simply stay still: the LED says so. */
+     * keep the boat still; the LED keeps its heartbeat, then shows the steps.
+     * The dashboard's Calibrate button starts the same routine at any time. */
     s_stored_calibration_valid = nvs_load_success;
     s_calibrate_at_boot = force_calib_via_button || !nvs_load_success || DO_CALIBRATE_DEFAULT;
     if (s_calibrate_at_boot) {
         ESP_LOGI(TAG, "Calibration requested (%s) -- runs once the dashboard is up",
                  force_calib_via_button ? "BOOT button" : "no valid calibration stored");
-        status_led_set(STATUS_LED_CAL_STILL);
     } else {
         ESP_LOGI(TAG, "Valid calibration found in NVS. Skipping calibration.");
-        status_led_set(STATUS_LED_OFF);   // cal-only LED: dark once we're running
     }
+    status_led_set(STATUS_LED_BOOTING);   // BOOT window over: back to the heartbeat
 
     // ESC differential-trim table -- own NVS record ("esc_trim"), entirely
     // independent of the IMU calibration blob loaded above. Empty table
@@ -453,5 +457,8 @@ void app_main(void) {
                  esp_err_to_name(training_log_ret));
     }
 
+    /* Booted. The heartbeat stops here; a calibration requested at boot has
+     * already taken over the LED with its own step patterns. */
+    if (!s_calibrate_at_boot) status_led_set(STATUS_LED_OFF);
     ESP_LOGI(TAG, "System running.");
 }

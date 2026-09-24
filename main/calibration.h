@@ -16,7 +16,9 @@
  *   PASS  -> saved to flash and applied at once
  *   FAIL  -> nothing changes; the previous calibration stays in use
  *
- * Arming is refused for as long as it runs. */
+ * Started at power-on (BOOT held, or nothing valid stored) or from the
+ * dashboard's Calibrate button (CompassCalCommand), which also cancels.
+ * Arming is refused for as long as it runs; a start is refused while armed. */
 
 /* CompassCalStatus.state */
 typedef enum {
@@ -38,6 +40,8 @@ typedef enum {
     COMPASS_CAL_REASON_SAVE_FAILED = 5,     /* flash write failed: not applied */
     COMPASS_CAL_REASON_NO_IMU = 6,          /* no IMU readings at all */
     COMPASS_CAL_REASON_SPIN_NOT_STARTED = 7,/* no turning within 30 s: cancelled */
+    COMPASS_CAL_REASON_ARMED = 8,           /* dashboard start refused: motors armed */
+    COMPASS_CAL_REASON_CANCELLED = 9,       /* dashboard Cancel */
     COMPASS_CAL_REASON_FIT_BASE = 10,
 } compass_cal_reason_t;
 
@@ -48,7 +52,7 @@ typedef enum {
  * the step-1 gyro drift + level are still saved (compass NOT calibrated). */
 esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_valid);
 
-/* True from compass_cal_start(run_now=true) until PASS/FAIL. */
+/* True while a calibration runs (boot or dashboard) until PASS/FAIL. */
 bool compass_cal_active(void);
 
 #endif // CALIBRATION_H

@@ -1044,6 +1044,8 @@ typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
 typedef struct { uint32_t state; uint32_t reason; float still_progress; uint32_t coverage_mask; float turn_deg; float elapsed_s; float axis_ratio; float fit_rms; float gyro_scale; float gyro_dev_deg; float radius; bool calibrated; float field_ratio; float heading_deg; } boat_CompassCalStatus;
 #define boat_BoatMessage_compass_cal_status_tag 19
+typedef struct { bool start; bool cancel; } boat_CompassCalCommand;
+#define boat_BoatMessage_compass_cal_tag 20
 typedef struct {
     int which_payload;
     union {
@@ -1063,6 +1065,7 @@ typedef struct {
         boat_BenchStatus bench_status;
         boat_AssistCommand assist;
         boat_CompassCalStatus compass_cal_status;
+        boat_CompassCalCommand compass_cal;
     } payload;
 } boat_BoatMessage;
 #define boat_BoatMessage_motor_tag 1
@@ -1112,6 +1115,8 @@ void pipeline_register_steer_handler(steer_command_handler_fn handler);
 void pipeline_register_servo_power_handler(servo_power_handler_fn handler);
 void pipeline_register_steer_raw_handler(steer_raw_command_handler_fn handler);
 void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler);
+typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel);
+void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler);
 void pipeline_register_bench_handler(bench_command_handler_fn handler);
 void pipeline_register_assist_handler(assist_command_handler_fn handler);
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap);
@@ -1203,6 +1208,8 @@ static void steer_handler(const boat_SteerCommand *command) { (void)command; ++m
 static void power_handler(bool on) { (void)on; ++manual_control_calls; }
 static void raw_handler(const boat_SteerRawCommand *command) { (void)command; ++manual_control_calls; }
 static void calibrate_handler(bool start, bool average) { (void)start; (void)average; ++calibrate_calls; }
+static unsigned compass_cal_calls;
+static void compass_cal_handler(bool start, bool cancel) { (void)start; (void)cancel; ++compass_cal_calls; }
 static void bench_handler(uint32_t kind, float base, float delta, float reset_c, bool abort) {
     (void)abort; (void)kind; (void)base; (void)delta; (void)reset_c; }
 static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }
@@ -1234,6 +1241,7 @@ int main(void) {
     pipeline_register_servo_power_handler(power_handler);
     pipeline_register_steer_raw_handler(raw_handler);
     pipeline_register_calibrate_handler(calibrate_handler);
+    pipeline_register_compass_cal_handler(compass_cal_handler);
     pipeline_register_bench_handler(bench_handler);
     pipeline_register_assist_handler(assist_handler);
     pipeline_register_steer_rate_handler(steer_rate_handler);
@@ -1254,6 +1262,13 @@ int main(void) {
     decoded_tag = boat_BoatMessage_calibrate_tag;
     pipeline_handle_incoming(input, sizeof(input));
     assert(calibrate_calls == 1);
+    assert(manual_control_calls == 0);
+
+    /* The dashboard's compass calibration command reaches its own handler
+     * and never manual-control ingress: it cannot move an actuator. */
+    decoded_tag = boat_BoatMessage_compass_cal_tag;
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(compass_cal_calls == 1);
     assert(manual_control_calls == 0);
 
     decoded_tag = boat_BoatMessage_motor_tag;

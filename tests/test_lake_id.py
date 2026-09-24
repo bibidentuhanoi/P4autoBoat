@@ -1102,6 +1102,8 @@ class GuardTest(unittest.TestCase):
         'main/include/common.h', 'main/file_system.c', 'main/file_system.h',
         'main/main.c', 'main/pipeline.h', 'main/runtime_schedule.h',
         'main/proto/boat.pb.c',
+        # 2026-09-24: Calibrate button on the dashboard + boot heartbeat LED.
+        'main/drivers/status_led.c', 'main/drivers/status_led.h',
     }
 
     def _git(self, *args):

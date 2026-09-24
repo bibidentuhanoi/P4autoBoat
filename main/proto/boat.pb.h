@@ -218,6 +218,13 @@ typedef struct _boat_CalibrateStatus {
     uint32_t points_done;
 } boat_CalibrateStatus;
 
+/* Dashboard -> boat: start or cancel the compass + IMU calibration.  The boat
+ refuses a start while the motors are armed (answered in CompassCalStatus). */
+typedef struct _boat_CompassCalCommand {
+    bool start;
+    bool cancel;
+} boat_CompassCalCommand;
+
 /* Compass + IMU calibration (hold still, then spin the boat flat), and the
  live health of the calibration in use.  Published only on the WiFi link:
  ~5 Hz while a calibration runs, 1 Hz otherwise.  Enums are in calibration.h. */
@@ -333,6 +340,7 @@ typedef struct _boat_BoatMessage {
         boat_AssistCommand assist;
         boat_SteerRateCommand steer_rate;
         boat_CompassCalStatus compass_cal_status;
+        boat_CompassCalCommand compass_cal;
     } payload;
 } boat_BoatMessage;
 
@@ -361,6 +369,7 @@ extern "C" {
 #define boat_SystemStatus_init_default           {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_default       {0, 0}
 #define boat_CalibrateStatus_init_default        {0, 0, 0, 0, 0, 0, 0}
+#define boat_CompassCalCommand_init_default      {0, 0}
 #define boat_CompassCalStatus_init_default       {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_default          {0, 0, 0}
 #define boat_BenchCommand_init_default           {0, 0, 0, 0, 0}
@@ -385,6 +394,7 @@ extern "C" {
 #define boat_SystemStatus_init_zero              {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_CalibrateCommand_init_zero          {0, 0}
 #define boat_CalibrateStatus_init_zero           {0, 0, 0, 0, 0, 0, 0}
+#define boat_CompassCalCommand_init_zero         {0, 0}
 #define boat_CompassCalStatus_init_zero          {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_AssistCommand_init_zero             {0, 0, 0}
 #define boat_BenchCommand_init_zero              {0, 0, 0, 0, 0}
@@ -484,6 +494,8 @@ extern "C" {
 #define boat_CalibrateStatus_yaw_avg_dps_tag     5
 #define boat_CalibrateStatus_making_way_tag      6
 #define boat_CalibrateStatus_points_done_tag     7
+#define boat_CompassCalCommand_start_tag         1
+#define boat_CompassCalCommand_cancel_tag        2
 #define boat_CompassCalStatus_state_tag          1
 #define boat_CompassCalStatus_reason_tag         2
 #define boat_CompassCalStatus_still_progress_tag 3
@@ -544,6 +556,7 @@ extern "C" {
 #define boat_BoatMessage_assist_tag              17
 #define boat_BoatMessage_steer_rate_tag          18
 #define boat_BoatMessage_compass_cal_status_tag  19
+#define boat_BoatMessage_compass_cal_tag         20
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -721,6 +734,12 @@ X(a, STATIC,   SINGULAR, UINT32,   points_done,       7)
 #define boat_CalibrateStatus_CALLBACK NULL
 #define boat_CalibrateStatus_DEFAULT NULL
 
+#define boat_CompassCalCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     start,             1) \
+X(a, STATIC,   SINGULAR, BOOL,     cancel,            2)
+#define boat_CompassCalCommand_CALLBACK NULL
+#define boat_CompassCalCommand_DEFAULT NULL
+
 #define boat_CompassCalStatus_FIELDLIST(X, a) \
 X(a, STATIC,   SINGULAR, UINT32,   state,             1) \
 X(a, STATIC,   SINGULAR, UINT32,   reason,            2) \
@@ -797,7 +816,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,bench,payload.bench),  15) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,bench_status,payload.bench_status),  16) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,assist,payload.assist),  17) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_rate,payload.steer_rate),  18) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal_status,payload.compass_cal_status),  19)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal_status,payload.compass_cal_status),  19) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal,payload.compass_cal),  20)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -819,6 +839,7 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal_status,payload.compass_c
 #define boat_BoatMessage_payload_assist_MSGTYPE boat_AssistCommand
 #define boat_BoatMessage_payload_steer_rate_MSGTYPE boat_SteerRateCommand
 #define boat_BoatMessage_payload_compass_cal_status_MSGTYPE boat_CompassCalStatus
+#define boat_BoatMessage_payload_compass_cal_MSGTYPE boat_CompassCalCommand
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
@@ -839,6 +860,7 @@ extern const pb_msgdesc_t boat_ServoPowerCommand_msg;
 extern const pb_msgdesc_t boat_SystemStatus_msg;
 extern const pb_msgdesc_t boat_CalibrateCommand_msg;
 extern const pb_msgdesc_t boat_CalibrateStatus_msg;
+extern const pb_msgdesc_t boat_CompassCalCommand_msg;
 extern const pb_msgdesc_t boat_CompassCalStatus_msg;
 extern const pb_msgdesc_t boat_AssistCommand_msg;
 extern const pb_msgdesc_t boat_BenchCommand_msg;
@@ -865,6 +887,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_SystemStatus_fields &boat_SystemStatus_msg
 #define boat_CalibrateCommand_fields &boat_CalibrateCommand_msg
 #define boat_CalibrateStatus_fields &boat_CalibrateStatus_msg
+#define boat_CompassCalCommand_fields &boat_CompassCalCommand_msg
 #define boat_CompassCalStatus_fields &boat_CompassCalStatus_msg
 #define boat_AssistCommand_fields &boat_AssistCommand_msg
 #define boat_BenchCommand_fields &boat_BenchCommand_msg
@@ -880,6 +903,7 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_BoatMessage_size                    13275
 #define boat_CalibrateCommand_size               4
 #define boat_CalibrateStatus_size                35
+#define boat_CompassCalCommand_size              4
 #define boat_CompassCalStatus_size               70
 #define boat_DetectCommand_size                  0
 #define boat_Detection_size                      60

@@ -67,6 +67,9 @@ static void status_led_task(void *arg) {
                 for (int i = 0; i < 12 && s_state == st; i++) pulse(st, 60, 60);
                 if (s_state == STATUS_LED_CAL_DONE_FAIL) s_state = STATUS_LED_OFF;
                 break;
+            case STATUS_LED_BOOTING:                    /* heartbeat — "alive, booting" */
+                pulse(st, 150, 850);
+                break;
             case STATUS_LED_OFF:
             default:
                 led_write(false);
