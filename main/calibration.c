@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
@@ -150,18 +151,74 @@ static bool hold_still(float gyro_bias[3], float accel_mean[3])
 
 /* ---- Step 2 + 3 ---- */
 
-static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
+/* One raw sample of the spin, kept so the whole run can be written to the SD
+ * card afterwards (CALSPIN.CSV): a FAIL can then be diagnosed from the data
+ * instead of guessed at. */
+typedef struct {
+    uint32_t t_ms;
+    int16_t mx, my, mz, ax, ay, az, gz;
+    uint8_t mag_valid;
+    uint8_t stored;          /* 1 = used for the fit, 0 = skipped (tilt / no compass) */
+} spin_raw_t;
+
+#define SPIN_RAW_CAPACITY   9500           /* 180 s at 50 Hz, with margin */
+#define SPIN_MAX_TILT_DEG   3.0f           /* tilted further than this: reading skipped */
+#define SPIN_CSV            "CALSPIN.CSV"  /* 8.3 name (FATFS without long names) */
+
+static void write_spin_csv(const spin_raw_t *raw, int n, const float gyro_bias[3],
+                           const float accel_ref[3], const char *verdict,
+                           const mag_fit_t *fit)
+{
+    if (!raw || n <= 0 || !fs_sdcard_ready()) return;
+    const size_t cap = 4096;
+    char *buf = malloc(cap);
+    if (!buf) return;
+    int len = snprintf(buf, cap,
+        "# BoatEspP4 compass spin. verdict=%s centre=%.1f,%.1f radius=%.1f ratio=%.4f "
+        "rms=%.4f slices=%d gyro_scale=%.4f worst_dev_deg=%.2f\n"
+        "# gyro_bias=%.2f,%.2f,%.2f counts  level_ref_accel=%.1f,%.1f,%.1f  max_tilt_deg=%.1f\n"
+        "t_ms,mx,my,mz,ax,ay,az,gz,mag_valid,stored\n",
+        verdict, fit->cal.center[0], fit->cal.center[1], fit->cal.radius,
+        fit->axis_ratio, fit->rms, fit->bins, fit->gyro_scale, fit->gyro_dev_deg,
+        gyro_bias[0], gyro_bias[1], gyro_bias[2],
+        accel_ref[0], accel_ref[1], accel_ref[2], SPIN_MAX_TILT_DEG);
+    esp_err_t err = fs_sdcard_write(SPIN_CSV, buf, (size_t)len);
+    for (int i = 0; i < n && err == ESP_OK; ) {
+        len = 0;
+        for (; i < n && len < (int)cap - 96; i++) {
+            const spin_raw_t *r = &raw[i];
+            len += snprintf(buf + len, cap - len, "%lu,%d,%d,%d,%d,%d,%d,%d,%u,%u\n",
+                            (unsigned long)r->t_ms, r->mx, r->my, r->mz,
+                            r->ax, r->ay, r->az, r->gz, r->mag_valid, r->stored);
+        }
+        err = fs_sdcard_append(SPIN_CSV, buf, (size_t)len);
+    }
+    free(buf);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "  spin data: %d samples written to /sdcard/%s", n, SPIN_CSV);
+    } else {
+        ESP_LOGW(TAG, "  spin data: SD write failed (%s)", esp_err_to_name(err));
+    }
+}
+
+static bool spin_and_fit(const float gyro_bias[3], const float accel_ref[3], mag_fit_t *fit)
 {
     size_t bytes = SPIN_CAPACITY * sizeof(float);
-    /* 3 x 16 KB, only for the length of the spin.  PSRAM first; internal RAM
-     * if PSRAM is short, so a busy moment is never a false FAIL. */
+    /* Only for the length of the spin.  PSRAM first; internal RAM if PSRAM
+     * is short, so a busy moment is never a false FAIL.  The raw record is
+     * optional: without it the calibration still runs, only the CSV is lost. */
     float *bx = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
     float *by = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
     float *bt = heap_caps_malloc_prefer(bytes, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_8BIT);
+    spin_raw_t *raw = heap_caps_malloc(SPIN_RAW_CAPACITY * sizeof(spin_raw_t),
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    int n_raw = 0;
+    bool ok = false;
+    mag_cal_verdict_t v = MAG_CAL_FAIL_TOO_FEW;
+    memset(fit, 0, sizeof(*fit));
     if (!bx || !by || !bt) {
-        heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
         fail(COMPASS_CAL_REASON_NO_MEMORY);
-        return false;
+        goto out;
     }
 
     enter(COMPASS_CAL_SPIN);
@@ -184,9 +241,26 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
             last_us = s.captured_us;
             float rate = FUSION_YAW_GYRO_SIGN * ((float)s.gz - gyro_bias[2]) /
                          FUSION_GYRO_COUNTS_PER_DPS;
-            mag_circle_add(&circle,
-                           s.mag_valid ? (float)s.mx : NAN,
-                           s.mag_valid ? (float)s.my : NAN, rate, dt);
+            /* A tilted boat leaks its strong vertical field into x/y: keep
+             * only readings taken within SPIN_MAX_TILT_DEG of the level
+             * reference.  The gyro keeps counting either way. */
+            float a[3] = {(float)s.ax, (float)s.ay, (float)s.az};
+            bool level = mag_cal_tilt_deg(a, accel_ref) <= SPIN_MAX_TILT_DEG;
+            bool use = s.mag_valid && level;
+            if (s.mag_valid && !level) {
+                s_status.tilted = true;
+                s_status.tilt_skipped++;
+            }
+            mag_circle_add(&circle, use ? (float)s.mx : NAN, use ? (float)s.my : NAN,
+                           rate, dt);
+            if (raw && n_raw < SPIN_RAW_CAPACITY) {
+                raw[n_raw++] = (spin_raw_t){
+                    .t_ms = (uint32_t)((int64_t)s.captured_us / 1000 - t0 / 1000),
+                    .mx = s.mx, .my = s.my, .mz = s.mz,
+                    .ax = s.ax, .ay = s.ay, .az = s.az, .gz = s.gz,
+                    .mag_valid = s.mag_valid, .stored = use,
+                };
+            }
         }
         int64_t now = esp_timer_get_time();
         s_status.turn_deg = circle.turn_deg;
@@ -194,38 +268,39 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
         if (now - last_pub >= PUBLISH_RUN_US) {
             s_status.coverage_mask = mag_circle_live_mask(&circle);
             publish();
+            s_status.tilted = false;          /* "tilted" = since the last update */
             last_pub = now;
         }
         if (mag_circle_complete(&circle)) { complete = true; break; }
         if (cancelled()) {
-            heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
             fail(COMPASS_CAL_REASON_CANCELLED);
-            return false;
+            goto out;
         }
         if (now - t0 > SPIN_START_TIMEOUT_US &&
             fabsf(circle.turn_deg) < SPIN_START_MIN_DEG) {
             ESP_LOGW(TAG, "  spin: never started (%.0f deg in 30 s)", circle.turn_deg);
-            heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
             fail(COMPASS_CAL_REASON_SPIN_NOT_STARTED);
-            return false;
+            goto out;
         }
         if (now - t0 > SPIN_TIMEOUT_US) break;
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
     s_status.coverage_mask = mag_circle_live_mask(&circle);
+    s_status.tilted = false;
+    ESP_LOGI(TAG, "  spin: %lu compass readings skipped for tilt > %.0f deg",
+             (unsigned long)s_status.tilt_skipped, SPIN_MAX_TILT_DEG);
 
     if (!complete) {
         ESP_LOGW(TAG, "  spin: not completed (%d samples, %.0f deg turned, %d/32 slices)",
                  circle.n, circle.turn_deg, __builtin_popcount(s_status.coverage_mask));
-        heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
         fail(COMPASS_CAL_REASON_SPIN_TIMEOUT);
-        return false;
+        write_spin_csv(raw, n_raw, gyro_bias, accel_ref, "SPIN_TIMEOUT", fit);
+        goto out;
     }
 
     enter(COMPASS_CAL_CHECKING);
     publish();
-    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, circle.n, fit);
-    heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+    v = mag_cal_fit_and_judge(bx, by, bt, circle.n, fit);
 
     s_status.axis_ratio = fit->axis_ratio;
     s_status.fit_rms = fit->rms;
@@ -238,11 +313,19 @@ static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
              mag_cal_verdict_text(v), fit->cal.center[0], fit->cal.center[1],
              fit->cal.radius, fit->axis_ratio, fit->rms, fit->bins,
              fit->gyro_scale, fit->gyro_dev_deg, circle.n);
+    write_spin_csv(raw, n_raw, gyro_bias, accel_ref, mag_cal_verdict_text(v), fit);
     if (v != MAG_CAL_PASS) {
         fail((compass_cal_reason_t)(COMPASS_CAL_REASON_FIT_BASE + (int)v));
-        return false;
+        goto out;
     }
-    return true;
+    ok = true;
+
+out:
+    heap_caps_free(bx);
+    heap_caps_free(by);
+    heap_caps_free(bt);
+    heap_caps_free(raw);
+    return ok;
 }
 
 static bool apply(const CalibrationData *next)
@@ -276,7 +359,7 @@ static void run_calibration(void)
     next.pitch_tare = atan2f(-accel[0], sqrtf(accel[1] * accel[1] + accel[2] * accel[2])) *
                       RAD_TO_DEG;
 
-    if (!spin_and_fit(gyro_bias, &fit)) {
+    if (!spin_and_fit(gyro_bias, accel, &fit)) {
         /* With a good calibration stored, a FAIL changes nothing.  With none
          * (first boot after a flash), keep the fresh gyro drift + level from
          * step 1 rather than run the heading hold on an uncorrected gyro;

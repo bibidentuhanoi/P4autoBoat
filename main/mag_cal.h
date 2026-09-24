@@ -52,6 +52,13 @@ void mag_cal_apply(const mag_cal_2d_t *cal, float mx, float my,
 /* atan2(y, x) in degrees, wrapped to [0, 360). */
 float mag_cal_heading_deg(float x, float y);
 
+/* Angle between two accelerometer vectors, degrees (180 if either is zero).
+ * Used during the spin to skip compass readings taken while the boat is
+ * tilted away from the level reference of step 1: the boat's strong vertical
+ * field leaks into x/y when it tilts.  Needs no knowledge of how the IMU and
+ * compass chips are mounted relative to each other, only the tilt angle. */
+float mag_cal_tilt_deg(const float accel[3], const float ref[3]);
+
 /* ---- Step 1: hold still ------------------------------------------------ */
 
 typedef enum {

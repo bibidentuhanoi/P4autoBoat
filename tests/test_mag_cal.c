@@ -424,6 +424,22 @@ static void test_heading_that_runs_backwards_fails(void)
     assert(fit.gyro_scale < 0.0f);
 }
 
+static void test_tilt_angle_between_accelerometer_readings(void)
+{
+    float ref[3] = {0.0f, 0.0f, 16384.0f};
+    float same[3] = {0.0f, 0.0f, 16000.0f};                 /* length differs, angle 0 */
+    assert(mag_cal_tilt_deg(same, ref) < 0.01f);
+    float t5[3] = {16384.0f * sinf(RAD(5.0f)), 0.0f, 16384.0f * cosf(RAD(5.0f))};
+    assert(fabsf(mag_cal_tilt_deg(t5, ref) - 5.0f) < 0.01f);
+    float t3[3] = {0.0f, -16384.0f * sinf(RAD(3.0f)), 16384.0f * cosf(RAD(3.0f))};
+    assert(fabsf(mag_cal_tilt_deg(t3, ref) - 3.0f) < 0.01f);
+    float zero[3] = {0.0f, 0.0f, 0.0f};
+    assert(mag_cal_tilt_deg(zero, ref) == 180.0f);
+    /* a level-but-not-flat mounting: reference itself tilted, boat still level */
+    float mount[3] = {1000.0f, -500.0f, 16300.0f};
+    assert(mag_cal_tilt_deg(mount, mount) < 0.01f);
+}
+
 /* ---- stillness ---- */
 
 static void feed_still(mag_still_t *s, int n, float gyro_noise, float accel_noise)
@@ -500,6 +516,7 @@ int main(void)
     test_uneven_hand_spin_with_pause_and_gyro_drift_passes();
     test_right_hand_spin_passes_too();
     test_heading_that_runs_backwards_fails();
+    test_tilt_angle_between_accelerometer_readings();
     test_still_board_measures_gyro_bias_and_level();
     test_moving_board_never_finishes();
     test_a_bump_restarts_the_collection();

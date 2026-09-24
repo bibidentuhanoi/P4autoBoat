@@ -57,6 +57,21 @@ float mag_cal_heading_deg(float x, float y)
     return h;
 }
 
+float mag_cal_tilt_deg(const float accel[3], const float ref[3])
+{
+    double dot = 0.0, na = 0.0, nr = 0.0;
+    for (int i = 0; i < 3; i++) {
+        dot += (double)accel[i] * ref[i];
+        na += (double)accel[i] * accel[i];
+        nr += (double)ref[i] * ref[i];
+    }
+    if (!(na > 0.0) || !(nr > 0.0) || !isfinite(dot)) return 180.0f;
+    double c = dot / sqrt(na * nr);
+    if (c > 1.0) c = 1.0;
+    if (c < -1.0) c = -1.0;
+    return (float)(acos(c) * 180.0 / PI_D);
+}
+
 /* ---- Step 1: hold still ------------------------------------------------ */
 
 void mag_still_init(mag_still_t *s, int window, int collect,

@@ -20,6 +20,11 @@ assert.strictEqual(el('ccal-start').style.display,'none'); assert.strictEqual(el
 assert.deepStrictEqual(scrolls,['ccal']);
 updateCompassCal({state:2,coverageMask:0xFFFFFFFF,turnDeg:600,runId:1});
 assert.match(el('ccal-detail').innerHTML,/✓ directions 32\/32/); assert.match(el('ccal-detail').innerHTML,/✓ turns 1.7\/1.5/);
+assert.doesNotMatch(el('ccal-detail').innerHTML,/keep it level/);
+updateCompassCal({state:2,coverageMask:0x0000FFFF,turnDeg:200,runId:1,tilted:true,tiltSkipped:12});
+assert.match(el('ccal-detail').innerHTML,/keep it level/);
+updateCompassCal({state:2,coverageMask:0x0000FFFF,turnDeg:220,runId:1,tilted:false,tiltSkipped:12});
+assert.match(el('ccal-detail').innerHTML,/12 tilted readings skipped/);
 el('ccal-cancel').listeners.click(); assert.deepStrictEqual(sent.pop(),{compassCal:{start:false,cancel:true}});
 updateCompassCal({state:4,axisRatio:1.1,fitRms:0.01,gyroScale:1,gyroDevDeg:1,radius:4000,calibrated:true,runId:1,lastState:4});
 assert.match(el('ccal-step').textContent,/PASS/); assert.strictEqual(el('ccal-start').disabled,false);

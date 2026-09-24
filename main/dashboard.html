@@ -544,7 +544,7 @@ message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
 message CompassCalCommand { bool start = 1; bool cancel = 2; }
-message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; uint32 run_id = 15; uint32 last_state = 16; uint32 last_reason = 17; bool gyro_level_saved = 18; }
+message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; uint32 run_id = 15; uint32 last_state = 16; uint32 last_reason = 17; bool gyro_level_saved = 18; bool tilted = 19; uint32 tilt_skipped = 20; }
 message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
 message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; bool abort = 5; }
 message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; float heading_target_deg = 9; float heading_error_deg = 10; float yaw_target_dps = 11; float p_term = 12; float i_term = 13; float dynamic_c = 14; float effective_c = 15; float c_limit = 16; bool ctrl_active = 17; bool heading_hold = 18; bool saturated = 19; }
@@ -2328,7 +2328,9 @@ function updateCompassCal(cc) {
     step.textContent = 'Step 2/2 — spin the boat flat, slowly';
     det.innerHTML = `<span class="${dirOk ? 'ccal-ok' : 'ccal-no'}">${dirOk ? '✓' : '…'} directions ${n}/32</span> · `
       + `<span class="${turnOk ? 'ccal-ok' : 'ccal-no'}">${turnOk ? '✓' : '…'} turns ${turns.toFixed(1)}/1.5</span> · `
-      + `${Math.round(cc.elapsedS || 0)} s — keep going until both are ✓`;
+      + `${Math.round(cc.elapsedS || 0)} s — keep going until both are ✓`
+      + (cc.tilted ? '<br><span class="ccal-no">⚠ keep it level — tilted readings are skipped</span>'
+                   : (cc.tiltSkipped ? `<br>${cc.tiltSkipped} tilted readings skipped` : ''));
   } else if (state === 3) {
     step.textContent = 'Checking…';
     det.textContent = 'Fitting the circle and comparing it with the gyro.';

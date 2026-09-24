@@ -231,6 +231,8 @@ message CompassCalStatus {
   uint32 last_state     = 16;  // result of the last finished run: 4 pass, 5 fail, 0 none
   uint32 last_reason    = 17;  // its fail reason
   bool   gyro_level_saved = 18; // last FAIL still saved step 1 (nothing valid was stored)
+  bool   tilted         = 19;  // spin: a reading was just skipped, boat tilted > 3 deg
+  uint32 tilt_skipped   = 20;  // spin: compass readings skipped for tilt so far
 }
 
 // Runtime switch for the temporary proportional yaw assist. Runtime, not
