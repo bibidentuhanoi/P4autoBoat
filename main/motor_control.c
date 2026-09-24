@@ -252,7 +252,28 @@ static bool s_assist_saturated = false;
 static const char *s_trim_why = "starting up";
 static float s_trim_thr = 0.0f;
 #endif
-static bench_t s_bench;
+/* The on-boat BASE-run recording, ~92 KB since the yaw-controller columns
+ * were added (was ~21 KB).  As a static it sat in internal RAM, and in WiFi
+ * mode the HTTP/WebSocket servers then left too little for the remaining
+ * tasks: ToFRead, Snapshot, Diagnostics, CompassCal and TrainingLog all
+ * failed to start with ESP_ERR_NO_MEM (hw, 2026-09-24).  Allocated once at
+ * boot instead: with CONFIG_SPIRAM_USE_MALLOC and ALWAYSINTERNAL=16384, a
+ * request this size goes to PSRAM (internal only if PSRAM is unavailable).
+ * The name is kept so every use reads exactly as before. */
+static bench_t *s_bench_storage;
+#define s_bench (*s_bench_storage)
+
+static esp_err_t bench_storage_init(void)
+{
+    if (s_bench_storage) return ESP_OK;
+    s_bench_storage = calloc(1, sizeof(bench_t));
+    if (!s_bench_storage) {
+        ESP_LOGE(TAG, "bench recording buffer (%u bytes) could not be allocated",
+                 (unsigned)sizeof(bench_t));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
 /* Run profile. Zero-initialising this would make every run finish instantly,
  * so it is spelled out here. 0.5 s still + 3.0 s driving + 1.0 s coasting. */
 /* Run length is set by the POOL and by COMPARABILITY, never by the learner.
@@ -2370,7 +2391,9 @@ static void task_control(void *arg)
 
 esp_err_t motor_control_init_hw(void)
 {
-    esp_err_t ret = esc_driver_init();
+    esp_err_t ret = bench_storage_init();
+    if (ret != ESP_OK) return ret;
+    ret = esc_driver_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ESC driver init failed: %s", esp_err_to_name(ret));
     }
@@ -2403,6 +2426,8 @@ void motor_control_disarm(void)
 
 esp_err_t motor_control_init(void)
 {
+    esp_err_t storage = bench_storage_init();     /* normally done by _init_hw */
+    if (storage != ESP_OK) return storage;
     control_arbiter_init(&s_arbiter);
     s_last_control_rx_us = 0;
     s_control_failsafe = true;
