@@ -179,15 +179,11 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         ESP_LOGI(TAG, "ICM20948 detected (WHO_AM_I=0xEA)");
     }
 
-    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
-    i2c_write_byte(h_icm, PWR_MGMT_1, 0x01);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_write_byte(h_icm, USER_CTRL, 0x00);
-
-    // Explicitly set Gyro range to +/- 250 dps (Bank 2, Reg 0x1B)
-    i2c_write_byte(h_icm, REG_BANK_SEL, 0x20); // Switch to Bank 2
-    i2c_write_byte(h_icm, GYRO_CONFIG_1, 0x01); // 250 dps, DLPF on (bank-2 reg 0x01)
-    i2c_write_byte(h_icm, REG_BANK_SEL, 0x00); // Switch back to Bank 0
+    /* Wake + gyro range, verified by read-back (see imu_reinit_accel_gyro). */
+    if (s_icm_ok && imu_reinit_accel_gyro() != ESP_OK) {
+        ESP_LOGE(TAG, "ICM20948 wake/config did NOT stick after retries -- pitch/roll may "
+                      "be frozen; the sensor task keeps re-trying");
+    }
 
     /* Boot-time liveness verdict for accel/gyro (mirror of the mag check): an
      * awake ICM reports live accel (~1g gravity, always dithering); an ICM that
@@ -198,9 +194,20 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus_handle) {
         imu_read_accel_gyro(&ax0, &ay0, &az0, &g, &g, &g);
         vTaskDelay(pdMS_TO_TICKS(60));
         imu_read_accel_gyro(&ax1, &ay1, &az1, &g, &g, &g);
+        /* Not measuring: wake it again (verified) and re-check, a few times,
+         * instead of only reporting it. */
+        for (int retry = 0; retry < 3 && ax0 == ax1 && ay0 == ay1 && az0 == az1; retry++) {
+            ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) -- re-waking (%d/3)",
+                     ax0, ay0, az0, retry + 1);
+            imu_reinit_accel_gyro();
+            vTaskDelay(pdMS_TO_TICKS(60));
+            imu_read_accel_gyro(&ax0, &ay0, &az0, &g, &g, &g);
+            vTaskDelay(pdMS_TO_TICKS(60));
+            imu_read_accel_gyro(&ax1, &ay1, &az1, &g, &g, &g);
+        }
         if (ax0 == ax1 && ay0 == ay1 && az0 == az1) {
             ESP_LOGW(TAG, "ICM20948 accel NOT changing at boot (%d,%d,%d) — chip asleep/not measuring "
-                          "(wiring), pitch/roll WILL be frozen", ax0, ay0, az0);
+                          "(wiring), pitch/roll WILL be frozen until the sensor task wakes it", ax0, ay0, az0);
         } else {
             ESP_LOGI(TAG, "ICM20948 live: accel moving (%d,%d,%d)->(%d,%d,%d) — sensor+wiring good",
                      ax0, ay0, az0, ax1, ay1, az1);
@@ -232,17 +239,38 @@ esp_err_t imu_reinit_mag(void) {
     return ESP_FAIL;                                /* config never stuck — wiring/chip, not code */
 }
 
-/* Re-apply the ICM20948 config (wake + gyro range). Unconfigured, the chip
- * boots ASLEEP (PWR_MGMT_1=0x41) and returns zeros despite ACKing. */
+/* Re-apply the ICM20948 config (wake + gyro range) and VERIFY it by reading
+ * the registers back.  Unconfigured, the chip boots ASLEEP (PWR_MGMT_1=0x41)
+ * and returns zeros despite ACKing; a wake write silently lost on the shared
+ * bus left it exactly like that (hw 2026-09-24: "accel NOT changing at boot
+ * (0,0,0)", pitch/roll frozen).  A lost bank switch would likewise leave
+ * every data read hitting bank-2 registers.  So each write is checked: awake
+ * (SLEEP clear, auto clock), gyro range set, bank 0 selected -- retried. */
 esp_err_t imu_reinit_accel_gyro(void) {
-    esp_err_t e0 = i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
-    esp_err_t e1 = i2c_write_byte(h_icm, PWR_MGMT_1, 0x01);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    i2c_write_byte(h_icm, USER_CTRL, 0x00);
-    i2c_write_byte(h_icm, REG_BANK_SEL, 0x20);
-    i2c_write_byte(h_icm, GYRO_CONFIG_1, 0x01); // 250 dps, DLPF on (bank-2 reg 0x01)
-    esp_err_t e2 = i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
-    return (e0 == ESP_OK && e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : ESP_FAIL;
+    if (!h_icm) return ESP_ERR_INVALID_STATE;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (attempt) vTaskDelay(pdMS_TO_TICKS(5));
+        i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);
+        i2c_write_byte(h_icm, PWR_MGMT_1, 0x01);            /* wake, auto clock */
+        vTaskDelay(pdMS_TO_TICKS(10));
+        i2c_write_byte(h_icm, USER_CTRL, 0x00);
+        i2c_write_byte(h_icm, REG_BANK_SEL, 0x20);          /* bank 2 */
+        i2c_write_byte(h_icm, GYRO_CONFIG_1, 0x01);         /* 250 dps, DLPF on */
+        uint8_t gyro_cfg = 0xFF;
+        esp_err_t eg = i2c_read_bytes(h_icm, GYRO_CONFIG_1, &gyro_cfg, 1);
+        i2c_write_byte(h_icm, REG_BANK_SEL, 0x00);          /* back to bank 0 */
+        uint8_t bank = 0xFF, pwr = 0xFF;
+        esp_err_t eb = i2c_read_bytes(h_icm, REG_BANK_SEL, &bank, 1);
+        esp_err_t ep = i2c_read_bytes(h_icm, PWR_MGMT_1, &pwr, 1);
+        if (eg == ESP_OK && eb == ESP_OK && ep == ESP_OK &&
+            gyro_cfg == 0x01 && (bank & 0x30) == 0x00 &&
+            (pwr & 0x40) == 0x00 && (pwr & 0x07) == 0x01) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "ICM20948 config not confirmed (try %d): PWR_MGMT_1=0x%02X "
+                      "GYRO_CONFIG_1=0x%02X BANK=0x%02X", attempt + 1, pwr, gyro_cfg, bank);
+    }
+    return ESP_FAIL;
 }
 
 /* Full recovery for a fully-unresponsive ICM20948 (sustained NACK). The

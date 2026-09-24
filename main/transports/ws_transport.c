@@ -44,6 +44,13 @@ static uint8_t  s_slot_buf[2][WS_SLOT_SIZE];
 static size_t   s_slot_len[2];
 static volatile int s_write_idx = 0;
 static SemaphoreHandle_t s_slot_mutex = NULL;
+/* Given = no send in flight.  ws_tx_task takes it before touching tx_buf /
+ * send_arg (and before closing fds); ws_queued_send gives it back when the
+ * httpd task has finished sending.  Without it, a new message was copied into
+ * tx_buf while httpd was still sending the previous one, and the browser got
+ * the head of one message glued to the tail of another ("[Proto] decode error:
+ * invalid wire type 6 at offset 25", hw 2026-09-24). */
+static SemaphoreHandle_t s_send_done = NULL;
 static TaskHandle_t s_tx_task = NULL;
 
 static void add_client(int fd)
@@ -161,6 +168,7 @@ static void ws_queued_send(void *arg)
             }
         }
     }
+    xSemaphoreGive(s_send_done);      /* tx_buf and send_arg are free again */
 }
 
 /* ---- TX task: drains the latest slot over WiFi ---- */
@@ -172,14 +180,33 @@ static void ws_tx_task(void *arg)
     /* Local copy — sensor can freely overwrite the slot while we send */
     static uint8_t tx_buf[WS_SLOT_SIZE];
 
-    /* Queued-send argument — static because ws_tx_task waits for
-     * notification before reusing, so it stays alive across the queue call */
+    /* Queued-send argument — static: it must outlive the queue call.  Both it
+     * and tx_buf are only touched while holding s_send_done. */
     static ws_queued_send_arg_t send_arg;
 
     while (true) {
         uint64_t metric_started = esp_timer_get_time();
         runtime_metrics_cycle_begin(RUNTIME_TASK_WS_TX, metric_started, metric_started);
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
+        /* Previous send still in flight in the httpd task: do not touch the
+         * buffer or close anything this round.  The newest data is still in
+         * the slot and goes out on a later round. */
+        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(50)) != pdTRUE) {
+            runtime_metrics_cycle_end(RUNTIME_TASK_WS_TX, esp_timer_get_time());
+            continue;
+        }
+        bool queued = false;
+
+        /* ---- Drain deferred-close queue ----
+         * Safe exactly here: holding s_send_done means no send() is in
+         * flight in the httpd task. */
+        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
+        for (int i = 0; i < s_close_count; i++) {
+            close(s_close_fds[i]);
+        }
+        s_close_count = 0;
+        xSemaphoreGive(s_client_mutex);
 
         /* ---- Copy slot under mutex ---- */
         xSemaphoreTake(s_slot_mutex, portMAX_DELAY);
@@ -206,17 +233,13 @@ static void ws_tx_task(void *arg)
                 send_arg.count = count;
                 memcpy(send_arg.fds, fds, count * sizeof(int));
 
-                httpd_queue_work(s_server, ws_queued_send, &send_arg);
+                queued = (httpd_queue_work(s_server, ws_queued_send, &send_arg) == ESP_OK);
             }
         }
 
-        /* ---- Drain deferred-close queue (safe: no send() in flight) ---- */
-        xSemaphoreTake(s_client_mutex, portMAX_DELAY);
-        for (int i = 0; i < s_close_count; i++) {
-            close(s_close_fds[i]);
-        }
-        s_close_count = 0;
-        xSemaphoreGive(s_client_mutex);
+        /* Nothing handed to httpd: release now.  A queued send releases it
+         * itself when ws_queued_send finishes. */
+        if (!queued) xSemaphoreGive(s_send_done);
         runtime_metrics_cycle_end(RUNTIME_TASK_WS_TX, esp_timer_get_time());
     }
 }
@@ -319,6 +342,15 @@ esp_err_t ws_transport_init(httpd_handle_t server)
         ESP_LOGE(TAG, "Failed to create client mutex");
         return ESP_ERR_NO_MEM;
     }
+
+    if (!s_send_done) {
+        s_send_done = xSemaphoreCreateBinary();
+        if (!s_send_done) {
+            ESP_LOGE(TAG, "Failed to create send-done semaphore");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xSemaphoreGive(s_send_done);          /* nothing in flight yet */
 
     s_slot_mutex = xSemaphoreCreateMutex();
     if (!s_slot_mutex) {

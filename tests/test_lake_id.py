@@ -1104,6 +1104,10 @@ class GuardTest(unittest.TestCase):
         'main/proto/boat.pb.c',
         # 2026-09-24: Calibrate button on the dashboard + boot heartbeat LED.
         'main/drivers/status_led.c', 'main/drivers/status_led.h',
+        # 2026-09-24 first WiFi-mode hw boot: torn WebSocket frames (send
+        # buffer reused mid-send) and an ICM20948 left asleep at boot.
+        'main/transports/ws_transport.c', 'main/drivers/imu_driver.c',
+        'main/imu_freeze.h',
     }
 
     def _git(self, *args):

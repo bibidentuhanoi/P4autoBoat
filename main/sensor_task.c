@@ -12,6 +12,7 @@
  * ═══════════════════════════════════════════════════════════════ */
 
 #include "sensor_task.h"
+#include "imu_freeze.h"
 #include "detect_task.h"
 #include "pipeline.h"
 #include "training_log_task.h"
@@ -46,6 +47,8 @@ static inline int16_t median3(int16_t a, int16_t b, int16_t c) {
                                      * -- no point publishing faster than the
                                      * cache actually refreshes, or slower and
                                      * sitting on fresher data than we send. */
+/* 25 identical accel/gyro reads in a row (0.5 s at 50 Hz) = not measuring. */
+#define IMU_FREEZE_LIMIT      25
 #define STATUS_EVERY_N        20   /* SystemStatus every 20th iteration (~1Hz) */
 
 /* ─── ToF acquisition and processing ────────────────────────────────────────
@@ -300,7 +303,7 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
         }
     }
 
-    if (!sample->accel_gyro_valid) {
+    if (ag_err != ESP_OK) {
         ++ag_fails;
         if (ag_fails == 50) imu_set_icm_ok(false);
         if (ag_fails == 50 && !bus_scanned) {
@@ -334,6 +337,46 @@ bool sensor_read_imu_sample(imu_sample_t *sample)
             imu_set_icm_ok(true);
         }
         ag_fails = 0;
+    }
+
+    /* Frozen accel/gyro: the chip ACKs but is not measuring (asleep, or on
+     * the wrong register bank).  Its readings are withheld from fusion --
+     * stale gyro must never look like a real, constant turn to the heading
+     * hold -- the chip is marked not OK, and it is re-woken (verified) every
+     * IMU_FREEZE_LIMIT samples until its values move again. */
+    if (ag_err == ESP_OK) {
+        static imu_freeze_t s_ag_freeze;
+        static uint32_t s_ag_frozen_samples;
+        const int16_t v[6] = {sample->ax, sample->ay, sample->az,
+                              sample->gx, sample->gy, sample->gz};
+        switch (imu_freeze_update(&s_ag_freeze, v, IMU_FREEZE_LIMIT)) {
+        case IMU_FREEZE_JUST_FROZE:
+            ESP_LOGW(TAG, "ICM20948 data frozen at (%d,%d,%d | %d,%d,%d) for %d samples -- "
+                          "chip not measuring; withheld from fusion, re-waking",
+                     v[0], v[1], v[2], v[3], v[4], v[5], IMU_FREEZE_LIMIT);
+            imu_set_icm_ok(false);
+            s_ag_frozen_samples = 0;
+            /* fall through */
+        case IMU_FREEZE_STILL_FROZEN:
+            sample->accel_gyro_valid = false;
+            if ((s_ag_frozen_samples++ % IMU_FREEZE_LIMIT) == 0) {
+                esp_err_t rw = imu_reinit_accel_gyro();
+                if ((s_ag_frozen_samples % (IMU_FREEZE_LIMIT * 20)) == 1) {
+                    ESP_LOGW(TAG, "ICM20948 re-wake %s (frozen %lu samples)",
+                             rw == ESP_OK ? "confirmed" : "NOT confirmed",
+                             (unsigned long)s_ag_frozen_samples);
+                }
+            }
+            break;
+        case IMU_FREEZE_JUST_RECOVERED:
+            ESP_LOGI(TAG, "ICM20948 data moving again after %lu frozen samples",
+                     (unsigned long)s_ag_frozen_samples);
+            imu_set_icm_ok(true);
+            break;
+        case IMU_FREEZE_LIVE:
+        default:
+            break;
+        }
     }
 
     if (!sample->accel_gyro_valid && !sample->mag_valid) {
