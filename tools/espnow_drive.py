@@ -356,7 +356,7 @@ RUDDER_TEST_ASSIST_ACK_S = 2.0
 # One session at a time. A reload supersedes the old one, so a stale tab cannot
 # keep driving alongside a fresh one.
 CONTROL_HEARTBEAT_HZ = 12          # browser -> here; inside the lease with margin
-CONTROL_LEASE_S = 0.30             # ~3.6 missed heartbeats
+CONTROL_LEASE_S = 0.40             # ~4.8 missed heartbeats
 # How often an unconfirmed Assisted-OFF is re-sent.
 ASSIST_OFF_RETRY_S = 0.25
 # How long manual control may be held while an assisted-OFF goes unconfirmed
@@ -470,7 +470,7 @@ LAKE_ID_SYSTEMSTATUS_POWERED_MAX_AGE_S = 4.0   # ~1 Hz publish; two lost + jitte
 LAKE_ID_TELEM_ALIVE_S = 0.5
 LAKE_ID_STATUS_ALIVE_CAP_S = 10.0
 LAKE_ID_SYSTEMSTATUS_MAX_AGE_S = 3.0    # ~1 Hz publish; three missed = gone
-LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 300 ms lease
+LAKE_ID_SUPERVISION_S = 2.0             # browser heartbeat; NOT the 400 ms manual lease
 LAKE_ID_STOP_CONFIRM_MAX_AGE_S = 1.5
 LAKE_ID_RUDDER_NEUTRAL_US = 1516
 LAKE_ID_RUDDER_CENTRE_TOL_US = 10
@@ -2106,6 +2106,17 @@ class BoatLink:
         self.session_id = None
         self.session_seq = 0
         self.session_last_hb = 0.0
+        # Timing breadcrumbs for the next manual-lease expiry. The HTTP
+        # arrival timestamp is written before taking _lock, so it can show
+        # whether a request reached Python but waited behind radio/serial I/O.
+        self._last_http_hb_arrival = None
+        self._last_http_hb_seq = None
+        self._last_hb_reject_code = None
+        self._last_browser_gap_ms = None
+        self._last_hb_http_to_lock_ms = None
+        self._last_hb_lock_wait_ms = None
+        self._hb_max_serial_write_ms = 0.0
+        self._hb_max_stream_lock_ms = 0.0
         # Assisted-OFF is a transition that must be ACKNOWLEDGED, not merely
         # sent: an unacknowledged OFF leaves the boat steering itself while the
         # operator believes they have manual control.
@@ -2207,6 +2218,7 @@ class BoatLink:
     def _write_locked(self, payload: bytes):
         frame = build_frame(MSG_MOTOR_CMD, payload, self.seq)
         self.seq = (self.seq + 1) & 0xFF
+        started = self._now()
         try:
             self.ser.write(frame)
             self.last_error = None
@@ -2214,6 +2226,10 @@ class BoatLink:
         except Exception as exc:                        # noqa: BLE001
             self.last_error = str(exc)
             return False
+        finally:
+            elapsed_ms = (self._now() - started) * 1000.0
+            self._hb_max_serial_write_ms = max(
+                getattr(self, '_hb_max_serial_write_ms', 0.0), elapsed_ms)
 
     def _send_motor_locked(self, left: float, right: float):
         msg = self.pb2.BoatMessage()
@@ -2633,14 +2649,17 @@ class BoatLink:
                 and (now - self.session_last_hb) <= CONTROL_LEASE_S)
 
     def control_heartbeat(self, session_id, seq, throttle=None, rudder=None,
-                          left=None, right=None, split=None):
+                          left=None, right=None, split=None,
+                          http_arrival_mono=None, browser_gap_ms=None):
         """The browser's full-state heartbeat: 'I am alive, and this is every
         control value I intend'.
 
         Full state rather than deltas on purpose -- a dropped delta would
         otherwise leave the boat holding a value nobody is asking for any
         more."""
+        lock_requested = self._now()
         with self._lock:
+            lock_acquired = self._now()
             # The CODE matters as much as the message. Two of these mean the
             # session is gone and the browser must acquire a new one; two mean
             # this single request was not applied and the session is perfectly
@@ -2648,21 +2667,39 @@ class BoatLink:
             # mid-transition assist-OFF tear down a working session and stop
             # the boat for no reason.
             if self.session_id is None:
+                self._last_hb_reject_code = 'no_session'
                 return False, ('no control session — reload the page',
                                'no_session')
             if session_id != self.session_id:
                 # Includes the post-STOP case: STOP drops the session, so a
                 # request already in flight when it landed cannot restore
                 # anything.
+                self._last_hb_reject_code = 'wrong_session'
                 return False, ('not the active control session', 'wrong_session')
             if not isinstance(seq, int) or seq <= self.session_seq:
                 # Out-of-order arrival, not a dead session. Refuse the REQUEST
                 # and keep the session: heartbeats are sent continuously and
                 # the next in-order one lands in under 100 ms.
+                self._last_hb_reject_code = 'stale_seq'
                 return False, ('stale command sequence', 'stale_seq')
+            self._last_hb_reject_code = None
+            self._last_hb_lock_wait_ms = (lock_acquired - lock_requested) * 1000.0
+            self._last_hb_http_to_lock_ms = (lock_acquired - http_arrival_mono) * 1000.0 \
+                if http_arrival_mono is not None else None
+            self._last_browser_gap_ms = browser_gap_ms
+            if self.lease_expired_at is not None:
+                print('[lease] heartbeat returned: browser_send_gap=%sms '
+                      'http_to_lock=%sms lock_wait=%sms max_serial_write=%sms '
+                      'max_stream_lock=%sms' % (
+                          browser_gap_ms, self._last_hb_http_to_lock_ms,
+                          self._last_hb_lock_wait_ms,
+                          getattr(self, '_hb_max_serial_write_ms', 0.0),
+                          getattr(self, '_hb_max_stream_lock_ms', 0.0)), flush=True)
             self.session_seq = seq
             self.session_last_hb = self._now()
             self.lease_expired_at = None
+            self._hb_max_serial_write_ms = 0.0
+            self._hb_max_stream_lock_ms = 0.0
             if self._assist_off_pending_locked():
                 # Assisted mode may still be ON aboard, where these values mean
                 # something entirely different. Refuse rather than guess -- but
@@ -4495,6 +4532,7 @@ class BoatLink:
         next_tick = time.monotonic()
         while not self._stop.is_set():
             with self._lock:
+                stream_lock_started = self._now()
                 # Before the sends: the sequence only sets throttle/rudder and
                 # the block below transmits them, so it inherits every existing
                 # safety path instead of opening a second command route.
@@ -4513,14 +4551,32 @@ class BoatLink:
                         age = now_mono - self.session_last_hb
                         reason = ('no active control session' if self.session_id is None else
                                   'last browser heartbeat %.2fs ago' % age)
+                        http_arrival = getattr(self, '_last_http_hb_arrival', None)
+                        http_age_ms = ((now_mono - http_arrival) * 1000.0
+                                       if http_arrival is not None else None)
                         print('[lease] %s (limit %.2fs) — zeroing manual controls. '
                               'Keep the control tab visible; if this repeats while visible, '
                               'check browser/HTTP responsiveness.'
                               % (reason, CONTROL_LEASE_S), flush=True)
+                        print('[lease] timing: last_http_arrival_age=%sms '
+                              'last_browser_send_gap=%sms last_http_to_lock=%sms '
+                              'last_lock_wait=%sms max_serial_write=%sms '
+                              'max_stream_lock=%sms accepted_seq=%s '
+                              'last_http_seq=%s last_reject=%s' % (
+                                  http_age_ms, getattr(self, '_last_browser_gap_ms', None),
+                                  getattr(self, '_last_hb_http_to_lock_ms', None),
+                                  getattr(self, '_last_hb_lock_wait_ms', None),
+                                  getattr(self, '_hb_max_serial_write_ms', 0.0),
+                                  getattr(self, '_hb_max_stream_lock_ms', 0.0),
+                                  self.session_seq, getattr(self, '_last_http_hb_seq', None),
+                                  getattr(self, '_last_hb_reject_code', None)), flush=True)
                     self._zero_controls_locked()
                     self._transmit_zeros_locked()
                 if self.connected:
                     self._stream_send_locked()
+                self._hb_max_stream_lock_ms = max(
+                    getattr(self, '_hb_max_stream_lock_ms', 0.0),
+                    (self._now() - stream_lock_started) * 1000.0)
             # File I/O deliberately outside the lock -- a few ms of CSV write
             # must never sit inside the 15 Hz command loop's critical section.
             self._flush_rudder_test_write()
@@ -5323,13 +5379,13 @@ async function openSession() {
 }
 
 // A single slow HTTP response must not prevent the next full-state heartbeat
-// from reaching the server before its 300 ms lease expires. Allow a FEW
+// from reaching the server before its 400 ms lease expires. Allow a FEW
 // overlapping requests: sequence numbers reject a late older command, while
 // the cap prevents an unresponsive server from accumulating unlimited fetches.
 // Epochs keep a delayed response from a released/old session from touching a
 // new session. Full-state requests make a dropped or stale one harmless.
 const MAX_HB_IN_FLIGHT = 4;
-var hbInFlight = 0, hbPending = false, hbEpoch = 0;
+var hbInFlight = 0, hbPending = false, hbEpoch = 0, lastHbSendMs = null;
 
 // SESSION WATCHDOG. A session can be missing for several unrelated reasons --
 // the page was reloaded while already connected (the connect button never
@@ -5352,13 +5408,17 @@ setInterval(ensureSession, 500);
 async function sendHeartbeat() {
   if (!sessionId) return;
   if (hbInFlight >= MAX_HB_IN_FLIGHT) { hbPending = true; return; }
+  const sendMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const browserGapMs = lastHbSendMs === null ? null : Math.round(sendMs - lastHbSendMs);
+  lastHbSendMs = sendMs;
   const sentSession = sessionId, epoch = hbEpoch;
   hbInFlight++;
   try {
     const r = await api('/api/state', 'POST', {
       session_id: sentSession, seq: ++ctrlSeq,
       throttle: ctrl.throttle, rudder: ctrl.rudder,
-      left: ctrl.left, right: ctrl.right, split: ctrl.split });
+      left: ctrl.left, right: ctrl.right, split: ctrl.split,
+      browser_gap_ms: browserGapMs });
     if (r && !r.ok) {
       // ONLY a dead session tears this down. stale_seq means one request
       // arrived out of order, and assist_off_pending means the boat is
@@ -5390,6 +5450,7 @@ function stopHeartbeat() {
   hbEpoch++;
   hbInFlight = 0;
   hbPending = false;
+  lastHbSendMs = null;
 }
 
 // Going away must both stop the stream AND give up the session, so nothing can
@@ -6664,7 +6725,12 @@ class Handler(BaseHTTPRequestHandler):
             pass   # browser closed/refreshed/navigated away -- not an error
 
     def do_POST(self):
+        http_arrival_mono = self.link._now() if self.path == '/api/state' else None
+        if http_arrival_mono is not None:
+            self.link._last_http_hb_arrival = http_arrival_mono
         body = self._read_body()
+        if http_arrival_mono is not None:
+            self.link._last_http_hb_seq = body.get('seq')
         if self.path == '/api/connect':
             ok, err = self.link.connect(body.get('port', ''))
             self._json({'ok': ok, 'error': err})
@@ -6696,7 +6762,8 @@ class Handler(BaseHTTPRequestHandler):
                 body.get('session_id'), body.get('seq'),
                 throttle=body.get('throttle'), rudder=body.get('rudder'),
                 left=body.get('left'), right=body.get('right'),
-                split=body.get('split'))
+                split=body.get('split'), http_arrival_mono=http_arrival_mono,
+                browser_gap_ms=body.get('browser_gap_ms'))
             if ok:
                 self._json({'ok': True})
             else:

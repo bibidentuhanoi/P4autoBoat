@@ -219,6 +219,21 @@ class SessionBasicsTest(SessionBase):
 
 class DriveLeaseTest(SessionBase):
 
+    def test_manual_drive_survives_350ms_gap_but_stops_after_400ms(self):
+        s = self._open()
+        self.link.control_heartbeat(s, 1, throttle=0.4)
+        self.sent.clear()
+
+        self.clock.advance(0.35)
+        self._tick()
+        self.assertAlmostEqual(self.link.throttle, 0.4)
+        self.assertFalse(self._zeros_were_transmitted())
+
+        self.clock.advance(0.06)
+        self._tick()
+        self._assert_stopped()
+        self.assertTrue(self._zeros_were_transmitted())
+
     def test_browser_loss_at_forty_percent_throttle_zeroes_the_boat(self):
         """THE named case. The tab closes mid-drive and this process keeps
         streaming 40% because the boat cannot tell the difference."""
