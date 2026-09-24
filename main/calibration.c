@@ -94,8 +94,7 @@ static void fail(compass_cal_reason_t reason)
     enter(COMPASS_CAL_FAIL);
     s_status.reason = reason;
     status_led_set(STATUS_LED_CAL_DONE_FAIL);
-    ESP_LOGW(TAG, "Calibration FAILED (reason %d) -- previous calibration kept",
-             (int)reason);
+    ESP_LOGW(TAG, "Calibration FAILED (reason %d)", (int)reason);
 }
 
 /* ---- Step 1 ---- */
@@ -257,7 +256,8 @@ static bool apply(const CalibrationData *next)
         vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
     if (tries >= 200) {
-        ESP_LOGE(TAG, "Fusion did not take the new calibration; it applies after reboot");
+        ESP_LOGE(TAG, "Fusion has not taken the new calibration yet (fusion stalled?); "
+                      "it will on its next sample, and it is saved for the next boot");
     }
     *s_live = *next;
     return true;
@@ -280,15 +280,18 @@ static void run_calibration(void)
         /* With a good calibration stored, a FAIL changes nothing.  With none
          * (first boot after a flash), keep the fresh gyro drift + level from
          * step 1 rather than run the heading hold on an uncorrected gyro;
-         * the compass stays marked NOT calibrated. */
+         * the compass stays marked NOT calibrated.  Said so in the status. */
         if (!s_stored_valid) {
             memcpy(next.mag_center, (float[2]){0.0f, 0.0f}, sizeof(next.mag_center));
             memcpy(next.mag_soft, (float[4]){1.0f, 0.0f, 0.0f, 1.0f}, sizeof(next.mag_soft));
             next.mag_radius = 0.0f;
             next.mag_calibrated = 0;
             if (apply(&next)) {
+                s_status.gyro_level_saved = true;
                 ESP_LOGW(TAG, "No stored calibration: gyro drift + level saved, "
                               "compass still NOT calibrated");
+            } else {
+                ESP_LOGE(TAG, "No stored calibration and saving gyro drift + level failed");
             }
         }
         return;
@@ -310,48 +313,77 @@ static void run_calibration(void)
              next.pitch_tare, next.roll_tare);
 }
 
+/* A finished run's PASS/FAIL (or a refused start) stays on the dashboard for
+ * this long, then the card goes back to the live health view; the result is
+ * kept in last_state / last_reason. */
+#define RESULT_SHOW_US  (10LL * 1000000LL)
+static uint32_t s_run_id;
+static int64_t s_result_until_us;
+
 /* One full run.  s_active must already be set (arming locked). */
 static void run_once(void)
 {
     atomic_store_explicit(&s_cancel_requested, false, memory_order_release);
+    uint32_t last_state = s_status.last_state, last_reason = s_status.last_reason;
     s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;   /* fresh run */
+    s_status.run_id = ++s_run_id;
+    s_status.last_state = last_state;
+    s_status.last_reason = last_reason;
     run_calibration();
+    s_status.last_state = s_status.state;
+    s_status.last_reason = s_status.reason;
+    s_result_until_us = esp_timer_get_time() + RESULT_SHOW_US;
     atomic_store_explicit(&s_active, false, memory_order_release);
     publish();
 }
 
-/* Dashboard START: refused while the motors are armed or arming.  s_active
- * is set BEFORE the check, so an arm step arriving in between is refused by
- * motor_control's lock rather than racing past it. */
-static void start_from_dashboard(void)
+/* Motors armed or arming: never ask the operator to handle the boat.  The
+ * previous result (last_*) and metrics are left as they were. */
+static void refuse_armed(void)
 {
-    atomic_store_explicit(&s_active, true, memory_order_release);
+    atomic_store_explicit(&s_active, false, memory_order_release);
+    s_status.run_id = ++s_run_id;
+    enter(COMPASS_CAL_FAIL);
+    s_status.reason = COMPASS_CAL_REASON_ARMED;
+    s_status.gyro_level_saved = false;
+    s_result_until_us = esp_timer_get_time() + RESULT_SHOW_US;
+    ESP_LOGW(TAG, "Calibration refused: motors armed -- disarm first");
+    publish();
+}
+
+/* s_active is already set when this is called (boot: from the moment boot
+ * decided to calibrate; dashboard: just before), so an arm step arriving
+ * now is refused by motor_control's lock instead of racing past the check. */
+static void start_checked(const char *source)
+{
     if (esc_driver_get_state() != ESC_STATE_DISARMED) {
-        atomic_store_explicit(&s_active, false, memory_order_release);
-        enter(COMPASS_CAL_FAIL);
-        s_status.reason = COMPASS_CAL_REASON_ARMED;
-        ESP_LOGW(TAG, "Calibration refused: motors armed -- disarm first");
-        publish();
+        refuse_armed();
         return;
     }
-    ESP_LOGI(TAG, "Calibration started from the dashboard");
+    ESP_LOGI(TAG, "Calibration started (%s)", source);
     run_once();
 }
 
 static void task_compass_cal(void *arg)
 {
     (void)arg;
-    if (s_run_now) run_once();        /* s_active was set by compass_cal_start */
+    if (s_run_now) start_checked("power-on");
 
     /* Stay alive: the runtime metrics keep this task's handle, the dashboard
      * can start a calibration at any time, and it shows the health. */
     int64_t last_pub = 0;
     for (;;) {
         if (atomic_exchange_explicit(&s_start_requested, false, memory_order_acq_rel)) {
-            start_from_dashboard();
+            atomic_store_explicit(&s_active, true, memory_order_release);
+            start_checked("dashboard");
             last_pub = esp_timer_get_time();
         }
         int64_t now = esp_timer_get_time();
+        if ((s_status.state == COMPASS_CAL_PASS || s_status.state == COMPASS_CAL_FAIL) &&
+            now >= s_result_until_us) {
+            s_status.state = COMPASS_CAL_IDLE;
+            s_status.reason = COMPASS_CAL_REASON_NONE;
+        }
         if (now - last_pub >= PUBLISH_IDLE_US) {
             publish();
             last_pub = now;
@@ -374,6 +406,11 @@ static void on_dashboard_command(bool start, bool cancel)
     }
 }
 
+void compass_cal_lock_for_boot(void)
+{
+    atomic_store_explicit(&s_active, true, memory_order_release);
+}
+
 esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_valid)
 {
     if (!live) return ESP_ERR_INVALID_ARG;
@@ -382,7 +419,7 @@ esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_val
     s_stored_valid = stored_valid;
     s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;
     s_status.state = COMPASS_CAL_IDLE;
-    /* Lock arming before the task even exists. */
+    /* Keeps (or releases) the lock compass_cal_lock_for_boot() took. */
     atomic_store_explicit(&s_active, run_now, memory_order_release);
     atomic_store_explicit(&s_start_requested, false, memory_order_release);
     atomic_store_explicit(&s_cancel_requested, false, memory_order_release);

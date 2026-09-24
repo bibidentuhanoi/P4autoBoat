@@ -11,9 +11,8 @@
 typedef enum {
     STATUS_LED_OFF = 0,         /* dark — not calibrating */
     STATUS_LED_CAL_WINDOW,      /* fast blink — press BOOT now to force recalibration */
-    STATUS_LED_CAL_STILL,       /* solid on — Phase 1: hold flat & still */
-    STATUS_LED_CAL_MOVE,        /* triple-blip bursts — Phase 2: figure-8, keep moving */
-    STATUS_LED_CAL_POINT,       /* slow blink — Phase 3: point at the bow & hold */
+    STATUS_LED_CAL_STILL,       /* solid on — Step 1: hold level & still */
+    STATUS_LED_CAL_MOVE,        /* triple-blip bursts — Step 2: spin the boat flat */
     STATUS_LED_CAL_DONE_OK,     /* three slow flashes then OFF — calibration good */
     STATUS_LED_CAL_DONE_FAIL,   /* rapid flutter then OFF — calibration poor, redo */
     STATUS_LED_BOOTING,         /* heartbeat blink — powered, alive, still booting */

@@ -77,7 +77,7 @@
   #imu-card, #motor-card, #winch-card { overflow-y: auto; }
   .imu-vals { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; flex: 1; }
   .imu-val { background: var(--bg); border-radius: 6px; padding: 10px 6px; text-align: center; }
-  /* Compass + IMU calibration (runs at boot; this card only watches it). */
+  /* Compass + IMU calibration: Calibrate/Cancel here, status from the boat. */
   #ccal { margin-top: 8px; background: var(--bg); border-radius: 6px; padding: 8px; }
   #ccal .ccal-head { display: flex; justify-content: space-between; align-items: center;
                      font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
@@ -412,7 +412,7 @@
         <button class="btn-pwr" id="ccal-start" disabled
                 title="Hold still, then spin the boat flat about two circles. Refused while the motors are armed.">Calibrate</button>
         <button class="btn-pwr" id="ccal-cancel" disabled style="display:none;"
-                title="Stop the calibration. Nothing is saved; the current calibration stays in use.">Cancel</button>
+                title="Stop the calibration. The compass calibration in use is not changed.">Cancel</button>
         <span id="ccal-hint"></span>
       </div>
       <div class="ccal-body">
@@ -544,7 +544,7 @@ message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
 message CompassCalCommand { bool start = 1; bool cancel = 2; }
-message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; }
+message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; uint32 run_id = 15; uint32 last_state = 16; uint32 last_reason = 17; bool gyro_level_saved = 18; }
 message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
 message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; bool abort = 5; }
 message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; float heading_target_deg = 9; float heading_error_deg = 10; float yaw_target_dps = 11; float p_term = 12; float i_term = 13; float dynamic_c = 14; float effective_c = 15; float c_limit = 16; bool ctrl_active = 17; bool heading_hold = 18; bool saturated = 19; }
@@ -2238,9 +2238,10 @@ function updateCalibrateButton() {
   btn.disabled = !(ws && ws.readyState === WebSocket.OPEN && motorArmed) && !calibrating;
 }
 
-// ── Compass + IMU calibration (read-only view) ─────────────────────────
-// The boat runs it at power-on (BOOT held, or nothing valid stored) and
-// streams CompassCalStatus over WiFi only. States/reasons mirror calibration.h.
+// ── Compass + IMU calibration ──────────────────────────────────────────
+// Started by the Calibrate button (or at power-on: BOOT held / nothing valid
+// stored). The boat streams CompassCalStatus over WiFi only; the buttons
+// follow its answers. States/reasons mirror calibration.h.
 const CCAL_REASONS = {
   1: 'never held still (60 s)', 2: 'gyro drift too large — was it moving?',
   3: 'circle not finished in 3 min', 4: 'out of memory', 5: 'could not save to flash',
@@ -2250,7 +2251,8 @@ const CCAL_REASONS = {
   14: 'readings too scattered', 15: 'field strength not Earth-like',
   16: 'part of the circle missing', 17: 'compass turn disagrees with gyro',
 };
-let _ccalLast = 0, _ccalShownState = 0, _ccalState = 0, _ccalPressedAt = 0;
+let _ccalLast = 0, _ccalShownState = 0, _ccalState = 0, _ccalPressedAt = 0,
+    _ccalRunId = 0, _ccalPressRun = -1;
 
 function sendCompassCal(start, cancel) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -2276,7 +2278,9 @@ function updateCcalButtons() {
 
 $('ccal-start').addEventListener('click', () => {
   if (motorArmed) return;
-  if (sendCompassCal(true, false)) { _ccalPressedAt = Date.now(); updateCcalButtons(); }
+  if (sendCompassCal(true, false)) {
+    _ccalPressedAt = Date.now(); _ccalPressRun = _ccalRunId; updateCcalButtons();
+  }
 });
 $('ccal-cancel').addEventListener('click', () => { sendCompassCal(false, true); });
 
@@ -2299,7 +2303,8 @@ function drawCcalRing(mask, active) {
 function updateCompassCal(cc) {
   _ccalLast = Date.now();
   _ccalState = cc.state || 0;
-  if (_ccalState >= 1) _ccalPressedAt = 0;      // the boat answered
+  _ccalRunId = cc.runId || 0;
+  if (_ccalPressedAt && _ccalRunId !== _ccalPressRun) _ccalPressedAt = 0;   // answered
   const state = cc.state || 0, badge = $('ccal-badge'), step = $('ccal-step'), det = $('ccal-detail');
   const hdg = (cc.headingDeg != null && cc.headingDeg >= 0) ? `${cc.headingDeg.toFixed(1)}°` : '—';
   const metrics = () => `squash ${(cc.axisRatio || 0).toFixed(2)} · spread ${((cc.fitRms || 0) * 100).toFixed(1)}% · `
@@ -2334,29 +2339,35 @@ function updateCompassCal(cc) {
   } else if (state === 5) {
     step.textContent = `FAIL — ${CCAL_REASONS[cc.reason] || ('reason ' + cc.reason)}`;
     step.style.color = 'var(--danger)';
-    det.textContent = 'Compass calibration not changed. Press Calibrate to try again.'
-      + (cc.radius ? ` (${metrics()})` : '');
+    det.textContent = (cc.gyroLevelSaved
+        ? 'Gyro drift + level were saved; the compass is still NOT calibrated.'
+        : 'Compass calibration not changed.')
+      + ' Press Calibrate to try again.'
+      + ((cc.reason || 0) >= 10 ? ` (${metrics()})` : '');
   } else {
     const fr = cc.fieldRatio || 0;
+    const last = cc.lastState === 4 ? 'last calibration: PASS · '
+               : cc.lastState === 5 ? `last calibration: FAIL (${CCAL_REASONS[cc.lastReason] || cc.lastReason}) · ` : '';
     if (!cc.calibrated) {
       step.textContent = `Heading ${hdg} (uncorrected)`;
-      det.textContent = 'Press Calibrate: keep it still, then spin it flat about two circles.';
+      det.textContent = last + 'Press Calibrate: keep it still, then spin it flat about two circles.';
     } else if (fr > 0 && (fr < 0.85 || fr > 1.15)) {
       step.textContent = `Heading ${hdg}`;
       step.style.color = 'var(--warn)';
-      det.textContent = `Field is ${fr.toFixed(2)}× what it was at calibration — something magnetic moved near `
-        + 'the compass. Press Calibrate to recalibrate.';
+      det.textContent = last + `Field is ${fr.toFixed(2)}× what it was at calibration — something magnetic `
+        + 'moved near the compass. Press Calibrate to recalibrate.';
     } else {
       step.textContent = `Heading ${hdg}`;
-      det.textContent = fr > 0 ? `field ${fr.toFixed(2)}× calibration (1.00 = unchanged)` : 'waiting for compass data';
+      det.textContent = last + (fr > 0 ? `field ${fr.toFixed(2)}× calibration (1.00 = unchanged)` : 'waiting for compass data');
     }
   }
   drawCcalRing(mask, active);
   updateCcalButtons();
+  if (state === 0 || state >= 4) _ccalShownState = 0;
   // On wide screens this card has a fixed height and scrolls: bring the
-  // calibration into view once per step while one is running, never after,
-  // so it does not fight the operator's own scrolling.
-  if (state >= 1 && state <= 5 && state !== _ccalShownState) {
+  // calibration into view once per step while one is running (hold still /
+  // spin / checking), never otherwise, so it does not fight the operator.
+  if (state >= 1 && state <= 3 && state !== _ccalShownState) {
     _ccalShownState = state;
     const box = $('ccal');
     if (box && box.scrollIntoView) box.scrollIntoView({ block: 'nearest' });

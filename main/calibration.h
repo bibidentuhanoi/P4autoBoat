@@ -52,6 +52,10 @@ typedef enum {
  * the step-1 gyro drift + level are still saved (compass NOT calibrated). */
 esp_err_t compass_cal_start(CalibrationData *live, bool run_now, bool stored_valid);
 
+/* Refuse arming from the moment boot decides to calibrate -- before any
+ * command link exists -- until compass_cal_start() keeps or releases it. */
+void compass_cal_lock_for_boot(void);
+
 /* True while a calibration runs (boot or dashboard) until PASS/FAIL. */
 bool compass_cal_active(void);
 

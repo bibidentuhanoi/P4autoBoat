@@ -61,6 +61,7 @@ static CalibrationData calib_data = {
     .mag_calibrated = 0,
 };
 static bool s_calibrate_at_boot;
+static bool s_calibrate_boot_button;
 static bool s_stored_calibration_valid;
 
 static tof_devices_t tof_devs;
@@ -189,7 +190,12 @@ void app_main(void) {
      * The dashboard's Calibrate button starts the same routine at any time. */
     s_stored_calibration_valid = nvs_load_success;
     s_calibrate_at_boot = force_calib_via_button || !nvs_load_success || DO_CALIBRATE_DEFAULT;
+    s_calibrate_boot_button = force_calib_via_button;
     if (s_calibrate_at_boot) {
+        /* Arming is refused from HERE, before any command link (WiFi,
+         * ESP-NOW) exists, so nobody can arm in the gap before the
+         * calibration task starts and then be asked to spin an armed boat. */
+        compass_cal_lock_for_boot();
         ESP_LOGI(TAG, "Calibration requested (%s) -- runs once the dashboard is up",
                  force_calib_via_button ? "BOOT button" : "no valid calibration stored");
     } else {
@@ -440,13 +446,22 @@ void app_main(void) {
 
     // IMU + compass calibration (if requested above), then a 1 Hz health
     // report for the dashboard. Needs the sensor bus and fusion running.
-    esp_err_t cal_ret = compass_cal_start(&calib_data, s_calibrate_at_boot,
+    // In ESP-NOW field mode nobody can see or cancel it, so an automatic
+    // (no stored calibration) run is skipped there; BOOT held still forces it.
+    bool cal_run_now = s_calibrate_boot_button || (s_calibrate_at_boot && !g_field_mode);
+    if (s_calibrate_at_boot && !cal_run_now) {
+        ESP_LOGW(TAG, "No valid calibration stored, but field mode: automatic calibration "
+                      "skipped -- calibrate from the WiFi dashboard, or hold BOOT at power-on");
+    }
+    esp_err_t cal_ret = compass_cal_start(&calib_data, cal_run_now,
                                           s_stored_calibration_valid);
     if (cal_ret != ESP_OK) {
         ESP_LOGE(TAG, "Compass calibration task failed to start (%s)",
                  esp_err_to_name(cal_ret));
-        if (s_calibrate_at_boot) status_led_set(STATUS_LED_CAL_DONE_FAIL);
+        if (cal_run_now) status_led_set(STATUS_LED_CAL_DONE_FAIL);
+        cal_run_now = false;
     }
+    s_calibrate_at_boot = cal_run_now;
 
     // Dataset capture (JPEG + sensor sidecar to SD, trigger via WS/ESP-NOW).
     // Needs sensor_task_init() (sensor_tof_cache_load()) above; does not

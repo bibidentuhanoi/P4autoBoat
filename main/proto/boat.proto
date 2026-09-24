@@ -227,6 +227,10 @@ message CompassCalStatus {
   bool   calibrated     = 12;  // a PASSed compass calibration is in use
   float  field_ratio    = 13;  // live field / field at calibration (1.0 = healthy)
   float  heading_deg    = 14;  // live fused heading
+  uint32 run_id         = 15;  // +1 for every run or refused start (matches a button press)
+  uint32 last_state     = 16;  // result of the last finished run: 4 pass, 5 fail, 0 none
+  uint32 last_reason    = 17;  // its fail reason
+  bool   gyro_level_saved = 18; // last FAIL still saved step 1 (nothing valid was stored)
 }
 
 // Runtime switch for the temporary proportional yaw assist. Runtime, not

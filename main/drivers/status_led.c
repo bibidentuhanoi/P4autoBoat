@@ -56,9 +56,6 @@ static void status_led_task(void *arg) {
             case STATUS_LED_CAL_MOVE:                   /* 3 blips + gap — "keep moving" */
                 (void)(pulse(st, 70, 70) && pulse(st, 70, 70) && pulse(st, 70, 400));
                 break;
-            case STATUS_LED_CAL_POINT:                  /* slow blink — "aim & settle" */
-                pulse(st, 500, 500);
-                break;
             case STATUS_LED_CAL_DONE_OK:                /* 3 slow flashes, then dark */
                 pulse(st, 300, 200); pulse(st, 300, 200); pulse(st, 300, 200);
                 if (s_state == STATUS_LED_CAL_DONE_OK) s_state = STATUS_LED_OFF;
