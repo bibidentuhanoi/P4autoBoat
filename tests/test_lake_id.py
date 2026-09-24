@@ -1282,9 +1282,13 @@ class NextOrderReachesThePageTest(unittest.TestCase):
     def test_a_real_link_has_the_cache_from_construction(self):
         link = T.BoatLink(T.load_boat_pb2())
         nxt = link.lake_id_next()
-        # the straight-run indices ride the same cache (STRAIGHT 3s)
-        self.assertEqual(sorted(nxt), ['STRAIGHT_T15', 'STRAIGHT_T20', 'STRAIGHT_T30', 'STRAIGHT_T40',
-                                       'T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'])
+        # the straight-run indices ride the same cache (STRAIGHT 3s). The
+        # scan also adds a STRAIGHT_Txx key for every throttle already on
+        # disk, so only the always-present keys are pinned here.
+        self.assertLessEqual({'STRAIGHT_T20', 'STRAIGHT_T30',
+                              'T20_M30', 'T20_M60', 'T30_M30', 'T30_M60'}, set(nxt))
+        for key in nxt:
+            self.assertRegex(key, r'^(STRAIGHT_T\d+|T\d+_M\d+)$')
         self.assertIn(nxt['T20_M30']['next_order'], ('LR', 'RL'))
 
     def test_the_websocket_producer_fills_the_cache_too(self):
