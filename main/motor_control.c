@@ -1,5 +1,6 @@
 #include "motor_control.h"
 #include "arm_sequence.h"
+#include "calibration.h"
 #include "esc_trim.h"
 #include "esc_trim_cal.h"
 #include "bench_run.h"
@@ -1123,6 +1124,19 @@ static bool control_apply_arm_action(control_decision_t *decision, bool safe_sto
 {
     arm_action_t action;
     if (xQueueReceive(s_arm_action_queue, &action, 0) != pdTRUE) return false;
+
+    /* The boat is being held still or spun by hand for the compass/IMU
+     * calibration: the motors must not come alive under the operator. */
+    if ((action == ARM_ACTION_BEGIN || action == ARM_ACTION_COMPLETE) &&
+        compass_cal_active()) {
+        ESP_LOGW(TAG, "Arm refused -- compass/IMU calibration is running");
+        if (esc_driver_get_state() != ESC_STATE_DISARMED) {
+            esc_driver_disarm();
+            *changed = true;
+        }
+        submit_arm_request(ARM_REQUEST_DISARM, false, esp_timer_get_time());
+        return false;
+    }
 
     switch (action) {
     case ARM_ACTION_BEGIN:

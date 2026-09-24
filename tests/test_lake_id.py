@@ -1094,6 +1094,14 @@ class GuardTest(unittest.TestCase):
         'main/trim_learn.h', 'main/yaw_heading_control.c',
         'main/yaw_heading_control.h', 'proto/boat_pb2.py',
         'sdkconfig', 'sdkconfig.defaults',
+        # 2026-09-24, deliberately: the flat compass/IMU calibration shown on
+        # the WiFi dashboard (hold still, then spin) replaced the boot-time
+        # figure-8 + "point the bow" routine and the stored heading offset.
+        'main/calibration.c', 'main/calibration.h',
+        'main/mag_cal.c', 'main/mag_cal.h',
+        'main/include/common.h', 'main/file_system.c', 'main/file_system.h',
+        'main/main.c', 'main/pipeline.h', 'main/runtime_schedule.h',
+        'main/proto/boat.pb.c',
     }
 
     def _git(self, *args):

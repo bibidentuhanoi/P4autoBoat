@@ -8,8 +8,10 @@
 #include "esp_err.h"
 
 void fs_init(void);
-void fs_save_calibration(const CalibrationData* calib);
+bool fs_save_calibration(const CalibrationData* calib);   /* true = committed to flash */
 bool fs_load_calibration(CalibrationData* calib);
+/* Shape and range check shared by load and by the calibration before saving. */
+bool fs_calibration_sane(const CalibrationData* calib);
 
 void fs_save_tof_xtalk(const char* key, const uint8_t* data, size_t len);
 bool fs_load_tof_xtalk(const char* key, uint8_t* data, size_t len);

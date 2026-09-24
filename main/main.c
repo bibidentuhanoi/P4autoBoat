@@ -48,15 +48,19 @@ static const char* TAG = "MAIN";
 
 // Globals
 static i2c_master_bus_handle_t bus_handle;
+/* Used until a calibration is loaded or has PASSed: no gyro correction and
+ * an uncorrected compass (identity), flagged as not calibrated. */
 static CalibrationData calib_data = {
-    .magic_word = 0,
+    .magic_word = CALIB_MAGIC_WORD,
     .g_bias = {0.0f, 0.0f, 0.0f},
-    .m_bias = {0.0f, 0.0f, 0.0f},
-    .m_scale = {1.0f, 1.0f, 1.0f},
     .pitch_tare = 0.0f,
     .roll_tare = 0.0f,
-    .heading_tare = 0.0f
+    .mag_center = {0.0f, 0.0f},
+    .mag_soft = {1.0f, 0.0f, 0.0f, 1.0f},
+    .mag_radius = 0.0f,
+    .mag_calibrated = 0,
 };
+static bool s_calibrate_at_boot;
 
 static tof_devices_t tof_devs;
 volatile bool g_camera_ok = false;
@@ -174,11 +178,14 @@ void app_main(void) {
     // 8. Smart Boot Logic
     bool nvs_load_success = fs_load_calibration(&calib_data);
 
-    if (force_calib_via_button || !nvs_load_success || DO_CALIBRATE_DEFAULT) {
-        ESP_LOGI(TAG, "Proceeding to calibration routine...");
-        perform_calibration_routine(&calib_data);
-        calib_data.magic_word = CALIB_MAGIC_WORD;
-        fs_save_calibration(&calib_data);
+    /* The calibration itself runs later, once WiFi and the sensor tasks are
+     * up, so the dashboard can show it (compass_cal_start below). Until then
+     * the boat should simply stay still: the LED says so. */
+    s_calibrate_at_boot = force_calib_via_button || !nvs_load_success || DO_CALIBRATE_DEFAULT;
+    if (s_calibrate_at_boot) {
+        ESP_LOGI(TAG, "Calibration requested (%s) -- runs once the dashboard is up",
+                 force_calib_via_button ? "BOOT button" : "no valid calibration stored");
+        status_led_set(STATUS_LED_CAL_STILL);
     } else {
         ESP_LOGI(TAG, "Valid calibration found in NVS. Skipping calibration.");
         status_led_set(STATUS_LED_OFF);   // cal-only LED: dark once we're running
@@ -423,6 +430,15 @@ void app_main(void) {
                                      task_runtime_diagnostics, NULL, NULL);
     if (task_error != ESP_OK) {
         runtime_startup_handle_task_failure(RUNTIME_TASK_DIAGNOSTICS, task_error);
+    }
+
+    // IMU + compass calibration (if requested above), then a 1 Hz health
+    // report for the dashboard. Needs the sensor bus and fusion running.
+    esp_err_t cal_ret = compass_cal_start(&calib_data, s_calibrate_at_boot);
+    if (cal_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Compass calibration task failed to start (%s)",
+                 esp_err_to_name(cal_ret));
+        if (s_calibrate_at_boot) status_led_set(STATUS_LED_CAL_DONE_FAIL);
     }
 
     // Dataset capture (JPEG + sensor sidecar to SD, trigger via WS/ESP-NOW).

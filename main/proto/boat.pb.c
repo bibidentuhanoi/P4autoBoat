@@ -63,6 +63,9 @@ PB_BIND(boat_CalibrateCommand, boat_CalibrateCommand, AUTO)
 PB_BIND(boat_CalibrateStatus, boat_CalibrateStatus, AUTO)
 
 
+PB_BIND(boat_CompassCalStatus, boat_CompassCalStatus, AUTO)
+
+
 PB_BIND(boat_AssistCommand, boat_AssistCommand, AUTO)
 
 

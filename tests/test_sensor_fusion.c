@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -35,7 +36,7 @@ static imu_sample_t make_sample(uint32_t sequence)
 static CalibrationData calibration(void)
 {
     return (CalibrationData){
-        .m_scale = {1.0f, 1.0f, 1.0f},
+        .mag_soft = {1.0f, 0.0f, 0.0f, 1.0f},
     };
 }
 
@@ -182,10 +183,94 @@ static void test_result_reader_observes_only_complete_fusion_generations(void)
     assert(!atomic_load(&state.torn_result));
 }
 
+static imu_sample_t level_sample(uint32_t sequence, int16_t mx, int16_t my)
+{
+    imu_sample_t s = make_sample(sequence);
+    s.gx = s.gy = s.gz = 0;
+    s.mx = mx;
+    s.my = my;
+    return s;
+}
+
+static void test_compass_correction_gives_heading_with_no_zero_offset(void)
+{
+    /* Hard iron (1000, -500) and a soft iron that doubles x: the corrected
+     * field for this raw reading points along +y -> 90 deg, straight from
+     * the field, with no stored "zero heading" anywhere. */
+    CalibrationData calib = calibration();
+    calib.mag_center[0] = 1000.0f;
+    calib.mag_center[1] = -500.0f;
+    calib.mag_soft[0] = 2.0f;
+    calib.mag_radius = 3000.0f;
+    calib.mag_calibrated = 1;
+    fusion_init(&calib);
+
+    imu_sample_t s = level_sample(1, 1000, 2500);
+    fusion_update_sample(&s);
+    FusionResult r;
+    fusion_get_result(&r);
+    assert(r.heading_valid);
+    assert(fabsf(r.heading - 90.0f) < 0.01f);
+    assert(fabsf(fusion_get_field_ratio() - 1.0f) < 0.01f);
+
+    /* Same raw reading with the x-offset undone: 45 deg after the 2x on x. */
+    fusion_init(&calib);
+    s = level_sample(1, 1000 + 1500, -500 + 3000);
+    fusion_update_sample(&s);
+    fusion_get_result(&r);
+    assert(fabsf(r.heading - 45.0f) < 0.01f);
+}
+
+static void test_uncalibrated_compass_reports_no_field_ratio(void)
+{
+    CalibrationData calib = calibration();
+    fusion_init(&calib);
+    imu_sample_t s = level_sample(1, 3000, 0);
+    fusion_update_sample(&s);
+    assert(fusion_get_field_ratio() == 0.0f);
+}
+
+static void test_new_calibration_takes_over_on_the_next_sample(void)
+{
+    CalibrationData calib = calibration();
+    fusion_init(&calib);
+    imu_sample_t s = level_sample(1, 3000, 0);
+    fusion_update_sample(&s);
+    FusionResult r;
+    fusion_get_result(&r);
+    assert(fabsf(r.heading - 0.0f) < 0.01f);
+
+    /* A calibration that moves the centre so the same raw reading now points
+     * along +y.  The heading must jump to it at once, not drift there over
+     * the complementary filter's seconds-long time constant. */
+    CalibrationData next = calib;
+    next.mag_center[0] = 3000.0f;
+    next.mag_center[1] = -3000.0f;
+    next.mag_radius = 3000.0f;
+    next.mag_calibrated = 1;
+    next.pitch_tare = 1.5f;
+    assert(fusion_set_calibration(&next));
+    assert(fusion_calibration_pending());
+    assert(!fusion_set_calibration(&next));        /* not taken yet */
+
+    s = level_sample(2, 3000, 0);
+    fusion_update_sample(&s);
+    assert(!fusion_calibration_pending());
+    fusion_get_result(&r);
+    assert(fabsf(r.heading - 90.0f) < 0.01f);
+    assert(fabsf(fusion_get_field_ratio() - 1.0f) < 0.01f);
+    assert(fusion_set_calibration(&next));         /* free again */
+    s = level_sample(3, 3000, 0);
+    fusion_update_sample(&s);
+}
+
 int main(void)
 {
     test_fusion_uses_sample_timestamp_and_ignores_mag_only_sample();
     test_positive_left_yaw_decreases_compass_heading_prediction();
     test_result_reader_observes_only_complete_fusion_generations();
+    test_compass_correction_gives_heading_with_no_zero_offset();
+    test_uncalibrated_compass_reports_no_field_ratio();
+    test_new_calibration_takes_over_on_the_next_sample();
     return 0;
 }

@@ -77,6 +77,15 @@
   #imu-card, #motor-card, #winch-card { overflow-y: auto; }
   .imu-vals { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; flex: 1; }
   .imu-val { background: var(--bg); border-radius: 6px; padding: 10px 6px; text-align: center; }
+  /* Compass + IMU calibration (runs at boot; this card only watches it). */
+  #ccal { margin-top: 8px; background: var(--bg); border-radius: 6px; padding: 8px; }
+  #ccal .ccal-head { display: flex; justify-content: space-between; align-items: center;
+                     font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  #ccal-badge { font-size: 10px; font-weight: 600; text-transform: none; letter-spacing: 0; }
+  #ccal .ccal-body { display: flex; gap: 10px; align-items: center; margin-top: 6px; }
+  #ccal-ring { flex: none; width: 64px; height: 64px; }
+  #ccal-step { font-size: 12px; color: var(--text); font-weight: 600; }
+  #ccal-detail { font-size: 10px; color: var(--dim); margin-top: 3px; line-height: 1.4; word-break: break-word; }
   .imu-label { font-size: 9px; letter-spacing: 1px; color: var(--dim); text-transform: uppercase; }
   .imu-num { font-size: 22px; font-weight: bold; color: var(--accent); margin-top: 4px; }
   .imu-unit { font-size: 9px; color: var(--dim); }
@@ -393,6 +402,16 @@
         <div class="imu-unit">deg/s · signed, direction not yet established</div>
       </div>
     </div>
+    <div id="ccal">
+      <div class="ccal-head"><span>Compass calibration</span><span id="ccal-badge">no data</span></div>
+      <div class="ccal-body">
+        <canvas id="ccal-ring" width="128" height="128"></canvas>
+        <div style="min-width:0;">
+          <div id="ccal-step">waiting for the boat…</div>
+          <div id="ccal-detail">To calibrate: power on while holding BOOT, keep the boat level and still, then spin it flat about two full circles.</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="card" id="tof-card">
@@ -513,10 +532,11 @@ message ServoPowerCommand { bool on = 1; }
 message SystemStatus { uint32 heap_free = 1; int32 wifi_rssi = 2; uint64 uptime_us = 3; bool camera_ok = 4; bool tof_a_ok = 5; bool tof_b_ok = 6; bool imu_ok = 7; bool mag_ok = 8; bool gps_ok = 9; uint32 gps_detected_baud = 16; bool gps_baud_confirmed = 17; }
 message CalibrateCommand { bool start = 1; bool average_into_existing = 2; }
 message CalibrateStatus { uint32 state = 1; uint32 level_index = 2; float level_throttle = 3; float trim_diff = 4; float yaw_avg_dps = 5; bool making_way = 6; uint32 points_done = 7; }
+message CompassCalStatus { uint32 state = 1; uint32 reason = 2; float still_progress = 3; uint32 coverage_mask = 4; float turn_deg = 5; float elapsed_s = 6; float axis_ratio = 7; float fit_rms = 8; float gyro_scale = 9; float gyro_dev_deg = 10; float radius = 11; bool calibrated = 12; float field_ratio = 13; float heading_deg = 14; }
 message AssistCommand { bool p_on = 1; uint32 request_id = 3; bool rudder_assist = 2; }
 message BenchCommand { uint32 kind = 1; float base = 2; float delta = 3; float reset_c = 4; bool abort = 5; }
 message BenchStatus { uint32 state = 1; uint32 kind = 2; float base = 3; uint32 samples = 4; uint32 file_index = 5; float elapsed_s = 6; float learn_c = 7; bool p_on = 8; float heading_target_deg = 9; float heading_error_deg = 10; float yaw_target_dps = 11; float p_term = 12; float i_term = 13; float dynamic_c = 14; float effective_c = 15; float c_limit = 16; bool ctrl_active = 17; bool heading_hold = 18; bool saturated = 19; }
-message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; BenchCommand bench = 15; BenchStatus bench_status = 16; AssistCommand assist = 17; SteerRateCommand steer_rate = 18; } }
+message BoatMessage { oneof payload { SensorSnapshot sensors = 1; MotorCommand motor = 2; SystemStatus status = 3; DetectCommand detect = 4; GpsCoordinate coord = 5; MotorStatus motor_status = 6; ArmCommand arm_cmd = 7; WinchCommand winch = 8; SteerCommand steer = 9; ServoPowerCommand servo_power = 10; SteerRawCommand steer_raw = 11; TrainingLogCommand training_log = 12; CalibrateCommand calibrate = 13; CalibrateStatus calibrate_status = 14; BenchCommand bench = 15; BenchStatus bench_status = 16; AssistCommand assist = 17; SteerRateCommand steer_rate = 18; CompassCalStatus compass_cal_status = 19; } }
 `;
 const root = protobuf.parse(protoSchema).root;
 const BoatMessage = root.lookupType('boat.BoatMessage');
@@ -1417,6 +1437,9 @@ function connectWS() {
       if (msg.calibrateStatus) {
         updateCalibrateStatus(msg.calibrateStatus);
       }
+      if (msg.compassCalStatus) {
+        updateCompassCal(msg.compassCalStatus);
+      }
     } catch (e) { console.error('[Proto]', `decode error: ${e.message}`); }
   };
 
@@ -2202,6 +2225,99 @@ function updateCalibrateButton() {
   // Enabled whenever armed + connected; the firmware makes the final call.
   btn.disabled = !(ws && ws.readyState === WebSocket.OPEN && motorArmed) && !calibrating;
 }
+
+// ── Compass + IMU calibration (read-only view) ─────────────────────────
+// The boat runs it at power-on (BOOT held, or nothing valid stored) and
+// streams CompassCalStatus over WiFi only. States/reasons mirror calibration.h.
+const CCAL_REASONS = {
+  1: 'never held still (60 s)', 2: 'gyro drift too large — was it moving?',
+  3: 'circle not finished in 3 min', 4: 'out of memory', 5: 'could not save to flash',
+  6: 'no IMU readings', 11: 'not enough compass readings',
+  12: 'readings do not form a circle', 13: 'field too squashed — metal too close',
+  14: 'readings too scattered', 15: 'field strength not Earth-like',
+  16: 'part of the circle missing', 17: 'compass turn disagrees with gyro',
+};
+let _ccalLast = 0, _ccalShownState = 0;
+
+function drawCcalRing(mask, active) {
+  const c = $('ccal-ring');
+  if (!c) return;
+  const g = c.getContext('2d');
+  const w = c.width, r = w * 0.42, cx = w / 2, cy = w / 2;
+  g.clearRect(0, 0, w, w);
+  g.lineWidth = w * 0.12;
+  for (let i = 0; i < 32; i++) {
+    const a0 = (i / 32) * 2 * Math.PI - Math.PI / 2, a1 = a0 + (2 * Math.PI / 32) * 0.82;
+    const on = ((mask >>> i) & 1) === 1;
+    g.strokeStyle = on ? (active ? '#00BFFF' : '#00FF99') : '#1A2A44';
+    g.beginPath(); g.arc(cx, cy, r, a0, a1); g.stroke();
+  }
+}
+
+function updateCompassCal(cc) {
+  _ccalLast = Date.now();
+  const state = cc.state || 0, badge = $('ccal-badge'), step = $('ccal-step'), det = $('ccal-detail');
+  const hdg = (cc.headingDeg != null && cc.headingDeg >= 0) ? `${cc.headingDeg.toFixed(1)}°` : '—';
+  const metrics = () => `squash ${(cc.axisRatio || 0).toFixed(2)} · spread ${((cc.fitRms || 0) * 100).toFixed(1)}% · `
+    + `gyro agree ${(cc.gyroScale || 0).toFixed(3)} · worst ${(cc.gyroDevDeg || 0).toFixed(1)}° · field ${Math.round(cc.radius || 0)}`;
+  badge.textContent = cc.calibrated ? 'calibrated' : 'NOT calibrated';
+  badge.style.color = cc.calibrated ? 'var(--green)' : 'var(--warn)';
+  step.style.color = 'var(--text)';
+  let mask = cc.coverageMask || 0, active = false;
+  if (state === 1) {
+    step.textContent = `Step 1/2 — hold still  ${Math.round((cc.stillProgress || 0) * 100)}%`;
+    det.textContent = 'Boat level, do not touch it. Starts counting once it is really still.';
+    mask = 0;
+  } else if (state === 2) {
+    active = true;
+    const n = mask.toString(2).split('1').length - 1;
+    step.textContent = 'Step 2/2 — spin the boat flat, slowly';
+    det.textContent = `about two full circles · turned ${Math.round(Math.abs(cc.turnDeg || 0))}° of 540° min · `
+      + `${n}/32 directions seen · ${Math.round(cc.elapsedS || 0)} s`;
+  } else if (state === 3) {
+    step.textContent = 'Checking…';
+    det.textContent = 'Fitting the circle and comparing it with the gyro.';
+  } else if (state === 4) {
+    step.textContent = 'PASS — saved and in use';
+    step.style.color = 'var(--green)';
+    det.textContent = `${metrics()} · heading ${hdg}`;
+  } else if (state === 5) {
+    step.textContent = `FAIL — ${CCAL_REASONS[cc.reason] || ('reason ' + cc.reason)}`;
+    step.style.color = 'var(--danger)';
+    det.textContent = 'Previous calibration kept. Power on again holding BOOT to retry.'
+      + (cc.radius ? ` (${metrics()})` : '');
+  } else {
+    const fr = cc.fieldRatio || 0;
+    if (!cc.calibrated) {
+      step.textContent = `Heading ${hdg} (uncorrected)`;
+      det.textContent = 'Power on while holding BOOT, keep it still, then spin it flat about two circles.';
+    } else if (fr > 0 && (fr < 0.85 || fr > 1.15)) {
+      step.textContent = `Heading ${hdg}`;
+      step.style.color = 'var(--warn)';
+      det.textContent = `Field is ${fr.toFixed(2)}× what it was at calibration — something magnetic moved near `
+        + 'the compass. Recalibrate (hold BOOT at power-on).';
+    } else {
+      step.textContent = `Heading ${hdg}`;
+      det.textContent = fr > 0 ? `field ${fr.toFixed(2)}× calibration (1.00 = unchanged)` : 'waiting for compass data';
+    }
+  }
+  drawCcalRing(mask, active);
+  // On wide screens this card has a fixed height and scrolls: bring the
+  // calibration into view once per step while one is running, never after,
+  // so it does not fight the operator's own scrolling.
+  if (state >= 1 && state <= 5 && state !== _ccalShownState) {
+    _ccalShownState = state;
+    const box = $('ccal');
+    if (box && box.scrollIntoView) box.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+setInterval(() => {
+  if (_ccalLast && Date.now() - _ccalLast > 3000) {
+    $('ccal-badge').textContent = 'no data';
+    $('ccal-badge').style.color = 'var(--dim)';
+  }
+}, 1000);
 
 function updateCalibrateStatus(cs) {
   const el = $('calibrate-status');

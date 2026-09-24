@@ -308,6 +308,18 @@ void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status)
     xSemaphoreGive(s_msg_mutex);
 }
 
+void pipeline_publish_compass_cal_status(const boat_CompassCalStatus *status)
+{
+    if (!s_msg_mutex || !status) return;
+
+    uint8_t buf[boat_CompassCalStatus_size + 16];
+    xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
+    s_msg.which_payload = boat_BoatMessage_compass_cal_status_tag;
+    s_msg.payload.compass_cal_status = *status;
+    fanout_locked(buf, sizeof(buf), "compass_cal_status");
+    xSemaphoreGive(s_msg_mutex);
+}
+
 void pipeline_handle_incoming(const uint8_t *buf, size_t len)
 {
     if (!s_rx_msg_mutex) return;

@@ -3,6 +3,7 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "math.h"
+#include "mag_cal.h"
 #include "sd_card.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -121,29 +122,50 @@ esp_err_t fs_sdcard_append(const char *path, const void *data, size_t len)
     return failed ? ESP_FAIL : ESP_OK;
 }
 
-void fs_save_calibration(const CalibrationData* calib) {
+bool fs_calibration_sane(const CalibrationData* calib) {
+    if (!calib || calib->magic_word != CALIB_MAGIC_WORD) return false;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(calib->g_bias[i]) || fabsf(calib->g_bias[i]) > 5000.0f) return false;
+    }
+    if (!isfinite(calib->pitch_tare) || fabsf(calib->pitch_tare) > 45.0f ||
+        !isfinite(calib->roll_tare) || fabsf(calib->roll_tare) > 45.0f) {
+        return false;
+    }
+    mag_cal_2d_t mag;
+    memcpy(mag.center, calib->mag_center, sizeof(mag.center));
+    memcpy(mag.soft, calib->mag_soft, sizeof(mag.soft));
+    mag.radius = calib->mag_radius;
+    if (!mag_cal_valid(&mag)) return false;
+    /* A PASSed compass calibration always carries a real field strength. */
+    if (calib->mag_calibrated > 1U) return false;
+    if (calib->mag_calibrated && !(calib->mag_radius >= MAG_CAL_RADIUS_MIN_LSB)) return false;
+    return true;
+}
+
+bool fs_save_calibration(const CalibrationData* calib) {
     nvs_handle_t my_handle;
     esp_err_t err;
 
-    ESP_LOGI(TAG,"\nSaving calibration to NVS...\n");
+    if (!fs_calibration_sane(calib)) {
+        ESP_LOGE(TAG, "Refusing to save a calibration that fails its own sanity check");
+        return false;
+    }
 
     err = nvs_open("storage", NVS_READWRITE, &my_handle);
     if (err != ESP_OK) {
-        ESP_LOGI(TAG,"Error (%s) opening NVS handle!\n", esp_err_to_name(err));
-        return;
+        ESP_LOGE(TAG, "Calibration save: cannot open NVS (%s)", esp_err_to_name(err));
+        return false;
     }
 
     err = nvs_set_blob(my_handle, "imu_cal", calib, sizeof(CalibrationData));
-    if (err != ESP_OK) {
-        ESP_LOGI(TAG,"Failed to write blob to NVS! (%s)\n", esp_err_to_name(err));
-    } else {
-        err = nvs_commit(my_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG,"Calibration data successfully saved to flash memory!\n");
-        }
-    }
-
+    if (err == ESP_OK) err = nvs_commit(my_handle);
     nvs_close(my_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Calibration save failed (%s)", esp_err_to_name(err));
+        return false;
+    }
+    ESP_LOGI(TAG, "Calibration saved to flash");
+    return true;
 }
 
 bool fs_load_calibration(CalibrationData* calib) {
@@ -182,27 +204,21 @@ bool fs_load_calibration(CalibrationData* calib) {
         return false;
     }
 
-    for (int i = 0; i < 3; i++) {
-        if (isnan(temp_cal.g_bias[i]) || isinf(temp_cal.g_bias[i])) { return false; }
-        if (isnan(temp_cal.m_bias[i]) || isinf(temp_cal.m_bias[i])) { return false; }
-
-        if (isnan(temp_cal.m_scale[i]) || isinf(temp_cal.m_scale[i]) ||
-           (temp_cal.m_scale[i] <= 0.05f) || (temp_cal.m_scale[i] > 20.0f)) {
-            ESP_LOGI(TAG,"CRITICAL: Corrupted Magnetometer scale factor detected! Forcing recalibration.\n");
-            return false;
-        }
+    if (!fs_calibration_sane(&temp_cal)) {
+        ESP_LOGW(TAG, "Stored calibration fails its sanity check. Forcing recalibration.");
+        return false;
     }
 
     *calib = temp_cal;
 
-    ESP_LOGI(TAG,"\n--- LOADED CALIBRATION FROM NVS ---\n");
-    ESP_LOGI(TAG,".g_bias = {%.2ff, %.2ff, %.2ff}\n", calib->g_bias[0], calib->g_bias[1], calib->g_bias[2]);
-    ESP_LOGI(TAG,".m_bias = {%.2ff, %.2ff, %.2ff}\n", calib->m_bias[0], calib->m_bias[1], calib->m_bias[2]);
-    ESP_LOGI(TAG,".m_scale = {%.4ff, %.4ff, %.4ff}\n", calib->m_scale[0], calib->m_scale[1], calib->m_scale[2]);
-    ESP_LOGI(TAG,".pitch_tare = %.2ff\n", calib->pitch_tare);
-    ESP_LOGI(TAG,".roll_tare = %.2ff\n", calib->roll_tare);
-    ESP_LOGI(TAG,".heading_tare = %.2ff\n", calib->heading_tare);
-    ESP_LOGI(TAG,"-----------------------------------\n");
+    ESP_LOGI(TAG, "Loaded calibration: gyro bias {%.1f, %.1f, %.1f}  level p=%.2f r=%.2f",
+             calib->g_bias[0], calib->g_bias[1], calib->g_bias[2],
+             calib->pitch_tare, calib->roll_tare);
+    ESP_LOGI(TAG, "  compass %s: centre {%.0f, %.0f}  soft {%.4f %.4f; %.4f %.4f}  radius %.0f",
+             calib->mag_calibrated ? "calibrated" : "NOT calibrated",
+             calib->mag_center[0], calib->mag_center[1],
+             calib->mag_soft[0], calib->mag_soft[1], calib->mag_soft[2], calib->mag_soft[3],
+             calib->mag_radius);
 
     return true;
 }

@@ -32,17 +32,22 @@ extern volatile bool g_field_mode;
 #define DEG_TO_RAD          0.01745329251f
 #endif
 
-#define CALIB_MAGIC_WORD    0xCA11BEEF
+/* v2 (2026-09-24): flat compass calibration.  A new value, not just a new
+ * size, so an old record can never be read as this one. */
+#define CALIB_MAGIC_WORD    0xCA11B002
 
 // Calibration Data Structure (Strictly packed for NVS safety)
 typedef struct __attribute__((packed)) {
     uint32_t magic_word;
-    float g_bias[3];
-    float m_bias[3];
-    float m_scale[3];
-    float pitch_tare;
+    float g_bias[3];        /* gyro drift, raw counts */
+    float pitch_tare;       /* level reference, deg */
     float roll_tare;
-    float heading_tare;
+    /* Compass: corrected = soft * (raw_xy - center), heading = atan2(y, x).
+     * No heading offset: north comes from the magnetic field itself. */
+    float mag_center[2];    /* hard iron, raw counts */
+    float mag_soft[4];      /* soft iron, row-major 2x2 */
+    float mag_radius;       /* corrected field strength, raw counts; 0 = never calibrated */
+    uint32_t mag_calibrated;/* 1 once a compass calibration has PASSED */
 } CalibrationData;
 
 #endif // COMMON_H

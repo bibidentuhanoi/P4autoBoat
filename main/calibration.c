@@ -1,528 +1,285 @@
 #include "calibration.h"
-#include "esp_timer.h"
+
+#include <math.h>
+#include <stdatomic.h>
+#include <string.h>
+
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "math.h"
-#include "sdkconfig.h"
+
 #include "drivers/status_led.h"
+#include "file_system.h"
+#include "mag_cal.h"
+#include "pipeline.h"
+#include "runtime_task.h"
+#include "sensor_fusion.h"
+#include "sensor_task.h"
 
-static const char* TAG = "CALIB";
+static const char *TAG = "CALIB";
 
-// ============================================================
-// DYNAMIC CALIBRATION THRESHOLDS
-// Tune these for your environment if needed
-// ============================================================
+/* Step 1: hold still.  Samples arrive at the 50 Hz IMU rate. */
+#define STILL_WINDOW          50        /* ~1 s per stillness decision */
+#define STILL_COLLECT         150       /* ~3 s of still samples averaged */
+#define STILL_ACCEL_STD_MAX   90.0f     /* counts at +/-2 g (~5.5 mg) */
+#define STILL_GYRO_STD_MAX    65.0f     /* counts at 131/dps (0.5 deg/s) */
+#define STILL_TIMEOUT_US      (60LL * 1000000LL)
+#define GYRO_BIAS_SANITY_MAX  2000.0f   /* counts; larger = moved, or a bad IMU */
 
-// Phase 1: Gyro/Level
-#define STILLNESS_ACCEL_VARIANCE_THRESHOLD  8000.0f   // LSB^2 — max variance to be considered "still"
-#define STILLNESS_WINDOW_SAMPLES            50        // samples to measure variance over
-#define STILLNESS_TIMEOUT_MS                10000     // give up waiting for stillness after this
-#define GYRO_BIAS_SANITY_MAX                2000.0f   // LSB — if bias > this, sensor was likely disturbed
+/* Step 2: spin. */
+#define SPIN_TIMEOUT_US       (180LL * 1000000LL)
+#define SPIN_CAPACITY         4000      /* samples kept; thinned beyond that */
 
-// Phase 2: Mag figure-8
-#define MAG_MIN_DURATION_MS                 8000      // never stop before this even if converged
-#define MAG_MAX_DURATION_MS                 60000     // give up and save best data after this
-#define MAG_CONVERGENCE_WINDOW_MS           4000      // no new min/max in this window = converged
-#define MAG_MIN_AXIS_RANGE_LSB              400       // minimum per-axis chord to accept as covered
-#define MAG_SCALE_SANITY_MIN                0.3f      // scale factor below this = bad calibration
-#define MAG_SCALE_SANITY_MAX                3.0f      // scale factor above this = bad calibration
+#define POLL_MS               10
+#define PUBLISH_RUN_US        200000LL  /* 5 Hz while calibrating */
+#define PUBLISH_IDLE_US       1000000LL /* 1 Hz afterwards */
 
-// Phase 3: Alignment
-#define ALIGN_STABILITY_SAMPLES             100
-#define ALIGN_STABILITY_MAX_STDDEV          5.0f      // degrees — heading must be this stable to accept
+static CalibrationData *s_live;
+static bool s_run_now;
+static atomic_bool s_active;
+static boat_CompassCalStatus s_status;   /* owned by the CompassCal task */
 
-
-// ============================================================
-// INTERNAL TYPES
-// ============================================================
-
-typedef struct {
-    int   score;
-    bool  gyro_ok;
-    bool  mag_coverage_ok;
-    bool  mag_scale_ok;
-    bool  align_ok;
-    float mag_chord[3];
-    float gyro_bias_magnitude;
-} CalibQuality;
-
-
-// ============================================================
-// HELPERS
-// ============================================================
-
-static float compute_variance(float* arr, int n) {
-    if (n <= 1) return 0.0f;
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) { sum += arr[i]; }
-    float mean = sum / n;
-    float var  = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float d = arr[i] - mean;
-        var += d * d;
-    }
-    return var / n;
+bool compass_cal_active(void)
+{
+    return atomic_load_explicit(&s_active, memory_order_acquire);
 }
 
-/* Solve the 4x4 linear system A x = b in place (Gaussian elimination + partial
- * pivot). Returns false if singular. Used by the magnetometer sphere fit. */
-static bool solve4(double A[4][4], double b[4], double x[4]) {
-    for (int col = 0; col < 4; col++) {
-        int piv = col;
-        for (int r = col + 1; r < 4; r++)
-            if (fabs(A[r][col]) > fabs(A[piv][col])) piv = r;
-        if (fabs(A[piv][col]) < 1e-9) return false;
-        if (piv != col) {
-            for (int c = 0; c < 4; c++) { double t = A[col][c]; A[col][c] = A[piv][c]; A[piv][c] = t; }
-            double t = b[col]; b[col] = b[piv]; b[piv] = t;
-        }
-        for (int r = 0; r < 4; r++) {
-            if (r == col) continue;
-            double f = A[r][col] / A[col][col];
-            for (int c = col; c < 4; c++) A[r][c] -= f * A[col][c];
-            b[r] -= f * b[col];
-        }
+static void publish(void)
+{
+    s_status.calibrated = s_live && s_live->mag_calibrated;
+    s_status.field_ratio = fusion_get_field_ratio();
+    FusionResult r;
+    fusion_get_result(&r);
+    s_status.heading_deg = r.heading_valid ? r.heading : -1.0f;
+    /* WiFi only: over ESP-NOW an unknown message would go out labelled as
+     * sensor telemetry, on a link that is already short of bandwidth. */
+    if (!g_field_mode) pipeline_publish_compass_cal_status(&s_status);
+}
+
+static void enter(compass_cal_state_t state)
+{
+    s_status.state = state;
+    s_status.elapsed_s = 0.0f;
+}
+
+static bool next_sample(uint32_t *last_seq, imu_sample_t *out)
+{
+    sample_snapshot_t *snap = sensor_imu_sample_snapshot();
+    if (!snap || !sample_snapshot_read(snap, out) || out->sequence == *last_seq) {
+        return false;
     }
-    for (int i = 0; i < 4; i++) x[i] = b[i] / A[i][i];
+    *last_seq = out->sequence;
     return true;
 }
 
-static void countdown(int seconds) {
-    for (int i = seconds; i > 0; i--) {
-        ESP_LOGI(TAG, "%d...", i);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+static void fail(compass_cal_reason_t reason)
+{
+    enter(COMPASS_CAL_FAIL);
+    s_status.reason = reason;
+    status_led_set(STATUS_LED_CAL_DONE_FAIL);
+    ESP_LOGW(TAG, "Calibration FAILED (reason %d) -- previous calibration kept",
+             (int)reason);
 }
 
-static void print_quality_report(const CalibQuality* q) {
-    ESP_LOGI(TAG, " ");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "   CALIBRATION QUALITY REPORT");
-    ESP_LOGI(TAG, "================================================");
-    ESP_LOGI(TAG, "Overall Score: %d / 100", q->score);
-    ESP_LOGI(TAG, " ");
+/* ---- Step 1 ---- */
 
-    // Gyro
-    if (q->gyro_ok) {
-        ESP_LOGI(TAG, "[GYRO BIAS]  OK  (magnitude: %.1f LSB)", q->gyro_bias_magnitude);
-    } else {
-        ESP_LOGW(TAG, "[GYRO BIAS]  WARNING - HIGH BIAS  (magnitude: %.1f LSB)", q->gyro_bias_magnitude);
-        ESP_LOGW(TAG, "  >> Board may not have been still during Phase 1.");
-        ESP_LOGW(TAG, "  >> Check for vibration or nearby magnetic interference.");
-    }
+static bool hold_still(float gyro_bias[3], float accel_mean[3])
+{
+    enter(COMPASS_CAL_STILL);
+    status_led_set(STATUS_LED_CAL_STILL);
+    ESP_LOGI(TAG, "Step 1: HOLD STILL -- set the boat level and do not touch it");
 
-    // Mag coverage
-    if (q->mag_coverage_ok) {
-        ESP_LOGI(TAG, "[MAG AXES]   OK");
-    } else {
-        ESP_LOGW(TAG, "[MAG AXES]   WARNING - POOR AXIS COVERAGE");
-        ESP_LOGW(TAG, "  >> Next time, tilt the sensor MORE aggressively in all directions.");
-    }
-    ESP_LOGI(TAG, "  >> Chord  X: %d  Y: %d  Z: %d  LSB  (min needed: %d)",
-             (int)q->mag_chord[0], (int)q->mag_chord[1], (int)q->mag_chord[2],
-             MAG_MIN_AXIS_RANGE_LSB);
-
-    // Mag scale
-    if (q->mag_scale_ok) {
-        ESP_LOGI(TAG, "[MAG SCALE]  OK");
-    } else {
-        ESP_LOGW(TAG, "[MAG SCALE]  WARNING - EXTREME SCALE FACTORS DETECTED");
-        ESP_LOGW(TAG, "  >> Severe magnetic distortion near sensor.");
-        ESP_LOGW(TAG, "  >> Check for nearby ferromagnetic objects or high-current cables.");
-    }
-
-    // Alignment
-    if (q->align_ok) {
-        ESP_LOGI(TAG, "[ALIGNMENT]  OK");
-    } else {
-        ESP_LOGW(TAG, "[ALIGNMENT]  WARNING - HEADING WAS UNSTABLE");
-        ESP_LOGW(TAG, "  >> Sensor may have moved during Phase 3. Zero reference may be off.");
-    }
-
-    ESP_LOGI(TAG, "================================================");
-
-    if (q->score < 60) {
-        ESP_LOGW(TAG, ">>> RESULT: Score below 60. Please recalibrate before trusting output.");
-    } else if (q->score < 80) {
-        ESP_LOGI(TAG, ">>> RESULT: Acceptable. For best results, recalibrate in final mounted position.");
-    } else {
-        ESP_LOGI(TAG, ">>> RESULT: Good calibration. You're ready to go!");
-    }
-    ESP_LOGI(TAG, "================================================");
-}
-
-
-// ============================================================
-// PHASE 1: GYRO & LEVEL
-// ============================================================
-
-static bool phase1_gyro_level(CalibrationData* out, CalibQuality* quality) {
-    status_led_set(STATUS_LED_CAL_STILL);   // LED solid: hold flat & still
-    ESP_LOGI(TAG, " ");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "   PHASE 1: GYRO & LEVEL");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "Place the board FLAT and STATIONARY on a level surface.");
-    ESP_LOGI(TAG, "Waiting for stillness...");
-
-    // --- Wait for the board to actually be still before sampling ---
-    float   az_window[STILLNESS_WINDOW_SAMPLES];
-    bool    is_still        = false;
-    int64_t stillness_start = esp_timer_get_time();
-
-    while (!is_still) {
-        for (int i = 0; i < STILLNESS_WINDOW_SAMPLES; i++) {
-            int16_t ax, ay, az, gx, gy, gz;
-            if (imu_read_accel_gyro(&ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
-                az_window[i] = (float)az;
-            }
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-
-        float   var     = compute_variance(az_window, STILLNESS_WINDOW_SAMPLES);
-        int64_t elapsed = (esp_timer_get_time() - stillness_start) / 1000;
-
-        if (var < STILLNESS_ACCEL_VARIANCE_THRESHOLD) {
-            is_still = true;
-            ESP_LOGI(TAG, ">> Board is STILL! (variance: %.1f)  Starting measurement...", var);
-        } else {
-            ESP_LOGW(TAG, "   Still moving... (variance: %.1f)  Put it down and hold still!  [%lldms elapsed]",
-                     var, elapsed);
-        }
-
-        if (elapsed > STILLNESS_TIMEOUT_MS) {
-            ESP_LOGW(TAG, "!! Timeout waiting for stillness. Proceeding with best available data.");
-            is_still = true;
-        }
-    }
-
-    // --- Sample gyro and accel ---
-    long g_sum[3] = {0};
-    long a_sum[3] = {0};
-    int  samples  = CONFIG_CALIB_GYRO_SAMPLES;
-    int  valid    = 0;
-
-    for (int i = 0; i < samples; i++) {
-        int16_t ax, ay, az, gx, gy, gz;
-        if (imu_read_accel_gyro(&ax, &ay, &az, &gx, &gy, &gz) == ESP_OK) {
-            a_sum[0] += ax; a_sum[1] += ay; a_sum[2] += az;
-            g_sum[0] += gx; g_sum[1] += gy; g_sum[2] += gz;
+    mag_still_t still;
+    mag_still_init(&still, STILL_WINDOW, STILL_COLLECT,
+                   STILL_ACCEL_STD_MAX, STILL_GYRO_STD_MAX);
+    uint32_t seq = 0;
+    int valid = 0;
+    int64_t t0 = esp_timer_get_time(), last_pub = 0;
+    for (;;) {
+        imu_sample_t s;
+        while (next_sample(&seq, &s)) {
+            if (!s.accel_gyro_valid) continue;
             valid++;
+            int16_t a[3] = {s.ax, s.ay, s.az};
+            int16_t g[3] = {s.gx, s.gy, s.gz};
+            mag_still_add(&still, a, g);
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        int64_t now = esp_timer_get_time();
+        s_status.still_progress = mag_still_progress(&still);
+        s_status.elapsed_s = (float)(now - t0) / 1e6f;
+        if (still.state == MAG_STILL_DONE) break;
+        if (now - t0 > STILL_TIMEOUT_US) {
+            fail(valid ? COMPASS_CAL_REASON_STILL_TIMEOUT : COMPASS_CAL_REASON_NO_IMU);
+            return false;
+        }
+        if (now - last_pub >= PUBLISH_RUN_US) { publish(); last_pub = now; }
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
 
-    if (valid == 0) {
-        ESP_LOGE(TAG, "!! ERROR: No valid IMU readings in Phase 1! Check I2C connection.");
+    mag_still_result(&still, gyro_bias, accel_mean);
+    float mag = sqrtf(gyro_bias[0] * gyro_bias[0] + gyro_bias[1] * gyro_bias[1] +
+                      gyro_bias[2] * gyro_bias[2]);
+    ESP_LOGI(TAG, "  still: gyro bias {%.1f, %.1f, %.1f} counts (|%.1f|)",
+             gyro_bias[0], gyro_bias[1], gyro_bias[2], mag);
+    if (!(mag < GYRO_BIAS_SANITY_MAX)) {
+        fail(COMPASS_CAL_REASON_GYRO_BIAS);
+        return false;
+    }
+    return true;
+}
+
+/* ---- Step 2 + 3 ---- */
+
+static bool spin_and_fit(const float gyro_bias[3], mag_fit_t *fit)
+{
+    size_t bytes = SPIN_CAPACITY * sizeof(float);
+    float *bx = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    float *by = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    float *bt = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!bx || !by || !bt) {
+        heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+        fail(COMPASS_CAL_REASON_NO_MEMORY);
         return false;
     }
 
-    out->g_bias[0] = (float)g_sum[0] / valid;
-    out->g_bias[1] = (float)g_sum[1] / valid;
-    out->g_bias[2] = (float)g_sum[2] / valid;
+    enter(COMPASS_CAL_SPIN);
+    s_status.still_progress = 1.0f;
+    status_led_set(STATUS_LED_CAL_MOVE);
+    ESP_LOGI(TAG, "Step 2: SPIN -- turn the boat slowly, flat, about two full circles");
 
-    float ax_avg = (float)a_sum[0] / valid;
-    float ay_avg = (float)a_sum[1] / valid;
-    float az_avg = (float)a_sum[2] / valid;
-
-    float acc_denom = sqrtf(ay_avg * ay_avg + az_avg * az_avg);
-    if (acc_denom < 0.0001f) { acc_denom = 0.0001f; }
-
-    out->roll_tare  = atan2f(ay_avg, az_avg)     * RAD_TO_DEG;
-    out->pitch_tare = atan2f(-ax_avg, acc_denom) * RAD_TO_DEG;
-
-    // --- Quality assessment ---
-    float bias_mag = sqrtf(out->g_bias[0] * out->g_bias[0] +
-                           out->g_bias[1] * out->g_bias[1] +
-                           out->g_bias[2] * out->g_bias[2]);
-
-    quality->gyro_bias_magnitude = bias_mag;
-    quality->gyro_ok = (bias_mag < GYRO_BIAS_SANITY_MAX);
-
-    ESP_LOGI(TAG, ">> Gyro Bias:  X=%.1f  Y=%.1f  Z=%.1f  LSB  (magnitude: %.1f)",
-             out->g_bias[0], out->g_bias[1], out->g_bias[2], bias_mag);
-    ESP_LOGI(TAG, ">> Level Tare: Pitch=%.2f deg  Roll=%.2f deg",
-             out->pitch_tare, out->roll_tare);
-
-    if (!quality->gyro_ok) {
-        ESP_LOGW(TAG, "!! Gyro bias magnitude is HIGH (%.1f LSB). Was the board really still?", bias_mag);
-    } else {
-        ESP_LOGI(TAG, ">> Phase 1 complete!");
+    mag_circle_t circle;
+    mag_circle_init(&circle, bx, by, bt, SPIN_CAPACITY);
+    uint32_t seq = 0;
+    uint64_t last_us = 0;
+    int64_t t0 = esp_timer_get_time(), last_pub = 0;
+    bool complete = false;
+    for (;;) {
+        imu_sample_t s;
+        while (next_sample(&seq, &s)) {
+            if (!s.accel_gyro_valid) continue;
+            float dt = (last_us && s.captured_us > last_us)
+                     ? (float)(s.captured_us - last_us) / 1e6f : 0.0f;
+            last_us = s.captured_us;
+            float rate = FUSION_YAW_GYRO_SIGN * ((float)s.gz - gyro_bias[2]) /
+                         FUSION_GYRO_COUNTS_PER_DPS;
+            mag_circle_add(&circle,
+                           s.mag_valid ? (float)s.mx : NAN,
+                           s.mag_valid ? (float)s.my : NAN, rate, dt);
+        }
+        int64_t now = esp_timer_get_time();
+        s_status.turn_deg = circle.turn_deg;
+        s_status.elapsed_s = (float)(now - t0) / 1e6f;
+        if (now - last_pub >= PUBLISH_RUN_US) {
+            s_status.coverage_mask = mag_circle_live_mask(&circle);
+            publish();
+            last_pub = now;
+        }
+        if (mag_circle_complete(&circle)) { complete = true; break; }
+        if (now - t0 > SPIN_TIMEOUT_US) break;
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
     }
+    s_status.coverage_mask = mag_circle_live_mask(&circle);
 
-    return true;
-}
-
-
-// ============================================================
-// PHASE 2: MAG FIGURE-8
-// ============================================================
-
-static bool phase2_mag(CalibrationData* out, CalibQuality* quality) {
-    status_led_set(STATUS_LED_CAL_MOVE);    // LED blips: pick up & figure-8
-    ESP_LOGI(TAG, " ");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "   PHASE 2: COMPASS FIGURE-8");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "Pick up the board and rotate it in a Figure-8.");
-    ESP_LOGI(TAG, "IMPORTANT: Tilt in ALL directions -- not just flat spinning!");
-    ESP_LOGI(TAG, "The routine stops automatically once your data is good.");
-    ESP_LOGI(TAG, "Max time: %d seconds.", MAG_MAX_DURATION_MS / 1000);
-
-    countdown(3);
-    ESP_LOGI(TAG, ">> GO!  Keep moving!");
-
-    int16_t m_min[3] = { 30000,  30000,  30000};
-    int16_t m_max[3] = {-30000, -30000, -30000};
-
-    /* Least-squares sphere-fit accumulators. Doubles: samples ~1e4, summed over
-     * thousands of points => ~1e11, well within double precision. */
-    double Sx=0, Sy=0, Sz=0, Sxx=0, Syy=0, Szz=0, Sxy=0, Sxz=0, Syz=0;
-    double Sxw=0, Syw=0, Szw=0, Sw=0;
-    long   Nfit=0;
-
-    int64_t start_time       = esp_timer_get_time();
-    int64_t last_update_time = start_time;
-    int64_t last_print_time  = start_time;
-    int     total_samples    = 0;
-    bool    converged        = false;
-
-    while (true) {
-        int64_t now_us          = esp_timer_get_time();
-        int64_t elapsed_ms      = (now_us - start_time)       / 1000;
-        int64_t since_update_ms = (now_us - last_update_time) / 1000;
-
-        bool min_time_met   = (elapsed_ms      >= MAG_MIN_DURATION_MS);
-        bool max_time_hit   = (elapsed_ms      >= MAG_MAX_DURATION_MS);
-        bool data_converged = (since_update_ms >= MAG_CONVERGENCE_WINDOW_MS);
-
-        if (max_time_hit) {
-            ESP_LOGW(TAG, ">> Max time reached. Saving best data collected.");
-            break;
-        }
-        if (min_time_met && data_converged) {
-            converged = true;
-            ESP_LOGI(TAG, ">> Data converged! No new extremes in %.1f s.  Done!",
-                     MAG_CONVERGENCE_WINDOW_MS / 1000.0f);
-            break;
-        }
-
-        // --- Read mag ---
-        int16_t mx, my, mz;
-        bool updated = false;
-        if (imu_read_mag(&mx, &my, &mz) == ESP_OK) {
-            total_samples++;
-            /* Feed the sphere fit (uses every sample, not just the extremes). */
-            double x=mx, y=my, z=mz, w=x*x + y*y + z*z;
-            Sx+=x; Sy+=y; Sz+=z;
-            Sxx+=x*x; Syy+=y*y; Szz+=z*z; Sxy+=x*y; Sxz+=x*z; Syz+=y*z;
-            Sxw+=x*w; Syw+=y*w; Szw+=z*w; Sw+=w; Nfit++;
-            if (mx < m_min[0]) { m_min[0] = mx; updated = true; }
-            if (mx > m_max[0]) { m_max[0] = mx; updated = true; }
-            if (my < m_min[1]) { m_min[1] = my; updated = true; }
-            if (my > m_max[1]) { m_max[1] = my; updated = true; }
-            if (mz < m_min[2]) { m_min[2] = mz; updated = true; }
-            if (mz > m_max[2]) { m_max[2] = mz; updated = true; }
-            if (updated) { last_update_time = now_us; }
-        }
-
-        // --- Live status every second ---
-        if ((now_us - last_print_time) >= 1000000) {
-            last_print_time = now_us;
-
-            int chord_x = m_max[0] - m_min[0];
-            int chord_y = m_max[1] - m_min[1];
-            int chord_z = m_max[2] - m_min[2];
-
-            // Uppercase = axis well covered, lowercase = still needs work
-            char cov_x = (chord_x >= MAG_MIN_AXIS_RANGE_LSB) ? 'X' : 'x';
-            char cov_y = (chord_y >= MAG_MIN_AXIS_RANGE_LSB) ? 'Y' : 'y';
-            char cov_z = (chord_z >= MAG_MIN_AXIS_RANGE_LSB) ? 'Z' : 'z';
-
-            int stable_sec   = (int)(since_update_ms / 1000);
-            int min_sec_left = (int)((MAG_MIN_DURATION_MS - elapsed_ms) / 1000);
-            if (min_sec_left < 0) { min_sec_left = 0; }
-
-            if (min_sec_left > 0) {
-                ESP_LOGI(TAG, "  t=%llds | Axes [%c%c%c] | Range X:%d Y:%d Z:%d | Min time left: %ds",
-                         elapsed_ms / 1000, cov_x, cov_y, cov_z,
-                         chord_x, chord_y, chord_z, min_sec_left);
-            } else {
-                ESP_LOGI(TAG, "  t=%llds | Axes [%c%c%c] | Range X:%d Y:%d Z:%d | Stable for: %ds / %.0fs",
-                         elapsed_ms / 1000, cov_x, cov_y, cov_z,
-                         chord_x, chord_y, chord_z,
-                         stable_sec, MAG_CONVERGENCE_WINDOW_MS / 1000.0f);
-            }
-
-            // Targeted hints for whichever axes still need coverage
-            if (chord_x < MAG_MIN_AXIS_RANGE_LSB) { ESP_LOGW(TAG, "  >> Tilt LEFT and RIGHT more!"); }
-            if (chord_y < MAG_MIN_AXIS_RANGE_LSB) { ESP_LOGW(TAG, "  >> Tilt FORWARD and BACK more!"); }
-            if (chord_z < MAG_MIN_AXIS_RANGE_LSB) { ESP_LOGW(TAG, "  >> Tilt UPSIDE-DOWN and back!"); }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-
-    // --- Robust centre (bias) via least-squares SPHERE FIT over ALL samples ---
-    // Min/max trusts only the 6 extreme points, so one noisy sweep => wrong centre
-    // (the "heading sticks then jumps" saga). A sphere fit uses every sample and is
-    // stable even with poor Z-tilt coverage (validated: cx,cy within ~1 LSB). The
-    // field on this boat is a clean sphere (no soft-iron), so the model is centre +
-    // unit scale; per-axis m_scale stays 1.0. Min/max is kept as a fallback only.
-    quality->mag_chord[0] = (float)(m_max[0] - m_min[0]);
-    quality->mag_chord[1] = (float)(m_max[1] - m_min[1]);
-    quality->mag_chord[2] = (float)(m_max[2] - m_min[2]);
-
-    bool sphere_ok = false;
-    if (Nfit >= 20) {
-        double A[4][4] = { {Sxx,Sxy,Sxz,Sx}, {Sxy,Syy,Syz,Sy},
-                           {Sxz,Syz,Szz,Sz}, {Sx ,Sy ,Sz ,(double)Nfit} };
-        double b[4] = { Sxw, Syw, Szw, Sw };
-        double s[4];
-        if (solve4(A, b, s)) {
-            float cx = (float)(s[0] * 0.5), cy = (float)(s[1] * 0.5), cz = (float)(s[2] * 0.5);
-            double r2 = s[3] + (double)cx*cx + (double)cy*cy + (double)cz*cz;
-            /* Sane only if the centre sits inside the sampled cloud and R>0. */
-            if (r2 > 1.0 &&
-                cx > m_min[0] - 1 && cx < m_max[0] + 1 &&
-                cy > m_min[1] - 1 && cy < m_max[1] + 1) {
-                out->m_bias[0] = cx; out->m_bias[1] = cy; out->m_bias[2] = cz;
-                out->m_scale[0] = out->m_scale[1] = out->m_scale[2] = 1.0f;
-                sphere_ok = true;
-                ESP_LOGI(TAG, ">> Sphere fit OK: centre=(%.0f,%.0f,%.0f) R=%.0f  (%ld pts)",
-                         cx, cy, cz, sqrt(r2), Nfit);
-            }
-        }
-    }
-    if (!sphere_ok) {
-        ESP_LOGW(TAG, ">> Sphere fit rejected (thin/degenerate data) — using min/max centre");
-        out->m_bias[0] = (m_max[0] + m_min[0]) / 2.0f;
-        out->m_bias[1] = (m_max[1] + m_min[1]) / 2.0f;
-        out->m_bias[2] = (m_max[2] + m_min[2]) / 2.0f;
-        out->m_scale[0] = out->m_scale[1] = out->m_scale[2] = 1.0f;
-    }
-
-    bool coverage_ok = (quality->mag_chord[0] >= MAG_MIN_AXIS_RANGE_LSB) &&
-                       (quality->mag_chord[1] >= MAG_MIN_AXIS_RANGE_LSB) &&
-                       (quality->mag_chord[2] >= MAG_MIN_AXIS_RANGE_LSB);
-
-    quality->mag_coverage_ok = coverage_ok;
-    quality->mag_scale_ok    = sphere_ok;   /* robust fit succeeded (vs min/max fallback) */
-
-    ESP_LOGI(TAG, ">> Mag Bias:    X=%.1f  Y=%.1f  Z=%.1f",
-             out->m_bias[0], out->m_bias[1], out->m_bias[2]);
-    ESP_LOGI(TAG, ">> Mag Scale:   X=%.4f  Y=%.4f  Z=%.4f",
-             out->m_scale[0], out->m_scale[1], out->m_scale[2]);
-    ESP_LOGI(TAG, ">> Samples: %d | Converged: %s",
-             total_samples, converged ? "YES" : "NO (max time hit)");
-
-    return true;
-}
-
-
-// ============================================================
-// PHASE 3: ALIGNMENT
-// ============================================================
-
-static bool phase3_alignment(CalibrationData* out, CalibQuality* quality) {
-    status_led_set(STATUS_LED_CAL_POINT);   // LED slow blink: point at bow & hold
-    ESP_LOGI(TAG, " ");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "   PHASE 3: ALIGNMENT (Set Zero Heading)");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "Point the sensor exactly FORWARD (toward the bow).");
-    ESP_LOGI(TAG, "Hold it PERFECTLY STILL. This sets your zero reference.");
-
-    countdown(5);
-    ESP_LOGI(TAG, ">> Capturing heading reference...");
-
-    float headings[ALIGN_STABILITY_SAMPLES];
-    int   valid = 0;
-
-    for (int i = 0; i < ALIGN_STABILITY_SAMPLES; i++) {
-        int16_t mx, my, mz;
-        if (imu_read_mag(&mx, &my, &mz) == ESP_OK) {
-            float mx_cal = ((float)mx - out->m_bias[0]) * out->m_scale[0];
-            float my_cal = ((float)my - out->m_bias[1]) * out->m_scale[1];
-
-            float h = atan2f(my_cal, mx_cal) * RAD_TO_DEG;
-            if (h < 0.0f) { h += 360.0f; }
-            headings[valid++] = h;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-
-    if (valid == 0) {
-        ESP_LOGE(TAG, "!! ERROR: No valid mag readings in Phase 3! Check I2C connection.");
-        quality->align_ok = false;
+    if (!complete) {
+        ESP_LOGW(TAG, "  spin: not completed (%d samples, %.0f deg turned, %d/32 slices)",
+                 circle.n, circle.turn_deg, __builtin_popcount(s_status.coverage_mask));
+        heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+        fail(COMPASS_CAL_REASON_SPIN_TIMEOUT);
         return false;
     }
 
-    // Mean heading via sin/cos averaging — handles 0/360 wraparound correctly
-    float sin_sum = 0.0f, cos_sum = 0.0f;
-    for (int i = 0; i < valid; i++) {
-        sin_sum += sinf(headings[i] * DEG_TO_RAD);
-        cos_sum += cosf(headings[i] * DEG_TO_RAD);
+    enter(COMPASS_CAL_CHECKING);
+    publish();
+    mag_cal_verdict_t v = mag_cal_fit_and_judge(bx, by, bt, circle.n, fit);
+    heap_caps_free(bx); heap_caps_free(by); heap_caps_free(bt);
+
+    s_status.axis_ratio = fit->axis_ratio;
+    s_status.fit_rms = fit->rms;
+    s_status.gyro_scale = fit->gyro_scale;
+    s_status.gyro_dev_deg = fit->gyro_dev_deg;
+    s_status.radius = fit->cal.radius;
+    s_status.coverage_mask = fit->mask;
+    ESP_LOGI(TAG, "  fit: %s -- centre {%.0f, %.0f} radius %.0f ratio %.3f rms %.4f "
+                  "slices %d/32 gyro scale %.3f worst dev %.2f deg (%d samples)",
+             mag_cal_verdict_text(v), fit->cal.center[0], fit->cal.center[1],
+             fit->cal.radius, fit->axis_ratio, fit->rms, fit->bins,
+             fit->gyro_scale, fit->gyro_dev_deg, circle.n);
+    if (v != MAG_CAL_PASS) {
+        fail((compass_cal_reason_t)(COMPASS_CAL_REASON_FIT_BASE + (int)v));
+        return false;
     }
-
-    float ref_heading = atan2f(sin_sum / valid, cos_sum / valid) * RAD_TO_DEG;
-    if (ref_heading < 0.0f) { ref_heading += 360.0f; }
-
-    // Circular std dev — true stability measure for angular data
-    float R           = sqrtf((sin_sum / valid) * (sin_sum / valid) +
-                              (cos_sum / valid) * (cos_sum / valid));
-    float circ_stddev = (R > 0.0001f) ? sqrtf(-2.0f * logf(R)) * RAD_TO_DEG : 999.0f;
-
-    ESP_LOGI(TAG, ">> Zero Reference Heading: %.2f deg", ref_heading);
-    ESP_LOGI(TAG, ">> Heading Stability (std dev): %.2f deg  (max allowed: %.1f deg)",
-             circ_stddev, ALIGN_STABILITY_MAX_STDDEV);
-
-    quality->align_ok = (circ_stddev <= ALIGN_STABILITY_MAX_STDDEV);
-
-    if (!quality->align_ok) {
-        ESP_LOGW(TAG, "!! Heading was not stable during capture. Did the sensor move?");
-        ESP_LOGW(TAG, "   Saving best reference anyway, but consider redoing Phase 3.");
-    } else {
-        ESP_LOGI(TAG, ">> Phase 3 complete! Zero heading locked in.");
-    }
-
-    out->heading_tare = ref_heading;
     return true;
 }
 
+static void run_calibration(void)
+{
+    float gyro_bias[3], accel[3];
+    mag_fit_t fit;
+    if (!hold_still(gyro_bias, accel) || !spin_and_fit(gyro_bias, &fit)) return;
 
-// ============================================================
-// PUBLIC ENTRY POINT
-// ============================================================
+    CalibrationData next = *s_live;
+    next.magic_word = CALIB_MAGIC_WORD;
+    memcpy(next.g_bias, gyro_bias, sizeof(next.g_bias));
+    next.roll_tare = atan2f(accel[1], accel[2]) * RAD_TO_DEG;
+    next.pitch_tare = atan2f(-accel[0], sqrtf(accel[1] * accel[1] + accel[2] * accel[2])) *
+                      RAD_TO_DEG;
+    memcpy(next.mag_center, fit.cal.center, sizeof(next.mag_center));
+    memcpy(next.mag_soft, fit.cal.soft, sizeof(next.mag_soft));
+    next.mag_radius = fit.cal.radius;
+    next.mag_calibrated = 1;
 
-void perform_calibration_routine(CalibrationData* output_calib) {
-    ESP_LOGI(TAG, " ");
-    ESP_LOGI(TAG, "################################################");
-    ESP_LOGI(TAG, "   ENTERING CALIBRATION MODE");
-    ESP_LOGI(TAG, "   (Data-driven -- stops when quality is met)");
-    ESP_LOGI(TAG, "################################################");
+    /* Saved first: a calibration that would vanish at the next power-on is
+     * not applied either, so what runs always matches what is stored. */
+    if (!fs_save_calibration(&next)) {
+        fail(COMPASS_CAL_REASON_SAVE_FAILED);
+        return;
+    }
+    int tries = 0;
+    while (!fusion_set_calibration(&next) && ++tries < 200) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+    }
+    if (tries >= 200) {
+        ESP_LOGE(TAG, "Fusion did not take the new calibration; it applies after reboot");
+    }
+    *s_live = next;
 
-    CalibQuality quality = {0};
+    enter(COMPASS_CAL_PASS);
+    s_status.reason = COMPASS_CAL_REASON_NONE;
+    status_led_set(STATUS_LED_CAL_DONE_OK);
+    ESP_LOGI(TAG, "Calibration PASSED -- saved and in use (level p=%.2f r=%.2f)",
+             next.pitch_tare, next.roll_tare);
+}
 
-    bool ok1 = phase1_gyro_level(output_calib, &quality);
-    bool ok2 = phase2_mag(output_calib, &quality);
-    bool ok3 = phase3_alignment(output_calib, &quality);
+static void task_compass_cal(void *arg)
+{
+    (void)arg;
+    if (s_run_now) {
+        run_calibration();
+        atomic_store_explicit(&s_active, false, memory_order_release);
+    }
+    /* Stay alive: the runtime metrics keep this task's handle, and the
+     * dashboard needs the calibration's health after a reboot too. */
+    for (;;) {
+        publish();
+        vTaskDelay(pdMS_TO_TICKS(PUBLISH_IDLE_US / 1000));
+    }
+}
 
-    // --- Score ---
-    int score = 100;
-    if (!ok1 || !quality.gyro_ok)  { score -= 20; }
-    if (!ok2)                       { score -= 40; }
-    if (!quality.mag_coverage_ok)  { score -= 20; }
-    if (!quality.mag_scale_ok)     { score -= 15; }
-    if (!ok3 || !quality.align_ok) { score -= 15; }
-    if (score < 0) { score = 0; }
-
-    quality.score = score;
-
-    // LED verdict (auto-returns to OFF after the flash): steady triple = good,
-    // rapid flutter = redo. 60 mirrors print_quality_report's "recalibrate" line.
-    status_led_set(score >= 60 ? STATUS_LED_CAL_DONE_OK : STATUS_LED_CAL_DONE_FAIL);
-
-    print_quality_report(&quality);
+esp_err_t compass_cal_start(CalibrationData *live, bool run_now)
+{
+    if (!live) return ESP_ERR_INVALID_ARG;
+    s_live = live;
+    s_run_now = run_now;
+    s_status = (boat_CompassCalStatus)boat_CompassCalStatus_init_zero;
+    s_status.state = COMPASS_CAL_IDLE;
+    /* Lock arming before the task even exists. */
+    atomic_store_explicit(&s_active, run_now, memory_order_release);
+    esp_err_t err = runtime_task_create(RUNTIME_TASK_COMPASS_CAL, task_compass_cal,
+                                        NULL, NULL);
+    if (err != ESP_OK) {
+        atomic_store_explicit(&s_active, false, memory_order_release);
+    }
+    return err;
 }

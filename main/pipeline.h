@@ -137,3 +137,10 @@ void pipeline_publish_bench_status(const boat_BenchStatus *status);
  *        Called from the control task while a calibration sweep runs.
  */
 void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
+
+/**
+ * @brief Encode a CompassCalStatus and fan out to all transports.  Callers
+ *        must only use this on the WiFi link: in ESP-NOW field mode an
+ *        unrecognised message would be sent labelled as sensor telemetry.
+ */
+void pipeline_publish_compass_cal_status(const boat_CompassCalStatus *status);

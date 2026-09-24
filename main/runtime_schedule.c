@@ -30,6 +30,9 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
     [RUNTIME_TASK_DIAGNOSTICS] = {"Diagnostics", 4096, 2, 1, 1000000, 0, false},
     [RUNTIME_TASK_TRAINING_LOG] = {"TrainingLog", 8192, 2, 1, 0, 0, false},
     [RUNTIME_TASK_STATUS_LED] = {"StatusLED", 2048, 2, 1, 0, 0, false},
+    /* Compass/IMU calibration at boot, then a 1 Hz health report. Low
+     * priority: it only reads the shared sensor snapshot, never the bus. */
+    [RUNTIME_TASK_COMPASS_CAL] = {"CompassCal", 6144, 2, 1, 0, 0, false},
 };
 
 const runtime_task_spec_t *runtime_schedule_get(runtime_task_id_t id)

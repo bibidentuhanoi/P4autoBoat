@@ -11,7 +11,7 @@
  * published yaw_rate reflects gz / 131.0 and sequence advances. */
 int main(void)
 {
-    static CalibrationData calib = { .m_scale = {1, 1, 1} };
+    static CalibrationData calib = { .mag_soft = {1, 0, 0, 1} };
     fusion_init(&calib);
 
     imu_sample_t s = {0};

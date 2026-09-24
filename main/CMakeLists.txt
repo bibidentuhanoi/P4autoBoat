@@ -22,6 +22,7 @@ idf_component_register(
         "yaw_heading_control.c"
         "stability_control.c"
         "calibration.c"
+        "mag_cal.c"
         "drivers/imu_driver.c"
         "drivers/tof_driver.c"
         "drivers/camera_driver.c"

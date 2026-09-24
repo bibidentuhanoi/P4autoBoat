@@ -8,21 +8,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 STUB_HEADERS = {
-    "common.h": r"""
-#pragma once
-#include <stdint.h>
-typedef struct {
-    uint32_t magic_word;
-    float g_bias[3];
-    float m_bias[3];
-    float m_scale[3];
-    float pitch_tare;
-    float roll_tare;
-    float heading_tare;
-} CalibrationData;
-#define RAD_TO_DEG 57.2957795131f
-#define DEG_TO_RAD 0.01745329251f
-""",
+    # The REAL main/include/common.h is used (it only needs esp_err.h), so
+    # the calibration layout under test can never drift from the firmware's.
+    "esp_err.h": "#pragma once\ntypedef int esp_err_t;\n",
     "sdkconfig.h": r"""
 #pragma once
 #define CONFIG_FUSION_COMPLEMENTARY_ALPHA "0.96"
@@ -94,9 +82,10 @@ class FusionYawRateTest(unittest.TestCase):
                 [
                     os.environ.get("CC", "cc"),
                     "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
-                    "-I", str(tmpdir), "-I", str(ROOT / "main"),
+                    "-I", str(tmpdir), "-I", str(ROOT / "main"), "-I", str(ROOT / "main" / "include"),
                     str(ROOT / "main" / "sample_snapshot.c"),
                     str(ROOT / "main" / "sensor_fusion.c"),
+                    str(ROOT / "main" / "mag_cal.c"),
                     str(ROOT / "tests" / "test_fusion_yaw_rate.c"),
                     str(tmpdir / "stubs.c"), "-lm", "-o", str(binary),
                 ],

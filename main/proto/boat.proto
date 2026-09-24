@@ -202,6 +202,26 @@ message CalibrateStatus {
   uint32 points_done    = 7;
 }
 
+// Compass + IMU calibration (hold still, then spin the boat flat), and the
+// live health of the calibration in use.  Published only on the WiFi link:
+// ~5 Hz while a calibration runs, 1 Hz otherwise.  Enums are in calibration.h.
+message CompassCalStatus {
+  uint32 state          = 1;   // 0 idle, 1 hold still, 2 spin, 3 checking, 4 pass, 5 fail
+  uint32 reason         = 2;   // why it failed (0 = none)
+  float  still_progress = 3;   // 0..1
+  uint32 coverage_mask  = 4;   // 32 slices of the circle seen so far
+  float  turn_deg       = 5;   // gyro-measured rotation so far
+  float  elapsed_s      = 6;   // time in the current step
+  float  axis_ratio     = 7;   // ellipse long/short axis
+  float  fit_rms        = 8;   // spread around the circle, fraction
+  float  gyro_scale     = 9;   // compass turn / gyro turn
+  float  gyro_dev_deg   = 10;  // worst compass-vs-gyro heading disagreement
+  float  radius         = 11;  // corrected field strength, raw counts
+  bool   calibrated     = 12;  // a PASSed compass calibration is in use
+  float  field_ratio    = 13;  // live field / field at calibration (1.0 = healthy)
+  float  heading_deg    = 14;  // live fused heading
+}
+
 // Runtime switch for the temporary proportional yaw assist. Runtime, not
 // compile-time, so the A and B arms of an experiment run the SAME firmware --
 // a rebuild between arms would let a build difference look like a result.
@@ -295,5 +315,6 @@ message BoatMessage {
     BenchStatus    bench_status = 16;
     AssistCommand  assist       = 17;
     SteerRateCommand steer_rate = 18;
+    CompassCalStatus compass_cal_status = 19;
   }
 }

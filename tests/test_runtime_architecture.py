@@ -178,6 +178,7 @@ bool imu_mag_ok(void);
 typedef struct { float pitch; float roll; float heading; float yaw_rate; uint32_t sequence; uint64_t captured_us; } FusionResult;
 void fusion_get_result(FusionResult *result);
 """,
+    "calibration.h": "#pragma once\n#include <stdbool.h>\nbool compass_cal_active(void);\n",
     "transports/ws_transport.h": "#pragma once\nint ws_transport_client_count(void);\n",
     "pipeline.h": r"""
 #pragma once
@@ -252,6 +253,7 @@ HARNESS = r"""
 #include <setjmp.h>
 #include <string.h>
 #include "motor_control.h"
+#include "arm_sequence.h"
 #include "pipeline.h"
 #include "runtime_task.h"
 #include "runtime_metrics.h"
@@ -291,6 +293,7 @@ static float winch_speed;
 static float steer_value = 1.0f;
 static bool servo_power;
 static bool gps_lock;
+static bool compass_cal_running;
 static esc_state_t esc_state = ESC_STATE_DISARMED;
 static TaskFunction_t control_fn;
 static TaskFunction_t arm_sequence_fn;
@@ -375,6 +378,7 @@ esp_err_t gps_driver_get_fix(gps_fix_t *fix) { (void)fix; return ESP_OK; }
 bool imu_icm_ok(void) { return false; }
 bool imu_mag_ok(void) { return false; }
 void fusion_get_result(FusionResult *result) { (void)result; }
+bool compass_cal_active(void) { return compass_cal_running; }
 int ws_transport_client_count(void) { return 1; }
 int64_t esp_timer_get_time(void) { return now_us; }
 esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *out) { (void)args; *out = (void *)1; return ESP_OK; }
@@ -693,6 +697,52 @@ int main(void) {
     assert(observed_arm_wait == pdMS_TO_TICKS(3000));
     assert(arm_begin_calls == 2 && arm_complete_calls == 1 && disarm_calls == 2);
 
+    /* Compass/IMU calibration running (the boat is being held or spun by
+     * hand): an arm step reaching the control task must not start the ESCs,
+     * must stop one already arming, and must send the sequence to DISARM. */
+    {
+        /* Baseline first: after a real ARM request, with the link alive and
+         * no calibration, the very same BEGIN does start arming -- so the
+         * refusal below is caused by the calibration and nothing else. */
+        now_us += 1000;
+        esc_state = ESC_STATE_DISARMED;
+        motor_handler(&(boat_MotorCommand){0});
+        arm_handler(true, true);
+        run_one_control_cycle();
+        test_queues[0].count = test_queues[0].head = test_queues[0].tail = 0;
+        unsigned begins = arm_begin_calls, completes = arm_complete_calls;
+        arm_action_t act = ARM_ACTION_BEGIN;
+        assert(queue_push(&test_queues[1], &act, false) == pdTRUE);
+        run_one_control_cycle();
+        assert(arm_begin_calls == begins + 1 && esc_state == ESC_STATE_ARMING);
+
+        compass_cal_running = true;
+        esc_state = ESC_STATE_DISARMED;
+        motor_handler(&(boat_MotorCommand){0});
+        arm_handler(true, true);
+        run_one_control_cycle();
+        test_queues[0].count = test_queues[0].head = test_queues[0].tail = 0;
+        begins = arm_begin_calls;
+        act = ARM_ACTION_BEGIN;
+        assert(queue_push(&test_queues[1], &act, false) == pdTRUE);
+        run_one_control_cycle();
+        assert(arm_begin_calls == begins && esc_state == ESC_STATE_DISARMED);
+        assert(test_queues[0].count == 1);          /* DISARM requested */
+
+        test_queues[0].count = test_queues[0].head = test_queues[0].tail = 0;
+        esc_state = ESC_STATE_ARMING;
+        unsigned disarms = disarm_calls;
+        act = ARM_ACTION_COMPLETE;
+        assert(queue_push(&test_queues[1], &act, false) == pdTRUE);
+        run_one_control_cycle();
+        assert(arm_complete_calls == completes);
+        assert(disarm_calls == disarms + 1 && esc_state == ESC_STATE_DISARMED);
+        assert(test_queues[0].count == 1);
+
+        test_queues[0].count = test_queues[0].head = test_queues[0].tail = 0;
+        compass_cal_running = false;
+    }
+
     esc_state = ESC_STATE_ARMED;
     servo_power = true;
     runtime_task_failure = RUNTIME_TASK_ARM_SEQUENCE;
@@ -992,6 +1042,8 @@ typedef struct { uint32_t kind; float base; float delta; float reset_c;
 typedef struct { bool p_on; bool rudder_assist; uint32_t request_id; } boat_AssistCommand;
 typedef struct { float target_dps; } boat_SteerRateCommand;
 #define boat_BoatMessage_steer_rate_tag 18
+typedef struct { uint32_t state; uint32_t reason; float still_progress; uint32_t coverage_mask; float turn_deg; float elapsed_s; float axis_ratio; float fit_rms; float gyro_scale; float gyro_dev_deg; float radius; bool calibrated; float field_ratio; float heading_deg; } boat_CompassCalStatus;
+#define boat_BoatMessage_compass_cal_status_tag 19
 typedef struct {
     int which_payload;
     union {
@@ -1010,6 +1062,7 @@ typedef struct {
         boat_BenchCommand bench;
         boat_BenchStatus bench_status;
         boat_AssistCommand assist;
+        boat_CompassCalStatus compass_cal_status;
     } payload;
 } boat_BoatMessage;
 #define boat_BoatMessage_motor_tag 1
@@ -1036,6 +1089,7 @@ typedef struct {
 #define boat_MotorStatus_size 56
 #define boat_CalibrateStatus_size 35
 #define boat_BenchStatus_size 91
+#define boat_CompassCalStatus_size 70
 #define boat_BoatMessage_fields NULL
 typedef esp_err_t (*transport_send_fn)(const uint8_t *, size_t, void *);
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
