@@ -26,6 +26,9 @@ class MissionBase(LakeBase):
         link._mission_req_seq = 0
         link.mission_status = T.BoatLink._blank_mission_status()
         link.mission_dir = self.tmp
+        link._mission_open = None
+        link._mission_open_answer_by = None
+        link._mission_stop_until = None
         self.frames = []
 
         def _write(payload):
@@ -215,10 +218,58 @@ class StopTest(MissionBase):
         self.assertTrue(self.missions() and self.missions()[0].stop)
         self.assertTrue(any(k == 'arm_cmd' for k in self.kinds()))
 
-    def test_stop_without_a_mission_is_exactly_the_old_stop(self):
+    def test_a_plain_stop_sends_one_mission_stop_and_never_disarms(self):
+        """No mission known: the zeros, then ONE MissionCommand.stop -- what
+        reaches a mission this tool lost track of, ignored by a boat with none
+        -- and no DISARM, no repeats (a plain STOP stays a plain STOP)."""
         self.link.stop(3)
-        self.assertNotIn('mission', self.kinds())
-        self.assertNotIn('arm_cmd', self.kinds())
+        self.assertEqual(self.kinds(), ['motor', 'steer', 'winch', 'mission'])
+        self.assertTrue(self.missions()[0].stop and not self.missions()[0].start)
+        for _ in range(10):
+            self.tick()
+        self.assertEqual(self.kinds(), ['motor', 'steer', 'winch', 'mission'])
+
+    def test_stop_still_reaches_a_start_that_was_never_answered(self):
+        """The boat took START but none of its reports arrive: the tool gives
+        the run up as no_answer -- and the boat is still flying it."""
+        rid = self.start()
+        for _ in range(int(T.MISSION_START_ANSWER_S * 15) + 3):
+            self.tick()
+        self.assertEqual(self.finished()['status'], 'no_answer')
+        self.frames.clear()
+        ok, err = self.link.stop(5)
+        self.assertTrue(ok, err)
+        self.assertTrue(self.missions()[0].stop)
+        arm = [m for k, m in self.frames if k == 'arm_cmd']
+        self.assertTrue(arm and not arm[0].arm)                  # DISARM as the backup
+        for _ in range(10):
+            self.tick()
+        self.assertGreaterEqual(len(self.missions()), 11)        # every tick, unconfirmed
+        # the boat's report gets through at last: that run is over
+        self.boat(run_id=3, request_id=rid, state=6, reason=10)
+        n = len(self.missions())
+        for _ in range(10):
+            self.tick()
+        self.assertEqual(len(self.missions()), n)                # confirmed: quiet
+        self.frames.clear()
+        self.link.stop(6)                                        # STOP is plain again
+        self.assertEqual(self.kinds(), ['motor', 'steer', 'winch', 'mission'])
+
+    def test_a_start_the_boat_never_took_closes_on_its_next_idle_report(self):
+        rid = self.start()
+        # inside the answer window an idle report proves nothing: START may be in flight
+        self.boat(run_id=2, request_id=rid - 1, state=5, reason=1)
+        self.assertEqual(self.link._mission_open, rid)
+        for _ in range(int(T.MISSION_START_ANSWER_S * 15) + 3):
+            self.tick()
+        self.finished()
+        self.assertEqual(self.link._mission_open, rid)           # no answer: still open
+        # after it, the boat alive and idle on an older run: it never took ours
+        self.boat(run_id=2, request_id=rid - 1, state=5, reason=1)
+        self.assertIsNone(self.link._mission_open)
+        self.frames.clear()
+        self.link.stop(5)
+        self.assertEqual(self.kinds(), ['motor', 'steer', 'winch', 'mission'])   # no DISARM
 
     def test_an_unconfirmed_stop_is_reported(self):
         rid = self.start()

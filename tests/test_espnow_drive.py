@@ -607,9 +607,10 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.link.stop(1)
 
         self.assertEqual(self.link.winch_speed, 0.0)
-        msg = self.messages()[-1]
-        self.assertEqual(msg.WhichOneof('payload'), 'winch')
-        self.assertEqual(msg.winch.speed, 0.0)
+        # in STOP's own frames (the one MissionCommand.stop comes after it)
+        winch = [m for m in self.messages() if m.WhichOneof('payload') == 'winch']
+        self.assertEqual(len(winch), 1)
+        self.assertEqual(winch[0].winch.speed, 0.0)
 
     def test_page_has_momentary_winch_and_explicit_servo_rail_controls(self):
         self.assertIn('id="servo-on-btn"', espnow_drive.PAGE)

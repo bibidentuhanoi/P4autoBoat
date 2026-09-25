@@ -79,6 +79,12 @@ class StopStaysMainCompatibleTest(unittest.TestCase):
     def _kinds(self):
         return [m.WhichOneof('payload') for m in self.sent]
 
+    def _assert_one_mission_stop(self, index):
+        """Every STOP carries one MissionCommand.stop (for a mission the tool
+        lost track of; both mains drop it -- test_stop_main_compat.py)."""
+        m = self.sent[index].mission
+        self.assertTrue(m.stop and not m.start)
+
     def test_the_abort_field_stays_in_the_a_b_schema_but_is_never_sent(self):
         f = self.link.pb2.BenchCommand.DESCRIPTOR.fields_by_name.get('abort')
         self.assertIsNotNone(f, 'BenchCommand.abort missing from the pb2 -- '
@@ -89,7 +95,8 @@ class StopStaysMainCompatibleTest(unittest.TestCase):
     def test_stop_sends_its_zeros_and_no_bench_message(self):
         ok, err = self.link.stop(1)
         self.assertTrue(ok, err)
-        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch'])
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'mission'])
+        self._assert_one_mission_stop(3)
         m = self.sent[0]
         self.assertEqual((m.motor.left, m.motor.right), (0.0, 0.0))
         self.assertEqual((self.sent[1].steer.left, self.sent[1].steer.right), (0.0, 0.0))
@@ -108,8 +115,9 @@ class StopStaysMainCompatibleTest(unittest.TestCase):
                                       last_rx_monotonic=__import__('time').monotonic())
         ok, err = self.link.stop(1)
         self.assertTrue(ok, err)
-        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'arm_cmd'])
-        self.assertFalse(self.sent[3].arm_cmd.arm)
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'mission', 'arm_cmd'])
+        self._assert_one_mission_stop(3)
+        self.assertFalse(self.sent[4].arm_cmd.arm)
         self.assertFalse(self.link.armed_cmd)
 
     def test_stop_disarms_a_bench_just_requested(self):
@@ -118,7 +126,8 @@ class StopStaysMainCompatibleTest(unittest.TestCase):
         self.sent.clear()
         ok, err = self.link.stop(2)
         self.assertTrue(ok, err)
-        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'arm_cmd'])
+        self.assertEqual(self._kinds(), ['motor', 'steer', 'winch', 'mission', 'arm_cmd'])
+        self._assert_one_mission_stop(3)
         self.assertFalse(self.link.armed_cmd)
 
     def test_starting_a_run_never_sets_abort(self):

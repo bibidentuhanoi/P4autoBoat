@@ -2245,6 +2245,13 @@ class BoatLink:
         self._mission_req_seq = 0
         self.mission_status = self._blank_mission_status()
         self.mission_dir = MISSION_DIR
+        # The last START this tool sent whose END the boat has not reported
+        # (request id, and when its answer window closed).  It outlives the
+        # local run: a boat that took START but whose reports never arrive is
+        # still flying, and STOP must treat it as live.
+        self._mission_open = None
+        self._mission_open_answer_by = None
+        self._mission_stop_until = None   # STOP repeats with no local run
         self._last_send_mono = None       # stamped by _stream_send_locked
         # Fill the next-order cache ONCE here, at startup on the main thread
         # with no lock held, so every status path (HTTP poll and the WebSocket
@@ -2614,10 +2621,12 @@ class BoatLink:
         stop every firmware version honours for it is DISARM, so that case
         disarms.
 
-        A MISSION the boat is flying is the other exception: it flies through
-        radio loss by design, so zeros do not stop it. STOP sends
-        MissionCommand.stop -- again every tick until the boat reports the run
-        over (MISSION_STOP_RETRY_S at most) -- and DISARMs as the backup.
+        A MISSION is the other exception: it flies through radio loss by
+        design, so zeros do not stop it. Every STOP sends one
+        MissionCommand.stop (harmless with no mission -- _mission_stop_locked);
+        when a mission may be live (ours, one the boat reports, or a START the
+        boat never reported ended) it repeats every tick until the boat reports
+        the run over (MISSION_STOP_RETRY_S at most) and DISARMs as the backup.
 
         STOP never puts a BenchCommand on the wire. The boat runs main
         9543ed1, whose BenchCommand has no `abort` field and whose pipeline
@@ -2649,7 +2658,9 @@ class BoatLink:
             ]
             if was_calibrating:
                 self._send_calibrate_locked(False)   # re-arm the firmware start latch
-            if self._mission_stop_locked():
+            mission_live, mission_ok = self._mission_stop_locked()
+            writes_ok.append(mission_ok)
+            if mission_live:
                 # MissionCommand.stop is out (and repeats every tick until the
                 # boat confirms); DISARM backs it up -- a mission flies through
                 # radio loss by design, so the zeros alone do not stop it.
@@ -4328,6 +4339,15 @@ class BoatLink:
         ms = getattr(self, 'mission_status', None) or {}
         return bool(ms.get('have') and ms.get('state') in MISSION_ACTIVE_STATES)
 
+    def _mission_may_be_live_locked(self):
+        """A mission this tool is running, one the boat reports running, or a
+        START of ours the boat never reported ending (no answer, or reports
+        lost): each may be flying, so STOP repeats MissionCommand.stop and
+        DISARMs as the backup."""
+        return (getattr(self, 'mission', None) is not None
+                or self._mission_boat_running_locked()
+                or getattr(self, '_mission_open', None) is not None)
+
     def _mission_refusal_locked(self):
         if not self.connected:
             return 'serial link is disconnected'
@@ -4415,6 +4435,9 @@ class BoatLink:
                 }
                 self._mission_writer = writer
                 self.mission_result = None
+                self._mission_open = self.mission['request_id']
+                self._mission_open_answer_by = now + MISSION_START_ANSWER_S
+                self._mission_stop_until = None
                 # Presence only from here on. The stream keeps sending the
                 # zeros the boat's manual path needs -- a zero is never input;
                 # a non-zero stick is, and ends the mission on the boat.
@@ -4427,23 +4450,42 @@ class BoatLink:
         return False, why
 
     def _mission_stop_locked(self):
-        """Part of the universal STOP: MissionCommand.stop now and every tick
-        until the boat confirms (or MISSION_STOP_RETRY_S), then DISARM as the
-        backup (returns whether a mission was believed live)."""
+        """Part of the universal STOP.  MissionCommand.stop goes out on EVERY
+        STOP, believed live or not: it is the one thing that stops a mission
+        this tool lost track of (START never answered, the boat's reports
+        lost, the tool restarted), and it is harmless otherwise -- the mission
+        firmware ignores a stop with no run live (auto_drive_step, mission_step)
+        and older firmware logs an unhandled message and drops it.  When a
+        mission may be live it repeats every tick until the boat confirms
+        (MISSION_STOP_RETRY_S at most) and the caller DISARMs as the backup.
+        Returns (may_be_live, write_ok)."""
         m = getattr(self, 'mission', None)
-        live = m is not None or self._mission_boat_running_locked()
+        live = self._mission_may_be_live_locked()
+        ok = self._send_mission_locked(stop=True)
         if not live:
-            return False
-        self._send_mission_locked(stop=True)
+            return False, ok
         if m is not None:
             m['stop_until'] = self._now() + MISSION_STOP_RETRY_S
             m['stop_sent'] += 1
             self._mission_event_locked('stop_sent', 'STOP pressed')
-        return True
+        else:
+            self._mission_stop_until = self._now() + MISSION_STOP_RETRY_S
+            print('[mission] STOP: no local run, but a mission may be flying '
+                  '(%s) -- MissionCommand.stop repeats until the boat reports it over'
+                  % ('the boat reports one' if self._mission_boat_running_locked()
+                     else 'START %s was never reported ended' % getattr(self, '_mission_open', None)),
+                  flush=True)
+        return True, ok
 
     def _mission_tick_locked(self, now):
         """15 Hz, from the stream loop: repeat START until answered, STOP until
         confirmed; give up on a boat that never answers."""
+        until = getattr(self, '_mission_stop_until', None)
+        if until is not None:                      # a STOP with no local run
+            if now <= until and self._mission_may_be_live_locked():
+                self._send_mission_locked(stop=True)
+            else:
+                self._mission_stop_until = None
         m = getattr(self, 'mission', None)
         if m is None or m['finalizing']:
             return
@@ -4498,6 +4540,7 @@ class BoatLink:
                 'return_start_n_m': float(ms.return_start_n_m),
             }
             self.mission_status = st
+            self._mission_resolve_open_locked(st, now)
             m = getattr(self, 'mission', None)
             if m is None or m['finalizing']:
                 return
@@ -4517,6 +4560,21 @@ class BoatLink:
                 m['stop_until'] = None
                 status = {5: 'done', 6: 'aborted', 7: 'refused'}[st['state']]
                 self._finish_mission_locked(status, st['reason_text'])
+
+    def _mission_resolve_open_locked(self, st, now):
+        """Close the open START once the boat shows it is not flying it: it
+        reported that request ENDED (done / aborted / refused), or -- after the
+        answer window -- it reports another request with nothing running, so
+        it never took ours (a reboot reports request 0, idle: also over)."""
+        rid = getattr(self, '_mission_open', None)
+        if rid is None:
+            return
+        if st['request_id'] == rid:
+            if st['state'] in MISSION_TERMINAL_STATES:
+                self._mission_open = None
+        elif (st['state'] not in MISSION_ACTIVE_STATES
+              and now >= (getattr(self, '_mission_open_answer_by', None) or 0.0)):
+            self._mission_open = None
 
     def _mission_progress_locked(self, st, now):
         """The laptop's no-progress warning -- never a stop (Kiet: no time

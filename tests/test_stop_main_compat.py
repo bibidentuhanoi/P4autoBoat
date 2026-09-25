@@ -1,20 +1,25 @@
 """STOP must be understood by the firmware the boat is actually running.
 
-The P4 runs main 9543ed1. Its BenchCommand has no `abort` field, and a
+The boat runs MAIN (c8a4c5e): the working firmware, the one every change is
+checked against.  The same frames are also checked against the older main
+9543ed1, which is stricter: its BenchCommand has no `abort` field, and a
 BoatMessage carrying a bench payload -- even an empty one -- is dispatched by
-main's pipeline as a bench START with kind=0/base=0; bench_start() clamps a
+its pipeline as a bench START with kind=0/base=0; bench_start() clamps a
 zero base rather than refusing it. A STOP that put BenchCommand.abort on the
 wire would therefore, on that firmware, start a 3 s zero-throttle BASE run:
 boat busy, junk SD and laptop files, sticks ignored.
 
-So ordinary and lake-test STOP send exactly what 9543ed1 understands -- motor
+So ordinary and lake-test STOP send exactly what both understand -- motor
 zeros, centred steer, winch zero, immediately -- and a bench the tool believes
 is running or was just requested is stopped by DISARM, which every firmware
-version honours.
+version honours.  Every STOP also carries one MissionCommand.stop (the mission
+firmware's; it reaches a mission the tool lost track of): neither main has
+such a field, both decode an empty message and their pipelines drop it
+("Unhandled message type") -- checked frame by frame and in their source.
 
-The 9543ed1 schema is taken from git at test time and loaded into a private
-descriptor pool, so these tests decode the frames exactly as THAT firmware
-reads them.
+Each firmware's schema is taken from git at test time and loaded into a
+private descriptor pool, so these tests decode the frames exactly as THAT
+firmware reads them.
 """
 
 import ast
@@ -28,38 +33,69 @@ from pathlib import Path
 from google.protobuf import descriptor_pool, message_factory
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN_COMMIT = '9543ed1'          # what is flashed on the P4
+MAIN_COMMIT = 'c8a4c5e'          # main: the working firmware on the boat
+OLDER_MAIN_COMMIT = '9543ed1'    # the older main, no BenchCommand.abort
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_lake_id import LakeBase, T            # noqa: E402
 
 
-def _main_schema_pool():
-    r = subprocess.run(['git', '-C', str(ROOT), 'show', MAIN_COMMIT + ':proto/boat_pb2.py'],
+def _git_show(commit, path):
+    r = subprocess.run(['git', '-C', str(ROOT), 'show', '%s:%s' % (commit, path)],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise AssertionError('cannot read %s:proto/boat_pb2.py from git: %s' % (MAIN_COMMIT, r.stderr))
-    m = re.search(r"AddSerializedFile\((b'(?:[^'\\]|\\.)*')\)", r.stdout)
+        raise AssertionError('cannot read %s:%s from git: %s' % (commit, path, r.stderr))
+    return r.stdout
+
+
+def _schema_pool(commit):
+    src = _git_show(commit, 'proto/boat_pb2.py')
+    m = re.search(r"AddSerializedFile\((b'(?:[^'\\]|\\.)*')\)", src)
     if not m:
-        raise AssertionError('serialized descriptor not found in the %s boat_pb2.py' % MAIN_COMMIT)
+        raise AssertionError('serialized descriptor not found in the %s boat_pb2.py' % commit)
     pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(ast.literal_eval(m.group(1)))
     return pool
 
 
-MAIN_POOL = _main_schema_pool()
-MainBoatMessage = message_factory.GetMessageClass(MAIN_POOL.FindMessageTypeByName('boat.BoatMessage'))
+POOLS = {c: _schema_pool(c) for c in (MAIN_COMMIT, OLDER_MAIN_COMMIT)}
+MESSAGES = {c: message_factory.GetMessageClass(pool.FindMessageTypeByName('boat.BoatMessage'))
+            for c, pool in POOLS.items()}
 
 
-def as_main_firmware(payload):
-    """Decode one wire payload the way main 9543ed1 does."""
-    m = MainBoatMessage()
+def as_firmware(payload, commit):
+    """Decode one wire payload the way that firmware does."""
+    m = MESSAGES[commit]()
     m.ParseFromString(payload)
     return m
 
 
+class FirmwareSchemaTest(unittest.TestCase):
+    """Sanity for the proof itself: the pools really are those firmwares'."""
+
+    def test_only_the_older_main_lacks_bench_abort(self):
+        older = POOLS[OLDER_MAIN_COMMIT].FindMessageTypeByName('boat.BenchCommand')
+        self.assertNotIn('abort', older.fields_by_name)
+        main = POOLS[MAIN_COMMIT].FindMessageTypeByName('boat.BenchCommand')
+        self.assertIn('abort', main.fields_by_name)
+        self.assertIn('abort', T.load_boat_pb2().BenchCommand.DESCRIPTOR.fields_by_name)
+
+    def test_neither_main_knows_the_mission_and_both_drop_what_they_do_not_know(self):
+        for commit in (MAIN_COMMIT, OLDER_MAIN_COMMIT):
+            fields = POOLS[commit].FindMessageTypeByName('boat.BoatMessage').fields_by_name
+            self.assertNotIn('mission', fields, commit)
+            pipeline = _git_show(commit, 'main/pipeline.c')
+            switch = pipeline[pipeline.index('switch (s_rx_msg.which_payload)'):]
+            default = switch[switch.index('default:'):]
+            default = default[:default.index('break;')]
+            self.assertIn('Unhandled message type', default, commit)
+            self.assertNotIn('handler', default, commit)      # logged, never dispatched
+
+
 class _RawWire(LakeBase):
     """LakeBase, plus every raw payload the tool writes, in order."""
+
+    FIRMWARE = MAIN_COMMIT
 
     def setUp(self):
         super().setUp()
@@ -71,26 +107,40 @@ class _RawWire(LakeBase):
             return inner(payload)
         self.link._write_locked = capture
 
+    def as_main_firmware(self, payload):
+        return as_firmware(payload, self.FIRMWARE)
+
     def main_kinds(self):
-        return [as_main_firmware(p).WhichOneof('payload') for p in self.raw]
+        """What the firmware makes of each frame.  Every STOP also carries one
+        MissionCommand.stop (it reaches a mission the tool lost track of);
+        main has no such field, decodes an EMPTY message and its pipeline
+        drops it (default: "Unhandled message type") -- 'ignored' here, and
+        only ever that exact frame."""
+        kinds = []
+        for p in self.raw:
+            old = self.as_main_firmware(p)
+            kind = old.WhichOneof('payload')
+            if kind is None:
+                self.assertEqual(old.ListFields(), [])          # nothing main can act on
+                new = T.load_boat_pb2().BoatMessage()
+                new.ParseFromString(p)
+                self.assertEqual(new.WhichOneof('payload'), 'mission')
+                self.assertTrue(new.mission.stop and not new.mission.start)
+                kind = 'ignored'
+            kinds.append(kind)
+        return kinds
 
 
 class ManualStopOnMainFirmwareTest(_RawWire):
-
-    def test_the_main_schema_really_has_no_abort_field(self):
-        """Sanity for the proof itself: the pool is 9543ed1's, not the tool's."""
-        old = MAIN_POOL.FindMessageTypeByName('boat.BenchCommand')
-        self.assertNotIn('abort', old.fields_by_name)
-        self.assertIn('abort', T.load_boat_pb2().BenchCommand.DESCRIPTOR.fields_by_name)
 
     def test_manual_stop_sends_zeros_immediately_and_no_bench_payload(self):
         self.link.throttle = 0.4; self.link.rudder = -0.3
         ok, err = self.link.stop(self.link.winch_command_seq + 1)
         self.assertTrue(ok, err)
-        msgs = [as_main_firmware(p) for p in self.raw]
-        kinds = [m.WhichOneof('payload') for m in msgs]
+        msgs = [self.as_main_firmware(p) for p in self.raw]
+        kinds = self.main_kinds()
         self.assertNotIn('bench', kinds)
-        self.assertEqual(kinds, ['motor', 'steer', 'winch'])
+        self.assertEqual(kinds, ['motor', 'steer', 'winch', 'ignored'])
         self.assertEqual((msgs[0].motor.left, msgs[0].motor.right), (0.0, 0.0))
         self.assertEqual((msgs[1].steer.left, msgs[1].steer.right), (0.0, 0.0))
         self.assertEqual(msgs[2].winch.speed, 0.0)
@@ -103,11 +153,11 @@ class ManualStopOnMainFirmwareTest(_RawWire):
                                       last_rx_monotonic=time.monotonic())
         ok, err = self.link.stop(self.link.winch_command_seq + 1)
         self.assertTrue(ok, err)
-        msgs = [as_main_firmware(p) for p in self.raw]
-        kinds = [m.WhichOneof('payload') for m in msgs]
+        msgs = [self.as_main_firmware(p) for p in self.raw]
+        kinds = self.main_kinds()
         self.assertNotIn('bench', kinds)
-        self.assertEqual(kinds, ['motor', 'steer', 'winch', 'arm_cmd'])
-        self.assertFalse(msgs[3].arm_cmd.arm)
+        self.assertEqual(kinds, ['motor', 'steer', 'winch', 'ignored', 'arm_cmd'])
+        self.assertFalse(msgs[4].arm_cmd.arm)
         self.assertFalse(self.link.armed_cmd)
 
     def test_stop_disarms_a_bench_run_just_requested(self):
@@ -118,7 +168,7 @@ class ManualStopOnMainFirmwareTest(_RawWire):
         self.raw.clear()
         ok, err = self.link.stop(self.link.winch_command_seq + 1)
         self.assertTrue(ok, err)
-        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch', 'arm_cmd'])
+        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch', 'ignored', 'arm_cmd'])
         self.assertFalse(self.link.armed_cmd)
 
     def test_a_request_the_boat_has_answered_or_that_is_old_does_not_disarm(self):
@@ -130,13 +180,13 @@ class ManualStopOnMainFirmwareTest(_RawWire):
         self.raw.clear()
         ok, err = self.link.stop(self.link.winch_command_seq + 1)
         self.assertTrue(ok, err)
-        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch'])
+        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch', 'ignored'])
         self.assertTrue(self.link.armed_cmd)
         # a request older than the pending window, never answered
         self.link.bench_requested_at = time.monotonic() - T.BENCH_REQUEST_PENDING_S - 0.1
         self.raw.clear()
         self.link.stop(self.link.winch_command_seq + 1)
-        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch'])
+        self.assertEqual(self.main_kinds(), ['motor', 'steer', 'winch', 'ignored'])
         self.assertTrue(self.link.armed_cmd)
 
     def test_stop_while_disconnected_sends_nothing(self):
@@ -159,13 +209,15 @@ class LakeStopOnMainFirmwareTest(_RawWire):
         self.assertIn('STOP', r['reason'])
         kinds = self.main_kinds()
         self.assertNotIn('bench', kinds)
-        self.assertTrue(set(kinds) <= {'motor', 'steer', 'winch'}, kinds)
+        self.assertTrue(set(kinds) <= {'motor', 'steer', 'winch', 'ignored'}, kinds)
         # STOP's own frames, sent inside stop(): the lake finish zeros, then STOP's
-        stop_msgs = [as_main_firmware(p) for p in self.raw[n_before:]]
-        stop_kinds = [m.WhichOneof('payload') for m in stop_msgs]
-        self.assertEqual(stop_kinds, ['motor', 'steer', 'motor', 'steer', 'winch'])
+        stop_msgs = [self.as_main_firmware(p) for p in self.raw[n_before:]]
+        stop_kinds = kinds[n_before:]
+        self.assertEqual(stop_kinds, ['motor', 'steer', 'motor', 'steer', 'winch', 'ignored'])
         for m in stop_msgs:
             k = m.WhichOneof('payload')
+            if k is None:
+                continue                                  # the ignored mission stop
             if k == 'motor':
                 self.assertEqual((m.motor.left, m.motor.right), (0.0, 0.0))
             elif k == 'steer':
@@ -195,6 +247,14 @@ class LakeStopOnMainFirmwareTest(_RawWire):
         src = (ROOT / 'tools' / 'espnow_drive.py').read_text()
         self.assertNotIn('_send_bench_abort_locked', src)
         self.assertNotIn('bench.abort = True', src)
+
+
+class ManualStopOnOlderMainTest(ManualStopOnMainFirmwareTest):
+    FIRMWARE = OLDER_MAIN_COMMIT
+
+
+class LakeStopOnOlderMainTest(LakeStopOnMainFirmwareTest):
+    FIRMWARE = OLDER_MAIN_COMMIT
 
 
 if __name__ == '__main__':
