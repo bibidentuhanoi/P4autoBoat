@@ -353,6 +353,16 @@ static const char *reason_text(uint8_t r)
     }
 }
 
+/* The Avoidance slot (spec section 3): the last word before the setpoint.
+ * Today it passes the mission's demand through unchanged.  Later it is the
+ * emergency layer -- ToF and the camera model: slow down, stop, turn in
+ * place -- allowed to override whatever guidance asked for, as SUSHI's
+ * reactive control behaviours override its path follower. */
+static mission_output_t avoidance(const mission_output_t *demand)
+{
+    return *demand;
+}
+
 /* One 50 ms step.  Everything the mission knows comes in here and its
  * setpoint goes out to the control task every step, active or not -- an idle
  * setpoint (active = false) is what keeps the jets unowned. */
@@ -377,7 +387,10 @@ static void autonomy_step(int64_t now_us)
         in.settings = settings_from(&cmd);
     }
 
-    const mission_output_t out = mission_step(&s_m, &s_cfg, &in);
+    /* mission -> navigation -> planner -> guidance (mission.c, path_follow.c,
+     * planner.c), then avoidance, then the control task. */
+    const mission_output_t demand = mission_step(&s_m, &s_cfg, &in);
+    const mission_output_t out = avoidance(&demand);
     const auto_setpoint_t sp = {
         .run_id = s_m.run_id,
         .active = out.active,

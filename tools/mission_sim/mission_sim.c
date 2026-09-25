@@ -3,8 +3,8 @@
  *
  * Build (from the repository root):
  *   cc -std=c11 -O2 -I main tools/mission_sim/mission_sim.c main/mission.c \
- *      main/nav_geo.c main/course_error.c main/auto_drive.c main/esc_trim.c \
- *      main/yaw_heading_control.c -lm -o mission_sim
+ *      main/nav_geo.c main/course_error.c main/path_follow.c main/planner.c \
+ *      main/auto_drive.c main/esc_trim.c main/yaw_heading_control.c -lm -o mission_sim
  *
  * The REAL mission, AUTO owner, heading hold and mixer (the main/ sources) fly
  * a boat model fitted to the 2026-09-20/21 lake runs (the stable current

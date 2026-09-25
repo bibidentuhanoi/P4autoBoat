@@ -23,6 +23,8 @@ idf_component_register(
         "nav_geo.c"
         "course_error.c"
         "mission.c"
+        "path_follow.c"
+        "planner.c"
         "auto_drive.c"
         "autonomy.c"
         "stability_control.c"

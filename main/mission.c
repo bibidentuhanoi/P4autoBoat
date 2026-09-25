@@ -1,5 +1,7 @@
 #include "mission.h"
 
+#include "planner.h"
+
 #include <math.h>
 #include <string.h>
 
@@ -335,6 +337,9 @@ static void step_turn(mission_t *m, const mission_cfg_t *cfg, const mission_inpu
             return;
         }
         m->return_start = m->pos;
+        /* The Planner slot: today the straight line home. */
+        m->path = planner_straight(m->return_start, (nav_en_t){0.0f, 0.0f});
+        path_follow_reset(&m->follow);
         m->closest_m = m->dist_home_m;
         m->zone_count = m->pass_count = m->slip_count = 0;
         m->t_beta_last_s = in->t_s;
@@ -342,22 +347,20 @@ static void step_turn(mission_t *m, const mission_cfg_t *cfg, const mission_inpu
     }
 }
 
-/* ---- RETURN: LOS on the line turn-end -> home; slow approach; arrive ---- */
+/* ---- RETURN: follow the path turn-end -> home; slow approach; arrive ----- */
 static void step_return(mission_t *m, const mission_cfg_t *cfg, const mission_input_t *in)
 {
-    const nav_en_t home = {0.0f, 0.0f};
     const float approach_r = cfg->approach_factor * m->settings.home_radius_m;
     if (in->gps_new) {
         const bool good_fix = update_position(m, cfg, in);
-        m->line = nav_line_position(m->return_start, home, m->pos);
+        /* Guidance: follow the planner's path home (path_follow.c -- past
+         * its end without arriving, it points at home instead). */
+        const path_follow_out_t pf = path_follow_step(&m->follow, &m->path, m->pos,
+                                                      cfg->lookahead_m);
+        m->line = pf.line;
         m->dist_target_m = m->dist_home_m;
-        m->bearing_target_deg = nav_bearing_deg(m->pos, home);
-        /* Follow the line home.  Once past its end without arriving (only
-         * possible far off the line), point at home instead, so the boat
-         * turns back rather than carrying on along the line's direction. */
-        m->wanted_course_deg = (m->line.progress > 1.0f)
-            ? m->bearing_target_deg
-            : nav_los_course_deg(m->return_start, home, m->pos, cfg->lookahead_m);
+        m->bearing_target_deg = pf.bearing_to_end_deg;
+        m->wanted_course_deg = pf.course_deg;
         m->approach = m->dist_home_m <= approach_r;
         if (!good_fix) {
             m->wanted_heading_deg = nav_wrap_360(m->wanted_course_deg - m->beta_deg);

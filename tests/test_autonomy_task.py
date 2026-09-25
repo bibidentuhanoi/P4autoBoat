@@ -334,7 +334,8 @@ def test_the_mission_task_glue():
              "-I", str(tmpdir), "-I", str(ROOT / "main"), "-I", str(ROOT / "main" / "drivers"),
              "-I", str(NANOPB),
              str(tmpdir / "harness.c"),
-             *[str(ROOT / "main" / s) for s in ("mission.c", "nav_geo.c", "course_error.c")],
+             *[str(ROOT / "main" / s) for s in ("mission.c", "nav_geo.c", "course_error.c",
+                                               "path_follow.c", "planner.c")],
              "-lm", "-o", str(binary)],
             check=True)
         res = subprocess.run([str(binary)], capture_output=True, text=True)

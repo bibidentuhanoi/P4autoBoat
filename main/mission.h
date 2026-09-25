@@ -5,6 +5,7 @@
 
 #include "course_error.h"
 #include "nav_geo.h"
+#include "path_follow.h"
 
 /* The out-and-back mission: pure logic, stepped by the autonomy task at 20 Hz.
  * It never touches hardware.  Its output is the setpoint the control task
@@ -198,6 +199,8 @@ typedef struct {
     float t_turn_start_s;
     nav_en_t turn_start;
     nav_en_t return_start;
+    nav_path_t path;             /* the planner's path for the leg being followed */
+    path_follow_t follow;
     float leg_turn_deg;          /* signed rotation in the current leg (spin guard) */
     /* arrival */
     uint32_t zone_count;

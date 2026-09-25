@@ -1121,6 +1121,9 @@ class GuardTest(unittest.TestCase):
         'main/autonomy.c', 'main/autonomy.h', 'main/motor_control.h',
         'main/runtime_metrics.c',
         'main/transports/espnow_protocol.h', 'main/transports/espnow_transport.c',
+        # 2026-09-25: the Planner + Guidance seam (straight segment today; the
+        # ground for waypoint missions and a SUSHI-style obstacle planner).
+        'main/path_follow.c', 'main/path_follow.h', 'main/planner.c', 'main/planner.h',
     }
 
     def _git(self, *args):

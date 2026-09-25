@@ -22,7 +22,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SIM_DIR = ROOT / "tools" / "mission_sim"
 REF = json.loads((SIM_DIR / "model_ref.json").read_text())
-SOURCES = ["mission.c", "nav_geo.c", "course_error.c", "auto_drive.c", "esc_trim.c", "yaw_heading_control.c"]
+SOURCES = ["mission.c", "nav_geo.c", "course_error.c", "path_follow.c", "planner.c", "auto_drive.c",
+           "esc_trim.c", "yaw_heading_control.c"]
 
 
 @pytest.fixture(scope="module")
