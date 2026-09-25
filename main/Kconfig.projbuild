@@ -307,6 +307,20 @@ menu "Board Configuration"
             default "0.50"
             depends on STABILITY_TRIMLEARN_ENABLE
 
+        config STABILITY_YAW_PI_DEFAULT_ON
+            bool "Heading hold (Motor P) is ON at every boot"
+            default y
+            depends on STABILITY_TRIMLEARN_ENABLE
+            help
+                The Motor P switch runs heading hold + the yaw-rate PI whose
+                I term is the live auto-trim. Lake 2026-09-21: P ON drifted
+                about 1 deg in 10 s, P OFF 37-40 deg. With this set the boat
+                boots with P ON; the laptop switch still turns it off until
+                the next boot, and steering by motor difference still
+                suspends the hold by itself. n restores the old boot state
+                (OFF). The out-and-back mission runs the heading hold itself
+                whatever this says.
+
         config STABILITY_TRIMLEARN_DEADBAND_DPS
             string "TrimLearn: ignore drift below this (deg/s)"
             default "0.5"

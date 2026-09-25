@@ -195,9 +195,19 @@ static uint64_t s_trim_last_capture_us = 0;
 static bool s_trim_moved = false;
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
 /* The fast P correction, added on top of the learned c and never stored.
- * s_p_assist_on is a RUNTIME switch (default off) so the A and B arms of the
- * experiment run the same firmware -- a rebuild between arms would let a
- * compiler or config difference masquerade as a result. */
+ * s_p_assist_on is a RUNTIME switch so the A and B arms of an experiment run
+ * the same firmware -- a rebuild between arms would let a compiler or config
+ * difference masquerade as a result. Its BOOT state comes from
+ * CONFIG_STABILITY_YAW_PI_DEFAULT_ON (ON since 2026-09-25) and is applied in
+ * motor_control_init(). */
+/* A bool Kconfig symbol set to n is simply ABSENT from sdkconfig.h, so
+ * absence must mean OFF: a "fallback to 1 when undefined" here would silently
+ * ignore an explicit n. */
+#ifdef CONFIG_STABILITY_YAW_PI_DEFAULT_ON
+#define YAW_PI_BOOT_STATE true
+#else
+#define YAW_PI_BOOT_STATE false
+#endif
 static yaw_heading_control_t s_yaw_heading;
 static yaw_heading_cfg_t s_yaw_heading_cfg;
 static yaw_heading_output_t s_yaw_heading_out;
@@ -2440,6 +2450,12 @@ esp_err_t motor_control_init(void)
     s_arm_action_queue = xQueueCreate(ARM_ACTION_QUEUE_LENGTH,
                                       sizeof(arm_action_t));
     if (!s_arm_request_queue || !s_arm_action_queue) return ESP_ERR_NO_MEM;
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    /* Before the first status commit, so the very first MotorStatus already
+     * carries the boot state the laptop tool adopts. */
+    s_p_assist_on = YAW_PI_BOOT_STATE;
+    s_p_assist_req_pending = false;
+#endif
     status_commit_current(true);
 
     pipeline_register_motor_handler(motor_command_handler);
@@ -2479,8 +2495,9 @@ esp_err_t motor_control_init(void)
     s_yaw_heading_out = (yaw_heading_output_t){0};
     s_yaw_last_sequence = 0;
     s_yaw_last_capture_us = 0;
-    ESP_LOGI(TAG, "Yaw PI + heading hold built in (default OFF): rate_kp=%.3f "
+    ESP_LOGI(TAG, "Yaw PI + heading hold built in (boot state %s): rate_kp=%.3f "
                   "rate_ki=%.3f yaw_tau=%.2fs heading_kp=%.2f max_rate=%.1f",
+             YAW_PI_BOOT_STATE ? "ON" : "OFF",
              (double)s_yaw_heading_cfg.rate_kp,
              (double)s_yaw_heading_cfg.rate_ki,
              (double)s_yaw_heading_cfg.yaw_tau_s,

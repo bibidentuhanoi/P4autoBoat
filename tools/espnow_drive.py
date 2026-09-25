@@ -2090,8 +2090,11 @@ class BoatLink:
         # push alike) has it from the first message. The real page uses the
         # WebSocket, and a GET-only pre-step left NEXT ORDER at '--'.
         self._lake_id_refresh_next()
-        # Mirrors the boat's runtime P switch. Default OFF -- the A arm must be
-        # the default so a forgotten toggle cannot silently make every run a B.
+        # The boat's runtime Motor P switch, AS THE BOAT REPORTS IT. Only a
+        # placeholder until the first MotorStatus: the boat boots with P ON
+        # (CONFIG_STABILITY_YAW_PI_DEFAULT_ON) and a reboot resets it, so
+        # _handle_motor_status adopts the boat's word whenever no request of
+        # ours is waiting for its acknowledgement.
         self.p_assist_on = False
         # Assisted Steering (rudder loop). Requested state; the BOAT's own
         # answer arrives in MotorStatus.assist_rudder and is what gets shown.
@@ -4446,6 +4449,13 @@ class BoatLink:
                 'motor_yaw_target_dps': float(getattr(ms, 'motor_yaw_target_dps', 0.0)),
                 'motor_yaw_filt_dps': float(getattr(ms, 'motor_yaw_filt_dps', 0.0)),
             }
+            # The boat, not this tool, decides what Motor P is. While a
+            # request of ours is still waiting for its acknowledgement,
+            # _assist_off_tick_locked owns the transition -- an older report
+            # must not flip the request back. Otherwise the report IS the
+            # state (boot default ON, or a reboot mid-session).
+            if getattr(self, '_assist_off_req_id', None) is None:
+                self.p_assist_on = bool(ms.assist_motor_p)
 
     def _handle_calibrate_status(self, cs):
         """Store a CalibrateStatus received from the boat. State follows
@@ -5047,7 +5057,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <div class="telem-row"><label>Learner c</label><span class="val" id="bench-learn-c">--</span></div>
   <div class="row" style="margin-top:6px;">
     <label style="min-width:auto;">Fast P assist</label>
-    <button id="p-assist" title="temporary proportional yaw correction on the motors -- OFF is the control arm">P ASSIST: OFF</button>
+    <button id="p-assist" title="Motor P = heading hold + auto-trim. The boat boots with it ON; this shows what the BOAT reports">P ASSIST: ? (waiting for boat)</button>
     <span class="pill" id="p-confirm" style="margin-left:8px;">boat: --</span>
   </div>
   <div class="telem-row"><label>Run</label><span class="val" id="bench-progress">--</span></div>
@@ -5910,12 +5920,18 @@ function refreshBenchPreview() {
 $('bench-throttle').addEventListener('input', refreshBenchPreview);
 $('bench-delta').addEventListener('input', refreshBenchPreview);
 refreshBenchPreview();
-// Runtime switch, deliberately not a rebuild: both arms of the A/B must run
-// the same binary. OFF is the control arm and the default.
-var pAssistOn = false;       // confirmed boat state, never merely requested state
+// Runtime switch, deliberately not a rebuild: both arms of an A/B run the
+// same binary. What is shown is the BOAT's report -- it boots with P ON and a
+// reboot resets it -- so nothing is assumed before the first MotorStatus.
+var pAssistOn = false;       // last boat-confirmed state (valid once pAssistKnown)
+var pAssistKnown = false;    // a fresh MotorStatus has been heard on this page
 var pAssistPending = false;
 $('p-assist').addEventListener('click', async () => {
   if (pAssistPending) return;
+  if (!pAssistKnown) {
+    $('bench-msg').textContent = 'wait for the boat to report Motor P first';
+    return;
+  }
   const want = !pAssistOn;
   const r = await api('/api/assist', 'POST', { p_on: want });
   if (r && r.ok) {
@@ -6089,14 +6105,16 @@ function applyStatus(s) {
     // laptop wrote a request; only the echoed request/state proves the boat
     // applied it.
     pAssistPending = !!s.assist_mode_pending;
-    if (mst && mst.have && !mst.stale) pAssistOn = !!mst.assist_motor_p;
+    const pFresh = !!(mst && mst.have && !mst.stale);
+    if (pFresh) { pAssistOn = !!mst.assist_motor_p; pAssistKnown = true; }
     const pButton = $('p-assist');
     const pWant = pAssistPending ? !!s.assist_mode_want_p : pAssistOn;
     pButton.disabled = pAssistPending;
     pButton.textContent = pAssistPending
       ? 'P ASSIST: WAITING FOR BOAT ' + (pWant ? 'ON' : 'OFF')
-      : 'P ASSIST: ' + (pAssistOn ? 'ON' : 'OFF');
-    pButton.classList.toggle('up', pAssistOn && !pAssistPending);
+      : !pAssistKnown ? 'P ASSIST: ? (waiting for boat)'
+      : 'P ASSIST: ' + (pAssistOn ? 'ON' : 'OFF') + (pFresh ? '' : ' (old)');
+    pButton.classList.toggle('up', pAssistKnown && pAssistOn && !pAssistPending);
 
     // The BOAT runs the test and writes the file; this just shows its progress
     // and which file number it saved as. Read the runs with tools/bench_analyze.py.

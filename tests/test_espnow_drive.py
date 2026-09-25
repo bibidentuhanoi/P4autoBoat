@@ -1388,13 +1388,15 @@ class PAssistControlTest(unittest.TestCase):
             self.assertEqual(m.assist.p_on, want)
             self.assertEqual(self.link.p_assist_on, want)
 
-    def test_it_defaults_off(self):
-        """OFF is the control arm. It must be the default so a forgotten
-        toggle cannot silently turn every run into a B."""
-        self.assertFalse(self.link.p_assist_on)
+    def test_the_tool_has_no_opinion_until_the_boat_reports(self):
+        """2026-09-25: the boat boots with Motor P ON (Kconfig), and a reboot
+        resets it. The tool's local flag is only a placeholder until the first
+        MotorStatus; the page says it is waiting instead of showing OFF."""
+        self.assertFalse(self.link.p_assist_on)          # placeholder only
         page = espnow_drive.PAGE
-        self.assertIn('P ASSIST: OFF', page)
-        self.assertIn('var pAssistOn = false;', page)
+        self.assertIn('P ASSIST: ? (waiting for boat)', page)
+        self.assertIn('var pAssistKnown = false;', page)
+        self.assertNotIn('>P ASSIST: OFF<', page)
 
     def test_a_disconnected_link_sends_nothing_and_does_not_flip_state(self):
         self.link.connected = False
@@ -1413,6 +1415,95 @@ class PAssistControlTest(unittest.TestCase):
     def test_the_page_has_the_control(self):
         self.assertIn('id="p-assist"', espnow_drive.PAGE)
         self.assertIn("'/api/assist'", espnow_drive.PAGE)
+
+
+class MotorPFollowsTheBoatTest(unittest.TestCase):
+    """The boat decides what Motor P is. The 2026-09-20 lake runs were refused
+    at the gate ('motor_p_consistent') because the tool kept its own OFF while
+    the boat had P ON; with P ON at boot that would happen on every connect."""
+
+    def setUp(self):
+        self.link = espnow_drive.BoatLink.__new__(espnow_drive.BoatLink)
+        self.link._lock = threading.Lock()
+        self.link.pb2 = espnow_drive.load_boat_pb2()
+        self.link.connected = True
+        self.link.rudder_test = None
+        self.link.lake_id = None
+        self.link.raw_throttle_test = False
+        self.link.assist_rudder_on = False
+        self.link.p_assist_on = False
+        self.link._now = espnow_drive.time.monotonic
+        self.link._assist_off_req_id = None
+        self.link._assist_off_next_retry = 0.0
+        self.link._assist_req_seq = 0
+        self.link.motor_status = espnow_drive.BoatLink._blank_motor_status()
+        self.link._diag_counts = {}
+        self.sent = []
+        self.link._write_locked = lambda p: (self.sent.append(p), True)[1]
+
+    def feed(self, **fields):
+        msg = self.link.pb2.BoatMessage()
+        for k, v in fields.items():
+            setattr(msg.motor_status, k, v)
+        frame = espnow_drive.build_frame(espnow_drive.MSG_MOTOR_STATUS,
+                                         msg.SerializeToString(), seq=1)
+        self.link._handle_incoming_frame(frame[:-1])      # strip the delimiter
+
+    def test_a_boat_that_boots_with_p_on_is_shown_and_gated_as_on(self):
+        self.feed(state=2, assist_motor_p=True)
+        self.assertTrue(self.link.p_assist_on)
+        gate = self.link._lake_id_motor_p_gate_locked(self.link.motor_status)
+        self.assertEqual(gate, {'motor_p_on': True})
+
+    def test_a_pending_request_is_not_undone_by_an_older_report(self):
+        ok, err = self.link.send_assist(False)
+        self.assertTrue(ok, err)
+        req = self.link._assist_off_req_id
+        self.assertIsNotNone(req)
+        self.feed(assist_motor_p=True, assist_request_id=0)   # sent before our OFF
+        self.assertFalse(self.link.p_assist_on)
+        self.feed(assist_motor_p=False, assist_request_id=req)
+        with self.link._lock:
+            self.link._assist_off_tick_locked(self.link._now())
+        self.assertIsNone(self.link._assist_off_req_id)
+        self.assertFalse(self.link.p_assist_on)
+
+    def test_a_boat_reboot_mid_session_is_followed(self):
+        # The operator had turned P OFF and the boat had confirmed it ...
+        self.link.p_assist_on = False
+        self.link._assist_off_req_id = None
+        # ... then the boat rebooted: P back ON, request echo back to 0.
+        self.feed(assist_motor_p=True, assist_request_id=0)
+        self.assertTrue(self.link.p_assist_on)
+
+    def test_the_page_shows_waiting_then_the_boats_word(self):
+        result = run_page_js(r"""
+vm.createContext(context);
+vm.runInContext(script, context);
+// The harness runs only the page's <script>, not its markup: the first
+// status without a MotorStatus is what paints the waiting text.
+context.applyStatus(Object.assign({}, CONNECTED_STATUS, { assist_mode_pending: false }));
+const before = elements['p-assist'].textContent;
+context.applyStatus(Object.assign({}, CONNECTED_STATUS, {
+  motor_status: { have: true, stale: false, age_s: 0.1, state: 0,
+                  left_throttle: 0, right_throttle: 0, winch_speed: 0,
+                  servo_power: true, assist_motor_p: true, assist_rudder: false },
+  assist_mode_pending: false }));
+const fresh = elements['p-assist'].textContent;
+context.applyStatus(Object.assign({}, CONNECTED_STATUS, {
+  motor_status: { have: true, stale: true, age_s: 9.0, state: 0,
+                  left_throttle: 0, right_throttle: 0, winch_speed: 0,
+                  servo_power: true, assist_motor_p: true, assist_rudder: false },
+  assist_mode_pending: false }));
+const old = elements['p-assist'].textContent;
+console.log(JSON.stringify({ before, fresh, old }));
+process.exit(0);
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out['before'], 'P ASSIST: ? (waiting for boat)')
+        self.assertEqual(out['fresh'], 'P ASSIST: ON')
+        self.assertEqual(out['old'], 'P ASSIST: ON (old)')
 
 
 class PAssistConfirmTest(unittest.TestCase):

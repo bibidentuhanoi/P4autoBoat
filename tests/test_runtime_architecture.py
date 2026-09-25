@@ -2119,7 +2119,17 @@ def test_turning_p_off_returns_exactly_to_the_pre_p_path():
     assert "if (s_p_correction != 0.0f) s_p_moved = true;" in tick, (
         "turning P off does not push the cleaned value out, so the boat would "
         "keep the last correction until the next pilot command")
-    assert "static bool s_p_assist_on = false;" in src, "P must default OFF"
+    # 2026-09-25 (Kiet, out-and-back mission spec section 4): the BOOT state
+    # is ON, from Kconfig, applied in init before the first status commit.
+    # OFF stays the exact pre-P path (asserted above). Behaviour is proven in
+    # tests/test_heading_hold_boot.py; this pins where the boot value is set.
+    init = _function_body(src, "esp_err_t motor_control_init(void)")
+    assert "s_p_assist_on = YAW_PI_BOOT_STATE;" in init
+    assert (init.index("s_p_assist_on = YAW_PI_BOOT_STATE;")
+            < init.index("status_commit_current(true);")), (
+        "the first MotorStatus would report the stale P state")
+    assert "#ifdef CONFIG_STABILITY_YAW_PI_DEFAULT_ON" in src, (
+        "a bool Kconfig symbol set to n is absent, so absence must mean OFF")
 
 
 def test_p_is_cleared_on_every_path_that_takes_the_motors_away():
