@@ -370,6 +370,9 @@ message MissionStatus {
   uint32 gps_outliers       = 36;  // fixes rejected as jumps
   uint32 sats               = 37;
   float  pdop               = 38;
+  float  start_heading_deg  = 39;  // the heading taken at HOME (the out line)
+  float  return_start_e_m   = 40;  // where the turn ended, metres east of home
+  float  return_start_n_m   = 41;  // ...and north (0, 0 until RETURN)
 }
 
 // Envelope — every message on the wire is a BoatMessage

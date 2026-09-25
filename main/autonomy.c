@@ -308,6 +308,10 @@ static void commit_status(const mission_input_t *in, const motor_drive_snapshot_
     st.gps_outliers = s_m.outliers;
     st.sats = in->sats;
     st.pdop = finite_or(in->pdop, 0.0f);
+    st.start_heading_deg = s_m.have_origin ? s_m.start_heading_deg : 0.0f;
+    const bool returning = s_m.state == MISSION_RETURN || (s_m.state == MISSION_DONE && s_m.have_origin);
+    st.return_start_e_m = returning ? s_m.return_start.e : 0.0f;
+    st.return_start_n_m = returning ? s_m.return_start.n : 0.0f;
 
     portENTER_CRITICAL(&s_status_lock);
     s_status = st;

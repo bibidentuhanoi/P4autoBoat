@@ -4493,6 +4493,9 @@ class BoatLink:
                 'file_index': int(ms.file_index), 'dist_home_m': float(ms.dist_home_m),
                 'speed_acc_mps': float(ms.speed_acc_mps), 'course_samples': int(ms.course_samples),
                 'gps_outliers': int(ms.gps_outliers), 'sats': int(ms.sats), 'pdop': float(ms.pdop),
+                'start_heading_deg': float(ms.start_heading_deg),
+                'return_start_e_m': float(ms.return_start_e_m),
+                'return_start_n_m': float(ms.return_start_n_m),
             }
             self.mission_status = st
             m = getattr(self, 'mission', None)
@@ -5429,6 +5432,9 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   .map-menu { gap: 8px; margin-bottom: 8px; }
   .map-menu .title { margin-right: auto; }
   .map-menu select { flex: 0 1 auto; padding: 3px 6px; font-size: 11px; }
+  .msn-num { width: 46px; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+             border-radius: 4px; padding: 2px 4px; font-size: 11px; }
+  .msn-lbl { font-size: 10px; white-space: nowrap; }
   .map-menu button { padding: 3px 8px; font-size: 10px; text-transform: uppercase;
                      letter-spacing: 1px; }
   .map-readout { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-bottom: 8px;
@@ -5644,19 +5650,21 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <summary class="card-title">10 m MISSION <span class="pill" id="msn-pill" style="margin-left:6px;">IDLE</span></summary>
   <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">The BOAT flies it by itself: point it, keep it still, press START. It takes home by GPS (~2 s), drives out on the heading it points, turns, comes back along the line home, slows down near home and stops the motors inside the radius &mdash; then catch it. It keeps going if the radio drops. STOP (top) stops it and disarms; touching the stick also ends it.</div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
-    <label style="font-size:10px;">out</label><input type="number" id="msn-out" min="3" max="50" step="1" value="10" style="width:44px;"><span style="font-size:10px;">m</span>
-    <label style="font-size:10px;">motors off at</label><input type="number" id="msn-radius" min="1.5" max="10" step="0.5" value="2.5" style="width:44px;"><span style="font-size:10px;">m</span>
-    <label style="font-size:10px;">throttle</label><input type="number" id="msn-thr" min="20" max="60" step="5" value="40" style="width:40px;"><span style="font-size:10px;">%</span>
-    <label style="font-size:10px;">slow approach</label><input type="number" id="msn-appr" min="15" max="60" step="5" value="20" style="width:40px;"><span style="font-size:10px;">%</span>
+    <label class="msn-lbl">out</label><input type="number" class="msn-num" id="msn-out" min="3" max="50" step="1" value="10"><span class="msn-lbl">m</span>
+    <label class="msn-lbl">motors off at</label><input type="number" class="msn-num" id="msn-radius" min="1.5" max="10" step="0.5" value="2.5"><span class="msn-lbl">m</span>
   </div>
   <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
-    <label style="font-size:10px;">turn</label>
-    <select id="msn-turn"><option value="right" selected>right</option><option value="left">left</option></select>
-    <label style="font-size:10px;">stage</label>
-    <select id="msn-stage"><option value="1">OUT ONLY</option><option value="2">OUT + TURN</option><option value="3" selected>FULL</option></select>
-    <label class="bench" style="font-size:10px;"><input type="checkbox" id="msn-dry">DRY RUN (motors stay off: carry it)</label>
-    <button id="msn-start" title="the boat takes home, then flies the mission on its own">START MISSION</button>
+    <label class="msn-lbl">throttle</label><input type="number" class="msn-num" id="msn-thr" min="20" max="60" step="5" value="40"><span class="msn-lbl">%</span>
+    <label class="msn-lbl">slow approach</label><input type="number" class="msn-num" id="msn-appr" min="15" max="60" step="5" value="20"><span class="msn-lbl">%</span>
   </div>
+  <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
+    <label class="msn-lbl">turn</label>
+    <select id="msn-turn"><option value="right" selected>right</option><option value="left">left</option></select>
+    <label class="msn-lbl">stage</label>
+    <select id="msn-stage"><option value="1">OUT ONLY</option><option value="2">OUT + TURN</option><option value="3" selected>FULL</option></select>
+    <label class="bench msn-lbl" title="motors stay off: carry the boat to check the logic on land"><input type="checkbox" id="msn-dry">DRY RUN</label>
+  </div>
+  <div class="motor-slider-row"><button id="msn-start" style="flex:1;" title="the boat takes home, then flies the mission on its own">START MISSION</button></div>
   <div class="telem-row"><label>Step</label><span class="val" id="msn-step">--</span></div>
   <div class="telem-row"><label>Target</label><span class="val" id="msn-target">--</span></div>
   <div class="telem-row"><label>Heading</label><span class="val" id="msn-heading">--</span></div>
@@ -6462,22 +6470,25 @@ function missionMap(b) {
     ['msnHome', 'msnZone', 'msnApproach', 'msnOut', 'msnReturn'].forEach(function (k) {
       if (mapState[k]) { map.removeLayer(mapState[k]); mapState[k] = null; }
     });
-    mapState.msnRun = b.run_id; mapState.msnStartHdg = null; mapState.msnReturnFrom = null;
+    mapState.msnRun = b.run_id;
+    // a new run: show its few metres (the 2.5 m circle is a dot at the lake zoom)
+    map.setView(home, Math.max(map.getZoom(), 19));
     mapState.msnHome = L.circleMarker(home, { radius: 5, color: '#FFD700', fillOpacity: 1, interactive: false }).addTo(map);
     mapState.msnZone = L.circle(home, { radius: r, color: '#32CD32', weight: 2, fill: false, interactive: false }).addTo(map);
     mapState.msnApproach = L.circle(home, { radius: 2 * r, color: '#32CD32', weight: 1, dashArray: '4 4', fill: false, interactive: false }).addTo(map);
     mapState.msnOut = L.polyline([home, home], { color: '#FFD700', weight: 2, dashArray: '6 4', interactive: false }).addTo(map);
     mapState.msnReturn = L.polyline([home, home], { color: '#FF8C00', weight: 2, interactive: false }).addTo(map);
   }
-  if (b.state === 2 && isFinite(b.wanted_heading_deg)) mapState.msnStartHdg = b.wanted_heading_deg;
-  if (mapState.msnStartHdg != null) {
-    const h = mapState.msnStartHdg * Math.PI / 180, d = b.out_distance_m;
-    const out = [b.home_lat + d * Math.cos(h) / 110540,
-                 b.home_lon + d * Math.sin(h) / (111320 * Math.cos(b.home_lat * Math.PI / 180))];
-    mapState.msnOut.setLatLngs([home, out]);
+  // Both come from the BOAT, so a page opened mid-mission draws them too.
+  const kLon = 111320 * Math.cos(b.home_lat * Math.PI / 180);
+  if (b.state >= 2 && isFinite(b.start_heading_deg)) {
+    const h = b.start_heading_deg * Math.PI / 180, d = b.out_distance_m;
+    mapState.msnOut.setLatLngs([home, [b.home_lat + d * Math.cos(h) / 110540, b.home_lon + d * Math.sin(h) / kLon]]);
   }
-  if (b.state === 4 && !mapState.msnReturnFrom && mapState.last) mapState.msnReturnFrom = mapState.last;
-  if (mapState.msnReturnFrom) mapState.msnReturn.setLatLngs([mapState.msnReturnFrom, home]);
+  if (b.return_start_e_m || b.return_start_n_m) {
+    mapState.msnReturn.setLatLngs([[b.home_lat + b.return_start_n_m / 110540,
+                                    b.home_lon + b.return_start_e_m / kLon], home]);
+  }
 }
 
 // Runtime mode switch. Raw Manual is the boot mode and stays the default.
