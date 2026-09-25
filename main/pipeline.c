@@ -44,6 +44,7 @@ static compass_cal_command_handler_fn s_compass_cal_handler = NULL;
 static bench_command_handler_fn s_bench_handler = NULL;
 static assist_command_handler_fn s_assist_handler = NULL;
 static steer_rate_command_handler_fn s_steer_rate_handler = NULL;
+static mission_command_handler_fn s_mission_handler = NULL;
 
 /* ---- Shared protobuf envelopes ----
  * boat_BoatMessage is a ~7KB union (SensorSnapshot member holds the 256-entry
@@ -133,6 +134,7 @@ esp_err_t pipeline_init(void)
     s_bench_handler = NULL;
     s_assist_handler = NULL;
     s_steer_rate_handler = NULL;
+    s_mission_handler = NULL;
     if (!s_msg_mutex) {
         s_msg_mutex = xSemaphoreCreateMutex();
         if (!s_msg_mutex) {
@@ -221,6 +223,11 @@ void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler)
 void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler)
 {
     s_compass_cal_handler = handler;
+}
+
+void pipeline_register_mission_handler(mission_command_handler_fn handler)
+{
+    s_mission_handler = handler;
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)
@@ -324,6 +331,18 @@ void pipeline_publish_compass_cal_status(const boat_CompassCalStatus *status)
     s_msg.which_payload = boat_BoatMessage_compass_cal_status_tag;
     s_msg.payload.compass_cal_status = *status;
     fanout_locked(buf, sizeof(buf), "compass_cal_status");
+    xSemaphoreGive(s_msg_mutex);
+}
+
+void pipeline_publish_mission_status(const boat_MissionStatus *status)
+{
+    if (!s_msg_mutex || !status) return;
+
+    uint8_t buf[boat_MissionStatus_size + 16];
+    xSemaphoreTake(s_msg_mutex, portMAX_DELAY);
+    s_msg.which_payload = boat_BoatMessage_mission_status_tag;
+    s_msg.payload.mission_status = *status;
+    fanout_locked(buf, sizeof(buf), "mission_status");
     xSemaphoreGive(s_msg_mutex);
 }
 
@@ -453,6 +472,17 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
                                   s_rx_msg.payload.compass_cal.tolerance_deg);
         } else {
             ESP_LOGW(TAG, "Compass calibration command received but no handler registered");
+        }
+        break;
+    case boat_BoatMessage_mission_tag:
+        ESP_LOGI(TAG, "Mission command: %s%s (request %u)",
+                 s_rx_msg.payload.mission.start ? "START" : "",
+                 s_rx_msg.payload.mission.stop ? "STOP" : "",
+                 (unsigned)s_rx_msg.payload.mission.request_id);
+        if (s_mission_handler) {
+            s_mission_handler(&s_rx_msg.payload.mission);
+        } else {
+            ESP_LOGW(TAG, "Mission command received but no handler registered");
         }
         break;
     default:

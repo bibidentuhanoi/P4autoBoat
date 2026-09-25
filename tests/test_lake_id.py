@@ -1115,6 +1115,12 @@ class GuardTest(unittest.TestCase):
         'main/course_error.c', 'main/course_error.h',
         'main/mission.c', 'main/mission.h',
         'main/auto_drive.c', 'main/auto_drive.h',
+        # 2026-09-25 Part 3 of the same plan: the mission task and the AUTO owner
+        # in the control task, MissionCommand/MissionStatus, ESP-NOW type 0x09,
+        # MissionStatus + SD record published from the diagnostics task.
+        'main/autonomy.c', 'main/autonomy.h', 'main/motor_control.h',
+        'main/runtime_metrics.c',
+        'main/transports/espnow_protocol.h', 'main/transports/espnow_transport.c',
     }
 
     def _git(self, *args):

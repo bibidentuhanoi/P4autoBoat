@@ -327,6 +327,67 @@ typedef struct _boat_BenchStatus {
     bool saturated;
 } boat_BenchStatus;
 
+/* Laptop -> boat: the out-and-back mission ("10 m MISSION" card, 2026-09-25).
+ The boat flies it on its own; the link only carries START and STOP, and a
+ radio outage never stops it. A START repeated with the same request_id is
+ ignored; a START while a mission runs is ignored; STOP always wins. */
+typedef struct _boat_MissionCommand {
+    bool start;
+    bool stop;
+    uint32_t request_id;
+    uint32_t stage; /* 1 OUT ONLY, 2 OUT + TURN, 3 FULL */
+    float out_distance_m; /* 3..50 */
+    float home_radius_m; /* 1.5..10: motors off inside it */
+    float throttle; /* 0.20..0.60 */
+    float approach_throttle; /* 0.15..throttle, from 2 x home radius */
+    bool turn_right;
+    bool dry_run; /* motors stay 0; the boat is carried */
+} boat_MissionCommand;
+
+/* Boat -> laptop: the mission as the BOAT sees it. 5 Hz while it runs, 1 Hz
+ otherwise -- continuous, so a terminal state is repeated by construction.
+ One ESP-NOW packet: keep the worst-case encoding under ~230 bytes. */
+typedef struct _boat_MissionStatus {
+    uint32_t run_id;
+    uint32_t request_id;
+    uint32_t state; /* 0 idle 1 home 2 outbound 3 turn 4 return 5 done 6 aborted 7 refused */
+    uint32_t reason; /* done 1-5, abort 10-20, refuse 30-42 (main/mission.h) */
+    uint32_t stage;
+    float out_distance_m;
+    float home_radius_m;
+    float throttle;
+    float approach_throttle;
+    bool turn_right;
+    bool dry_run;
+    double home_lat;
+    double home_lon;
+    float dist_target_m;
+    float bearing_target_deg;
+    float cross_track_m; /* + = right of the return line */
+    float wanted_heading_deg;
+    float heading_deg;
+    float beta_deg; /* GPS course minus compass heading, as used */
+    bool beta_valid;
+    bool compass_bad;
+    float turned_deg; /* + = right */
+    float turn_peak_dps;
+    bool approach; /* slow approach throttle in use */
+    bool hold_active; /* the heading hold is steering */
+    bool p_switch; /* the operator's Motor P switch (never changed by the mission) */
+    uint32_t outages;
+    float longest_outage_s;
+    float closest_m;
+    float elapsed_s;
+    uint32_t record_state; /* 0 none 1 recording 2 saving 3 saved 4 failed 5 unavailable */
+    uint32_t file_index; /* MSN_<NNN>.CSV */
+    float dist_home_m;
+    float speed_acc_mps; /* GPS sAcc: never recorded before, stage 1 needs it */
+    uint32_t course_samples; /* beta samples accepted this run */
+    uint32_t gps_outliers; /* fixes rejected as jumps */
+    uint32_t sats;
+    float pdop;
+} boat_MissionStatus;
+
 /* Envelope — every message on the wire is a BoatMessage */
 typedef struct _boat_BoatMessage {
     pb_size_t which_payload;
@@ -351,6 +412,8 @@ typedef struct _boat_BoatMessage {
         boat_SteerRateCommand steer_rate;
         boat_CompassCalStatus compass_cal_status;
         boat_CompassCalCommand compass_cal;
+        boat_MissionCommand mission;
+        boat_MissionStatus mission_status;
     } payload;
 } boat_BoatMessage;
 
@@ -384,6 +447,8 @@ extern "C" {
 #define boat_AssistCommand_init_default          {0, 0, 0}
 #define boat_BenchCommand_init_default           {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_default            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MissionCommand_init_default         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MissionStatus_init_default          {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_default            {0, {boat_SensorSnapshot_init_default}}
 #define boat_IMUData_init_zero                   {0, 0, 0, 0}
 #define boat_ToFGrid_init_zero                   {0, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 0, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
@@ -409,6 +474,8 @@ extern "C" {
 #define boat_AssistCommand_init_zero             {0, 0, 0}
 #define boat_BenchCommand_init_zero              {0, 0, 0, 0, 0}
 #define boat_BenchStatus_init_zero               {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MissionCommand_init_zero            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+#define boat_MissionStatus_init_zero             {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 #define boat_BoatMessage_init_zero               {0, {boat_SensorSnapshot_init_zero}}
 
 /* Field tags (for use in manual encoding/decoding) */
@@ -557,6 +624,54 @@ extern "C" {
 #define boat_BenchStatus_ctrl_active_tag         17
 #define boat_BenchStatus_heading_hold_tag        18
 #define boat_BenchStatus_saturated_tag           19
+#define boat_MissionCommand_start_tag            1
+#define boat_MissionCommand_stop_tag             2
+#define boat_MissionCommand_request_id_tag       3
+#define boat_MissionCommand_stage_tag            4
+#define boat_MissionCommand_out_distance_m_tag   5
+#define boat_MissionCommand_home_radius_m_tag    6
+#define boat_MissionCommand_throttle_tag         7
+#define boat_MissionCommand_approach_throttle_tag 8
+#define boat_MissionCommand_turn_right_tag       9
+#define boat_MissionCommand_dry_run_tag          10
+#define boat_MissionStatus_run_id_tag            1
+#define boat_MissionStatus_request_id_tag        2
+#define boat_MissionStatus_state_tag             3
+#define boat_MissionStatus_reason_tag            4
+#define boat_MissionStatus_stage_tag             5
+#define boat_MissionStatus_out_distance_m_tag    6
+#define boat_MissionStatus_home_radius_m_tag     7
+#define boat_MissionStatus_throttle_tag          8
+#define boat_MissionStatus_approach_throttle_tag 9
+#define boat_MissionStatus_turn_right_tag        10
+#define boat_MissionStatus_dry_run_tag           11
+#define boat_MissionStatus_home_lat_tag          12
+#define boat_MissionStatus_home_lon_tag          13
+#define boat_MissionStatus_dist_target_m_tag     14
+#define boat_MissionStatus_bearing_target_deg_tag 15
+#define boat_MissionStatus_cross_track_m_tag     16
+#define boat_MissionStatus_wanted_heading_deg_tag 17
+#define boat_MissionStatus_heading_deg_tag       18
+#define boat_MissionStatus_beta_deg_tag          19
+#define boat_MissionStatus_beta_valid_tag        20
+#define boat_MissionStatus_compass_bad_tag       21
+#define boat_MissionStatus_turned_deg_tag        22
+#define boat_MissionStatus_turn_peak_dps_tag     23
+#define boat_MissionStatus_approach_tag          24
+#define boat_MissionStatus_hold_active_tag       25
+#define boat_MissionStatus_p_switch_tag          26
+#define boat_MissionStatus_outages_tag           27
+#define boat_MissionStatus_longest_outage_s_tag  28
+#define boat_MissionStatus_closest_m_tag         29
+#define boat_MissionStatus_elapsed_s_tag         30
+#define boat_MissionStatus_record_state_tag      31
+#define boat_MissionStatus_file_index_tag        32
+#define boat_MissionStatus_dist_home_m_tag       33
+#define boat_MissionStatus_speed_acc_mps_tag     34
+#define boat_MissionStatus_course_samples_tag    35
+#define boat_MissionStatus_gps_outliers_tag      36
+#define boat_MissionStatus_sats_tag              37
+#define boat_MissionStatus_pdop_tag              38
 #define boat_BoatMessage_sensors_tag             1
 #define boat_BoatMessage_motor_tag               2
 #define boat_BoatMessage_status_tag              3
@@ -577,6 +692,8 @@ extern "C" {
 #define boat_BoatMessage_steer_rate_tag          18
 #define boat_BoatMessage_compass_cal_status_tag  19
 #define boat_BoatMessage_compass_cal_tag         20
+#define boat_BoatMessage_mission_tag             21
+#define boat_BoatMessage_mission_status_tag      22
 
 /* Struct field encoding specification for nanopb */
 #define boat_IMUData_FIELDLIST(X, a) \
@@ -827,6 +944,62 @@ X(a, STATIC,   SINGULAR, BOOL,     saturated,        19)
 #define boat_BenchStatus_CALLBACK NULL
 #define boat_BenchStatus_DEFAULT NULL
 
+#define boat_MissionCommand_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, BOOL,     start,             1) \
+X(a, STATIC,   SINGULAR, BOOL,     stop,              2) \
+X(a, STATIC,   SINGULAR, UINT32,   request_id,        3) \
+X(a, STATIC,   SINGULAR, UINT32,   stage,             4) \
+X(a, STATIC,   SINGULAR, FLOAT,    out_distance_m,    5) \
+X(a, STATIC,   SINGULAR, FLOAT,    home_radius_m,     6) \
+X(a, STATIC,   SINGULAR, FLOAT,    throttle,          7) \
+X(a, STATIC,   SINGULAR, FLOAT,    approach_throttle,   8) \
+X(a, STATIC,   SINGULAR, BOOL,     turn_right,        9) \
+X(a, STATIC,   SINGULAR, BOOL,     dry_run,          10)
+#define boat_MissionCommand_CALLBACK NULL
+#define boat_MissionCommand_DEFAULT NULL
+
+#define boat_MissionStatus_FIELDLIST(X, a) \
+X(a, STATIC,   SINGULAR, UINT32,   run_id,            1) \
+X(a, STATIC,   SINGULAR, UINT32,   request_id,        2) \
+X(a, STATIC,   SINGULAR, UINT32,   state,             3) \
+X(a, STATIC,   SINGULAR, UINT32,   reason,            4) \
+X(a, STATIC,   SINGULAR, UINT32,   stage,             5) \
+X(a, STATIC,   SINGULAR, FLOAT,    out_distance_m,    6) \
+X(a, STATIC,   SINGULAR, FLOAT,    home_radius_m,     7) \
+X(a, STATIC,   SINGULAR, FLOAT,    throttle,          8) \
+X(a, STATIC,   SINGULAR, FLOAT,    approach_throttle,   9) \
+X(a, STATIC,   SINGULAR, BOOL,     turn_right,       10) \
+X(a, STATIC,   SINGULAR, BOOL,     dry_run,          11) \
+X(a, STATIC,   SINGULAR, DOUBLE,   home_lat,         12) \
+X(a, STATIC,   SINGULAR, DOUBLE,   home_lon,         13) \
+X(a, STATIC,   SINGULAR, FLOAT,    dist_target_m,    14) \
+X(a, STATIC,   SINGULAR, FLOAT,    bearing_target_deg,  15) \
+X(a, STATIC,   SINGULAR, FLOAT,    cross_track_m,    16) \
+X(a, STATIC,   SINGULAR, FLOAT,    wanted_heading_deg,  17) \
+X(a, STATIC,   SINGULAR, FLOAT,    heading_deg,      18) \
+X(a, STATIC,   SINGULAR, FLOAT,    beta_deg,         19) \
+X(a, STATIC,   SINGULAR, BOOL,     beta_valid,       20) \
+X(a, STATIC,   SINGULAR, BOOL,     compass_bad,      21) \
+X(a, STATIC,   SINGULAR, FLOAT,    turned_deg,       22) \
+X(a, STATIC,   SINGULAR, FLOAT,    turn_peak_dps,    23) \
+X(a, STATIC,   SINGULAR, BOOL,     approach,         24) \
+X(a, STATIC,   SINGULAR, BOOL,     hold_active,      25) \
+X(a, STATIC,   SINGULAR, BOOL,     p_switch,         26) \
+X(a, STATIC,   SINGULAR, UINT32,   outages,          27) \
+X(a, STATIC,   SINGULAR, FLOAT,    longest_outage_s,  28) \
+X(a, STATIC,   SINGULAR, FLOAT,    closest_m,        29) \
+X(a, STATIC,   SINGULAR, FLOAT,    elapsed_s,        30) \
+X(a, STATIC,   SINGULAR, UINT32,   record_state,     31) \
+X(a, STATIC,   SINGULAR, UINT32,   file_index,       32) \
+X(a, STATIC,   SINGULAR, FLOAT,    dist_home_m,      33) \
+X(a, STATIC,   SINGULAR, FLOAT,    speed_acc_mps,    34) \
+X(a, STATIC,   SINGULAR, UINT32,   course_samples,   35) \
+X(a, STATIC,   SINGULAR, UINT32,   gps_outliers,     36) \
+X(a, STATIC,   SINGULAR, UINT32,   sats,             37) \
+X(a, STATIC,   SINGULAR, FLOAT,    pdop,             38)
+#define boat_MissionStatus_CALLBACK NULL
+#define boat_MissionStatus_DEFAULT NULL
+
 #define boat_BoatMessage_FIELDLIST(X, a) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,sensors,payload.sensors),   1) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,motor,payload.motor),   2) \
@@ -847,7 +1020,9 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,bench_status,payload.bench_status), 
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,assist,payload.assist),  17) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,steer_rate,payload.steer_rate),  18) \
 X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal_status,payload.compass_cal_status),  19) \
-X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal,payload.compass_cal),  20)
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal,payload.compass_cal),  20) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mission,payload.mission),  21) \
+X(a, STATIC,   ONEOF,    MESSAGE,  (payload,mission_status,payload.mission_status),  22)
 #define boat_BoatMessage_CALLBACK NULL
 #define boat_BoatMessage_DEFAULT NULL
 #define boat_BoatMessage_payload_sensors_MSGTYPE boat_SensorSnapshot
@@ -870,6 +1045,8 @@ X(a, STATIC,   ONEOF,    MESSAGE,  (payload,compass_cal,payload.compass_cal),  2
 #define boat_BoatMessage_payload_steer_rate_MSGTYPE boat_SteerRateCommand
 #define boat_BoatMessage_payload_compass_cal_status_MSGTYPE boat_CompassCalStatus
 #define boat_BoatMessage_payload_compass_cal_MSGTYPE boat_CompassCalCommand
+#define boat_BoatMessage_payload_mission_MSGTYPE boat_MissionCommand
+#define boat_BoatMessage_payload_mission_status_MSGTYPE boat_MissionStatus
 
 extern const pb_msgdesc_t boat_IMUData_msg;
 extern const pb_msgdesc_t boat_ToFGrid_msg;
@@ -895,6 +1072,8 @@ extern const pb_msgdesc_t boat_CompassCalStatus_msg;
 extern const pb_msgdesc_t boat_AssistCommand_msg;
 extern const pb_msgdesc_t boat_BenchCommand_msg;
 extern const pb_msgdesc_t boat_BenchStatus_msg;
+extern const pb_msgdesc_t boat_MissionCommand_msg;
+extern const pb_msgdesc_t boat_MissionStatus_msg;
 extern const pb_msgdesc_t boat_BoatMessage_msg;
 
 /* Defines for backwards compatibility with code written before nanopb-0.4.0 */
@@ -922,6 +1101,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_AssistCommand_fields &boat_AssistCommand_msg
 #define boat_BenchCommand_fields &boat_BenchCommand_msg
 #define boat_BenchStatus_fields &boat_BenchStatus_msg
+#define boat_MissionCommand_fields &boat_MissionCommand_msg
+#define boat_MissionStatus_fields &boat_MissionStatus_msg
 #define boat_BoatMessage_fields &boat_BoatMessage_msg
 
 /* Maximum encoded size of messages (where known) */
@@ -940,6 +1121,8 @@ extern const pb_msgdesc_t boat_BoatMessage_msg;
 #define boat_GpsCoordinate_size                  18
 #define boat_GpsFix_size                         63
 #define boat_IMUData_size                        20
+#define boat_MissionCommand_size                 40
+#define boat_MissionStatus_size                  211
 #define boat_MotorCommand_size                   20
 #define boat_MotorStatus_size                    130
 #define boat_SensorSnapshot_size                 13272

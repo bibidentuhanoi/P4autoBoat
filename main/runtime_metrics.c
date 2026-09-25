@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "drivers/gps_driver.h"
 #include "motor_control.h"
+#include "autonomy.h"
 #include "pipeline.h"
 #include <string.h>
 #endif
@@ -260,6 +261,7 @@ void task_runtime_diagnostics(void *arg)
          * the run progress and which file number it saved as. */
         motor_control_bench_flush();   /* slow SD write, off the control loop */
         motor_control_trimlearn_log();  /* logs; must stay off the control loop */
+        autonomy_diagnostics_tick(periodic_report);   /* MissionStatus + its SD record */
         boat_BenchStatus bench_status;
         uint32_t bench_generation = motor_control_get_bench_status(&bench_status);
         bool bench_terminal = (bench_status.state == 4u || bench_status.state == 5u);

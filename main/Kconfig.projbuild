@@ -321,6 +321,19 @@ menu "Board Configuration"
                 (OFF). The out-and-back mission runs the heading hold itself
                 whatever this says.
 
+        config MISSION_ENABLE
+            bool "Out-and-back mission (START from the laptop's 10 m MISSION card)"
+            default y
+            depends on STABILITY_TRIMLEARN_ENABLE
+            help
+                The boat flies an out-and-back mission by itself: home from
+                GPS, out on the start heading, turn, back along the line to
+                home, motors off inside the home radius. It keeps going
+                through radio outages; STOP, touching the stick, disarm or an
+                explicit servo PWR-OFF end it at once. n removes the whole
+                feature (no mission task, nothing ever owns the jets) -- the
+                field kill switch.
+
         config STABILITY_TRIMLEARN_DEADBAND_DPS
             string "TrimLearn: ignore drift below this (deg/s)"
             default "0.5"

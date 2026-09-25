@@ -149,3 +149,12 @@ void pipeline_publish_calibrate_status(const boat_CalibrateStatus *status);
  *        unrecognised message would be sent labelled as sensor telemetry.
  */
 void pipeline_publish_compass_cal_status(const boat_CompassCalStatus *status);
+
+/* The out-and-back mission (2026-09-25): START/STOP + settings from the
+ * laptop's mission card.  Runs in the RX task: record or forward only. */
+typedef void (*mission_command_handler_fn)(const boat_MissionCommand *cmd);
+void pipeline_register_mission_handler(mission_command_handler_fn handler);
+
+/* One MissionStatus to every transport.  On ESP-NOW it goes out labelled
+ * MSG_MISSION_STATUS (espnow_send_fn recognises BoatMessage field 22). */
+void pipeline_publish_mission_status(const boat_MissionStatus *status);

@@ -57,6 +57,18 @@ void motor_control_bench_flush(void);
 void motor_control_trimlearn_log(void);
 float motor_control_trimlearn_c(void);
 bool motor_control_p_assist_on(void);
+/* the out-and-back mission's AUTO owner (2026-09-25), as in main/motor_control.h */
+#include "auto_drive.h"
+bool motor_control_mission_built(void);
+void motor_control_set_auto_setpoint(const auto_setpoint_t *sp);
+void motor_control_request_auto_stop(void);
+void motor_control_get_auto_abort(uint32_t *run_id, uint8_t *reason);
+bool motor_control_jets_busy(void);
+bool motor_control_link_alive(void);
+bool motor_control_armed(void);
+typedef struct { float left; float right; bool hold_active; float hold_target_deg;
+                 float p_term; float i_term; } motor_drive_snapshot_t;
+void motor_control_get_drive_snapshot(motor_drive_snapshot_t *out);
 """,
     "esp_err.h": r"""
 #pragma once
@@ -1046,6 +1058,11 @@ typedef struct { uint32_t state; uint32_t reason; float still_progress; uint32_t
 #define boat_BoatMessage_compass_cal_status_tag 19
 typedef struct { bool start; bool cancel; float tolerance_deg; } boat_CompassCalCommand;
 #define boat_BoatMessage_compass_cal_tag 20
+typedef struct { bool start; bool stop; uint32_t request_id; uint32_t stage; float out_distance_m;
+    float home_radius_m; float throttle; float approach_throttle; bool turn_right; bool dry_run; } boat_MissionCommand;
+#define boat_BoatMessage_mission_tag 21
+typedef struct { uint32_t run_id; uint32_t state; uint32_t reason; } boat_MissionStatus;
+#define boat_BoatMessage_mission_status_tag 22
 typedef struct {
     int which_payload;
     union {
@@ -1066,6 +1083,8 @@ typedef struct {
         boat_AssistCommand assist;
         boat_CompassCalStatus compass_cal_status;
         boat_CompassCalCommand compass_cal;
+        boat_MissionCommand mission;
+        boat_MissionStatus mission_status;
     } payload;
 } boat_BoatMessage;
 #define boat_BoatMessage_motor_tag 1
@@ -1093,6 +1112,7 @@ typedef struct {
 #define boat_CalibrateStatus_size 35
 #define boat_BenchStatus_size 91
 #define boat_CompassCalStatus_size 70
+#define boat_MissionStatus_size 211
 #define boat_BoatMessage_fields NULL
 typedef esp_err_t (*transport_send_fn)(const uint8_t *, size_t, void *);
 typedef void (*motor_command_handler_fn)(const boat_MotorCommand *);
@@ -1119,6 +1139,9 @@ typedef void (*compass_cal_command_handler_fn)(bool start, bool cancel, float to
 void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler);
 void pipeline_register_bench_handler(bench_command_handler_fn handler);
 void pipeline_register_assist_handler(assist_command_handler_fn handler);
+typedef void (*mission_command_handler_fn)(const boat_MissionCommand *cmd);
+void pipeline_register_mission_handler(mission_command_handler_fn handler);
+void pipeline_publish_mission_status(const boat_MissionStatus *status);
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap);
 void pipeline_publish_status(const boat_SystemStatus *status);
 void pipeline_publish_motor_status(const boat_MotorStatus *status);
@@ -1214,6 +1237,9 @@ static void bench_handler(uint32_t kind, float base, float delta, float reset_c,
     (void)abort; (void)kind; (void)base; (void)delta; (void)reset_c; }
 static void assist_handler(bool p_on, bool ra, uint32_t id) { (void)p_on; (void)ra; (void)id; }
 static void steer_rate_handler(float d) { (void)d; }
+static unsigned mission_calls;
+static bool mission_saw_start;
+static void mission_handler(const boat_MissionCommand *c) { ++mission_calls; mission_saw_start = c->start; }
 static esp_err_t transport_send(const uint8_t *buf, size_t len, void *ctx) {
     (void)buf; (void)len; (void)ctx; ++transport_calls; return ESP_OK;
 }
@@ -1245,6 +1271,7 @@ int main(void) {
     pipeline_register_bench_handler(bench_handler);
     pipeline_register_assist_handler(assist_handler);
     pipeline_register_steer_rate_handler(steer_rate_handler);
+    pipeline_register_mission_handler(mission_handler);
 
     decoded_tag = boat_BoatMessage_detect_tag;
     pipeline_handle_incoming(input, sizeof(input));
@@ -1270,6 +1297,22 @@ int main(void) {
     pipeline_handle_incoming(input, sizeof(input));
     assert(compass_cal_calls == 1);
     assert(manual_control_calls == 0);
+
+    /* A mission START/STOP (2026-09-25) goes to the mission task's handler
+     * and never to manual-control ingress: the mission owns the jets only
+     * through the control task's AUTO owner. */
+    decoded_tag = boat_BoatMessage_mission_tag;
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 1);
+    assert(manual_control_calls == 0);
+    (void)mission_saw_start;
+
+    /* ...and its status goes out to every transport. */
+    const unsigned encodes_before = encode_calls, sends_before = transport_calls;
+    boat_MissionStatus mission_status = {.run_id = 1, .state = 2};
+    pipeline_publish_mission_status(&mission_status);
+    assert(encode_calls == encodes_before + 1);
+    assert(transport_calls == sends_before + 1);
 
     decoded_tag = boat_BoatMessage_motor_tag;
     pipeline_handle_incoming(input, sizeof(input));
@@ -1363,7 +1406,9 @@ DIAGNOSTICS_HARNESS = r"""
 
 static unsigned motor_status_publishes;
 static unsigned gps_status_reads;
+static unsigned mission_ticks;
 static jmp_buf diagnostics_wait;
+void autonomy_diagnostics_tick(bool periodic) { (void)periodic; ++mission_ticks; }
 
 void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
 uint32_t motor_control_get_status(boat_MotorStatus *out) {
@@ -1417,6 +1462,7 @@ int main(void) {
     if (setjmp(diagnostics_wait) == 0) task_runtime_diagnostics(NULL);
     assert(motor_status_publishes == 1);
     assert(gps_status_reads == 1);
+    assert(mission_ticks == 1);   /* MissionStatus + the mission's SD record, off core 0 */
     return 0;
 }
 """
@@ -1745,11 +1791,15 @@ def test_ordinary_forward_driving_is_not_bench_only():
     assert "float thr = driving ? decision->throttle : 0.0f;" in tick
 
     # 3. and those are the values actually handed over.
+    # 2026-09-25: `&& !mission` added on purpose -- a mission flies the heading
+    # hold itself, whose integral then owns the trim exactly as with P on.
+    # In ordinary driving `mission` is false, so the mirror is unchanged.
     assert ("s_trim_moved = trim_learn_update(&s_trim_learn, &s_trim_learn_cfg,\n"
             "                                     f.sequence, dt_s, yaw,\n"
-            "                                     thr, steering, healthy && !s_p_assist_on);") in tick, (
+            "                                     thr, steering, healthy && !s_p_assist_on && !mission);") in tick, (
         "the learner call no longer freezes while yaw PI owns integral action -- the "
         "ordinary-driving mirror in test_normal_driving_learns.c is now wrong")
+    assert "const bool mission = auto_owns();" in tick
 
     # 4. the bench override is scoped to a bench run and nothing else, so it
     #    cannot quietly become the only way thr is ever non-zero.
@@ -1787,7 +1837,7 @@ def test_every_way_of_steering_the_boat_freezes_the_learner():
 
     # Both consumers must key off the same flag, or the slow and fast loops
     # would disagree about whether the boat is being steered.
-    assert "thr, steering, healthy && !s_p_assist_on);" in tick, (
+    assert "thr, steering, healthy && !s_p_assist_on && !mission);" in tick, (
         "the learner is not given `steering`")
     assert ".steering = steering ? 1.0f : 0.0f" in tick, (
         "the yaw PI input no longer receives the shared steering gate")

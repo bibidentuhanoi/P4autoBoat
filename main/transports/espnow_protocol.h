@@ -18,6 +18,9 @@ typedef enum {
      * Replaces MSG_SENSOR for the ESP-NOW link specifically; WS/bench mode
      * keeps sending full SensorSnapshot via MSG_SENSOR, unaffected. */
     MSG_FIELD_TELEMETRY = 0x08,
+    /* MissionStatus (BoatMessage field 22, wire tag bytes 0xB2 0x01): the
+     * out-and-back mission as the boat sees it, ~5 Hz while it runs. */
+    MSG_MISSION_STATUS = 0x09,
     MSG_ESPNOW_INIT   = 0x10,
     /* S3 ground station -> boat: "I am here". Broadcast periodically by the
      * USB bridge. The boat listens for it at boot to decide whether to run in

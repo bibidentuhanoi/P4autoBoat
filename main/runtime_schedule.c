@@ -34,6 +34,12 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
      * priority: it only reads the shared sensor snapshot, never the bus.
      * 8 KB: it also writes the spin record to SD (FATFS runs on this stack). */
     [RUNTIME_TASK_COMPASS_CAL] = {"CompassCal", 8192, 2, 1, 0, 0, false},
+    /* The out-and-back mission (2026-09-25): 20 Hz on core 1, above every
+     * other core-1 task so the control task's setpoint never goes stale
+     * (0.5 s ends the run).  Pure arithmetic: no bus, no SD (the record is
+     * written by Diagnostics), no radio (MissionStatus too).  Optional: if it
+     * cannot start the boat simply has no mission. */
+    [RUNTIME_TASK_AUTONOMY] = {"Autonomy", 4096, 8, 1, 50000, 50000, false},
 };
 
 const runtime_task_spec_t *runtime_schedule_get(runtime_task_id_t id)

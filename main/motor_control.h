@@ -1,5 +1,6 @@
 #pragma once
 
+#include "auto_drive.h"
 #include "esc_trim.h"
 #include "esp_err.h"
 #include "proto/boat.pb.h"
@@ -65,6 +66,40 @@ float motor_control_trimlearn_c(void);
 /* Whether the boat is actually applying the fast P assist. Reported so an A/B
  * file can be checked against what the operator believes they selected. */
 bool motor_control_p_assist_on(void);
+
+/* ---- The out-and-back mission's AUTO owner (2026-09-25) -------------------
+ * The autonomy task (core 1, 20 Hz) hands the control task a setpoint; the
+ * control task flies it through the heading hold as the LAST ESC write of the
+ * cycle, exempt from the manual link-loss failsafe -- the bench-run pattern.
+ * STOP, a non-zero manual command, disarm, an explicit rail PWR-OFF, another
+ * owner of the jets, or a setpoint older than 0.5 s end it at once.
+ * Without CONFIG_MISSION_ENABLE (or the heading hold) all of this compiles to
+ * "not built": the setpoint is ignored and nothing ever owns the jets. */
+bool motor_control_mission_built(void);
+/* Autonomy task: the setpoint of this 50 ms step (auto_drive.h). */
+void motor_control_set_auto_setpoint(const auto_setpoint_t *sp);
+/* RX task: MissionCommand.stop -- the jets stop on the next control cycle. */
+void motor_control_request_auto_stop(void);
+/* The last run the control task stopped and why (auto_abort_t); 0/0 = none. */
+void motor_control_get_auto_abort(uint32_t *run_id, uint8_t *reason);
+/* Calibration, a bench run or its SD save, or the compass calibration owns
+ * (or is about to own) the jets: a mission START is refused. */
+bool motor_control_jets_busy(void);
+/* Manual-control traffic arrived within the link timeout. */
+bool motor_control_link_alive(void);
+bool motor_control_armed(void);
+/* What the jets and the heading hold are doing, for the mission's status and
+ * record.  Lock-free and side-effect free -- NOT motor_control_get_status(),
+ * which also makes the caller the MotorStatus reader it notifies. */
+typedef struct {
+    float left;                /* ESC commands as written */
+    float right;
+    bool hold_active;          /* the heading hold is steering */
+    float hold_target_deg;
+    float p_term;
+    float i_term;
+} motor_drive_snapshot_t;
+void motor_control_get_drive_snapshot(motor_drive_snapshot_t *out);
 
 #ifdef __cplusplus
 }

@@ -78,6 +78,12 @@ PB_BIND(boat_BenchCommand, boat_BenchCommand, AUTO)
 PB_BIND(boat_BenchStatus, boat_BenchStatus, AUTO)
 
 
+PB_BIND(boat_MissionCommand, boat_MissionCommand, AUTO)
+
+
+PB_BIND(boat_MissionStatus, boat_MissionStatus, AUTO)
+
+
 PB_BIND(boat_BoatMessage, boat_BoatMessage, 4)
 
 

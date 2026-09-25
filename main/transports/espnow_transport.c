@@ -250,6 +250,8 @@ static esp_err_t espnow_send_fn(const uint8_t *buf, size_t len, void *ctx)
         switch (buf[0]) {
         case 0x1A: msg_type = MSG_STATUS;       break;  /* SystemStatus */
         case 0x32: msg_type = MSG_MOTOR_STATUS; break;  /* MotorStatus */
+        /* Field numbers >= 16 take a two-byte tag: 22 -> (22<<3|2) = 0xB2 0x01. */
+        case 0xB2: msg_type = (len > 1 && buf[1] == 0x01) ? MSG_MISSION_STATUS : MSG_SENSOR; break;
         default:   msg_type = MSG_SENSOR;       break;  /* SensorSnapshot (0x0A), or unknown -> safe default */
         }
     }

@@ -1,4 +1,5 @@
 #include "motor_control.h"
+#include "auto_drive.h"
 #include "arm_sequence.h"
 #include "calibration.h"
 #include "esc_trim.h"
@@ -224,6 +225,41 @@ static bool s_p_log_pending = false;
 #endif
 /* Read by the drive path in BOTH builds; always false when P is compiled out. */
 static bool s_p_moved = false;
+
+/* The out-and-back mission's AUTO owner (2026-09-25).  It flies the mission
+ * through the heading hold, so it only exists where the hold does.  A bool
+ * Kconfig symbol set to n is ABSENT from sdkconfig.h: absence means off. */
+#if defined(CONFIG_MISSION_ENABLE) && CONFIG_STABILITY_TRIMLEARN_ENABLE
+#define MISSION_BUILT 1
+#else
+#define MISSION_BUILT 0
+#endif
+#if MISSION_BUILT
+/* Written by the autonomy task under s_arbiter_lock; read by the control task. */
+static auto_setpoint_t s_auto_sp;
+/* MissionCommand.stop, set by the RX task under s_arbiter_lock. */
+static bool s_auto_stop_pending = false;
+/* Control task only: the owner's state and THIS cycle's decision, made before
+ * control_apply_decision so the heading hold is fed the mission's target. */
+static auto_drive_t s_auto;
+static auto_out_t s_auto_out;
+/* The mission let go for any reason but the operator's own stick: the jets go
+ * to zero once, whatever the manual path last held. */
+static bool s_auto_release_zero = false;
+/* Control task -> autonomy task, under s_arbiter_lock. */
+static uint32_t s_auto_abort_run = 0;
+static uint8_t s_auto_abort_reason = 0;
+#endif
+
+/* True while the mission owns the jets this cycle. */
+static inline bool auto_owns(void)
+{
+#if MISSION_BUILT
+    return s_auto_out.own;
+#else
+    return false;
+#endif
+}
 #if CONFIG_STABILITY_SAS_ENABLE
 /* Assisted Steering: the rudder yaw-rate loop. RUNTIME switch, OFF at every
  * boot -- the default mode is Raw Manual and nothing persists this. Kept
@@ -1230,7 +1266,10 @@ static void trim_learn_tick(const control_decision_t *decision)
     portEXIT_CRITICAL(&s_arbiter_lock);
     if (req_pending && req != s_p_assist_on) {
         s_p_assist_on = req;
-        if (!req) {                     /* OFF returns to the exact pre-P path */
+        /* OFF returns to the exact pre-P path -- except under a mission, which
+         * flies the hold itself: the switch still changes (and applies the
+         * moment the mission lets go, which resets the hold anyway). */
+        if (!req && !auto_owns()) {
             yaw_heading_control_reset(&s_yaw_heading);
             s_yaw_heading_out = (yaw_heading_output_t){0};
             s_yaw_last_sequence = 0;
@@ -1355,12 +1394,28 @@ static void trim_learn_tick(const control_decision_t *decision)
      * uncorrelated is worth seeing. */
     const float yaw = f.yaw_rate;
 
+    /* A mission flies the heading hold itself -- with its own target and
+     * throttle, whatever the operator's P switch says, and without ever
+     * changing that switch.  The learner holds still meanwhile: the hold's
+     * integral owns the trim, exactly as with P on. */
+    const bool mission = auto_owns();
     uint32_t before = s_trim_learn.last_seq;
     bool fresh_sample = (f.sequence != s_yaw_last_sequence);
     s_trim_moved = trim_learn_update(&s_trim_learn, &s_trim_learn_cfg,
                                      f.sequence, dt_s, yaw,
-                                     thr, steering, healthy && !s_p_assist_on);
+                                     thr, steering, healthy && !s_p_assist_on && !mission);
     if (s_trim_learn.last_seq != before) s_trim_last_capture_us = f.captured_us;
+
+    /* What the hold runs on this cycle.  Without a mission these are exactly
+     * the P switch, the pilot's throttle and the pilot's steering. */
+    const bool hold_on = s_p_assist_on || mission;
+#if MISSION_BUILT
+    const float hold_thr = mission ? ((driving && s_auto_out.drive) ? s_auto_out.throttle : 0.0f)
+                                   : thr;
+#else
+    const float hold_thr = thr;
+#endif
+    const bool hold_steering = steering && !mission;
 
     /* Cascaded heading / yaw-rate PI.  One update per FUSION sample: the
      * control task ticks twice as fast and must not integrate a sample twice. */
@@ -1372,7 +1427,7 @@ static void trim_learn_tick(const control_decision_t *decision)
         }
         s_yaw_last_sequence = f.sequence;
         s_yaw_last_capture_us = f.captured_us;
-        const yaw_heading_input_t input = {
+        yaw_heading_input_t input = {
             .dt_s = yaw_dt_s,
             .yaw_rate_dps = yaw,
             .heading_deg = f.heading,
@@ -1385,15 +1440,18 @@ static void trim_learn_tick(const control_decision_t *decision)
             .heading_valid = f.heading_valid,
             .base_capture_now = bench_learning && !s_yaw_heading.initialized,
         };
+#if MISSION_BUILT
+        if (mission) auto_drive_hold_input(&s_auto_out, &input);
+#endif
         s_yaw_heading_out = yaw_heading_control_update(
             &s_yaw_heading, &s_yaw_heading_cfg, &input);
         s_p_correction = s_yaw_heading_out.dynamic_c;
-    } else if (!s_p_assist_on || !healthy || !driving ||
-               thr < s_yaw_heading_cfg.min_throttle) {
+    } else if (!hold_on || !healthy || !driving ||
+               hold_thr < s_yaw_heading_cfg.min_throttle) {
         yaw_heading_control_reset(&s_yaw_heading);
         s_yaw_heading_out = (yaw_heading_output_t){0};
         s_p_correction = 0.0f;
-    } else if (steering) {
+    } else if (hold_steering) {
         /* Do not wait up to one fusion period to stop fighting a manual turn.
          * The next fresh sample records the suspended state and freezes I. */
         s_yaw_heading_out.active = false;
@@ -1405,7 +1463,8 @@ static void trim_learn_tick(const control_decision_t *decision)
      * or P would be visible in the log and absent from the motors. */
     if (s_p_correction != p_prev) s_p_moved = true;
 
-    s_trim_why = !healthy   ? "gyro stale"
+    s_trim_why = mission    ? "mission owns the motors"
+               : !healthy   ? "gyro stale"
                : steering   ? "steering"
                : !driving   ? "disarmed"
                : s_p_assist_on ? "yaw PI owns integral"
@@ -1533,8 +1592,11 @@ static void control_apply_decision(control_decision_t *decision)
          * needs the rail live to do it. Cutting it would let the rudder float
          * off-centre and corrupt the yaw measurement. An explicit PWR-OFF still
          * cuts the rail (the explicit_off branch above, not this one) and aborts
-         * calibration via s_rail_cut. */
-        if (winch_driver_get_power() && !s_calibrating && !s_bench_active) {
+         * calibration via s_rail_cut.
+         *
+         * A mission is the same case: it flies through radio outages by
+         * design and holds the rudder centred all the way. */
+        if (winch_driver_get_power() && !s_calibrating && !s_bench_active && !auto_owns()) {
             winch_driver_set_power(false);
             changed = true;
         }
@@ -1542,7 +1604,8 @@ static void control_apply_decision(control_decision_t *decision)
         s_manual_right = 0.0f;
         s_manual_rudder = 0.0f;
         heading_assist_reset();
-        if (!control_link_alive() && changed && !s_calibrating && !s_bench_active) {
+        if (!control_link_alive() && changed && !s_calibrating && !s_bench_active &&
+            !auto_owns()) {
             ESP_LOGW(TAG, "Control link lost — throttle 0, winch 0, rudders centred, servo rail cut");
         }
     }
@@ -1653,8 +1716,9 @@ static void stability_sas_tick(bool steer_raw, int64_t now_us)
 {
 #if CONFIG_STABILITY_SAS_ENABLE
     /* Calibration owns the rudder (holds it at 0) and the ESCs while it runs;
-     * SAS must not fight it. calibration_tick already ran this cycle. */
-    if (s_calibrating || s_bench_active) {
+     * SAS must not fight it. calibration_tick already ran this cycle.  A
+     * mission holds the rudder centred the same way (auto_tick). */
+    if (s_calibrating || s_bench_active || auto_owns()) {
         return;
     }
     if (!s_stab_cfg_loaded) {
@@ -1971,6 +2035,81 @@ bool motor_control_p_assist_on(void)
 #endif
 }
 
+bool motor_control_mission_built(void)
+{
+    return MISSION_BUILT != 0;
+}
+
+void motor_control_set_auto_setpoint(const auto_setpoint_t *sp)
+{
+#if MISSION_BUILT
+    if (!sp) return;
+    portENTER_CRITICAL(&s_arbiter_lock);
+    s_auto_sp = *sp;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+#else
+    (void)sp;
+#endif
+}
+
+void motor_control_request_auto_stop(void)
+{
+#if MISSION_BUILT
+    portENTER_CRITICAL(&s_arbiter_lock);
+    s_auto_stop_pending = true;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+    if (s_control_task) xTaskNotifyGive(s_control_task);   /* act now, not next tick */
+#endif
+}
+
+void motor_control_get_auto_abort(uint32_t *run_id, uint8_t *reason)
+{
+    uint32_t run = 0;
+    uint8_t why = 0;
+#if MISSION_BUILT
+    portENTER_CRITICAL(&s_arbiter_lock);
+    run = s_auto_abort_run;
+    why = s_auto_abort_reason;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+#endif
+    if (run_id) *run_id = run;
+    if (reason) *reason = why;
+}
+
+/* Read from the autonomy task.  Single-byte flags owned by the control task:
+ * a stale read at START costs nothing -- the AUTO owner still stops the run
+ * the moment another owner appears (other_owner). */
+bool motor_control_jets_busy(void)
+{
+    return s_calibrating || s_bench_active || s_bench_save_pending || compass_cal_active();
+}
+
+bool motor_control_link_alive(void)
+{
+    return control_link_alive();
+}
+
+bool motor_control_armed(void)
+{
+    return esc_driver_get_state() == ESC_STATE_ARMED;
+}
+
+/* Another task reads the control task's words here without a lock: each is
+ * a single aligned 32-bit read, so a value may be one cycle old but is never
+ * torn -- good enough for a status and a record, never used to actuate. */
+void motor_control_get_drive_snapshot(motor_drive_snapshot_t *out)
+{
+    if (!out) return;
+    *out = (motor_drive_snapshot_t){0};
+    esc_driver_get_throttle(&out->left, &out->right);
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+    out->hold_active = s_yaw_heading_out.active;
+    out->hold_target_deg = s_yaw_heading_out.heading_target_deg;
+    out->p_term = s_yaw_heading_out.p_term;
+    out->i_term = s_yaw_heading_out.i_term;
+#endif
+}
+
 float motor_control_trimlearn_c(void)
 {
 #if CONFIG_STABILITY_TRIMLEARN_ENABLE
@@ -2062,7 +2201,7 @@ static void bench_tick(int64_t now_us)
 
     if (start_req && !s_bench_active && !s_calibrating) {
         if (esc_driver_get_state() == ESC_STATE_ARMED && !s_rail_cut &&
-            fs_sdcard_ready() && !s_bench_save_pending) {
+            fs_sdcard_ready() && !s_bench_save_pending && !auto_owns()) {
             /* Unknown kinds still fall back to the safest run. The bound has
              * to include BASE_LONG or a long request would silently execute
              * as an ordinary 3 s BASE -- and be filed as one. */
@@ -2113,10 +2252,10 @@ static void bench_tick(int64_t now_us)
                          (unsigned)kind, (double)base, (double)delta);
             }
         } else {
-            ESP_LOGW(TAG, "BENCH,start_rejected,armed=%d,rail_cut=%d,sd=%d,saving=%d",
+            ESP_LOGW(TAG, "BENCH,start_rejected,armed=%d,rail_cut=%d,sd=%d,saving=%d,mission=%d",
                      (int)(esc_driver_get_state() == ESC_STATE_ARMED),
                      (int)s_rail_cut, (int)fs_sdcard_ready(),
-                     (int)s_bench_save_pending);
+                     (int)s_bench_save_pending, (int)auto_owns());
         }
     }
 
@@ -2243,7 +2382,8 @@ static void calibration_tick(int64_t now_us)
         s_cal_ready = true;
     }
     if (start_req && !s_calibrating && s_cal_ready) {
-        if (esc_driver_get_state() == ESC_STATE_ARMED && cal_link_alive && !s_rail_cut) {
+        if (esc_driver_get_state() == ESC_STATE_ARMED && cal_link_alive && !s_rail_cut &&
+            !auto_owns()) {
             s_cal_cfg.average_into_existing = average;
             /* Force-armed ("bench / no GPS") -> drop the making-way gate so a
              * level records on yaw settling alone (operator watches the boat).
@@ -2257,8 +2397,9 @@ static void calibration_tick(int64_t now_us)
             ESP_LOGI(TAG, "CAL,start,avg=%d,levels=%u,gps_gate=%d",
                      (int)average, (unsigned)s_cal_cfg.level_count, (int)!s_force_armed);
         } else {
-            ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d",
-                     (int)(esc_driver_get_state() == ESC_STATE_ARMED), (int)s_rail_cut);
+            ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d,mission=%d",
+                     (int)(esc_driver_get_state() == ESC_STATE_ARMED), (int)s_rail_cut,
+                     (int)auto_owns());
         }
     }
 
@@ -2340,6 +2481,100 @@ static void calibration_tick(int64_t now_us)
      * not a stale replay). No new failsafe logic (design doc sec 7a). */
 }
 
+#if MISSION_BUILT
+/* The operator touched something: a NEW accepted manual command that is not
+ * zero.  The laptop's all-zero presence stream and a failsafe transition are
+ * not input -- they must never end a mission. */
+static bool manual_input_in(const control_decision_t *d)
+{
+    return (d->drive_changed && (fabsf(d->throttle) > 0.02f || fabsf(d->rudder) > 0.02f)) ||
+           (d->steer_changed && (d->steer_raw || fabsf(d->steer) > 0.02f)) ||
+           (d->winch_changed && d->winch != 0.0f);
+}
+#endif
+
+/* The AUTO owner's decision for this cycle.  BEFORE control_apply_decision,
+ * so the heading hold (in trim_learn_tick) already runs on the mission's
+ * target, and a stick that ends the mission is applied in this same cycle. */
+static void auto_decide(const control_decision_t *d, int64_t now_us)
+{
+#if MISSION_BUILT
+    portENTER_CRITICAL(&s_arbiter_lock);
+    const auto_setpoint_t sp = s_auto_sp;
+    const bool stop = s_auto_stop_pending;
+    s_auto_stop_pending = false;
+    portEXIT_CRITICAL(&s_arbiter_lock);
+
+    const auto_inputs_t in = {
+        .now_us = now_us,
+        .armed = esc_driver_get_state() == ESC_STATE_ARMED,
+        .rail_cut = s_rail_cut || d->servo_power_off,
+        .other_owner = s_calibrating || s_bench_active || compass_cal_active(),
+        .manual_input = manual_input_in(d),
+        .stop_request = stop,
+    };
+    const bool owned_before = s_auto_out.own;
+    s_auto_out = auto_drive_step(&s_auto, &sp, &in);
+    if (s_auto_out.abort != AUTO_ABORT_NONE) {
+        portENTER_CRITICAL(&s_arbiter_lock);
+        s_auto_abort_run = s_auto.aborted_run_id;
+        s_auto_abort_reason = (uint8_t)s_auto.abort_reason;
+        portEXIT_CRITICAL(&s_arbiter_lock);
+    }
+    if (owned_before != s_auto_out.own) {
+        /* Taking or giving back the jets: the heading hold starts clean
+         * either way -- the mission from its own target, the operator's P
+         * from a freshly captured heading, never the other side's target. */
+        yaw_heading_control_reset(&s_yaw_heading);
+        s_yaw_heading_out = (yaw_heading_output_t){0};
+        s_yaw_last_sequence = 0;
+        s_yaw_last_capture_us = 0;
+        s_p_correction = 0.0f;
+        s_trim_last_capture_us = 0;         /* no learner step spanning the run */
+        s_auto_release_zero = owned_before && s_auto_out.abort != AUTO_ABORT_MANUAL;
+    }
+#else
+    (void)d;
+    (void)now_us;
+#endif
+}
+
+/* The mission's ESC write: LAST of the cycle, after calibration and bench
+ * (which refuse to start while it owns), overriding the manual path -- which,
+ * with the link quiet, zeroes the jets every cycle.  Rudder held centred. */
+static void auto_tick(void)
+{
+#if MISSION_BUILT
+    if (s_auto_out.own) {
+        float left = 0.0f;
+        float right = 0.0f;
+        if (s_auto_out.drive) {
+            auto_drive_mix(s_auto_out.throttle, s_trim_learn.c, s_p_correction,
+                           s_yaw_heading_out.active, &left, &right);
+            /* The rudder must be held, not left floating: power the rail as a
+             * non-zero stick would -- unless the operator explicitly cut it,
+             * which has already ended the run. */
+            if (!s_rail_cut && !winch_driver_get_power()) {
+                steer_driver_reassert();
+                winch_driver_set_power(true);
+            }
+        }
+        float now_left;
+        float now_right;
+        esc_driver_get_throttle(&now_left, &now_right);
+        if (now_left != left || now_right != right) {
+            esc_driver_set_throttle(left, right);
+        }
+        if (steer_driver_get() != 0.0f) {
+            steer_driver_set(0.0f);
+        }
+    } else if (s_auto_release_zero) {
+        s_auto_release_zero = false;
+        esc_driver_set_throttle(0.0f, 0.0f);
+    }
+#endif
+}
+
 static void run_control_cycle(bool scheduled, int64_t scheduled_us)
 {
     static uint8_t heading_divider = 0;
@@ -2357,9 +2592,11 @@ static void run_control_cycle(bool scheduled, int64_t scheduled_us)
     s_control_failsafe = failsafe;
     portEXIT_CRITICAL(&s_arbiter_lock);
 
+    auto_decide(&decision, start_us);
     control_apply_decision(&decision);
     calibration_tick(start_us);
     bench_tick(start_us);
+    auto_tick();
     stability_sas_tick(decision.steer_raw, start_us);
     status_commit_current(false);
 

@@ -311,6 +311,67 @@ message BenchStatus {
   bool   saturated          = 19;
 }
 
+// Laptop -> boat: the out-and-back mission ("10 m MISSION" card, 2026-09-25).
+// The boat flies it on its own; the link only carries START and STOP, and a
+// radio outage never stops it. A START repeated with the same request_id is
+// ignored; a START while a mission runs is ignored; STOP always wins.
+message MissionCommand {
+  bool   start             = 1;
+  bool   stop              = 2;
+  uint32 request_id        = 3;
+  uint32 stage             = 4;   // 1 OUT ONLY, 2 OUT + TURN, 3 FULL
+  float  out_distance_m    = 5;   // 3..50
+  float  home_radius_m     = 6;   // 1.5..10: motors off inside it
+  float  throttle          = 7;   // 0.20..0.60
+  float  approach_throttle = 8;   // 0.15..throttle, from 2 x home radius
+  bool   turn_right        = 9;
+  bool   dry_run           = 10;  // motors stay 0; the boat is carried
+}
+
+// Boat -> laptop: the mission as the BOAT sees it. 5 Hz while it runs, 1 Hz
+// otherwise -- continuous, so a terminal state is repeated by construction.
+// One ESP-NOW packet: keep the worst-case encoding under ~230 bytes.
+message MissionStatus {
+  uint32 run_id             = 1;
+  uint32 request_id         = 2;
+  uint32 state              = 3;   // 0 idle 1 home 2 outbound 3 turn 4 return 5 done 6 aborted 7 refused
+  uint32 reason             = 4;   // done 1-5, abort 10-20, refuse 30-42 (main/mission.h)
+  uint32 stage              = 5;
+  float  out_distance_m     = 6;
+  float  home_radius_m      = 7;
+  float  throttle           = 8;
+  float  approach_throttle  = 9;
+  bool   turn_right         = 10;
+  bool   dry_run            = 11;
+  double home_lat           = 12;
+  double home_lon           = 13;
+  float  dist_target_m      = 14;
+  float  bearing_target_deg = 15;
+  float  cross_track_m      = 16;  // + = right of the return line
+  float  wanted_heading_deg = 17;
+  float  heading_deg        = 18;
+  float  beta_deg           = 19;  // GPS course minus compass heading, as used
+  bool   beta_valid         = 20;
+  bool   compass_bad        = 21;
+  float  turned_deg         = 22;  // + = right
+  float  turn_peak_dps      = 23;
+  bool   approach           = 24;  // slow approach throttle in use
+  bool   hold_active        = 25;  // the heading hold is steering
+  bool   p_switch           = 26;  // the operator's Motor P switch (never changed by the mission)
+  uint32 outages            = 27;
+  float  longest_outage_s   = 28;
+  float  closest_m          = 29;
+  float  elapsed_s          = 30;
+  uint32 record_state       = 31;  // 0 none 1 recording 2 saving 3 saved 4 failed 5 unavailable
+  uint32 file_index         = 32;  // MSN_<NNN>.CSV
+  float  dist_home_m        = 33;
+  float  speed_acc_mps      = 34;  // GPS sAcc: never recorded before, stage 1 needs it
+  uint32 course_samples     = 35;  // beta samples accepted this run
+  uint32 gps_outliers       = 36;  // fixes rejected as jumps
+  uint32 sats               = 37;
+  float  pdop               = 38;
+}
+
 // Envelope — every message on the wire is a BoatMessage
 message BoatMessage {
   oneof payload {
@@ -334,5 +395,7 @@ message BoatMessage {
     SteerRateCommand steer_rate = 18;
     CompassCalStatus compass_cal_status = 19;
     CompassCalCommand compass_cal = 20;
+    MissionCommand mission      = 21;
+    MissionStatus  mission_status = 22;
   }
 }

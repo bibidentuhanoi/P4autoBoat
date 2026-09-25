@@ -61,7 +61,8 @@ static yaw_heading_cfg_t shipped_assist_cfg(void)
  *                     decision->steer_raw;
  *     bool driving  = (esc_driver_get_state() == ESC_STATE_ARMED);
  *     float thr     = driving ? decision->throttle : 0.0f;
- *     trim_learn_update(..., healthy && !s_p_assist_on);
+ *     trim_learn_update(..., healthy && !s_p_assist_on && !mission);
+ *     (mission is false in ordinary driving -- no mission owns the jets)
  *     yaw_heading_control_update(..., learned_c as feed-forward);
  *
  * tests/test_runtime_architecture.py pins those lines against the real source,

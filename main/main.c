@@ -39,6 +39,7 @@
 #include "drivers/sd_card.h"
 #include "runtime_metrics.h"
 #include "runtime_startup.h"
+#include "autonomy.h"
 #include "runtime_task.h"
 static const char* TAG = "MAIN";
 
@@ -302,6 +303,11 @@ void app_main(void) {
     // Register motor control handlers (after pipeline_init so handlers aren't zeroed)
     ESP_LOGI(TAG, "Registering motor control handlers...");
     ESP_ERROR_CHECK(motor_control_init());
+
+    /* The out-and-back mission: its MissionCommand handler must be in place
+     * before the radio starts.  Never fatal -- without it the boat drives
+     * exactly as before and a mission START gets no answer. */
+    (void)autonomy_init();
 
     // Initialize detection task (lazy-loads model on first trigger)
     ESP_LOGI(TAG, "Initializing detection task...");
