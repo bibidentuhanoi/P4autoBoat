@@ -220,14 +220,22 @@ void pipeline_register_calibrate_handler(calibrate_command_handler_fn handler)
     s_calibrate_handler = handler;
 }
 
+/* These two are registered LATE in boot (compass_cal_start, and autonomy_init
+ * which runs last), with the radio already delivering commands: the store
+ * takes the RX lock that pipeline_handle_incoming() holds while it reads the
+ * pointer, so a registration can never race a dispatch. */
 void pipeline_register_compass_cal_handler(compass_cal_command_handler_fn handler)
 {
+    if (s_rx_msg_mutex) xSemaphoreTake(s_rx_msg_mutex, portMAX_DELAY);
     s_compass_cal_handler = handler;
+    if (s_rx_msg_mutex) xSemaphoreGive(s_rx_msg_mutex);
 }
 
 void pipeline_register_mission_handler(mission_command_handler_fn handler)
 {
+    if (s_rx_msg_mutex) xSemaphoreTake(s_rx_msg_mutex, portMAX_DELAY);
     s_mission_handler = handler;
+    if (s_rx_msg_mutex) xSemaphoreGive(s_rx_msg_mutex);
 }
 
 void pipeline_publish_sensors(const boat_SensorSnapshot *snap)

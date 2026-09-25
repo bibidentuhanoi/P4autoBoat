@@ -2423,6 +2423,11 @@ static void calibration_tick(int64_t now_us)
             ESP_LOGW(TAG, "CAL,start_rejected,armed=%d,rail_cut=%d,mission=%d",
                      (int)(esc_driver_get_state() == ESC_STATE_ARMED), (int)s_rail_cut,
                      (int)auto_owns());
+            /* Refused because a mission owns the jets: spend the latch, so the
+             * keepalives that keep coming cannot start a sweep by themselves the
+             * moment the run ends -- the operator is catching the boat then.
+             * A new start needs a stop first, as after every finished sweep. */
+            if (auto_owns()) s_cal_ready = false;
         }
     }
 

@@ -379,3 +379,108 @@ class StreamAndCliTest(MissionBase):
                              capture_output=True, text=True, timeout=60)
         self.assertEqual(res.returncode, 0, res.stderr[-1000:])
         self.assertTrue((run / 'merged.csv').exists())
+
+
+class InterlockTest(MissionBase):
+    """Server-side refusals while a mission may own the jets (a disabled
+    button is decoration: a stale tab or a curl reaches the API directly)."""
+
+    def _fly(self):
+        rid = self.start()
+        self.boat(run_id=4, request_id=rid, state=2)             # OUTBOUND
+        return rid
+
+    def test_runs_and_mode_changes_are_refused_while_a_mission_runs(self):
+        self._fly()
+        seq = lambda: self.link.winch_command_seq + 1           # noqa: E731
+        refusals = {
+            'bench': self.link.send_bench('both', 0.2, 0.0, seq()),
+            'calibration': self.link.set_calibrate(True, seq()),
+            'lake test': self.link.start_lake_id(0.20, 0.30, seq()),
+            'rudder test': self.link.start_rudder_test(1, seq()),
+            'P on': self.link.send_assist(True),
+            'P off': self.link.send_assist(False),
+        }
+        for what, (ok, err) in refusals.items():
+            self.assertFalse(ok, what)
+            self.assertIn('mission is running', err, what)
+        self.assertFalse(self.link.calibrating)                 # no keepalives will go out
+        # what the operator reaches for to END it is never refused
+        self.assertTrue(self.link.set_calibrate(False, seq())[0])
+        ok, err = self.link.set_winch(0.5, seq())
+        self.assertNotIn('mission', err or '')
+
+    def test_a_mission_the_boat_reports_blocks_them_too(self):
+        # a restarted tool: no local run, the boat says one is flying
+        self.boat(run_id=8, request_id=4242, state=4)
+        ok, err = self.link.send_bench('both', 0.2, 0.0, self.link.winch_command_seq + 1)
+        self.assertFalse(ok)
+        self.assertIn('mission is running', err)
+
+    def test_they_work_again_once_the_run_is_over(self):
+        rid = self._fly()
+        self.boat(run_id=4, request_id=rid, state=5, reason=3)  # DONE
+        self.finished()
+        ok, err = self.link.send_bench('both', 0.2, 0.0, self.link.winch_command_seq + 1)
+        self.assertTrue(ok, err)
+
+    def test_a_start_on_firmware_without_missions_is_forgotten(self):
+        """The boat answers MotorStatus but has never sent a MissionStatus:
+        no mission firmware. Its START started nothing -- STOP is plain again
+        and the bench is not blocked."""
+        self.start()
+        for _ in range(int(3 * T.MISSION_START_ANSWER_S * 15) + 3):
+            self.link.motor_status = dict(self.link.motor_status, have=True,
+                                          last_rx_monotonic=self.clock.t)
+            self.tick()
+        self.assertIsNone(self.link._mission_open)
+        self.frames.clear()
+        self.link.stop(self.link.winch_command_seq + 1)
+        self.assertNotIn('arm_cmd', self.kinds())
+        ok, err = self.link.send_bench('both', 0.2, 0.0, self.link.winch_command_seq + 1)
+        self.assertTrue(ok, err)
+
+    def test_a_silent_boat_keeps_the_start_open(self):
+        """No MotorStatus either: the downlink is gone, not the firmware --
+        the boat may be flying, so STOP still disarms."""
+        self.start()
+        for _ in range(int(3 * T.MISSION_START_ANSWER_S * 15) + 3):
+            self.tick()
+        self.assertIsNotNone(self.link._mission_open)
+
+    def test_mission_firmware_that_goes_quiet_keeps_the_start_open(self):
+        """It has reported missions before, so it HAS mission firmware: a START
+        it never answered may be flying even though MotorStatus still comes."""
+        self.boat(run_id=3, request_id=7, state=5, reason=3)     # an earlier run's report
+        self.start()
+        for _ in range(int(3 * T.MISSION_START_ANSWER_S * 15) + 3):
+            self.link.motor_status = dict(self.link.motor_status, have=True,
+                                          last_rx_monotonic=self.clock.t)
+            self.tick()
+        self.assertIsNotNone(self.link._mission_open)
+
+
+class RecordNameTest(MissionBase):
+    """The run folder names the boat's SD file even when the boat's first
+    terminal report went out while the file was still being written."""
+
+    def test_the_end_waits_for_the_file_name(self):
+        rid = self.start()
+        self.boat(run_id=4, request_id=rid, state=2)
+        self.boat(run_id=4, request_id=rid, state=5, reason=3, record_state=2)   # DONE, saving
+        self.assertIsNotNone(self.link.mission)                                   # not yet
+        self.tick()
+        self.boat(run_id=4, request_id=rid, state=5, reason=3, record_state=3, file_index=7)
+        summary = self.finished()
+        self.assertEqual(summary['status'], 'done')
+        self.assertEqual(summary['boat_record'], 'MSN_007.CSV on the boat SD card')
+
+    def test_a_record_never_confirmed_still_ends_the_run(self):
+        rid = self.start()
+        self.boat(run_id=4, request_id=rid, state=5, reason=3, record_state=2)
+        for _ in range(int(T.MISSION_RECORD_WAIT_S * 15) + 3):
+            self.tick()
+        summary = self.finished()
+        self.assertEqual(summary['status'], 'done')
+        self.assertIsNone(summary['boat_record'])
+        self.assertIn('boat record not confirmed', summary['warnings'])

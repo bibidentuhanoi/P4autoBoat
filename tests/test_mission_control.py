@@ -320,3 +320,36 @@ def test_the_drive_snapshot_is_this_cycles_jets_without_the_esc_driver():
     }
 """)
 
+
+
+def test_a_calibration_asked_for_during_a_mission_never_starts_by_itself_after():
+    """The tool keeps sending CalibrateCommand start keepalives once a
+    calibration is asked for. Refused while the mission owns the jets -- and
+    it must stay refused when the mission ends: the operator is catching the
+    boat then, and a sweep starting on its own would drive the jets at them.
+    A new start needs an explicit stop first (the latch the tool already
+    honours after every sweep)."""
+    run_case(r"""
+    arm();
+    start_mission(12u, 90.0f, 0.40f);
+    run(50);
+    for (int i = 0; i < 30; ++i) { calibrate_handler(true, false); cycle(true); }   /* keepalives */
+    boat_CalibrateStatus cs;
+    motor_control_get_calibrate_status(&cs);
+    assert(cs.state == 0u && "refused under the mission");
+    /* the mission ends; the keepalives keep coming */
+    sp.active = false; sp.drive = false;
+    for (int i = 0; i < 200; ++i) {
+        if ((i % 5) == 0) motor_handler(&(boat_MotorCommand){0});
+        calibrate_handler(true, false);
+        cycle(true);
+    }
+    motor_control_get_calibrate_status(&cs);
+    assert(cs.state == 0u && "never starts by itself when the mission ends");
+    assert(esc_left == 0.0f && esc_right == 0.0f);
+    /* stop, then start: the deliberate way still works */
+    calibrate_handler(false, false); cycle(true);
+    for (int i = 0; i < 20; ++i) { calibrate_handler(true, false); cycle(true); }
+    motor_control_get_calibrate_status(&cs);
+    assert(cs.state != 0u);
+""")

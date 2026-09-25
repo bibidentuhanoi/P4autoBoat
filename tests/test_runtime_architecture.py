@@ -1574,6 +1574,20 @@ def test_a_capture_without_a_camera_is_refused_not_a_reboot():
         assert 0 <= guard < take, fn + " takes the camera mutex without checking it exists"
 
 
+def test_late_handlers_register_under_the_rx_lock():
+    """The mission handler (autonomy_init, the end of boot) and the compass
+    one are registered with the radio already delivering commands: their
+    store takes the lock pipeline_handle_incoming() reads them under."""
+    src = (ROOT / "main" / "pipeline.c").read_text()
+    for fn in ("void pipeline_register_mission_handler(",
+               "void pipeline_register_compass_cal_handler("):
+        body = _function_body(src, fn)
+        take = body.index("xSemaphoreTake(s_rx_msg_mutex")
+        give = body.index("xSemaphoreGive(s_rx_msg_mutex")
+        store = body.index("_handler = handler;")
+        assert take < store < give, fn
+
+
 def test_the_mission_starts_last_at_boot():
     """The mission task and its 2.7 MB PSRAM record take their memory only
     after every other task has its own -- Detect's one contiguous 32 KB

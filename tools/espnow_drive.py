@@ -1489,6 +1489,8 @@ MISSION_START_ANSWER_S = 5.0       # ...for this long
 MISSION_STOP_RETRY_S = 5.0         # STOP again every tick until the boat confirms
 MISSION_STATUS_STALE_S = 1.5       # 5 Hz while running: 1.5 s is a gap
 MISSION_NO_PROGRESS_S = 30.0       # laptop-only warning, never stops the boat
+MISSION_RECORD_SAVING = 2          # MissionStatus.record_state: the boat is writing MSN_NNN.CSV
+MISSION_RECORD_WAIT_S = 8.0        # a run's end waits this long for the file's name
 MISSION_NO_PROGRESS_M = 1.0
 MISSION_DIR = RUDDER_TEST_DIR
 MISSION_CSV_COLUMNS = (
@@ -2692,6 +2694,9 @@ class BoatLink:
             self.winch_command_seq = command_seq
             if start and self._rudder_test_busy_locked():
                 return False, 'a rudder test is running — wait for it to finish'
+            why = self._mission_live_refusal_locked() if start else None
+            if why:
+                return False, why
             if not self.connected:
                 return False, 'serial link is disconnected'
             if start and not self.armed_cmd:
@@ -3037,6 +3042,9 @@ class BoatLink:
             # controller under half the recording.
             if self._rudder_test_busy_locked():
                 return False, 'a rudder test is running — wait for it to finish'
+            why = self._mission_live_refusal_locked()
+            if why:
+                return False, why
             if p_on and self.assist_rudder_on:
                 return False, ('Assisted Steering is ON — the two assists are '
                                'mutually exclusive, switch it OFF first')
@@ -3075,6 +3083,9 @@ class BoatLink:
             self.winch_command_seq = command_seq
             if self._rudder_test_busy_locked():
                 return False, 'a rudder test is running — wait for it to finish'
+            why = self._mission_live_refusal_locked()
+            if why:
+                return False, why
             if kind not in BENCH_KIND:
                 return False, 'unknown run type'
             if not self.connected:
@@ -3134,6 +3145,9 @@ class BoatLink:
             self.winch_command_seq = command_seq
             if sign not in (-1, 1) or isinstance(sign, bool):
                 return False, 'direction must be -1 or +1'
+            why = self._mission_live_refusal_locked()
+            if why:
+                return False, why
             if self.rudder_test is not None:
                 return False, 'a rudder test is already running'
             if getattr(self, 'lake_id', None) is not None:
@@ -3672,6 +3686,9 @@ class BoatLink:
             return 'a lake steering test is already running'
         if self.rudder_test is not None:
             return 'a rudder test is running'
+        why = self._mission_live_refusal_locked()
+        if why:
+            return why
         if not self.connected:
             return 'serial link is disconnected'
         if self.calibrating:
@@ -4339,6 +4356,18 @@ class BoatLink:
         ms = getattr(self, 'mission_status', None) or {}
         return bool(ms.get('have') and ms.get('state') in MISSION_ACTIVE_STATES)
 
+    def _mission_live_refusal_locked(self):
+        """Server-side, like the rudder/lake-test interlock: a disabled button is
+        decoration. While a mission may own the jets, a bench run, an ESC-trim
+        calibration, a lake or rudder test and a P change are refused -- a
+        calibration asked for mid-run used to start on the boat by itself the
+        moment the run ended, with the operator catching the boat. A stick, the
+        winch and PWR-OFF are NOT refused: each ends the mission on the boat,
+        which is exactly what an operator reaching for them wants."""
+        if self._mission_may_be_live_locked():
+            return 'a mission is running \u2014 STOP it first'
+        return None
+
     def _mission_may_be_live_locked(self):
         """A mission this tool is running, one the boat reports running, or a
         START of ours the boat never reported ending (no answer, or reports
@@ -4480,6 +4509,20 @@ class BoatLink:
     def _mission_tick_locked(self, now):
         """15 Hz, from the stream loop: repeat START until answered, STOP until
         confirmed; give up on a boat that never answers."""
+        rid = getattr(self, '_mission_open', None)
+        if rid is not None and getattr(self, 'mission', None) is None:
+            answer_by = getattr(self, '_mission_open_answer_by', None) or 0.0
+            ms = getattr(self, 'motor_status', None) or {}
+            motors_fresh = bool(ms.get('have')) and (
+                now - (ms.get('last_rx_monotonic') or -1e9) < 2.0)
+            never_a_mission = not (getattr(self, 'mission_status', None) or {}).get('have')
+            if now > answer_by + MISSION_START_ANSWER_S and motors_fresh and never_a_mission:
+                # The downlink works (MotorStatus is fresh) yet no MissionStatus
+                # has EVER arrived: this firmware has no mission. The START
+                # started nothing, so nothing is left to stop.
+                self._mission_open = None
+                print('[mission] the boat answers but has never reported a mission: '
+                      'no mission firmware on it -- START %d forgotten' % rid, flush=True)
         until = getattr(self, '_mission_stop_until', None)
         if until is not None:                      # a STOP with no local run
             if now <= until and self._mission_may_be_live_locked():
@@ -4488,6 +4531,12 @@ class BoatLink:
                 self._mission_stop_until = None
         m = getattr(self, 'mission', None)
         if m is None or m['finalizing']:
+            return
+        if m.get('finish_by') is not None:
+            if now >= m['finish_by']:
+                status, reason = m['finish_pending']
+                m['warnings'].append('boat record not confirmed')
+                self._finish_mission_locked(status, reason)
             return
         if m['stop_until'] is not None:
             if now <= m['stop_until']:
@@ -4559,6 +4608,16 @@ class BoatLink:
             if st['state'] in MISSION_TERMINAL_STATES:
                 m['stop_until'] = None
                 status = {5: 'done', 6: 'aborted', 7: 'refused'}[st['state']]
+                if st['record_state'] == MISSION_RECORD_SAVING:
+                    # The boat is still writing its SD record, and its first
+                    # terminal report can go out a moment before the file is
+                    # named. The summary should name it: wait, bounded (the
+                    # tick finishes the run at finish_by without it).
+                    if m.get('finish_by') is None:
+                        m['finish_by'] = now + MISSION_RECORD_WAIT_S
+                        m['finish_pending'] = (status, st['reason_text'])
+                        self._mission_event_locked('awaiting_record', 'the boat is saving its SD record')
+                    return
                 self._finish_mission_locked(status, st['reason_text'])
 
     def _mission_resolve_open_locked(self, st, now):
