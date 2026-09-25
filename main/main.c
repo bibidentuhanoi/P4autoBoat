@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -304,11 +305,6 @@ void app_main(void) {
     ESP_LOGI(TAG, "Registering motor control handlers...");
     ESP_ERROR_CHECK(motor_control_init());
 
-    /* The out-and-back mission: its MissionCommand handler must be in place
-     * before the radio starts.  Never fatal -- without it the boat drives
-     * exactly as before and a mission START gets no answer. */
-    (void)autonomy_init();
-
     // Initialize detection task (lazy-loads model on first trigger)
     ESP_LOGI(TAG, "Initializing detection task...");
     esp_err_t detect_ret = detect_init();
@@ -477,6 +473,25 @@ void app_main(void) {
         ESP_LOGW(TAG, "Dataset capture unavailable (%s) — manual control continues",
                  esp_err_to_name(training_log_ret));
     }
+
+    /* The out-and-back mission starts LAST: every task above -- Detect's one
+     * contiguous 32 KB block first of all -- has its memory before the mission
+     * takes its task stack and its 2.7 MB PSRAM record.  If memory has run out
+     * it is the mission that is missing (logged), never telemetry or
+     * calibration.  Its MissionCommand handler is registered here too, so a
+     * START that arrives earlier in boot is ignored and gets no answer.
+     * Never fatal: without it the boat drives exactly as before. */
+    (void)autonomy_init();
+
+    /* One line to read after every flash: what is left once everything runs.
+     * A task that could not get its stack said so above. */
+    ESP_LOGI(TAG, "Memory after boot: internal %u B free (largest block %u, lowest ever %u), "
+                  "PSRAM %u B free (largest block %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
     /* Booted. The heartbeat stops here; a calibration requested at boot has
      * already taken over the LED with its own step patterns. */

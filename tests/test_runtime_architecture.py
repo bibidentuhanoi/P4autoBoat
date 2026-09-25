@@ -1490,6 +1490,33 @@ def test_core1_diagnostics_publishes_motor_status():
         subprocess.run([str(binary)], check=True)
 
 
+def test_the_mission_starts_last_at_boot():
+    """The mission task and its 2.7 MB PSRAM record take their memory only
+    after every other task has its own -- Detect's one contiguous 32 KB
+    internal block first of all (on hardware it failed once the heap was
+    fragmented).  Out of memory then means no mission, logged, never lost
+    telemetry or calibration.  One line after boot says what memory is left."""
+    body = _function_body((ROOT / "main" / "main.c").read_text(), "void app_main(void)")
+    assert body.count("autonomy_init()") == 1
+    mission = body.index("autonomy_init()")
+    for earlier in (
+        "detect_init()",
+        "http_server_start()",
+        "camera_stream_server_start()",
+        "runtime_task_create(RUNTIME_TASK_FUSION",
+        "runtime_task_create(RUNTIME_TASK_SENSOR_BUS",
+        "runtime_task_create(RUNTIME_TASK_TOF_READ",
+        "runtime_task_create(RUNTIME_TASK_TOF_PROCESS",
+        "runtime_task_create(RUNTIME_TASK_SNAPSHOT",
+        "runtime_task_create(RUNTIME_TASK_DIAGNOSTICS",
+        "compass_cal_start(",
+        "training_log_init()",
+    ):
+        assert body.index(earlier) < mission, earlier + " must start before the mission"
+    report = body.index("Memory after boot")
+    assert mission < report < body.index('"System running."')
+
+
 def test_fusion_only_consumes_versioned_raw_samples():
     fusion_source = (ROOT / "main" / "sensor_fusion.c").read_text()
     raw_snapshot_source = (ROOT / "main" / "sample_snapshot.c").read_text()

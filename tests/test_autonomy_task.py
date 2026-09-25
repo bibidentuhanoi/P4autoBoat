@@ -56,6 +56,7 @@ static inline void *heap_caps_malloc(size_t n, unsigned caps) { (void)caps; retu
 #include <stdint.h>
 typedef uint32_t TickType_t;
 typedef int BaseType_t;
+typedef unsigned UBaseType_t;
 typedef struct { int unused; } portMUX_TYPE;
 #define portMUX_INITIALIZER_UNLOCKED {0}
 #define portENTER_CRITICAL(l) ((void)(l))
@@ -72,6 +73,7 @@ TickType_t xTaskGetTickCount(void);
 void vTaskDelayUntil(TickType_t *prev, TickType_t period);
 BaseType_t xTaskNotifyGive(TaskHandle_t t);
 TaskHandle_t xTaskGetCurrentTaskHandle(void);
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t t);
 """,
     "runtime_metrics.h": r"""
 #pragma once
@@ -79,6 +81,9 @@ TaskHandle_t xTaskGetCurrentTaskHandle(void);
 #include "runtime_schedule.h"
 void runtime_metrics_cycle_begin(runtime_task_id_t id, uint64_t scheduled, uint64_t started);
 void runtime_metrics_cycle_end(runtime_task_id_t id, uint64_t ended);
+typedef struct { uint32_t runs; uint32_t max_exec_us; uint32_t max_gap_us; uint32_t max_jitter_us;
+                 uint32_t deadline_misses; uint32_t stack_free_words; } runtime_metric_snapshot_t;
+void runtime_metrics_snapshot(runtime_task_id_t id, runtime_metric_snapshot_t *out);
 """,
     "runtime_task.h": r"""
 #pragma once
@@ -159,10 +164,21 @@ static char file_body[1 << 20]; static size_t file_len = 0;
 int64_t esp_timer_get_time(void) { return now; }
 TickType_t xTaskGetTickCount(void) { return 0; }
 void vTaskDelayUntil(TickType_t *prev, TickType_t period) { (void)prev; (void)period; }
-BaseType_t xTaskNotifyGive(TaskHandle_t t) { (void)t; return pdPASS; }
+static unsigned notifies = 0; static TaskHandle_t notified = NULL;
+BaseType_t xTaskNotifyGive(TaskHandle_t t) { ++notifies; notified = t; return pdPASS; }
 TaskHandle_t xTaskGetCurrentTaskHandle(void) { return (TaskHandle_t)1; }
+/* Whichever "task" is running: the mission step or diagnostics. */
+static UBaseType_t stack_free_now = 0;
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t t) { assert(t == NULL); return stack_free_now; }
 void runtime_metrics_cycle_begin(runtime_task_id_t id, uint64_t a, uint64_t b) { (void)id; (void)a; (void)b; }
 void runtime_metrics_cycle_end(runtime_task_id_t id, uint64_t e) { (void)id; (void)e; }
+static uint32_t control_late = 0;
+void runtime_metrics_snapshot(runtime_task_id_t id, runtime_metric_snapshot_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (id == RUNTIME_TASK_CONTROL) { out->deadline_misses = control_late; out->max_exec_us = 850; }
+    else if (id == RUNTIME_TASK_AUTONOMY) { out->max_exec_us = 420; out->max_gap_us = 51000; out->deadline_misses = 3; }
+    else assert(0);
+}
 esp_err_t runtime_task_create(runtime_task_id_t id, TaskFunction_t fn, void *arg, TaskHandle_t *out) {
     assert(id == RUNTIME_TASK_AUTONOMY); (void)arg; (void)out; task_fn = fn; return ESP_OK;
 }
@@ -221,8 +237,8 @@ static void step(int n) {
         }
         fus.heading = heading; fus.heading_valid = true; fus.yaw_rate = 0.0f;
         fus.sequence++; fus.captured_us = (uint64_t)now;
-        autonomy_step(now);
-        autonomy_diagnostics_tick(false);
+        stack_free_now = 1111; autonomy_step(now);
+        stack_free_now = 2222; autonomy_diagnostics_tick(false);
     }
 }
 
@@ -233,12 +249,18 @@ static boat_MissionCommand start_cmd(uint32_t id) {
 }
 
 int main(void) {
+    /* The mission starts LAST at boot: diagnostics is already running and has
+     * named itself the status reader.  init must not forget it -- the first
+     * status still wakes it. */
+    autonomy_diagnostics_tick(false);
     assert(autonomy_init() == ESP_OK);
     assert(handler && task_fn && s_rec && s_rec_cap >= RECORD_FALLBACK_SAMPLES);
+    now += 50000; autonomy_step(now);
+    assert(notifies == 1 && notified == (TaskHandle_t)1);
 
     /* Idle: a setpoint every step, inactive; status at 1 Hz. */
     step(40);
-    assert(sp_writes == 40 && !last_sp.active && last_sp.run_id == 0);
+    assert(sp_writes == 41 && !last_sp.active && last_sp.run_id == 0);
     assert(status_publishes >= 2 && status_publishes <= 3);
     assert(last_status.state == 0 && last_status.sats == 12 && fabsf(last_status.pdop - 1.4f) < 1e-6f);
 
@@ -260,7 +282,9 @@ int main(void) {
     busy = false;
     assert(atomic_load(&s_rec_state) == REC_NONE);      /* refusals are never recorded */
 
-    /* A real start: HOME, then OUTBOUND on the start heading. */
+    /* A real start: HOME, then OUTBOUND on the start heading.  Control has
+     * been late 5 times since boot; 2 more happen during the run. */
+    control_late = 5;
     c = start_cmd(5); handler(&c); step(1);
     assert(s_m.state == MISSION_HOME && last_sp.active && !last_sp.drive && last_sp.run_id == s_m.run_id);
     assert(atomic_load(&s_rec_state) == REC_RECORDING);
@@ -276,19 +300,21 @@ int main(void) {
     assert(fabsf(last_status.speed_acc_mps - 0.08f) < 1e-6f);
     step(60);                                           /* past the 3 s settle: beta samples */
     assert(s_m.state == MISSION_OUTBOUND && last_status.course_samples > 0);
+    control_late = 7;
 
     /* STOP: the control task hears it from the RX task, at once. */
     boat_MissionCommand stop = {.stop = true};
     handler(&stop);
     assert(stop_requests == 1);
     const uint32_t run = s_m.run_id;
-    now += 50000; autonomy_step(now);
+    now += 50000; stack_free_now = 1111; autonomy_step(now);
     assert(s_m.state == MISSION_ABORTED && s_m.reason == MISSION_ABORT_STOP);
     assert(!last_sp.active);
     /* the record is handed over; a START meanwhile is refused as busy */
     assert(atomic_load(&s_save_pending) && atomic_load(&s_rec_state) == REC_SAVING);
     c = start_cmd(6); handler(&c); now += 50000; autonomy_step(now);
     assert(s_m.state == MISSION_REFUSED && s_m.reason == MISSION_REFUSE_BUSY);
+    stack_free_now = 2222;
     autonomy_diagnostics_tick(false);                   /* the diagnostics task writes it */
     assert(!atomic_load(&s_save_pending) && atomic_load(&s_rec_state) == REC_SAVED);
     assert(card_files == 1 && !strcmp(card[0], "MSN_001.CSV"));
@@ -296,6 +322,12 @@ int main(void) {
     file_body[file_len] = 0;
     assert(strstr(file_body, "# out-and-back mission run"));
     assert(strstr(file_body, "reason 10 (STOP)"));
+    /* The timing line: what the run cost the control task (P + auto-trim)
+     * and this task -- counted during the run, not since boot. */
+    assert(strstr(file_body, "# timing: control cycles late (>10 ms) during the run 2, "
+                             "slowest control cycle 850 us, slowest mission step 420 us, "
+                             "longest gap between mission steps 51000 us, "
+                             "stack free: mission task 1111 B, diagnostics 2222 B\n"));
     const char *data = strstr(file_body, "beta_valid\n");
     assert(data);
     data += strlen("beta_valid\n");

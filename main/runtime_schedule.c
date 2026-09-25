@@ -27,7 +27,12 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
     [RUNTIME_TASK_SNAPSHOT] = {"Snapshot", 16384, 5, 1, 50000, 50000, false},
     [RUNTIME_TASK_TOF_PROCESS] = {"ToFProc", 6144, 4, 1, 200000, 0, false},
     [RUNTIME_TASK_WS_TX] = {"WS_TX", 8192, 3, 1, 0, 0, false},
-    [RUNTIME_TASK_DIAGNOSTICS] = {"Diagnostics", 4096, 2, 1, 1000000, 0, false},
+    /* 6 KB: it writes the bench and mission records to SD -- printf of
+     * doubles, FATFS and the SDMMC driver all on this stack.  Measured from
+     * the linked firmware (2026-09-25): the worst path, a heap error logged
+     * from inside that printf, needs 5,520 B (5,104 B on main c8a4c5e), over
+     * the old 4 KB; the normal path ~3 KB. */
+    [RUNTIME_TASK_DIAGNOSTICS] = {"Diagnostics", 6144, 2, 1, 1000000, 0, false},
     [RUNTIME_TASK_TRAINING_LOG] = {"TrainingLog", 8192, 2, 1, 0, 0, false},
     [RUNTIME_TASK_STATUS_LED] = {"StatusLED", 2048, 2, 1, 0, 0, false},
     /* Compass/IMU calibration at boot, then a 1 Hz health report. Low

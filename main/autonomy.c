@@ -117,6 +117,20 @@ static uint32_t s_rec_n = 0;
 static bool s_rec_overflow = false;
 static char *s_rec_chunk = NULL;
 static mission_t s_rec_final;                /* the run as it ended, for the header */
+
+/* Did the run slow anything down?  The control task (P + auto-trim) and this
+ * task, counted from the runtime metrics at START and again at the end: the
+ * serial log and the file header both carry it, so a lake run answers the
+ * question without a laptop on the USB port. */
+typedef struct {
+    uint32_t control_misses;                 /* control cycles > 10 ms late, during the run */
+    uint32_t control_max_us;                 /* slowest control cycle since boot */
+    uint32_t step_max_us;                    /* slowest mission step since boot */
+    uint32_t step_max_gap_us;                /* longest gap between mission steps (50 ms nominal) */
+    uint32_t stack_free;                     /* this task's lowest free stack, bytes */
+} run_timing_t;
+static uint32_t s_start_control_misses = 0;
+static run_timing_t s_rec_timing;            /* handed to diagnostics with s_rec_final */
 /* The mission task hands a finished record over by setting this; diagnostics
  * clears it once the file is written.  A new START is refused meanwhile, so
  * the buffer is never written by both. */
@@ -367,6 +381,22 @@ static mission_output_t avoidance(const mission_output_t *demand)
     return *demand;
 }
 
+static run_timing_t run_timing_now(void)
+{
+    runtime_metric_snapshot_t control;
+    runtime_metric_snapshot_t step;
+    runtime_metrics_snapshot(RUNTIME_TASK_CONTROL, &control);
+    runtime_metrics_snapshot(RUNTIME_TASK_AUTONOMY, &step);
+    const run_timing_t t = {
+        .control_misses = control.deadline_misses - s_start_control_misses,
+        .control_max_us = control.max_exec_us,
+        .step_max_us = step.max_exec_us,
+        .step_max_gap_us = step.max_gap_us,
+        .stack_free = (uint32_t)uxTaskGetStackHighWaterMark(NULL),
+    };
+    return t;
+}
+
 /* One 50 ms step.  Everything the mission knows comes in here and its
  * setpoint goes out to the control task every step, active or not -- an idle
  * setpoint (active = false) is what keeps the jets unowned. */
@@ -416,6 +446,9 @@ static void autonomy_step(int64_t now_us)
         s_rec_overflow = false;
         atomic_store(&s_rec_file_index, 0u);
         atomic_store(&s_rec_state, s_rec ? (uint32_t)REC_RECORDING : (uint32_t)REC_UNAVAILABLE);
+        runtime_metric_snapshot_t control;
+        runtime_metrics_snapshot(RUNTIME_TASK_CONTROL, &control);
+        s_start_control_misses = control.deadline_misses;
         ESP_LOGW(TAG, "MISSION,start,run=%u,stage=%u,out=%.1f,radius=%.1f,thr=%.2f,approach=%.2f,%s%s",
                  (unsigned)s_m.run_id, (unsigned)s_m.settings.stage,
                  (double)s_m.settings.out_distance_m, (double)s_m.settings.home_radius_m,
@@ -431,11 +464,19 @@ static void autonomy_step(int64_t now_us)
                      s_m.state == MISSION_DONE ? "done" : s_m.state == MISSION_ABORTED ? "aborted" : "refused",
                      (unsigned)s_m.run_id, (unsigned)s_m.reason, reason_text(s_m.reason),
                      (double)s_m.dist_home_m, (double)s_m.closest_m, (unsigned)s_m.outages);
-            /* A run that drove leaves a record to write. */
-            if (s_m.run_id == s_rec_run && s_rec && atomic_load(&s_rec_state) == REC_RECORDING) {
-                s_rec_final = s_m;
-                atomic_store(&s_rec_state, (uint32_t)REC_SAVING);
-                atomic_store(&s_save_pending, true);
+            /* A run that drove leaves a record to write, and a timing line. */
+            if (s_m.run_id == s_rec_run) {
+                const run_timing_t t = run_timing_now();
+                ESP_LOGW(TAG, "MISSION,timing,run=%u,control_late=%u,control_max_us=%u,"
+                              "step_max_us=%u,step_gap_max_us=%u,stack_free=%u",
+                         (unsigned)s_m.run_id, (unsigned)t.control_misses, (unsigned)t.control_max_us,
+                         (unsigned)t.step_max_us, (unsigned)t.step_max_gap_us, (unsigned)t.stack_free);
+                if (s_rec && atomic_load(&s_rec_state) == REC_RECORDING) {
+                    s_rec_final = s_m;
+                    s_rec_timing = t;
+                    atomic_store(&s_rec_state, (uint32_t)REC_SAVING);
+                    atomic_store(&s_save_pending, true);
+                }
             }
         } else {
             ESP_LOGI(TAG, "MISSION,state=%u,run=%u", (unsigned)s_m.state, (unsigned)s_m.run_id);
@@ -467,7 +508,10 @@ static void task_autonomy(void *arg)
 }
 
 /* ---- diagnostics task: the SD file ---------------------------------------- */
-static bool write_record(void)
+/* noinline: the row snprintf passes 27 doubles on the stack; kept out of
+ * autonomy_diagnostics_tick's frame, it is only on the stack while a file is
+ * being written, not under every status publish. */
+static bool __attribute__((noinline)) write_record(void)
 {
     if (!fs_sdcard_ready()) {
         ESP_LOGE(TAG, "MISSION,record_failed,no SD card");
@@ -498,6 +542,9 @@ static bool write_record(void)
         "# result: state %u reason %u (%s), dist_home %.2f m, closest %.2f m, turned %.0f deg, "
         "beta %.1f deg (valid %d, compass bad %d), outages %u (longest %.1f s), gps outliers %u, "
         "samples %u%s\n"
+        "# timing: control cycles late (>10 ms) during the run %u, slowest control cycle %u us, "
+        "slowest mission step %u us, longest gap between mission steps %u us, "
+        "stack free: mission task %u B, diagnostics %u B\n"
         "t_s,state,reason,lat,lon,sats,pdop,sacc,fix_age_s,speed,course,heading,yaw_dps,"
         "wanted_course,wanted_heading,dist_target,bearing_target,cross_track,progress,beta,turned,"
         "throttle,left,right,hold_target,p_term,i_term,link,gps_new,hold,approach,beta_valid\n",
@@ -511,7 +558,10 @@ static bool write_record(void)
         (double)m->dist_home_m, (double)m->closest_m, (double)m->turned_deg,
         (double)m->beta_deg, (int)m->beta_valid, (int)m->compass_bad,
         (unsigned)m->outages, (double)m->longest_outage_s, (unsigned)m->outliers,
-        (unsigned)s_rec_n, s_rec_overflow ? " -- BUFFER FULL, the rest of the run is missing" : "");
+        (unsigned)s_rec_n, s_rec_overflow ? " -- BUFFER FULL, the rest of the run is missing" : "",
+        (unsigned)s_rec_timing.control_misses, (unsigned)s_rec_timing.control_max_us,
+        (unsigned)s_rec_timing.step_max_us, (unsigned)s_rec_timing.step_max_gap_us,
+        (unsigned)s_rec_timing.stack_free, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     if (n <= 0 || n >= RECORD_CHUNK || fs_sdcard_write(name, c, (size_t)n) != ESP_OK) {
         ESP_LOGE(TAG, "MISSION,record_failed,%s", name);
         return false;
@@ -542,7 +592,8 @@ static bool write_record(void)
     if (n > 0 && fs_sdcard_append(name, c, (size_t)n) != ESP_OK) goto fail;
     atomic_store(&s_rec_file_index, idx);
     s_rec_next_index = (idx % 999u) + 1u;
-    ESP_LOGI(TAG, "MISSION,saved,%s,samples=%u", name, (unsigned)s_rec_n);
+    ESP_LOGI(TAG, "MISSION,saved,%s,samples=%u,diagnostics_stack_free=%u", name, (unsigned)s_rec_n,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return true;
 fail:
     ESP_LOGE(TAG, "MISSION,record_failed,%s -- the file on the card is INCOMPLETE", name);
@@ -580,7 +631,9 @@ esp_err_t autonomy_init(void)
     atomic_store(&s_save_pending, false);
     atomic_store(&s_rec_state, (uint32_t)REC_NONE);
     atomic_store(&s_rec_file_index, 0u);
-    atomic_store(&s_status_reader, (uintptr_t)NULL);
+    /* s_status_reader is left alone: it starts NULL, and Diagnostics -- which
+     * runs before this, the mission starting last at boot -- may already have
+     * set it. */
 
     /* The record lives in PSRAM; without it the mission still flies and says
      * "record unavailable". */

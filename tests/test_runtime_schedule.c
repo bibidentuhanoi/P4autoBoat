@@ -33,9 +33,12 @@ int main(void)
     assert_task(RUNTIME_TASK_SNAPSHOT, "Snapshot", 16384, 5, 1, 50000, 50000, false);
     assert_task(RUNTIME_TASK_TOF_PROCESS, "ToFProc", 6144, 4, 1, 200000, 0, false);
     assert_task(RUNTIME_TASK_WS_TX, "WS_TX", 8192, 3, 1, 0, 0, false);
-    assert_task(RUNTIME_TASK_DIAGNOSTICS, "Diagnostics", 4096, 2, 1, 1000000, 0, false);
+    assert_task(RUNTIME_TASK_DIAGNOSTICS, "Diagnostics", 6144, 2, 1, 1000000, 0, false);
     assert_task(RUNTIME_TASK_TRAINING_LOG, "TrainingLog", 8192, 2, 1, 0, 0, false);
     assert_task(RUNTIME_TASK_STATUS_LED, "StatusLED", 2048, 2, 1, 0, 0, false);
+    assert_task(RUNTIME_TASK_COMPASS_CAL, "CompassCal", 8192, 2, 1, 0, 0, false);
+    /* The mission: above every other core-1 task, below Control (core 0). */
+    assert_task(RUNTIME_TASK_AUTONOMY, "Autonomy", 4096, 8, 1, 50000, 50000, false);
 
     assert(runtime_schedule_get(RUNTIME_TASK_WAYPOINT) == 0);
     assert(runtime_schedule_get(RUNTIME_TASK_ML_CONTROL) == 0);
