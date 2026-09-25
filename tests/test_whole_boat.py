@@ -493,6 +493,7 @@ static unsigned msn_on_card(void) {
     return n;
 }
 static bool turn_right_next = true;
+static unsigned runs_done = 0, runs_in_3m = 0;
 static void full_mission_ok(float thr) {
     int reason = 0;
     home_boat();
@@ -502,7 +503,12 @@ static void full_mission_ok(float thr) {
     printf("    (pointed at %.1f deg, turn %s)\n", (double)start_hdg, turn_right_next ? "right" : "left");
     assert(s == M_DONE);
     assert(reason == R_IN_ZONE || reason == R_PASSED || reason == R_NEAR);
-    assert(wb_closest() < 3.0f);
+    /* "passed" / "near" end a run only inside the approach circle (2 x 2.5 m) */
+    assert(wb_closest() < 5.0f);
+    ++runs_done; runs_in_3m += wb_closest() < 3.0f;
+    /* without wind every run ends truly inside 3 m; a crosswind at the slow
+     * approach can leave one just outside (the simulator's known limit) */
+    if (drift_n == 0.0f && drift_e == 0.0f) assert(wb_closest() < 3.0f);
     run_s(0.5f);
     assert(esc_left == 0.0f && esc_right == 0.0f);    /* motors off after DONE */
     expect_record_saved(next_file);
@@ -799,6 +805,9 @@ static void scenario_headings(void) {
     random_heading = true;                  /* and 40 more, anywhere */
     rng = 777u;
     for (int k = 0; k < 40; ++k) { turn_right_next = (k & 1) == 0; full_mission_ok(0.25f + 0.3f * (float)(k % 5) / 4.0f); }
+    printf("  %u missions DONE, %u truly inside 3 m (%.0f %%)\n", runs_done, runs_in_3m,
+           100.0 * runs_in_3m / (runs_done ? runs_done : 1u));
+    assert(10u * runs_in_3m >= 9u * runs_done);          /* in wind: at least 90 % */
 }
 
 int main(int argc, char **argv) {
@@ -812,7 +821,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "stick_rail_disarm")) scenario_stick_rail_disarm_end_it();
     else if (!strcmp(which, "radio_and_sensors")) scenario_radio_loss_and_sensors();
     else if (!strcmp(which, "random")) scenario_random((unsigned)atoi(argv[2]), atoi(argv[3]));
-    else if (!strcmp(which, "headings")) scenario_headings();
+    else if (!strcmp(which, "headings")) {
+        /* optional: the boat (straight-going split c) and the wind (m/s N, E) */
+        if (argc >= 3) c_bal = (float)atof(argv[2]);
+        if (argc >= 5) { drift_n = (float)atof(argv[3]); drift_e = (float)atof(argv[4]); }
+        printf("  boat: straight at c = %.2f, drift %.2f / %.2f m/s\n", (double)c_bal, (double)drift_n, (double)drift_e);
+        scenario_headings();
+    }
     else { printf("unknown scenario %s\n", which); return 2; }
     assert(violations == 0);
     printf("simulated %.0f s, %u violations\nOK\n", (double)now_us / 1e6, violations);
@@ -911,6 +926,13 @@ def run_scenario(*args, timeout=900):
 ])
 def test_whole_boat_sequences(scenario):
     print(run_scenario(scenario))
+
+
+@pytest.mark.parametrize("boat", [("0.05", "0", "0"), ("0.40", "0", "0"), ("0.20", "0.07", "-0.07")])
+def test_every_heading_on_other_boats(boat):
+    """The 74-mission heading sweep on the most mismatched jets of the
+    09-20/21 data (c 0.05 and 0.40) and in a 0.1 m/s wind."""
+    print(run_scenario("headings", *boat))
 
 
 @pytest.mark.parametrize("seed", range(1, 9))
