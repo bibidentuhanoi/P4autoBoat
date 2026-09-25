@@ -167,6 +167,10 @@ static int64_t s_status_continuous_us = 0;
 static uint32_t s_status_generation;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static atomic_uintptr_t s_status_reader_task;
+/* The jets and the heading hold as the mission's recorder sees them: copied
+ * by the control task every cycle, under s_status_lock, so another task never
+ * takes the ESC driver's mutex (motor_control_get_drive_snapshot). */
+static motor_drive_snapshot_t s_drive_snapshot;
 
 static bool s_arm_power_allowed;
 
@@ -733,8 +737,19 @@ static void status_commit_current(bool force)
         status.fusion_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
     }
 #endif
+    const motor_drive_snapshot_t drive = {
+        .left = status.left_throttle,
+        .right = status.right_throttle,
+#if CONFIG_STABILITY_TRIMLEARN_ENABLE
+        .hold_active = s_yaw_heading_out.active,
+        .hold_target_deg = s_yaw_heading_out.heading_target_deg,
+        .p_term = s_yaw_heading_out.p_term,
+        .i_term = s_yaw_heading_out.i_term,
+#endif
+    };
 
     portENTER_CRITICAL(&s_status_lock);
+    s_drive_snapshot = drive;            /* every cycle: before the rate limit */
     uint32_t generation = s_status_generation;
     const boat_MotorStatus *prev = &s_status_buffers[generation & 1U];
     if (!force) {
@@ -2100,14 +2115,13 @@ bool motor_control_armed(void)
 void motor_control_get_drive_snapshot(motor_drive_snapshot_t *out)
 {
     if (!out) return;
-    *out = (motor_drive_snapshot_t){0};
-    esc_driver_get_throttle(&out->left, &out->right);
-#if CONFIG_STABILITY_TRIMLEARN_ENABLE
-    out->hold_active = s_yaw_heading_out.active;
-    out->hold_target_deg = s_yaw_heading_out.heading_target_deg;
-    out->p_term = s_yaw_heading_out.p_term;
-    out->i_term = s_yaw_heading_out.i_term;
-#endif
+    /* The control task's own copy from this cycle's status_commit_current():
+     * one cycle's values together, and the ESC driver's mutex (no timeout)
+     * stays the control task's alone -- a mission task holding it while
+     * preempted on core 1 would make P and auto-trim wait. */
+    portENTER_CRITICAL(&s_status_lock);
+    *out = s_drive_snapshot;
+    portEXIT_CRITICAL(&s_status_lock);
 }
 
 float motor_control_trimlearn_c(void)

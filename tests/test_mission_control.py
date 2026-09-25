@@ -290,3 +290,33 @@ def test_turning_p_off_mid_mission_changes_the_switch_not_the_hold():
     assert(status().ctrl_active);
     assert(fabsf(status().i_term - i_before) < 0.01f);   /* not reset */
 """)
+
+
+def test_the_drive_snapshot_is_this_cycles_jets_without_the_esc_driver():
+    """What the mission's recorder reads every 50 ms: exactly what this control
+    cycle wrote to the jets, with the heading hold's terms from the same cycle
+    -- from the control task's own copy, never through the ESC driver, whose
+    mutex (no timeout) is the control task's alone."""
+    run_case(r"""
+    arm();
+    start_mission(5, 120.0f, 0.40f);
+    run(400);
+    const unsigned reads = esc_get_throttle_calls;
+    motor_drive_snapshot_t d;
+    motor_control_get_drive_snapshot(&d);
+    assert(esc_get_throttle_calls == reads);             /* never the driver */
+    assert(d.left == esc_left && d.right == esc_right);  /* this cycle's jets */
+    assert(d.left > 0.0f && d.right > 0.0f);
+    assert(d.hold_active);
+    assert(fabsf(d.hold_target_deg - 120.0f) < 1e-3f);
+    /* the hold's own terms: this plant needs a split of 0.08 to go straight,
+     * so after 4 s of holding the integral carries it */
+    assert(isfinite(d.p_term) && isfinite(d.i_term) && fabsf(d.i_term) > 0.01f);
+    /* and it follows the jets cycle by cycle, not the rate-limited MotorStatus */
+    for (int i = 0; i < 20; ++i) {
+        cycle(true);
+        motor_control_get_drive_snapshot(&d);
+        assert(d.left == esc_left && d.right == esc_right);
+    }
+""")
+

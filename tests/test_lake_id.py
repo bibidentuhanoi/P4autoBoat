@@ -1124,6 +1124,10 @@ class GuardTest(unittest.TestCase):
         # 2026-09-25: the Planner + Guidance seam (straight segment today; the
         # ground for waypoint missions and a SUSHI-style obstacle planner).
         'main/path_follow.c', 'main/path_follow.h', 'main/planner.c', 'main/planner.h',
+        # 2026-09-25 robustness pass before the first mission flash: a capture
+        # with no camera (camera_init failed) was xSemaphoreTake(NULL) -> a
+        # FreeRTOS assert and a reboot; now refused with INVALID_STATE.
+        'main/drivers/camera_driver.c',
     }
 
     def _git(self, *args):

@@ -42,8 +42,10 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
     /* The out-and-back mission (2026-09-25): 20 Hz on core 1, above every
      * other core-1 task so the control task's setpoint never goes stale
      * (0.5 s ends the run).  Pure arithmetic: no bus, no SD (the record is
-     * written by Diagnostics), no radio (MissionStatus too).  Optional: if it
-     * cannot start the boat simply has no mission. */
+     * written by Diagnostics), no radio (MissionStatus too), no mutex -- only
+     * spinlock copies (the drive snapshot included: never the ESC driver's
+     * mutex, which is the control task's) and the console lock of its few
+     * log lines.  Optional: if it cannot start the boat simply has no mission. */
     [RUNTIME_TASK_AUTONOMY] = {"Autonomy", 4096, 8, 1, 50000, 50000, false},
 };
 

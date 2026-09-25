@@ -474,17 +474,28 @@ void pipeline_handle_incoming(const uint8_t *buf, size_t len)
             ESP_LOGW(TAG, "Compass calibration command received but no handler registered");
         }
         break;
-    case boat_BoatMessage_mission_tag:
-        ESP_LOGI(TAG, "Mission command: %s%s (request %u)",
-                 s_rx_msg.payload.mission.start ? "START" : "",
-                 s_rx_msg.payload.mission.stop ? "STOP" : "",
-                 (unsigned)s_rx_msg.payload.mission.request_id);
+    case boat_BoatMessage_mission_tag: {
+        /* This runs on esp_hosted's rpc_rx thread: priority 23, above the
+         * control task, on either core.  STOP repeats the same command at
+         * 15 Hz for up to 5 s and a console line can busy-wait on the UART
+         * for milliseconds, so the line is written only when the command
+         * changes.  Every command still reaches the handler. */
+        static boat_MissionCommand s_mission_logged;
+        static bool s_mission_logged_any = false;
+        const boat_MissionCommand *mc = &s_rx_msg.payload.mission;
+        if (!s_mission_logged_any || mc->start != s_mission_logged.start ||
+            mc->stop != s_mission_logged.stop || mc->request_id != s_mission_logged.request_id) {
+            s_mission_logged = *mc;
+            s_mission_logged_any = true;
+            ESP_LOGI(TAG, "Mission command: %s%s (request %u)%s",
+                     mc->start ? "START" : "", mc->stop ? "STOP" : "", (unsigned)mc->request_id,
+                     s_mission_handler ? "" : " -- no mission task, ignored");
+        }
         if (s_mission_handler) {
-            s_mission_handler(&s_rx_msg.payload.mission);
-        } else {
-            ESP_LOGW(TAG, "Mission command received but no handler registered");
+            s_mission_handler(mc);
         }
         break;
+    }
     default:
         ESP_LOGW(TAG, "Unhandled message type: %d", (int)s_rx_msg.which_payload);
         break;

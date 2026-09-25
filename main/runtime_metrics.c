@@ -27,7 +27,6 @@
 #endif
 
 typedef struct {
-    atomic_uint sequence;
     atomic_uint runs;
     atomic_uint max_exec_us;
     atomic_uint max_gap_us;
@@ -68,21 +67,32 @@ static uint32_t histogram_bucket(uint32_t execution_us)
     return 7;
 }
 
+#ifdef ESP_PLATFORM
+/* One lock for every record: a portMUX critical section.  Its holder cannot be
+ * preempted on its own core and the other core waits microseconds -- every
+ * section below is a handful of loads and stores.  It replaces a CAS on an
+ * odd/even sequence taken in task context, which excluded nothing (its
+ * `continue` jumped to the CAS, which then succeeded on the odd value) and
+ * whose reader spun while the value was odd: a higher-priority task on the
+ * holder's core -- the mission task reading the control record while
+ * Diagnostics held it -- would have spun there forever, starving core 1. */
+static portMUX_TYPE s_records_lock = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
 static void lock_record(runtime_metric_record_t *record)
 {
-    unsigned expected;
-    do {
-        expected = atomic_load_explicit(&record->sequence, memory_order_acquire);
-        if (expected & 1U) continue;
-    } while (!atomic_compare_exchange_weak_explicit(&record->sequence, &expected,
-                                                     expected + 1U,
-                                                     memory_order_acquire,
-                                                     memory_order_relaxed));
+    (void)record;
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&s_records_lock);
+#endif
 }
 
 static void unlock_record(runtime_metric_record_t *record)
 {
-    atomic_fetch_add_explicit(&record->sequence, 1U, memory_order_release);
+    (void)record;
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&s_records_lock);
+#endif
 }
 
 static void update_max(atomic_uint *value, uint32_t candidate)
@@ -180,25 +190,20 @@ void runtime_metrics_snapshot(runtime_task_id_t id, runtime_metric_snapshot_t *o
     if (!valid_id(id)) return;
 
     runtime_metric_record_t *record = &s_records[id];
-    unsigned before;
-    unsigned after;
-    do {
-        before = atomic_load_explicit(&record->sequence, memory_order_acquire);
-        if (before & 1U) continue;
-        out->runs = atomic_load_explicit(&record->runs, memory_order_relaxed);
-        out->max_exec_us = atomic_load_explicit(&record->max_exec_us, memory_order_relaxed);
-        out->max_gap_us = atomic_load_explicit(&record->max_gap_us, memory_order_relaxed);
-        out->max_jitter_us = atomic_load_explicit(&record->max_jitter_us, memory_order_relaxed);
-        out->deadline_misses = atomic_load_explicit(&record->deadline_misses, memory_order_relaxed);
-        out->stack_free_words = atomic_load_explicit(&record->stack_free_words, memory_order_relaxed);
-        for (uint32_t i = 0; i < 8; ++i) {
-            out->exec_histogram[i] = atomic_load_explicit(&record->histogram[i], memory_order_relaxed);
-        }
-        for (uint32_t i = 0; i < RUNTIME_EVENT_COUNT; ++i) {
-            out->events[i] = atomic_load_explicit(&record->events[i], memory_order_relaxed);
-        }
-        after = atomic_load_explicit(&record->sequence, memory_order_acquire);
-    } while (before != after || (after & 1U));
+    lock_record(record);                 /* one consistent copy, never a retry loop */
+    out->runs = atomic_load_explicit(&record->runs, memory_order_relaxed);
+    out->max_exec_us = atomic_load_explicit(&record->max_exec_us, memory_order_relaxed);
+    out->max_gap_us = atomic_load_explicit(&record->max_gap_us, memory_order_relaxed);
+    out->max_jitter_us = atomic_load_explicit(&record->max_jitter_us, memory_order_relaxed);
+    out->deadline_misses = atomic_load_explicit(&record->deadline_misses, memory_order_relaxed);
+    out->stack_free_words = atomic_load_explicit(&record->stack_free_words, memory_order_relaxed);
+    for (uint32_t i = 0; i < 8; ++i) {
+        out->exec_histogram[i] = atomic_load_explicit(&record->histogram[i], memory_order_relaxed);
+    }
+    for (uint32_t i = 0; i < RUNTIME_EVENT_COUNT; ++i) {
+        out->events[i] = atomic_load_explicit(&record->events[i], memory_order_relaxed);
+    }
+    unlock_record(record);
 }
 
 bool runtime_metrics_core_attribution_complete(const uint8_t *affinity_masks,

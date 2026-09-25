@@ -353,6 +353,11 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
                                 uint32_t *width, uint32_t *height,
                                 uint32_t *pixel_fmt)
 {
+    /* camera_init() failed or never ran: no mutex, and xSemaphoreTake(NULL)
+     * is a FreeRTOS assert -- a reboot, motors and a running mission with it. */
+    if (!s_cam_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -368,6 +373,9 @@ esp_err_t camera_capture_frame(void **buf, size_t *len,
 esp_err_t camera_capture_raw(void **buf, size_t *len,
                               uint32_t *width, uint32_t *height)
 {
+    if (!s_cam_mutex) {
+        return ESP_ERR_INVALID_STATE;        /* no camera: see camera_capture_frame */
+    }
     if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -395,6 +403,9 @@ esp_err_t camera_capture_copy(uint8_t *dst, size_t dst_capacity, size_t *out_len
     }
     *out_len = 0;
 
+    if (!s_cam_mutex) {
+        return ESP_ERR_INVALID_STATE;        /* no camera: see camera_capture_frame */
+    }
     if (xSemaphoreTake(s_cam_mutex, pdMS_TO_TICKS(CAM_LOCK_TIMEOUT_MS)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -471,7 +482,7 @@ esp_err_t camera_stop_streaming(void)
 
 void camera_drain_frame(void)
 {
-    if (s_cam_fd < 0) return;
+    if (s_cam_fd < 0 || !s_cam_mutex) return;
 
     /* Non-blocking: CamDrain runs every 30ms just to keep the ISP pipeline
      * moving when nobody else is. If another capturer holds the mutex, the

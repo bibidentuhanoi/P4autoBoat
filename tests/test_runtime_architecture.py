@@ -375,7 +375,8 @@ esp_err_t esc_driver_arm_complete(void) { assert(esc_state == ESC_STATE_ARMING);
 esp_err_t esc_driver_disarm(void) { esc_state = ESC_STATE_DISARMED; esc_left = 0; esc_right = 0; ++disarm_calls; return ESP_OK; }
 esp_err_t esc_driver_set_throttle(float left, float right) { esc_left = left; esc_right = right; ++throttle_writes; return ESP_OK; }
 esc_state_t esc_driver_get_state(void) { return esc_state; }
-void esc_driver_get_throttle(float *left, float *right) { *left = esc_left; *right = esc_right; }
+static unsigned esc_get_throttle_calls;   /* who reads the ESC driver (its mutex) */
+void esc_driver_get_throttle(float *left, float *right) { ++esc_get_throttle_calls; *left = esc_left; *right = esc_right; }
 esp_err_t winch_driver_set_speed(float speed) { winch_speed = speed; ++winch_writes; return ESP_OK; }
 esp_err_t winch_driver_set_power(bool on) { servo_power = on; ++power_writes; return ESP_OK; }
 bool winch_driver_get_power(void) { return servo_power; }
@@ -1189,6 +1190,7 @@ PIPELINE_HARNESS = r"""
 #include "freertos/semphr.h"
 
 static int decoded_tag;
+static boat_MissionCommand next_mission;
 static unsigned detect_calls;
 static unsigned manual_control_calls;
 static unsigned training_log_calls;
@@ -1196,7 +1198,10 @@ static unsigned calibrate_calls;
 static unsigned encode_calls;
 static unsigned transport_calls;
 
-void test_log(const char *tag, const char *format, ...) { (void)tag; (void)format; }
+static unsigned mission_logs;
+void test_log(const char *tag, const char *format, ...) {
+    (void)tag; if (strstr(format, "Mission command")) ++mission_logs;
+}
 void detect_trigger(void) { ++detect_calls; }
 void training_log_trigger(void) { ++training_log_calls; }
 int64_t esp_timer_get_time(void) { return 0; }
@@ -1220,6 +1225,7 @@ bool pb_decode(pb_istream_t *stream, const void *fields, void *dest) {
     boat_BoatMessage *message = dest;
     message->which_payload = decoded_tag;
     message->payload.motor.left = 0.2f;
+    if (decoded_tag == boat_BoatMessage_mission_tag) message->payload.mission = next_mission;
     return true;
 }
 static void motor_handler(const boat_MotorCommand *command) {
@@ -1302,10 +1308,32 @@ int main(void) {
      * and never to manual-control ingress: the mission owns the jets only
      * through the control task's AUTO owner. */
     decoded_tag = boat_BoatMessage_mission_tag;
+    next_mission = (boat_MissionCommand){.start = true, .request_id = 5};
     pipeline_handle_incoming(input, sizeof(input));
-    assert(mission_calls == 1);
+    assert(mission_calls == 1 && mission_saw_start);
     assert(manual_control_calls == 0);
-    (void)mission_saw_start;
+    assert(mission_logs == 1);
+
+    /* This runs on esp_hosted's rpc_rx thread -- priority 23, above the
+     * control task, on either core -- and STOP repeats the same command at
+     * 15 Hz for up to 5 s.  Every one reaches the handler; the console line
+     * only when the command changes (a UART line can busy-wait for ms). */
+    next_mission = (boat_MissionCommand){.stop = true};
+    for (int i = 0; i < 10; ++i) pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 11 && !mission_saw_start);
+    assert(mission_logs == 2);
+    next_mission = (boat_MissionCommand){.start = true, .request_id = 6};
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 12 && mission_logs == 3);
+    next_mission.stop = true;                 /* only the stop flag changes: logged */
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 13 && mission_logs == 4);
+    next_mission.start = false;               /* only the start flag changes: logged */
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 14 && mission_logs == 5);
+    next_mission.request_id = 7;              /* only the request changes: logged */
+    pipeline_handle_incoming(input, sizeof(input));
+    assert(mission_calls == 15 && mission_logs == 6);
 
     /* ...and its status goes out to every transport. */
     const unsigned encodes_before = encode_calls, sends_before = transport_calls;
@@ -1488,6 +1516,62 @@ def test_core1_diagnostics_publishes_motor_status():
             check=True,
         )
         subprocess.run([str(binary)], check=True)
+
+
+def test_runtime_metric_records_use_a_preemption_safe_lock():
+    """Every task writes its own record and Diagnostics (prio 2, core 1) locks
+    each one once a second; the mission task (prio 8, core 1) reads records at
+    START and at the end of a run.  The old lock was a CAS on an odd/even
+    sequence in task context: its `continue` jumped to the CAS, which then
+    succeeded on the odd (held) value -- no exclusion at all -- and the reader
+    spun while the sequence was odd, comparing against an uninitialised
+    `after` on its first pass.  A higher-priority reader that preempted
+    Diagnostics inside that window on the same core spun forever and starved
+    core 1.  A portMUX critical section cannot be preempted on its own core
+    and waits only microseconds on the other."""
+    src = (ROOT / "main" / "runtime_metrics.c").read_text()
+    lock = _function_body(src, "static void lock_record(")
+    unlock = _function_body(src, "static void unlock_record(")
+    assert "portENTER_CRITICAL(&s_records_lock)" in lock
+    assert "portEXIT_CRITICAL(&s_records_lock)" in unlock
+    assert "static portMUX_TYPE s_records_lock = portMUX_INITIALIZER_UNLOCKED;" in src
+    assert "atomic_compare_exchange_weak_explicit(&record->sequence" not in src
+    snapshot = _function_body(src, "void runtime_metrics_snapshot(")
+    assert "lock_record(record);" in snapshot and "unlock_record(record);" in snapshot
+    assert "while (" not in snapshot and "continue" not in snapshot   # no retry loop to spin in
+
+
+def test_the_mission_drive_snapshot_never_takes_the_esc_mutex():
+    """The mission task records the jets every 50 ms.  The ESC driver's mutex
+    (no timeout) belongs to the control task; if the mission task held it and
+    was preempted on core 1 (esp_hosted runs at priority 23 there), the
+    control task -- P and auto-trim -- would wait behind it.  The control task
+    copies the drive values under its own status spinlock every cycle; the
+    snapshot reads that copy."""
+    src = (ROOT / "main" / "motor_control.c").read_text()
+    snap = _function_body(src, "void motor_control_get_drive_snapshot(")
+    assert "esc_driver_get_throttle" not in snap
+    assert "portENTER_CRITICAL(&s_status_lock)" in snap
+    commit = _function_body(src, "static void status_commit_current(")
+    locked = commit[commit.index("portENTER_CRITICAL(&s_status_lock);"):]
+    first_exit = locked.index("portEXIT_CRITICAL(&s_status_lock);")
+    assert "s_drive_snapshot = drive;" in locked[:first_exit], \
+        "the copy must be made every cycle, before the rate-limit returns"
+
+
+def test_a_capture_without_a_camera_is_refused_not_a_reboot():
+    """camera_init() failing (a loose ribbon) leaves s_cam_mutex NULL; boot
+    carries on.  A later capture -- Record to SD over ESP-NOW, detection, the
+    snapshot page -- then called xSemaphoreTake(NULL): a FreeRTOS assert and a
+    reboot, motors and a running mission with it.  Every entry point that takes
+    the camera mutex refuses first when there is none."""
+    src = (ROOT / "main" / "drivers" / "camera_driver.c").read_text()
+    for fn in ("esp_err_t camera_capture_frame(", "esp_err_t camera_capture_raw(",
+               "esp_err_t camera_capture_copy(", "void camera_drain_frame("):
+        body = _function_body(src, fn)
+        guard = body.find("!s_cam_mutex")
+        take = body.index("xSemaphoreTake(s_cam_mutex")
+        assert 0 <= guard < take, fn + " takes the camera mutex without checking it exists"
 
 
 def test_the_mission_starts_last_at_boot():
