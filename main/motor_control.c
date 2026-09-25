@@ -1589,7 +1589,13 @@ static void control_apply_decision(control_decision_t *decision)
         float left;
         float right;
         esc_driver_get_throttle(&left, &right);
-        if (left != 0.0f || right != 0.0f) {
+        /* Not while a mission owns the jets: it flies through a radio loss by
+         * design and auto_tick() writes them later in this same cycle. A zero
+         * written here first reaches the pin whenever a PWM period starts
+         * between the two writes (the compare value latches at each period
+         * start): one 20 ms stop pulse. A disarm or a PWR-OFF has already
+         * ended the mission in auto_decide(), so this zero still goes out. */
+        if ((left != 0.0f || right != 0.0f) && !auto_owns()) {
             esc_driver_set_throttle(0.0f, 0.0f);
             changed = true;
         }
@@ -1672,7 +1678,10 @@ static void control_apply_decision(control_decision_t *decision)
                 esc_trim_mix(decision->throttle, decision->rudder,
                              pts, count, &target_left, &target_right);
             }
-            if (left != target_left || right != target_right) {
+            /* The laptop's zero presence frames, and every heading-hold update,
+             * land here during a mission: the jets are the mission's, and
+             * auto_tick() writes them after this (see the safe_stop branch). */
+            if ((left != target_left || right != target_right) && !auto_owns()) {
                 esc_driver_set_throttle(target_left, target_right);
                 changed = true;
             }
