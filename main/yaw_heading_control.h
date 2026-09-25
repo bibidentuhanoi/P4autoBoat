@@ -28,6 +28,13 @@ typedef struct {
     bool gyro_fresh;
     bool heading_valid;
     bool base_capture_now;
+    /* The out-and-back mission owns the heading (2026-09-25).  When true,
+     * target_heading_deg is the heading target on EVERY update: nothing is
+     * captured and the steering suspend / recapture delay are bypassed -- the
+     * mission steers through the target, never through a motor difference.
+     * false (every existing caller) leaves the controller exactly as before. */
+    bool mission_owned;
+    float target_heading_deg;
 } yaw_heading_input_t;
 
 typedef struct {

@@ -39,6 +39,10 @@ class Input(ctypes.Structure):
         ("gyro_fresh", ctypes.c_bool),
         ("heading_valid", ctypes.c_bool),
         ("base_capture_now", ctypes.c_bool),
+        # 2026-09-25 mission fields: without them the C code reads past this
+        # struct.  False/0 = every existing caller, the old behaviour.
+        ("mission_owned", ctypes.c_bool),
+        ("target_heading_deg", ctypes.c_float),
     ]
 
 

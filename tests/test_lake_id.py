@@ -1109,6 +1109,12 @@ class GuardTest(unittest.TestCase):
         'main/transports/ws_transport.c', 'main/drivers/imu_driver.c',
         'main/drivers/imu_driver.h',
         'main/imu_freeze.h',
+        # 2026-09-25, Kiet approved the 10 m mission plan: its pure modules
+        # (host-tested, not yet in main/CMakeLists.txt -- Part 3 adds them).
+        'main/nav_geo.c', 'main/nav_geo.h',
+        'main/course_error.c', 'main/course_error.h',
+        'main/mission.c', 'main/mission.h',
+        'main/auto_drive.c', 'main/auto_drive.h',
     }
 
     def _git(self, *args):

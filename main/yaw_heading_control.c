@@ -90,7 +90,8 @@ yaw_heading_output_t yaw_heading_control_update(
         !isfinite(in->yaw_rate_dps) ||
         (in->heading_valid && !isfinite(in->heading_deg)) ||
         !isfinite(in->throttle) || !isfinite(in->feedforward_c) ||
-        !isfinite(in->steering)) {
+        !isfinite(in->steering) ||
+        (in->mission_owned && !isfinite(in->target_heading_deg))) {
         yaw_heading_control_reset(ctl);
         return out;
     }
@@ -107,7 +108,10 @@ yaw_heading_output_t yaw_heading_control_update(
         return out;
     }
 
-    const bool steering = fabsf(in->steering) > cfg->steering_deadband;
+    /* A mission-owned update is never "steering": the mission turns the boat
+     * by moving the target, and must not be suspended by its own turn. */
+    const bool steering = !in->mission_owned &&
+                          fabsf(in->steering) > cfg->steering_deadband;
     if (steering) {
         /* Deliberate turns own the boat.  Preserve only the mismatch estimate. */
         ctl->initialized = true;
@@ -138,6 +142,13 @@ yaw_heading_output_t yaw_heading_control_update(
     if (!in->heading_valid) {
         ctl->heading_hold = false;
         ctl->heading_error_filt = 0.0f;
+        ctl->recapture_elapsed_s = 0.0f;
+    } else if (in->mission_owned) {
+        /* The mission's target, every update.  The error filter keeps its
+         * state, so a jump in the target is slewed over heading_tau_s. */
+        ctl->heading_target = wrap_360(in->target_heading_deg);
+        ctl->heading_hold = true;
+        ctl->steering_suspended = false;
         ctl->recapture_elapsed_s = 0.0f;
     } else if (first_active || in->base_capture_now) {
         capture_heading(ctl, in->heading_deg);
