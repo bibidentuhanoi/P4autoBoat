@@ -353,3 +353,29 @@ def test_a_calibration_asked_for_during_a_mission_never_starts_by_itself_after()
     motor_control_get_calibrate_status(&cs);
     assert(cs.state != 0u);
 """)
+
+
+def test_the_published_motor_status_shows_the_jets_during_a_mission():
+    """The tool's Throttle L/R comes from MotorStatus. It used to read 0/0 for
+    the whole run: the manual path wrote the laptop's zero first in every
+    cycle, and the first status commit of the cycle took that zero and the
+    10 Hz publish slot before the mission's write. (Fixed with the zero ESC
+    write, 53390f1.)"""
+    run_case(r"""
+    arm();
+    start_mission(5, 120.0f, 0.40f);
+    unsigned zero_reports = 0, reports = 0;
+    uint32_t gen0 = 0;
+    for (int i = 0; i < 600; ++i) {
+        if ((i % 7) == 0) motor_handler(&(boat_MotorCommand){0});   /* the laptop's zero presence */
+        cycle(true);
+        boat_MotorStatus ms;
+        const uint32_t g = motor_control_get_status(&ms);
+        if (i > 100 && g != gen0) {
+            ++reports;
+            if (ms.left_throttle == 0.0f && ms.right_throttle == 0.0f) ++zero_reports;
+        }
+        gen0 = g;
+    }
+    assert(reports > 20 && zero_reports == 0);
+""")
