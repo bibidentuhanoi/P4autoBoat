@@ -89,6 +89,7 @@ import csv
 import os
 import random
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -1455,6 +1456,137 @@ def straight_run_summarize(rows, events, settings, provenance, status, reason,
     }
 
 
+# ---- The out-and-back mission (2026-09-25) -----------------------------------
+# The BOAT flies it (main/autonomy.c + main/mission.c); this tool only sends
+# START (with the settings) and STOP, shows what the boat reports, and records
+# it. A radio outage never stops the mission -- the card says so and greys the
+# values with their age. Spec: docs/superpowers/specs/2026-09-24-out-and-back-
+# mission-design.md, section 7.
+MSG_MISSION_STATUS = 0x09          # MissionStatus (BoatMessage field 22)
+MISSION_STATES = ('IDLE', 'HOME', 'OUTBOUND', 'TURN', 'RETURN', 'DONE', 'ABORTED', 'REFUSED')
+MISSION_ACTIVE_STATES = (1, 2, 3, 4)
+MISSION_TERMINAL_STATES = (5, 6, 7)
+# main/mission.h mission_reason_t, in words.
+MISSION_REASONS = {
+    0: '', 1: 'out distance reached', 2: 'turned to face home', 3: 'in the home zone',
+    4: 'passed home', 5: 'near home (moving away after the closest approach)',
+    10: 'STOP', 11: 'stick touched', 12: 'disarmed', 13: 'servo rail cut',
+    14: 'something else took the jets', 15: 'mission task stalled',
+    16: 'GPS lost', 17: 'heading lost', 18: 'not still while taking home',
+    19: 'spinning', 20: 'GPS frozen',
+    30: 'settings out of range', 31: 'no heading hold in this firmware',
+    32: 'busy (calibration, bench run or a record still saving)', 33: 'not armed',
+    34: 'GPS not in UBX mode', 35: 'no 3D fix', 36: 'fewer than 8 satellites',
+    37: 'pDOP above 2.5', 38: 'GPS fix too old', 39: 'compass not calibrated',
+    40: 'magnetic field far from calibration', 41: 'IMU not ok', 42: 'heading not valid',
+}
+MISSION_STAGES = {1: 'OUT', 2: 'TURN', 3: 'FULL'}
+MISSION_DEFAULTS = {'stage': 3, 'out_distance_m': 10.0, 'home_radius_m': 2.5,
+                    'throttle': 0.40, 'approach_throttle': 0.20,
+                    'turn_right': True, 'dry_run': False}
+MISSION_START_RESEND_S = 0.5       # START again until the boat answers it...
+MISSION_START_ANSWER_S = 5.0       # ...for this long
+MISSION_STOP_RETRY_S = 5.0         # STOP again every tick until the boat confirms
+MISSION_STATUS_STALE_S = 1.5       # 5 Hz while running: 1.5 s is a gap
+MISSION_NO_PROGRESS_S = 30.0       # laptop-only warning, never stops the boat
+MISSION_NO_PROGRESS_M = 1.0
+MISSION_DIR = RUDDER_TEST_DIR
+MISSION_CSV_COLUMNS = (
+    't_utc', 't_mono', 'rx_gap_s', 'run_id', 'request_id', 'state', 'state_name', 'reason',
+    'elapsed_s', 'dist_home_m', 'dist_target_m', 'bearing_target_deg', 'cross_track_m',
+    'wanted_heading_deg', 'heading_deg', 'beta_deg', 'beta_valid', 'compass_bad',
+    'turned_deg', 'turn_peak_dps', 'approach', 'hold_active', 'p_switch', 'outages',
+    'longest_outage_s', 'closest_m', 'speed_acc_mps', 'course_samples', 'gps_outliers',
+    'sats', 'pdop', 'record_state', 'file_index',
+    # the laptop's own view at that moment (field telemetry, ~20 Hz)
+    'lat', 'lon', 'speed_mps', 'course_deg', 'telem_heading_deg', 'yaw_dps', 'telem_age_s',
+    'bridge_rssi_dbm')
+MISSION_EVENT_COLUMNS = ('t_utc', 't_mono', 'event', 'detail')
+
+
+def mission_validate(settings):
+    """The firmware's own ranges (main/mission.c mission_settings_valid), so a
+    refusal can be explained before anything is sent. Returns (settings, None)
+    or (None, why). The boat checks again -- it has the last word."""
+    s = dict(MISSION_DEFAULTS)
+    s.update({k: v for k, v in (settings or {}).items() if k in MISSION_DEFAULTS})
+    try:
+        stage = int(s['stage'])
+        out = float(s['out_distance_m']); radius = float(s['home_radius_m'])
+        thr = float(s['throttle']); appr = float(s['approach_throttle'])
+    except (TypeError, ValueError):
+        return None, 'settings must be numbers'
+    if stage not in MISSION_STAGES:
+        return None, 'stage must be 1 (OUT ONLY), 2 (OUT + TURN) or 3 (FULL)'
+    if not (math.isfinite(out) and 3.0 <= out <= 50.0):
+        return None, 'out distance must be 3..50 m'
+    if not (math.isfinite(radius) and 1.5 <= radius <= 10.0):
+        return None, 'home radius must be 1.5..10 m'
+    if not (math.isfinite(thr) and 0.20 - 1e-9 <= thr <= 0.60 + 1e-9):
+        return None, 'mission throttle must be 20..60 %'
+    if not (math.isfinite(appr) and 0.15 - 1e-9 <= appr <= thr + 1e-9):
+        return None, 'approach throttle must be 15 % .. the mission throttle'
+    if out < 2.0 * radius:
+        return None, 'the out distance must be at least twice the home radius'
+    return {'stage': stage, 'out_distance_m': round(out, 2), 'home_radius_m': round(radius, 2),
+            'throttle': round(thr, 2), 'approach_throttle': round(appr, 2),
+            'turn_right': bool(s['turn_right']), 'dry_run': bool(s['dry_run'])}, None
+
+
+def mission_run_name(settings, directory):
+    """MISSION_<FULL|OUT|TURN|DRY>_T<pct>_D<m>_<NNN>: the next free index."""
+    tag = 'DRY' if settings['dry_run'] else MISSION_STAGES[settings['stage']]
+    cond = 'MISSION_%s_T%02d_D%02d' % (tag, round(settings['throttle'] * 100),
+                                       round(settings['out_distance_m']))
+    used = [int(p.name[-3:]) for p in Path(directory).glob(cond + '_???')
+            if p.name[-3:].isdigit()]
+    return '%s_%03d' % (cond, (max(used) + 1) if used else 1)
+
+
+def mission_merge(run_dir, boat_csv):
+    """Put the boat's own SD record (MSN_NNN.CSV, 20 Hz, complete through any
+    radio outage) beside the laptop's: copied in unchanged, plus merged.csv --
+    every boat row with the laptop's view of that moment (did a status arrive
+    within 0.3 s, and the link gap then). The boat's rows are authoritative;
+    the laptop's columns only say what the operator could see. Returns the
+    merged path."""
+    run_dir = Path(run_dir)
+    boat_csv = Path(boat_csv)
+    shutil.copyfile(boat_csv, run_dir / ('boat_' + boat_csv.name))
+    lap = []
+    with open(run_dir / 'samples.csv', newline='') as fh:
+        for row in csv.DictReader(line for line in fh if not line.startswith('#')):
+            try:
+                lap.append((float(row['elapsed_s']), float(row['rx_gap_s'] or 0.0)))
+            except (KeyError, ValueError):
+                continue
+    lap.sort()
+    header, rows = [], []
+    with open(boat_csv, newline='') as fh:
+        lines = [line for line in fh if not line.startswith('#')]
+    reader = csv.DictReader(lines)
+    header = list(reader.fieldnames or []) + ['laptop_saw_status', 'laptop_rx_gap_s']
+    import bisect
+    keys = [t for t, _ in lap]
+    for row in reader:
+        try:
+            t = float(row['t_s'])
+        except (KeyError, ValueError):
+            continue
+        i = bisect.bisect_left(keys, t)
+        near = [j for j in (i - 1, i) if 0 <= j < len(lap) and abs(lap[j][0] - t) <= 0.3]
+        row['laptop_saw_status'] = 1 if near else 0
+        row['laptop_rx_gap_s'] = ('%.2f' % lap[near[0]][1]) if near else ''
+        rows.append(row)
+    out = run_dir / 'merged.csv'
+    with open(out, 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=header)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+    return out
+
+
 class LakeIdWriter:
     """Bounded background writer. The control loop only ever enqueues (never
     blocks, never touches a file); this thread does every open/write/flush/
@@ -1713,6 +1845,27 @@ class LakeIdWriter:
             except OSError:
                 pass
         return self._verdict(summary, err, stage, summary_written)
+
+
+class MissionWriter(LakeIdWriter):
+    """The lake recorder's queue, off-lock writes and atomic summary.json, with
+    the mission's columns: one row per MissionStatus the laptop received
+    (gaps stay gaps -- the boat's SD record fills them, see mission_merge)."""
+
+    def prepare(self):
+        try:
+            self.dir.mkdir(parents=True, exist_ok=False)
+            self._dir_created = True
+            self._open_csv('samples', MISSION_CSV_COLUMNS,
+                           ('# out-and-back mission as the LAPTOP received it (~5 Hz MissionStatus '
+                            '+ the latest field telemetry). Gaps are radio outages, never filled; '
+                            'the boat keeps flying through them and records 20 Hz to MSN_NNN.CSV.',))
+            self._open_csv('events', MISSION_EVENT_COLUMNS, ())
+            for fh in self._fh.values():
+                fh.flush()
+        except Exception:
+            self.discard()
+            raise
 
 
 def rudder_test_drive_coverage(rows):
@@ -2084,6 +2237,14 @@ class BoatLink:
         self._lake_writer = None
         self._lake_id_next_cache = None
         self.lake_id_dir = LAKE_ID_DIR
+        # The out-and-back mission. The BOAT flies it; this is the laptop's
+        # side: the run it asked for, the boat's own report, the recorder.
+        self.mission = None
+        self.mission_result = None
+        self._mission_writer = None
+        self._mission_req_seq = 0
+        self.mission_status = self._blank_mission_status()
+        self.mission_dir = MISSION_DIR
         self._last_send_mono = None       # stamped by _stream_send_locked
         # Fill the next-order cache ONCE here, at startup on the main thread
         # with no lock held, so every status path (HTTP poll and the WebSocket
@@ -2453,6 +2614,11 @@ class BoatLink:
         stop every firmware version honours for it is DISARM, so that case
         disarms.
 
+        A MISSION the boat is flying is the other exception: it flies through
+        radio loss by design, so zeros do not stop it. STOP sends
+        MissionCommand.stop -- again every tick until the boat reports the run
+        over (MISSION_STOP_RETRY_S at most) -- and DISARMs as the backup.
+
         STOP never puts a BenchCommand on the wire. The boat runs main
         9543ed1, whose BenchCommand has no `abort` field and whose pipeline
         reads ANY bench payload as a start (kind 0, base 0 -- clamped, not
@@ -2483,6 +2649,14 @@ class BoatLink:
             ]
             if was_calibrating:
                 self._send_calibrate_locked(False)   # re-arm the firmware start latch
+            if self._mission_stop_locked():
+                # MissionCommand.stop is out (and repeats every tick until the
+                # boat confirms); DISARM backs it up -- a mission flies through
+                # radio loss by design, so the zeros alone do not stop it.
+                self.armed_cmd = False
+                writes_ok.append(self._send_arm_locked(False, self.force))
+                print('[stop] a mission is live: MissionCommand.stop (repeated until the boat '
+                      'confirms) + DISARM -- re-ARM when ready', flush=True)
             if self._bench_running_locked() or self._bench_locally_pending_locked():
                 # The zeros above are already out, so a lost disarm degrades
                 # to a boat being told nothing rather than a running one.
@@ -4133,6 +4307,320 @@ class BoatLink:
                 'warnings': list(rt['warnings']),
                 'recording_error': self._lake_writer.error if self._lake_writer else None}
 
+    # ---- the out-and-back mission (the BOAT flies it) -----------------------
+    @staticmethod
+    def _blank_mission_status() -> dict:
+        return {'have': False, 'last_rx_monotonic': None, 'rx_now': None,
+                'run_id': 0, 'request_id': 0, 'state': 0, 'state_name': 'IDLE',
+                'reason': 0, 'reason_text': ''}
+
+    def _next_mission_request_id(self):
+        seq = getattr(self, '_mission_req_seq', 0)
+        if seq == 0:
+            # A random start: a restarted tool never reuses a request id the
+            # boat may still hold as "already answered".
+            seq = random.randint(1 << 20, 1 << 30)
+        seq += 1
+        self._mission_req_seq = seq
+        return seq
+
+    def _mission_boat_running_locked(self):
+        ms = getattr(self, 'mission_status', None) or {}
+        return bool(ms.get('have') and ms.get('state') in MISSION_ACTIVE_STATES)
+
+    def _mission_refusal_locked(self):
+        if not self.connected:
+            return 'serial link is disconnected'
+        if getattr(self, 'mission', None) is not None:
+            return 'a mission is already running (STOP ends it)'
+        if getattr(self, 'lake_id', None) is not None:
+            return 'a lake test is running'
+        if getattr(self, 'rudder_test', None) is not None:
+            return 'a rudder test is running'
+        if self.calibrating:
+            return 'an ESC calibration is running'
+        if self._bench_running_locked() or self._bench_locally_pending_locked():
+            return 'a bench run is running'
+        if self._mission_boat_running_locked():
+            return 'the boat reports a mission running -- STOP it first'
+        return None
+
+    def _mission_event_locked(self, event, detail=''):
+        w = getattr(self, '_mission_writer', None)
+        if w is not None:
+            w.put('event', {'t_utc': lake_id_utc(), 't_mono': round(self._now(), 3),
+                            'event': event, 'detail': detail})
+        print('[mission] %s %s' % (event, detail), flush=True)
+
+    def _send_mission_locked(self, start=False, stop=False):
+        msg = self.pb2.BoatMessage()
+        cmd = msg.mission
+        cmd.start = bool(start)
+        cmd.stop = bool(stop)
+        m = getattr(self, 'mission', None)
+        if start and m is not None:
+            st = m['settings']
+            cmd.request_id = m['request_id']
+            cmd.stage = st['stage']
+            cmd.out_distance_m = st['out_distance_m']
+            cmd.home_radius_m = st['home_radius_m']
+            cmd.throttle = st['throttle']
+            cmd.approach_throttle = st['approach_throttle']
+            cmd.turn_right = st['turn_right']
+            cmd.dry_run = st['dry_run']
+            m['last_start_sent'] = self._now()
+        return self._write_locked(msg.SerializeToString())
+
+    def start_mission(self, settings, command_seq):
+        """START. Validate, open the run folder (lock RELEASED), then install
+        and send. The boat answers with its own accept or refusal (reason) in
+        MissionStatus; until it does, START is repeated -- the same request id,
+        so the boat treats a repeat as the same press. Returns (ok, error)."""
+        settings, why = mission_validate(settings)
+        if why:
+            return False, why
+        with self._lock:
+            why = self._mission_refusal_locked()
+        if why:
+            return False, why
+        provenance = lake_id_provenance(__file__)
+        base_dir = Path(getattr(self, 'mission_dir', MISSION_DIR))
+        name = mission_run_name(settings, base_dir)
+        writer = MissionWriter(base_dir / name)
+        try:
+            writer.prepare()
+        except Exception as exc:                        # noqa: BLE001
+            return False, 'cannot create the run folder: %s' % exc
+        with self._lock:
+            why = self._mission_refusal_locked()
+            if why is None:
+                try:
+                    writer.start()
+                except Exception as exc:                # noqa: BLE001
+                    why = 'cannot start the recorder: %s' % exc
+            if why is None:
+                if command_seq > self.winch_command_seq:
+                    self.winch_command_seq = command_seq
+                now = self._now()
+                self.mission = {
+                    'request_id': self._next_mission_request_id(), 'settings': settings,
+                    'name': name, 'dir': str(base_dir / name), 't0': now,
+                    't_utc_start': lake_id_utc(), 'provenance': provenance,
+                    'accepted': False, 'run_id': None, 'last_start_sent': None,
+                    'answer_by': now + MISSION_START_ANSWER_S, 'stop_until': None,
+                    'stop_sent': 0, 'rows': 0, 'last_rx': None, 'max_gap_s': 0.0,
+                    'gaps_over_1s': 0, 'np_state': None, 'np_best': None, 'np_t': None,
+                    'no_progress': False, 'warnings': [], 'max_dist_home_m': 0.0,
+                    'last_state': None, 'finalizing': False,
+                }
+                self._mission_writer = writer
+                self.mission_result = None
+                # Presence only from here on. The stream keeps sending the
+                # zeros the boat's manual path needs -- a zero is never input;
+                # a non-zero stick is, and ends the mission on the boat.
+                self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
+                self.motor_split = False; self.rudder = 0.0; self.winch_speed = 0.0
+                self._mission_event_locked('start_sent', json.dumps(settings, sort_keys=True))
+                self._send_mission_locked(start=True)
+                return True, None
+        writer.discard()
+        return False, why
+
+    def _mission_stop_locked(self):
+        """Part of the universal STOP: MissionCommand.stop now and every tick
+        until the boat confirms (or MISSION_STOP_RETRY_S), then DISARM as the
+        backup (returns whether a mission was believed live)."""
+        m = getattr(self, 'mission', None)
+        live = m is not None or self._mission_boat_running_locked()
+        if not live:
+            return False
+        self._send_mission_locked(stop=True)
+        if m is not None:
+            m['stop_until'] = self._now() + MISSION_STOP_RETRY_S
+            m['stop_sent'] += 1
+            self._mission_event_locked('stop_sent', 'STOP pressed')
+        return True
+
+    def _mission_tick_locked(self, now):
+        """15 Hz, from the stream loop: repeat START until answered, STOP until
+        confirmed; give up on a boat that never answers."""
+        m = getattr(self, 'mission', None)
+        if m is None or m['finalizing']:
+            return
+        if m['stop_until'] is not None:
+            if now <= m['stop_until']:
+                self._send_mission_locked(stop=True)
+                m['stop_sent'] += 1
+                return
+            m['stop_until'] = None
+            self._mission_event_locked('stop_unconfirmed',
+                                       'no stopped state from the boat in %.0f s' % MISSION_STOP_RETRY_S)
+            self._finish_mission_locked('stop_unconfirmed',
+                                        'STOP was sent %d times; the boat never reported it stopped'
+                                        % m['stop_sent'])
+            return
+        if not m['accepted']:
+            if now >= m['answer_by']:
+                self._mission_event_locked('no_answer', 'no MissionStatus for this START')
+                self._finish_mission_locked('no_answer', 'the boat never answered START '
+                                            '(old firmware, mission not built, or no radio)')
+                return
+            if m['last_start_sent'] is None or now - m['last_start_sent'] >= MISSION_START_RESEND_S:
+                self._send_mission_locked(start=True)
+
+    def _handle_mission_status(self, ms):
+        with self._lock:
+            now = self._now()
+            st = {
+                'have': True, 'last_rx_monotonic': time.monotonic(), 'rx_now': now,
+                'run_id': int(ms.run_id), 'request_id': int(ms.request_id),
+                'state': int(ms.state),
+                'state_name': MISSION_STATES[ms.state] if ms.state < len(MISSION_STATES) else str(ms.state),
+                'reason': int(ms.reason), 'reason_text': MISSION_REASONS.get(int(ms.reason), str(ms.reason)),
+                'stage': int(ms.stage), 'out_distance_m': float(ms.out_distance_m),
+                'home_radius_m': float(ms.home_radius_m), 'throttle': float(ms.throttle),
+                'approach_throttle': float(ms.approach_throttle), 'turn_right': bool(ms.turn_right),
+                'dry_run': bool(ms.dry_run), 'home_lat': float(ms.home_lat), 'home_lon': float(ms.home_lon),
+                'dist_target_m': float(ms.dist_target_m), 'bearing_target_deg': float(ms.bearing_target_deg),
+                'cross_track_m': float(ms.cross_track_m), 'wanted_heading_deg': float(ms.wanted_heading_deg),
+                'heading_deg': float(ms.heading_deg), 'beta_deg': float(ms.beta_deg),
+                'beta_valid': bool(ms.beta_valid), 'compass_bad': bool(ms.compass_bad),
+                'turned_deg': float(ms.turned_deg), 'turn_peak_dps': float(ms.turn_peak_dps),
+                'approach': bool(ms.approach), 'hold_active': bool(ms.hold_active),
+                'p_switch': bool(ms.p_switch), 'outages': int(ms.outages),
+                'longest_outage_s': float(ms.longest_outage_s), 'closest_m': float(ms.closest_m),
+                'elapsed_s': float(ms.elapsed_s), 'record_state': int(ms.record_state),
+                'file_index': int(ms.file_index), 'dist_home_m': float(ms.dist_home_m),
+                'speed_acc_mps': float(ms.speed_acc_mps), 'course_samples': int(ms.course_samples),
+                'gps_outliers': int(ms.gps_outliers), 'sats': int(ms.sats), 'pdop': float(ms.pdop),
+            }
+            self.mission_status = st
+            m = getattr(self, 'mission', None)
+            if m is None or m['finalizing']:
+                return
+            ours = st['request_id'] == m['request_id']
+            if not ours:
+                return                      # another laptop's run, or our START not seen yet
+            if not m['accepted']:
+                m['accepted'] = True
+                m['run_id'] = st['run_id']
+                self._mission_event_locked('answered', '%s %s' % (st['state_name'], st['reason_text']))
+            self._record_mission_row_locked(st, now)
+            if st['state'] != m['last_state']:
+                self._mission_event_locked('state', '%s %s' % (st['state_name'], st['reason_text']))
+                m['last_state'] = st['state']
+            self._mission_progress_locked(st, now)
+            if st['state'] in MISSION_TERMINAL_STATES:
+                m['stop_until'] = None
+                status = {5: 'done', 6: 'aborted', 7: 'refused'}[st['state']]
+                self._finish_mission_locked(status, st['reason_text'])
+
+    def _mission_progress_locked(self, st, now):
+        """The laptop's no-progress warning -- never a stop (Kiet: no time
+        limit). OUTBOUND must get >= 1 m farther from home, RETURN >= 1 m
+        nearer, within every 30 s; a TURN over 30 s also warns. The same rule
+        the simulator checks (tools/mission_sim/mission_sim.c)."""
+        m = self.mission
+        state, dist = st['state'], st['dist_home_m']
+        m['max_dist_home_m'] = max(m['max_dist_home_m'], dist)
+        if state != m['np_state']:
+            m['np_state'], m['np_t'] = state, now
+            m['np_best'] = -dist if state == 2 else dist
+            m['no_progress'] = False
+        if state in (2, 4):
+            metric = -dist if state == 2 else dist
+            if metric < m['np_best'] - MISSION_NO_PROGRESS_M:
+                m['np_best'], m['np_t'] = metric, now
+                m['no_progress'] = False
+            elif now - m['np_t'] > MISSION_NO_PROGRESS_S:
+                m['no_progress'] = True
+        elif state == 3:
+            m['no_progress'] = now - m['np_t'] > MISSION_NO_PROGRESS_S
+        if m['no_progress']:
+            text = ('no progress for %.0f s -- the boat keeps going; STOP if it is stuck'
+                    % (now - m['np_t']))
+            if not m['warnings'] or m['warnings'][-1] != 'no progress':
+                m['warnings'].append('no progress')
+                self._mission_event_locked('warning', text)
+
+    def _record_mission_row_locked(self, st, now):
+        m = self.mission
+        gap = 0.0 if m['last_rx'] is None else now - m['last_rx']
+        m['last_rx'] = now
+        m['max_gap_s'] = max(m['max_gap_s'], gap)
+        if gap > 1.0:
+            m['gaps_over_1s'] += 1
+        t = getattr(self, 'telemetry', None) or {}
+        bs = getattr(self, 'bridge_status', None) or {}
+        row = {k: st.get(k) for k in MISSION_CSV_COLUMNS if k in st}
+        row.update({
+            't_utc': lake_id_utc(), 't_mono': round(now, 3), 'rx_gap_s': round(gap, 3),
+            'lat': t.get('lat'), 'lon': t.get('lon'), 'speed_mps': t.get('speed_mps'),
+            'course_deg': t.get('course_deg'), 'telem_heading_deg': t.get('heading'),
+            'yaw_dps': t.get('yaw_rate'),
+            'telem_age_s': (round(time.monotonic() - t['last_rx_monotonic'], 3)
+                            if t.get('last_rx_monotonic') is not None else None),
+            'bridge_rssi_dbm': bs.get('uplink_rssi_dbm'),
+        })
+        m['rows'] += 1
+        w = getattr(self, '_mission_writer', None)
+        if w is not None:
+            w.put('row', row)
+
+    def _finish_mission_locked(self, status, reason):
+        m = self.mission
+        if m is None or m['finalizing']:
+            return
+        m['finalizing'] = True
+        st = dict(getattr(self, 'mission_status', None) or {})
+        st.pop('last_rx_monotonic', None)
+        summary = {
+            'schema': 'mission_summary_v1', 'name': m['name'], 'status': status, 'reason': reason,
+            'settings': m['settings'], 'request_id': m['request_id'], 'run_id': m['run_id'],
+            't_utc_start': m['t_utc_start'], 't_utc_end': lake_id_utc(),
+            'provenance': m['provenance'], 'boat_final_status': st if st.get('have') else None,
+            'status_rows': m['rows'], 'max_status_gap_s': round(m['max_gap_s'], 2),
+            'status_gaps_over_1s': m['gaps_over_1s'], 'max_dist_home_m': round(m['max_dist_home_m'], 2),
+            'warnings': list(m['warnings']), 'stop_sent': m['stop_sent'],
+            'boat_record': ('MSN_%03d.CSV on the boat SD card' % st['file_index']
+                            if st.get('file_index') else None),
+            'note': ('the BOAT flew this run; these rows are what the laptop received. '
+                     'Copy the boat SD file in and run --merge-mission for the complete record.'),
+        }
+        result = {'name': m['name'], 'status': status, 'reason': reason,
+                  'rows': m['rows'], 'warnings': list(m['warnings']),
+                  'closest_m': st.get('closest_m'), 'dist_home_m': st.get('dist_home_m'),
+                  'file_index': st.get('file_index'), 'write_error': None}
+        self.mission_result = result
+        writer = getattr(self, '_mission_writer', None)
+
+        def on_done(res):
+            with self._lock:
+                if getattr(self, 'mission_result', None) is result:
+                    result['write_error'] = res.get('error')
+        if writer is not None:
+            writer.finalize(summary, on_done)
+        self._mission_writer = None
+        self.mission = None
+        self._mission_event_locked('finished', '%s %s' % (status, reason))
+
+    def mission_status_locked(self):
+        m = getattr(self, 'mission', None)
+        ms = getattr(self, 'mission_status', None) or self._blank_mission_status()
+        boat = self._with_age(ms, MISSION_STATUS_STALE_S)
+        live = None
+        if m is not None:
+            now = self._now()
+            live = {'name': m['name'], 'settings': m['settings'], 'accepted': m['accepted'],
+                    'request_id': m['request_id'], 'elapsed_s': round(now - m['t0'], 1),
+                    'stopping': m['stop_until'] is not None, 'no_progress': m['no_progress'],
+                    'warnings': list(m['warnings']), 'rows': m['rows'],
+                    'recording_error': (self._mission_writer.error
+                                        if getattr(self, '_mission_writer', None) else None)}
+        return {'boat': boat, 'run': live,
+                'result': dict(self.mission_result) if getattr(self, 'mission_result', None) else None,
+                'defaults': dict(MISSION_DEFAULTS)}
+
     def _flush_rudder_test_write(self):
         """Write the pending CSV. Called from _stream_loop with the lock NOT
         held, and directly by tests."""
@@ -4359,6 +4847,7 @@ class BoatLink:
                 'lake_id': self.lake_id_status_locked(),
                 'lake_id_result': (dict(self.lake_id_result) if getattr(self, 'lake_id_result', None) else None),
                 'lake_id_next': self.lake_id_next(),
+                'mission': self.mission_status_locked(),
                 'lake_id_defaults': {'throttles': list(LAKE_ID_THROTTLES),
                                      'magnitudes': list(LAKE_ID_MAGNITUDES),
                                      'firmware_label': ('raw-throttle-test' if getattr(self, 'raw_throttle_test', False)
@@ -4521,7 +5010,9 @@ class BoatLink:
         # Motor-only lake profiles do not use the physical rudder. Sending a
         # zero SteerCommand beside every MotorCommand doubles the uplink load
         # and can keep an old drive proposal alive when a motor frame is lost.
-        if getattr(self, 'lake_id', None) is None:
+        # ...nor does a mission (the boat holds the rudder centred itself), and
+        # its link must carry MissionStatus and STOP, not idle zeros.
+        if getattr(self, 'lake_id', None) is None and getattr(self, 'mission', None) is None:
             ok = self._send_steer_locked(self.rudder) and ok
         # Only while an assisted run is live: the firmware
         # ignores it otherwise, but there is no reason to put
@@ -4533,7 +5024,8 @@ class BoatLink:
         # A lake run never moves the winch: its packet is a third
         # of the uplink the boat's 0.4 s failsafe watches, for
         # nothing. Manual driving keeps the keepalive as before.
-        if self.winch_speed != 0.0 or getattr(self, 'lake_id', None) is None:
+        if self.winch_speed != 0.0 or (getattr(self, 'lake_id', None) is None
+                                       and getattr(self, 'mission', None) is None):
             ok = self._send_winch_locked(self.winch_speed) and ok
         self._rudder_test_after_send_locked(ok)
 
@@ -4550,6 +5042,7 @@ class BoatLink:
                 self._assist_off_tick_locked(now_mono)
                 self._rudder_test_tick_locked(now_mono)
                 self._lake_id_tick_locked(now_mono)
+                self._mission_tick_locked(self._now())
                 # THE LEASE. A rudder test drives itself and is not browser
                 # input, so it keeps its own authority; anything else must be
                 # backed by a live browser saying so.
@@ -4707,6 +5200,18 @@ class BoatLink:
                 self._handle_system_status(msg.status)
             return
 
+        if msg_type == MSG_MISSION_STATUS:
+            if len(payload) != plen:
+                return
+            try:
+                msg = self.pb2.BoatMessage()
+                msg.ParseFromString(payload)
+            except Exception:                            # noqa: BLE001
+                return
+            if msg.HasField('mission_status'):
+                self._handle_mission_status(msg.mission_status)
+            return
+
         if msg_type != MSG_SENSOR:
             return
 
@@ -4735,6 +5240,9 @@ class BoatLink:
                 return
             if msg.HasField('calibrate_status'):
                 self._handle_calibrate_status(msg.calibrate_status)
+                return
+            if msg.HasField('mission_status'):
+                self._handle_mission_status(msg.mission_status)
                 return
             self._diag('decoded but no sensors field',
                         f'which_oneof={msg.WhichOneof("payload")!r}')
@@ -5130,6 +5638,35 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
   <div id="lake-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
   <div style="font-size:10px;color:var(--dim);">MotorStatus values are boat-APPLIED software commands, not measured RPM, thrust or servo angle. Turns measure the operational trimmed boat; recoveries include active autotrim.</div>
   <div style="font-size:10px;color:var(--dim);">Live warnings (never abort): yaw sign opposite to the hypothesis, IMU values frozen. A recording error aborts. GPS advisories, L/R differential drift, coverage and missing notes are post-run analysis in summary.json.</div>
+</details>
+
+<details class="card" open id="mission-card">
+  <summary class="card-title">10 m MISSION <span class="pill" id="msn-pill" style="margin-left:6px;">IDLE</span></summary>
+  <div style="font-size:10px;color:var(--dim);margin-bottom:4px;">The BOAT flies it by itself: point it, keep it still, press START. It takes home by GPS (~2 s), drives out on the heading it points, turns, comes back along the line home, slows down near home and stops the motors inside the radius &mdash; then catch it. It keeps going if the radio drops. STOP (top) stops it and disarms; touching the stick also ends it.</div>
+  <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
+    <label style="font-size:10px;">out</label><input type="number" id="msn-out" min="3" max="50" step="1" value="10" style="width:44px;"><span style="font-size:10px;">m</span>
+    <label style="font-size:10px;">motors off at</label><input type="number" id="msn-radius" min="1.5" max="10" step="0.5" value="2.5" style="width:44px;"><span style="font-size:10px;">m</span>
+    <label style="font-size:10px;">throttle</label><input type="number" id="msn-thr" min="20" max="60" step="5" value="40" style="width:40px;"><span style="font-size:10px;">%</span>
+    <label style="font-size:10px;">slow approach</label><input type="number" id="msn-appr" min="15" max="60" step="5" value="20" style="width:40px;"><span style="font-size:10px;">%</span>
+  </div>
+  <div class="motor-slider-row" style="gap:6px;flex-wrap:wrap;">
+    <label style="font-size:10px;">turn</label>
+    <select id="msn-turn"><option value="right" selected>right</option><option value="left">left</option></select>
+    <label style="font-size:10px;">stage</label>
+    <select id="msn-stage"><option value="1">OUT ONLY</option><option value="2">OUT + TURN</option><option value="3" selected>FULL</option></select>
+    <label class="bench" style="font-size:10px;"><input type="checkbox" id="msn-dry">DRY RUN (motors stay off: carry it)</label>
+    <button id="msn-start" title="the boat takes home, then flies the mission on its own">START MISSION</button>
+  </div>
+  <div class="telem-row"><label>Step</label><span class="val" id="msn-step">--</span></div>
+  <div class="telem-row"><label>Target</label><span class="val" id="msn-target">--</span></div>
+  <div class="telem-row"><label>Heading</label><span class="val" id="msn-heading">--</span></div>
+  <div class="telem-row"><label>Compass / GPS</label><span class="val" id="msn-beta">--</span></div>
+  <div class="telem-row"><label>Radio</label><span class="val" id="msn-radio">--</span></div>
+  <div class="telem-row"><label>Result</label><span class="val" id="msn-result">--</span></div>
+  <div class="telem-row"><label>Run</label><span class="val" id="msn-file">--</span></div>
+  <div id="msn-warn" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
+  <div id="msn-msg" style="font-size:10px;color:var(--warn);min-height:12px;"></div>
+  <div style="font-size:10px;color:var(--dim);">Everything here is what the BOAT reports. The laptop records it to dataout/MISSION_*; the boat records 20&nbsp;Hz to its SD card (MSN_NNN.CSV) through any radio outage.</div>
 </details>
 
 </div>
@@ -5685,10 +6222,10 @@ $('lake-yaw-pulse').addEventListener('click', () => runLakeId('yawpulse'));
 // browser or a curl all reach the HTTP API without ever seeing it.
 var _rtLockedOut = null;
 function setRudderTestLockout(on) {
-  on = on || _lakeActive;              // a lake run locks the same controls
+  on = on || _lakeActive || _missionActive;   // a lake run or a mission locks the same controls
   if (_rtLockedOut === on) return;      // don't fight the user every poll
   _rtLockedOut = on;
-  ['bench-left', 'bench-right', 'bench-base', 'bench-base-short', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start', 'lake-yaw-pulse',
+  ['bench-left', 'bench-right', 'bench-base', 'bench-base-short', 'bench-base-long', 'bench-reset', 'p-assist', 'lake-start', 'lake-yaw-pulse', 'msn-start',
    'rt-minus', 'rt-plus', 'rt-al', 'rt-ar', 'rt-assist',
    'calibrate-btn'].forEach(function (id) {
     const el = $(id);
@@ -5829,6 +6366,118 @@ function renderLakeId(s) {
     }
   }
   $('lake-start').disabled = !!(li && li.active) || _rtLockedOut;
+}
+
+
+// ---- the out-and-back mission ------------------------------------------------
+// The BOAT flies it. This card sends START with the settings and shows only
+// what the boat reports (MissionStatus, ~5 Hz); during a radio gap the values
+// stay, greyed, with their age -- the boat is still going.
+var _missionActive = false;
+async function startMission() {
+  const msg = $('msn-msg');
+  if (!connected) { msg.textContent = 'not connected'; return; }
+  msg.textContent = '';
+  const settings = {
+    stage: parseInt($('msn-stage').value, 10),
+    out_distance_m: parseFloat($('msn-out').value),
+    home_radius_m: parseFloat($('msn-radius').value),
+    throttle: parseFloat($('msn-thr').value) / 100,
+    approach_throttle: parseFloat($('msn-appr').value) / 100,
+    turn_right: $('msn-turn').value === 'right',
+    dry_run: $('msn-dry').checked,
+  };
+  const r = await api('/api/mission', 'POST', { settings, seq: ++winchCommandSeq });
+  if (r && !r.ok) msg.textContent = r.error || 'refused';
+}
+$('msn-start').addEventListener('click', startMission);
+function msnM(v) { return (v == null || !isFinite(v)) ? '--' : v.toFixed(1) + ' m'; }
+function msnDeg(v) { return (v == null || !isFinite(v)) ? '--' : v.toFixed(0) + '°'; }
+function renderMission(s) {
+  const mi = s.mission;
+  if (!mi) return;
+  const b = mi.boat || {}, run = mi.run, res = mi.result;
+  const pill = $('msn-pill');
+  const boatActive = !!(b.have && b.state >= 1 && b.state <= 4);
+  _missionActive = !!run || boatActive;
+  const stale = !!(b.have && b.stale);
+  const age = (b.age_s == null) ? '' : ' (' + b.age_s.toFixed(1) + ' s ago)';
+  ['msn-step', 'msn-target', 'msn-heading', 'msn-beta', 'msn-radio'].forEach(function (id) {
+    const el = $(id);
+    if (el && el.style) el.style.opacity = stale && _missionActive ? '0.5' : '';
+  });
+  if (run && !run.accepted) {
+    pill.textContent = run.stopping ? 'STOPPING' : 'SENT';
+  } else if (b.have) {
+    pill.textContent = (run && run.stopping) ? 'STOPPING' : b.state_name;
+  } else {
+    pill.textContent = res ? res.status.toUpperCase() : 'IDLE';
+  }
+  pill.classList.toggle('up', _missionActive && !stale);
+  pill.classList.toggle('stale', stale && _missionActive);
+  if (b.have && (_missionActive || res)) {
+    $('msn-step').textContent = b.state_name + (b.approach ? '  (slow approach)' : '')
+      + (b.dry_run ? '  DRY RUN' : '') + '   ' + b.elapsed_s.toFixed(0) + ' s' + (stale ? age : '');
+    $('msn-target').textContent = (b.state === 1 ? 'taking home' : msnM(b.dist_target_m) + ' at '
+      + msnDeg(b.bearing_target_deg)) + '   home ' + msnM(b.dist_home_m)
+      + (b.state === 4 ? '   off the line ' + msnM(b.cross_track_m) : '')
+      + (b.state === 3 ? '   turned ' + msnDeg(b.turned_deg) : '');
+    $('msn-heading').textContent = msnDeg(b.heading_deg) + ' -> ' + msnDeg(b.wanted_heading_deg)
+      + '   hold ' + (b.hold_active ? 'steering' : 'idle') + '   P switch ' + (b.p_switch ? 'ON' : 'OFF');
+    $('msn-beta').textContent = 'GPS course - compass ' + (b.beta_valid ? '' : '(learning) ')
+      + (isFinite(b.beta_deg) ? b.beta_deg.toFixed(0) + '°' : '--')
+      + (b.compass_bad ? '  COMPASS BAD' : '') + '   ' + b.sats + ' sats, pDOP '
+      + (isFinite(b.pdop) ? b.pdop.toFixed(1) : '--') + ', sAcc ' + (isFinite(b.speed_acc_mps) ? b.speed_acc_mps.toFixed(2) : '--')
+      + ' m/s, ' + b.course_samples + ' course samples' + (b.gps_outliers ? ', ' + b.gps_outliers + ' GPS jumps ignored' : '');
+    $('msn-radio').textContent = (stale && _missionActive
+      ? 'no signal ' + (b.age_s == null ? '?' : b.age_s.toFixed(0)) + ' s -- the boat continues on its own.  ' : '')
+      + b.outages + ' outages' + (b.outages ? ', longest ' + b.longest_outage_s.toFixed(1) + ' s' : '');
+  }
+  if (res) {
+    $('msn-result').textContent = res.status.toUpperCase() + (res.reason ? ':  ' + res.reason : '')
+      + (res.dist_home_m != null && res.status === 'done' ? '   ' + msnM(res.dist_home_m) + ' from home (closest '
+         + msnM(res.closest_m) + ')' : '');
+    $('msn-file').textContent = res.name + (res.file_index ? '   boat SD: MSN_' + String(res.file_index).padStart(3, '0') + '.CSV' : '')
+      + (res.write_error ? '   WRITE ERROR: ' + res.write_error : '');
+  } else if (run) {
+    $('msn-result').textContent = run.accepted ? 'running' : 'waiting for the boat to answer START';
+    $('msn-file').textContent = run.name + '  (' + run.rows + ' status rows)'
+      + (run.recording_error ? '   RECORDING FAILED: ' + run.recording_error : '');
+  }
+  const warns = (run ? run.warnings : (res ? res.warnings : [])) || [];
+  $('msn-warn').textContent = warns.map(function (w) {
+    return w === 'no progress' ? 'NO PROGRESS for 30 s -- the boat keeps trying; STOP if it is stuck' : w;
+  }).join('  |  ') + (b.compass_bad && _missionActive ? '  |  compass and GPS disagree by more than 45°' : '');
+  $('msn-start').disabled = _missionActive || _rtLockedOut;
+  missionMap(b);
+}
+// Map overlays: home, the motors-off circle, the slow-down circle, the out
+// line along the start heading, and the line home from where the turn ended.
+function missionMap(b) {
+  if (!mapState.ready || typeof L === 'undefined' || !b || !b.have || !b.run_id
+      || !isFinite(b.home_lat) || !isFinite(b.home_lon) || (b.home_lat === 0 && b.home_lon === 0)) return;
+  const map = mapState.map, home = [b.home_lat, b.home_lon];
+  const r = b.home_radius_m > 0 ? b.home_radius_m : 2.5;
+  if (mapState.msnRun !== b.run_id) {
+    ['msnHome', 'msnZone', 'msnApproach', 'msnOut', 'msnReturn'].forEach(function (k) {
+      if (mapState[k]) { map.removeLayer(mapState[k]); mapState[k] = null; }
+    });
+    mapState.msnRun = b.run_id; mapState.msnStartHdg = null; mapState.msnReturnFrom = null;
+    mapState.msnHome = L.circleMarker(home, { radius: 5, color: '#FFD700', fillOpacity: 1, interactive: false }).addTo(map);
+    mapState.msnZone = L.circle(home, { radius: r, color: '#32CD32', weight: 2, fill: false, interactive: false }).addTo(map);
+    mapState.msnApproach = L.circle(home, { radius: 2 * r, color: '#32CD32', weight: 1, dashArray: '4 4', fill: false, interactive: false }).addTo(map);
+    mapState.msnOut = L.polyline([home, home], { color: '#FFD700', weight: 2, dashArray: '6 4', interactive: false }).addTo(map);
+    mapState.msnReturn = L.polyline([home, home], { color: '#FF8C00', weight: 2, interactive: false }).addTo(map);
+  }
+  if (b.state === 2 && isFinite(b.wanted_heading_deg)) mapState.msnStartHdg = b.wanted_heading_deg;
+  if (mapState.msnStartHdg != null) {
+    const h = mapState.msnStartHdg * Math.PI / 180, d = b.out_distance_m;
+    const out = [b.home_lat + d * Math.cos(h) / 110540,
+                 b.home_lon + d * Math.sin(h) / (111320 * Math.cos(b.home_lat * Math.PI / 180))];
+    mapState.msnOut.setLatLngs([home, out]);
+  }
+  if (b.state === 4 && !mapState.msnReturnFrom && mapState.last) mapState.msnReturnFrom = mapState.last;
+  if (mapState.msnReturnFrom) mapState.msnReturn.setLatLngs([mapState.msnReturnFrom, home]);
 }
 
 // Runtime mode switch. Raw Manual is the boot mode and stays the default.
@@ -6206,6 +6855,7 @@ function applyStatus(s) {
 
     // ---- rudder test ------------------------------------------------------
     renderLakeId(s);                 // before the rudder-test block: it sets _lakeActive for the lockout
+    renderMission(s);                // ...and this _missionActive
     const rt = s.rudder_test, rtr = s.rudder_test_result;
     const rtPill = $('rt-pill');
     if (rt && rt.active) {
@@ -6923,6 +7573,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ok, err = self.link.send_assist(p_on)
             self._json({'ok': ok, 'error': err}, 200 if ok else 503)
+        elif self.path == '/api/mission':
+            command_seq = body.get('seq')
+            if (not isinstance(command_seq, int) or isinstance(command_seq, bool) or
+                    command_seq < 0):
+                self._json({'ok': False, 'error': 'seq must be a nonnegative integer'}, 400)
+                return
+            settings = body.get('settings')
+            if not isinstance(settings, dict):
+                self._json({'ok': False, 'error': 'settings must be an object'}, 400)
+                return
+            # Returns at once: the BOAT flies it; its answer arrives as status.
+            ok, err = self.link.start_mission(settings, command_seq)
+            self._json({'ok': ok, 'error': err} if not ok else {'ok': True}, 200 if ok else 409)
         elif self.path == '/api/record':
             ok, err = self.link.trigger_record()
             self._json({'ok': ok, 'error': err}, 200 if ok else 503)
@@ -6946,7 +7609,16 @@ def main() -> int:
                          'concurrent load (commands out + telemetry in), try a '
                          'lower rate (e.g. --hz 5) to see if that changes when '
                          'or whether it happens.')
+    ap.add_argument('--merge-mission', nargs=2, metavar=('RUN_DIR', 'BOAT_CSV'),
+                    help='put a mission\'s boat SD record (MSN_NNN.CSV) beside the laptop '
+                         'record in dataout/MISSION_*: copies it in and writes merged.csv, '
+                         'then exits')
     args = ap.parse_args()
+
+    if args.merge_mission:
+        out = mission_merge(*args.merge_mission)
+        print('merged: %s' % out)
+        return 0
 
     try:
         import serial  # noqa: F401 -- fail fast if pyserial is missing

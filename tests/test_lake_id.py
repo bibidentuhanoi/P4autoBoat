@@ -1178,7 +1178,7 @@ class UiTest(unittest.TestCase):
     def test_card_and_wiring(self):
         for s in ('id="lake-start"', 'id="lake-throttle"', 'id="lake-mag"', 'id="lake-fw"',
                   'id="lake-next"', 'id="lake-warn"', "api('/api/lake_id'", 'renderLakeId(s);',
-                  "'lake-start',", 'on = on || _lakeActive;'):
+                  "'lake-start',", 'on = on || _lakeActive || _missionActive;'):   # 09-25: a mission locks them too
             self.assertIn(s, self.src, s)
 
     def test_lake_render_runs_before_the_rudder_lockout(self):
