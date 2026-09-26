@@ -13,12 +13,34 @@
 
 #include "platform.h"
 
-//Use the timeout from the config, the default timeout is -1
-#if CONFIG_VL53L5CX_I2C_TIMEOUT == false
-#define VL53L5CX_I2C_TIMEOUT (-1)
+/* Every transfer is BOUNDED. The component's default is -1 (wait forever),
+ * and a marginal bus with -1 wedged the whole boot on hardware (2026-07-02:
+ * hung mid ToF-B bring-up while the IMU was loading the bus; the IMU driver got
+ * bounded timeouts then, this side did not). The ToF sensors share the bus with
+ * the IMU that P, the auto-trim and the mission steer by, so a ToF transfer
+ * that never ends must not be able to hold it.
+ *
+ * The bound fits the transfer: 3x its wire time at this bus speed, plus 100 ms.
+ * The 32 KB firmware upload (~0.3 s at 1 MHz) still fits; a normal 128-byte
+ * read gives up after ~0.1 s and releases the bus. CONFIG_VL53L5CX_I2C_TIMEOUT
+ * (the component's own option) still overrides it. */
+#if defined(CONFIG_TOF_I2C_FREQ_HZ) && CONFIG_TOF_I2C_FREQ_HZ > 0
+#define VL53L5CX_BUS_HZ ((uint64_t)CONFIG_TOF_I2C_FREQ_HZ)
 #else
-#define VL53L5CX_I2C_TIMEOUT CONFIG_VL53L5CX_I2C_TIMEOUT_VALUE
+#define VL53L5CX_BUS_HZ 100000ULL          /* slowest standard speed: the longest bound */
 #endif
+
+static int vl53l5cx_i2c_timeout_ms(uint32_t bytes)
+{
+#if defined(CONFIG_VL53L5CX_I2C_TIMEOUT) && CONFIG_VL53L5CX_I2C_TIMEOUT
+    (void)bytes;
+    return CONFIG_VL53L5CX_I2C_TIMEOUT_VALUE;
+#else
+    /* 9 bits per byte on the wire (8 + ACK), plus the address and register bytes */
+    const uint64_t wire_ms = (((uint64_t)bytes + 4u) * 9u * 1000u + VL53L5CX_BUS_HZ - 1u) / VL53L5CX_BUS_HZ;
+    return (int)(100u + 3u * wire_ms);
+#endif
+}
 
 /* The 8x8/four-target result block is about 1.4KB. Bound each transaction so
  * the ESP-IDF bus lock is released between chunks and the higher-priority IMU
@@ -54,7 +76,8 @@ uint8_t VL53L5CX_WrMulti(VL53L5CX_Platform *p_platform, uint16_t RegisterAdress,
     i2c_buffers[1].write_buffer = p_values;
     i2c_buffers[1].buffer_size = size;
 
-    return i2c_master_multi_buffer_transmit(p_platform->handle, i2c_buffers, 2, VL53L5CX_I2C_TIMEOUT);
+    return i2c_master_multi_buffer_transmit(p_platform->handle, i2c_buffers, 2,
+                                            vl53l5cx_i2c_timeout_ms(size + 2u));
 }
 
 uint8_t VL53L5CX_WrByte(VL53L5CX_Platform *p_platform, uint16_t RegisterAdress, uint8_t value) {
@@ -78,7 +101,7 @@ uint8_t VL53L5CX_RdMulti(VL53L5CX_Platform *p_platform, uint16_t RegisterAdress,
 
         uint8_t status = (uint8_t)i2c_master_transmit_receive(
             p_platform->handle, i2c_address, sizeof(i2c_address),
-            p_values + offset, chunk_size, VL53L5CX_I2C_TIMEOUT);
+            p_values + offset, chunk_size, vl53l5cx_i2c_timeout_ms(chunk_size + 2u));
         if (status != 0U) {
             return status;
         }

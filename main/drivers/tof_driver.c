@@ -159,11 +159,21 @@ esp_err_t tof_init(i2c_master_bus_handle_t bus_handle, tof_devices_t* devices) {
     gpio_set_level(TOF_A_LPN_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     devices->a_ok = tof_init_one(bus_handle, &devices->dev_a, TOF_A_ADDR, "xtalk_a", "A");
+    if (!devices->a_ok) {
+        /* A did not come up -- and may still answer at the DEFAULT address (an
+         * address change that did not take), exactly where B is about to wake.
+         * Two chips on one address have the same ID, so B's probe would look
+         * healthy while every write reached both. LPn low takes A off the bus. */
+        gpio_set_level(TOF_A_LPN_PIN, 0);
+    }
 
     // Sensor B — enable now that A (if present) has moved off the default address.
     gpio_set_level(TOF_B_LPN_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
     devices->b_ok = tof_init_one(bus_handle, &devices->dev_b, TOF_B_ADDR, "xtalk_b", "B");
+    if (!devices->b_ok) {
+        gpio_set_level(TOF_B_LPN_PIN, 0);   /* nothing half-started left talking on the bus */
+    }
 
     ESP_LOGI(TAG, "ToF init: A=%s B=%s I2C=%dHz targets/zone=%d",
              devices->a_ok ? "OK" : "absent", devices->b_ok ? "OK" : "absent",
