@@ -93,6 +93,7 @@ import shutil
 import struct
 import sys
 import threading
+import traceback
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -5171,57 +5172,62 @@ class BoatLink:
         period = 1.0 / self.send_hz
         next_tick = time.monotonic()
         while not self._stop.is_set():
-            with self._lock:
-                stream_lock_started = self._now()
-                # Before the sends: the sequence only sets throttle/rudder and
-                # the block below transmits them, so it inherits every existing
-                # safety path instead of opening a second command route.
-                now_mono = time.monotonic()
-                self._assist_off_tick_locked(now_mono)
-                self._rudder_test_tick_locked(now_mono)
-                self._lake_id_tick_locked(now_mono)
-                self._mission_tick_locked(self._now())
-                # THE LEASE. A rudder test drives itself and is not browser
-                # input, so it keeps its own authority; anything else must be
-                # backed by a live browser saying so.
-                if (self.rudder_test is None and getattr(self, 'lake_id', None) is None
-                        and not self._drive_lease_ok_locked(now_mono)
-                        and self._anything_commanded_locked()):
-                    if self.lease_expired_at is None:
-                        self.lease_expired_at = now_mono
-                        age = now_mono - self.session_last_hb
-                        reason = ('no active control session' if self.session_id is None else
-                                  'last browser heartbeat %.2fs ago' % age)
-                        http_arrival = getattr(self, '_last_http_hb_arrival', None)
-                        http_age_ms = ((now_mono - http_arrival) * 1000.0
-                                       if http_arrival is not None else None)
-                        print('[lease] %s (limit %.2fs) — zeroing manual controls. '
-                              'Keep the control tab visible; if this repeats while visible, '
-                              'check browser/HTTP responsiveness.'
-                              % (reason, CONTROL_LEASE_S), flush=True)
-                        print('[lease] timing: last_http_arrival_age=%sms '
-                              'last_browser_send_gap=%sms last_http_to_lock=%sms '
-                              'last_lock_wait=%sms max_serial_write=%sms '
-                              'max_stream_lock=%sms accepted_seq=%s '
-                              'last_http_seq=%s last_reject=%s' % (
-                                  http_age_ms, getattr(self, '_last_browser_gap_ms', None),
-                                  getattr(self, '_last_hb_http_to_lock_ms', None),
-                                  getattr(self, '_last_hb_lock_wait_ms', None),
-                                  getattr(self, '_hb_max_serial_write_ms', 0.0),
-                                  getattr(self, '_hb_max_stream_lock_ms', 0.0),
-                                  self.session_seq, getattr(self, '_last_http_hb_seq', None),
-                                  getattr(self, '_last_hb_reject_code', None)), flush=True)
-                    self._zero_controls_locked()
-                    self._transmit_zeros_locked()
-                if self.connected:
-                    self._stream_send_locked()
-                self._hb_max_stream_lock_ms = max(
-                    getattr(self, '_hb_max_stream_lock_ms', 0.0),
-                    (self._now() - stream_lock_started) * 1000.0)
-            # File I/O deliberately outside the lock -- a few ms of CSV write
-            # must never sit inside the 15 Hz command loop's critical section.
-            self._flush_rudder_test_write()
-            self._flush_bench_write()
+            try:
+                with self._lock:
+                    stream_lock_started = self._now()
+                    # Before the sends: the sequence only sets throttle/rudder and
+                    # the block below transmits them, so it inherits every existing
+                    # safety path instead of opening a second command route.
+                    now_mono = time.monotonic()
+                    self._assist_off_tick_locked(now_mono)
+                    self._rudder_test_tick_locked(now_mono)
+                    self._lake_id_tick_locked(now_mono)
+                    self._mission_tick_locked(self._now())
+                    # THE LEASE. A rudder test drives itself and is not browser
+                    # input, so it keeps its own authority; anything else must be
+                    # backed by a live browser saying so.
+                    if (self.rudder_test is None and getattr(self, 'lake_id', None) is None
+                            and not self._drive_lease_ok_locked(now_mono)
+                            and self._anything_commanded_locked()):
+                        if self.lease_expired_at is None:
+                            self.lease_expired_at = now_mono
+                            age = now_mono - self.session_last_hb
+                            reason = ('no active control session' if self.session_id is None else
+                                      'last browser heartbeat %.2fs ago' % age)
+                            http_arrival = getattr(self, '_last_http_hb_arrival', None)
+                            http_age_ms = ((now_mono - http_arrival) * 1000.0
+                                           if http_arrival is not None else None)
+                            print('[lease] %s (limit %.2fs) — zeroing manual controls. '
+                                  'Keep the control tab visible; if this repeats while visible, '
+                                  'check browser/HTTP responsiveness.'
+                                  % (reason, CONTROL_LEASE_S), flush=True)
+                            print('[lease] timing: last_http_arrival_age=%sms '
+                                  'last_browser_send_gap=%sms last_http_to_lock=%sms '
+                                  'last_lock_wait=%sms max_serial_write=%sms '
+                                  'max_stream_lock=%sms accepted_seq=%s '
+                                  'last_http_seq=%s last_reject=%s' % (
+                                      http_age_ms, getattr(self, '_last_browser_gap_ms', None),
+                                      getattr(self, '_last_hb_http_to_lock_ms', None),
+                                      getattr(self, '_last_hb_lock_wait_ms', None),
+                                      getattr(self, '_hb_max_serial_write_ms', 0.0),
+                                      getattr(self, '_hb_max_stream_lock_ms', 0.0),
+                                      self.session_seq, getattr(self, '_last_http_hb_seq', None),
+                                      getattr(self, '_last_hb_reject_code', None)), flush=True)
+                        self._zero_controls_locked()
+                        self._transmit_zeros_locked()
+                    if self.connected:
+                        self._stream_send_locked()
+                    self._hb_max_stream_lock_ms = max(
+                        getattr(self, '_hb_max_stream_lock_ms', 0.0),
+                        (self._now() - stream_lock_started) * 1000.0)
+                # File I/O deliberately outside the lock -- a few ms of CSV write
+                # must never sit inside the 15 Hz command loop's critical section.
+                self._flush_rudder_test_write()
+                self._flush_bench_write()
+            except Exception as exc:                     # noqa: BLE001
+                # One bad tick costs that tick. Dying here silently stopped the
+                # keepalive and the STOP repeats for the rest of the session.
+                self._thread_error('stream loop', exc)
             next_tick += period
             sleep_for = next_tick - time.monotonic()
             if sleep_for > 0:
@@ -5407,6 +5413,21 @@ class BoatLink:
             self._collect_lake_id_row_locked(s.imu.yaw_rate, s.imu.heading)
             self._record_fix_locked(s.gps.valid, s.gps.latitude, s.gps.longitude)
 
+    def _thread_error(self, where, exc):
+        """A background loop hit an unexpected exception: report it (the
+        traceback the first time, then at most every 5 s with a count) and let
+        the loop carry on -- a silent dead thread was the worse failure."""
+        counts = self.__dict__.setdefault('_thread_error_counts', {})
+        last = self.__dict__.setdefault('_thread_error_last', {})
+        counts[where] = n = counts.get(where, 0) + 1
+        now = time.monotonic()
+        if n == 1 or now - last.get(where, 0.0) >= 5.0:
+            last[where] = now
+            print('[error] %s: %s: %s (x%d) -- the loop keeps running'
+                  % (where, type(exc).__name__, exc, n), flush=True)
+            if n == 1:
+                traceback.print_exc()
+
     def _read_loop(self):
         """Telemetry downlink: same serial connection as the command uplink,
         read from a separate thread (full-duplex USB CDC, standard pyserial
@@ -5432,7 +5453,11 @@ class BoatLink:
                 i = buf.index(b'\x00')
                 frame, buf[:] = bytes(buf[:i]), buf[i + 1:]
                 if frame:
-                    self._handle_incoming_frame(frame)
+                    try:
+                        self._handle_incoming_frame(frame)
+                    except Exception as exc:             # noqa: BLE001
+                        # That frame is lost; the next status must not be.
+                        self._thread_error('read loop', exc)
 
     def shutdown(self):
         self.disconnect()

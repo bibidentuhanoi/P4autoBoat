@@ -430,6 +430,60 @@ class ServoRailAndWinchCommandTest(unittest.TestCase):
         self.assertEqual(msg.WhichOneof('payload'), 'winch')
         self.assertEqual(msg.winch.speed, 1.0)
 
+    def test_one_failing_tick_does_not_stop_the_stream(self):
+        """Review 2026-09-26: nothing guarded the 15 Hz loop. One unexpected
+        exception in any tick (a bad status field, a summary formatted from
+        odd data) killed the thread for the rest of the session, silently --
+        and with it the keepalive and the STOP repeats a mission relies on."""
+        self.link.send_hz = 100.0
+        self.link._stop = threading.Event()
+        calls = []
+
+        def flaky_tick(now):
+            calls.append(now)
+            if len(calls) == 1:
+                raise RuntimeError('unexpected state')
+        self.link._mission_tick_locked = flaky_tick
+        stream = threading.Thread(target=self.link._stream_loop)
+        stream.start()
+        time.sleep(0.06)
+        self.link._stop.set()
+        stream.join(timeout=1.0)
+
+        self.assertFalse(stream.is_alive())
+        self.assertGreaterEqual(len(calls), 3)                        # it kept ticking
+        kinds = [m.WhichOneof('payload') for m in self.messages()]
+        self.assertGreaterEqual(kinds.count('motor'), 2)              # and kept sending
+        self.assertTrue(self.link._lock.acquire(blocking=False))      # lock not left held
+        self.link._lock.release()
+
+    def test_a_frame_that_breaks_the_handler_does_not_stop_the_receiver(self):
+        """Same for the downlink: a frame whose handling raises must cost that
+        frame, not every status update for the rest of the session."""
+        frames = [b'A' * 5, b'B' * 5]
+        wire = [b'\x00'.join(frames) + b'\x00']
+
+        class FakeSerial:
+            def read(self, n):
+                return wire.pop(0) if wire else b''
+        handled = []
+
+        def handler(frame):
+            if frame == frames[0]:
+                raise ValueError('bad frame')
+            handled.append(frame)
+        self.link.ser = FakeSerial()
+        self.link._handle_incoming_frame = handler
+        self.link._stop = threading.Event()
+        reader = threading.Thread(target=self.link._read_loop)
+        reader.start()
+        time.sleep(0.05)
+        self.link._stop.set()
+        reader.join(timeout=1.0)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(handled, [frames[1]])
+
     def test_expired_winch_command_stops_retransmission(self):
         """Catches a missing server-side lease check in the 15 Hz loop."""
         self.link.winch_speed = 0.6
