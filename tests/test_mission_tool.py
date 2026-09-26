@@ -350,6 +350,91 @@ el('msn-dry').checked = true;
         self.assertTrue(out['lake_disabled'])                      # a mission locks the other tests
 
 
+class StaleSliderTest(MissionBase):
+    """Review 2026-09-26: the page's drive sliders do not spring back and its
+    12 Hz heartbeat re-sends whatever they show.  A slider left up -- from
+    driving, or from ending the previous run with a throttle touch, which the
+    field checklist asks for -- came straight back after START.  The boat reads
+    a new non-zero drive as the operator touching the throttle: it ends the
+    mission as MANUAL and drives at the slider.  Only a slider the operator
+    MOVES after START is a touch."""
+
+    def _hb(self, **kw):
+        return self.link.control_heartbeat(self.link.session_id,
+                                           self.link.session_seq + 1, **kw)
+
+    def _motor_frames(self):
+        return [(round(m.left, 3), round(m.right, 3)) for k, m in self.frames if k == 'motor']
+
+    def test_a_slider_left_up_cannot_come_back_after_start(self):
+        self.link.open_control_session()
+        self.assertTrue(self._hb(throttle=0.2, rudder=0.1)[0])       # driving before the run
+        self.assertEqual(self.link.throttle, 0.2)
+        self.start()
+        for _ in range(12):                                           # the same page, 1 s
+            ok, err = self._hb(throttle=0.2, rudder=0.1)
+            self.assertTrue(ok, err)                                  # still a keepalive
+            with self.link._lock:
+                self.link._stream_send_locked()
+        self.assertEqual((self.link.throttle, self.link.rudder), (0.0, 0.0))
+        self.assertTrue(self._motor_frames())
+        self.assertEqual(set(self._motor_frames()), {(0.0, 0.0)})     # zeros on the wire only
+
+    def test_nor_once_the_run_is_over(self):
+        self.link.open_control_session()
+        self._hb(left=0.3, right=0.1, split=True)                     # split sliders left up
+        rid = self.start()
+        self.boat(run_id=1, request_id=rid, state=5, reason=3, record_state=3, file_index=4)
+        self.finished()
+        self.assertIsNone(self.link.mission)
+        self._hb(left=0.3, right=0.1, split=True)                     # the run is over; page unchanged
+        self.assertEqual((self.link.motor_left, self.link.motor_right), (0.0, 0.0))
+
+    def test_moving_a_slider_after_start_is_a_touch(self):
+        self.link.open_control_session()
+        self._hb(throttle=0.2)
+        self.start()
+        self._hb(throttle=0.2)                                        # stale: ignored
+        self.assertTrue(self._hb(throttle=0.25)[0])                   # the operator moves it
+        self.assertEqual(self.link.throttle, 0.25)
+        self.assertTrue(self._hb(throttle=0.2)[0])                    # ...and back: also real
+        self.assertEqual(self.link.throttle, 0.2)
+
+    def test_a_fresh_session_forgets_the_old_sliders(self):
+        self.link.open_control_session()
+        self._hb(throttle=0.2)
+        self.start()
+        self.link.open_control_session()                              # page reload / tab back
+        self.assertTrue(self._hb(throttle=0.2)[0])                    # a real, new position
+        self.assertEqual(self.link.throttle, 0.2)
+
+
+class StartZeroesThePageTest(unittest.TestCase):
+
+    def test_start_zeroes_the_drive_sliders_before_it_asks(self):
+        result = run_page_js(r"""
+vm.createContext(context);
+vm.runInContext(script, context);
+context.applyStatus(Object.assign({}, CONNECTED_STATUS));
+const el = id => context.document.getElementById(id);
+(async function () {
+  await context.openSession();          // the session zeroes the sliders itself; drive AFTER it
+  for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0));
+  el('throttle').value = '20'; context.ctrl.throttle = 0.2;
+  el('motor-left').value = '30'; context.ctrl.left = 0.3;
+  await context.startMission();
+  console.log(JSON.stringify({ thr: Number(el('throttle').value), left: Number(el('motor-left').value),
+    ctrl: context.ctrl, posted: calls.some(c => c.path === '/api/mission') }));
+  process.exit(0);
+})();
+""")
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(out['posted'])
+        self.assertEqual((out['thr'], out['left']), (0, 0))
+        self.assertEqual((out['ctrl']['throttle'], out['ctrl']['left'], out['ctrl']['right']), (0, 0, 0))
+
+
 if __name__ == '__main__':
     unittest.main()
 

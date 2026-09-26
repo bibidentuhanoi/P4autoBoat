@@ -2789,6 +2789,7 @@ class BoatLink:
             # page's first heartbeat is recognised as "unchanged" rather than
             # as the operator grabbing a control.
             self._last_hb_state = (0.0, 0.0, 0.0, 0.0, False)
+            self._hb_stale_state = None     # a new session's page starts at zero
             if self.connected and not automated:
                 self._transmit_zeros_locked()
             return self.session_id
@@ -2904,6 +2905,14 @@ class BoatLink:
             # again? At 12 Hz most heartbeats are the latter, and treating
             # every one as fresh input aborted running rudder tests instantly.
             state = (throttle, rudder, left, right, split)
+            stale = getattr(self, '_hb_stale_state', None)
+            if stale is not None:
+                if state == stale:
+                    # The sliders still show what they showed at mission START:
+                    # a keepalive, not a command -- during the run and after it.
+                    self._last_hb_state = state
+                    return True, None
+                self._hb_stale_state = None     # the operator moved something
             moved = (self._last_hb_state is not None
                      and state != self._last_hb_state)
             self._last_hb_state = state
@@ -4472,6 +4481,15 @@ class BoatLink:
                 # a non-zero stick is, and ends the mission on the boat.
                 self.throttle = 0.0; self.motor_left = 0.0; self.motor_right = 0.0
                 self.motor_split = False; self.rudder = 0.0; self.winch_speed = 0.0
+                # ...and the page's sliders, which do not spring back, must not
+                # put them back: its 12 Hz heartbeat re-sends what they show,
+                # and a new non-zero drive is, to the boat, the operator
+                # touching the throttle (MANUAL -- and it drives at it).  That
+                # same page state is a keepalive from now on, until the
+                # operator moves something (control_heartbeat).
+                last = getattr(self, '_last_hb_state', None)
+                self._hb_stale_state = (last if last is not None
+                                        and last != (0.0, 0.0, 0.0, 0.0, False) else None)
                 self._mission_event_locked('start_sent', json.dumps(settings, sort_keys=True))
                 self._send_mission_locked(start=True)
                 return True, None
@@ -6503,6 +6521,9 @@ async function startMission() {
   const msg = $('msn-msg');
   if (!connected) { msg.textContent = 'not connected'; return; }
   msg.textContent = '';
+  // The mission drives from here: a slider left up would come back on the next
+  // heartbeat and end it as a stick touch. Hands off means sliders at zero.
+  zeroDriveUI();
   const settings = {
     stage: parseInt($('msn-stage').value, 10),
     out_distance_m: parseFloat($('msn-out').value),
