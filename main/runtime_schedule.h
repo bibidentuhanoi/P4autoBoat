@@ -33,6 +33,9 @@ typedef struct {
     uint32_t period_us;
     uint32_t deadline_us;
     bool critical;
+    /* Stack in PSRAM instead of internal RAM.  Only for a task that never
+     * writes flash or NVS on its own stack (tests/test_psram_stacks.py). */
+    bool stack_in_psram;
 } runtime_task_spec_t;
 
 const runtime_task_spec_t *runtime_schedule_get(runtime_task_id_t id);

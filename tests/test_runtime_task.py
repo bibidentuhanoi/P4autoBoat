@@ -17,6 +17,12 @@ def test_every_runtime_task_is_created_from_its_pinned_schedule_entry():
         (tmpdir / "esp_log.h").write_text(
             "#pragma once\nvoid test_log(const char *, const char *, ...);\n"
             "#define ESP_LOGE(...) test_log(__VA_ARGS__)\n"
+            "#define ESP_LOGW(...) test_log(__VA_ARGS__)\n"
+            "#define ESP_LOGI(...) test_log(__VA_ARGS__)\n"
+        )
+        (tmpdir / "esp_heap_caps.h").write_text(   # the real values (heap/include)
+            "#pragma once\n#define MALLOC_CAP_8BIT (1<<2)\n"
+            "#define MALLOC_CAP_SPIRAM (1<<10)\n#define MALLOC_CAP_INTERNAL (1<<11)\n"
         )
         (tmpdir / "freertos" / "FreeRTOS.h").write_text(
             "#pragma once\n#include <stdint.h>\n"
@@ -28,6 +34,9 @@ def test_every_runtime_task_is_created_from_its_pinned_schedule_entry():
             "typedef void *TaskHandle_t; typedef void (*TaskFunction_t)(void *);\n"
             "BaseType_t xTaskCreatePinnedToCore(TaskFunction_t, const char *, uint32_t, "
             "void *, UBaseType_t, TaskHandle_t *, BaseType_t);\n"
+            # freertos/idf_additions.h, included by the real FreeRTOS.h
+            "BaseType_t xTaskCreatePinnedToCoreWithCaps(TaskFunction_t, const char *, uint32_t, "
+            "void *, UBaseType_t, TaskHandle_t *, BaseType_t, UBaseType_t);\n"
         )
         binary = tmpdir / "runtime_task_test"
         subprocess.run(

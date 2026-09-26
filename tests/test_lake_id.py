@@ -1128,6 +1128,11 @@ class GuardTest(unittest.TestCase):
         # with no camera (camera_init failed) was xSemaphoreTake(NULL) -> a
         # FreeRTOS assert and a reboot; now refused with INVALID_STATE.
         'main/drivers/camera_driver.c',
+        # 2026-09-26 first hw boot of the mission build (WiFi mode): no 4 KB
+        # piece of internal RAM left for the mission's stack, none for
+        # TrainingLog's 8 KB (ESP_ERR_NO_MEM, "no missions this boot");
+        # runtime_task_create now puts a stack_in_psram task's stack in PSRAM.
+        'main/runtime_task.c',
     }
 
     def _git(self, *args):

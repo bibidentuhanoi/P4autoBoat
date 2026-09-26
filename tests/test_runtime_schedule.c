@@ -43,5 +43,18 @@ int main(void)
     assert(runtime_schedule_get(RUNTIME_TASK_WAYPOINT) == 0);
     assert(runtime_schedule_get(RUNTIME_TASK_ML_CONTROL) == 0);
 
+    /* Stack placement (hw, 2026-09-26: the first WiFi-mode boot of the mission
+     * build could not fit TrainingLog's 8 KB or the mission's 4 KB stack in the
+     * fragmented internal RAM).  Exactly these two live in PSRAM: neither ever
+     * writes flash or NVS from its own stack (TrainingLog's NVS session number
+     * is read in training_log_init(), on the boot task).  Every other task --
+     * the critical ones, and those that save to NVS -- stays internal. */
+    for (runtime_task_id_t id = RUNTIME_TASK_CONTROL; id < RUNTIME_TASK_COUNT; ++id) {
+        const runtime_task_spec_t *spec = runtime_schedule_get(id);
+        const bool psram = (id == RUNTIME_TASK_AUTONOMY || id == RUNTIME_TASK_TRAINING_LOG);
+        assert(spec->stack_in_psram == psram);
+        assert(!(spec->critical && spec->stack_in_psram));
+    }
+
     return 0;
 }

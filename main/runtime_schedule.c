@@ -33,7 +33,11 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
      * from inside that printf, needs 5,520 B (5,104 B on main c8a4c5e), over
      * the old 4 KB; the normal path ~3 KB. */
     [RUNTIME_TASK_DIAGNOSTICS] = {"Diagnostics", 6144, 2, 1, 1000000, 0, false},
-    [RUNTIME_TASK_TRAINING_LOG] = {"TrainingLog", 8192, 2, 1, 0, 0, false},
+    /* Stack in PSRAM (hw, 2026-09-26: in WiFi mode the internal RAM left after
+     * boot is ~17 KB in pieces under 1.4 KB, too small for this 8 KB stack).
+     * It captures a JPEG and writes it to the SD card, never flash: its NVS
+     * session number is read in training_log_init(), on the boot task. */
+    [RUNTIME_TASK_TRAINING_LOG] = {"TrainingLog", 8192, 2, 1, 0, 0, false, true},
     [RUNTIME_TASK_STATUS_LED] = {"StatusLED", 2048, 2, 1, 0, 0, false},
     /* Compass/IMU calibration at boot, then a 1 Hz health report. Low
      * priority: it only reads the shared sensor snapshot, never the bus.
@@ -45,8 +49,11 @@ static const runtime_task_spec_t s_schedule[RUNTIME_TASK_COUNT] = {
      * written by Diagnostics), no radio (MissionStatus too), no mutex -- only
      * spinlock copies (the drive snapshot included: never the ESC driver's
      * mutex, which is the control task's) and the console lock of its few
-     * log lines.  Optional: if it cannot start the boat simply has no mission. */
-    [RUNTIME_TASK_AUTONOMY] = {"Autonomy", 4096, 8, 1, 50000, 50000, false},
+     * log lines.  Optional: if it cannot start the boat simply has no mission.
+     * Stack in PSRAM: the internal RAM had no 4 KB piece left for it on the
+     * first WiFi-mode boot (hw, 2026-09-26, "no missions this boot"), and it
+     * never touches flash or NVS. */
+    [RUNTIME_TASK_AUTONOMY] = {"Autonomy", 4096, 8, 1, 50000, 50000, false, true},
 };
 
 const runtime_task_spec_t *runtime_schedule_get(runtime_task_id_t id)
@@ -64,6 +71,9 @@ bool runtime_schedule_validate(void)
         if (!spec->name || !spec->stack_size || !spec->priority ||
             (spec->core != 0 && spec->core != 1)) {
             return false;
+        }
+        if (spec->critical && spec->stack_in_psram) {
+            return false;       /* critical tasks keep internal stacks: some save to NVS */
         }
     }
 
