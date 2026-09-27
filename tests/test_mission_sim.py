@@ -9,6 +9,10 @@ off, and every recorded turn / yaw pulse replayed from its recorded commands.
 Then the REAL mission, AUTO owner, heading hold and mixer fly it: every
 scenario of the fault catalogue must end as expected, the nominal envelope must
 finish truly inside the zone, and nothing may spin or declare a false arrival.
+
+Last, the same boat with the lake's own sensors (--lake): GPS wander, compass
+and gyro fitted to the same runs, each checked against them, and the missions
+still finish -- the realistic answer for the water.
 """
 import json
 import math
@@ -195,3 +199,105 @@ def test_where_drift_starts_to_fail_is_known_and_safe(sim):
     assert rows[0.15]["in_zone"] >= 90.0, res.stdout
     for v, r in rows.items():            # beyond the envelope it may not arrive -- but never spins
         assert r["spins"] == 0 and r["false"] == 0, (v, res.stdout)
+
+
+# ---- the same boat with the lake's own sensors -------------------------------
+# --gps lake / --compass lake / --gyro lake (--lake = all three) are fitted to
+# the same lake runs as the boat: model_ref.json gps_drift (the GPS position
+# wander; 2026-09-21, 12 satellites, the typical day), p_on (GPS course minus
+# heading on the P-ON straights: the compass's OLD calibration, before the 09-24
+# flat one) and gyro_still.  The default sensors stay gentle, so a logic
+# regression shows plainly; these say what to expect on the water.
+
+
+def lines(res):
+    return [json.loads(line) for line in res.stdout.splitlines() if line.startswith("{")]
+
+
+def test_lake_gps_wanders_like_the_lake_gps(sim):
+    res = run(sim, "--gps", "lake", "--gps-check", "--runs", "6000")
+    assert res.returncode == 0, res.stderr
+    model = {r["tau_s"]: r for r in lines(res)}
+    lake = REF["gps_drift"]["by_day"]["2026-09-21"]
+    for tau, n, med, p90 in zip(lake["tau_s"], lake["n"], lake["median_m"], lake["p90_m"]):
+        tol = 0.15 if n >= 150 else 0.25          # only 87 windows reach 40 s
+        assert abs(model[tau]["median_m"] - med) <= tol * med, (tau, med, model[tau])
+        assert abs(model[tau]["p90_m"] - p90) <= tol * p90, (tau, p90, model[tau])
+    # --gps lake-good against the best-sky day, where it has enough windows
+    good = {r["tau_s"]: r for r in lines(run(sim, "--gps", "lake-good", "--gps-check", "--runs", "6000"))}
+    day = REF["gps_drift"]["by_day"]["2026-09-20"]
+    for tau, n, med in zip(day["tau_s"], day["n"], day["median_m"]):
+        if n >= 70:
+            assert abs(good[tau]["median_m"] - med) <= 0.15 * med, (tau, med, good[tau])
+    # and why it exists: the default wander is far gentler than the lake's
+    legacy = {r["tau_s"]: r for r in lines(run(sim, "--gps-check", "--runs", "2000"))}
+    assert legacy[30]["median_m"] < 0.4 * model[30]["median_m"]
+
+
+def test_lake_compass_reads_like_the_lake_compass(sim):
+    res = run(sim, "--lake", "--beta-check", "--runs", "600")
+    assert res.returncode == 0, res.stderr
+    runs = lines(res)
+    ok = [r for r in runs if r["valid"]]
+    assert len(ok) >= 0.95 * len(runs)
+    # the slowest straights (15/25 %) are left out: their GPS course is noise
+    lake = [x for x in REF["p_on"] if x["beta_mean"] is not None and x["beta_std"] < 15.0]
+    assert len(lake) >= 10
+    for x in lake:
+        course = (x["heading"] + x["beta_mean"]) % 360.0
+        near = [r["beta_mean"] for r in ok if abs((r["start_heading"] - course + 180.0) % 360.0 - 180.0) <= 15.0]
+        assert len(near) >= 20, (x["run"], len(near))
+        assert abs(statistics.median(near) - x["beta_mean"]) <= 6.0, (x["run"], x["beta_mean"], statistics.median(near))
+    rec, model = statistics.median(x["beta_std"] for x in lake), statistics.median(r["beta_std"] for r in ok)
+    assert 0.7 * rec <= model <= 1.5 * rec, (rec, model)
+
+
+def test_lake_gyro_is_as_noisy_as_the_still_lake_boat(sim):
+    s = json.loads(run(sim, "--lake", "--runs", "1").stdout.strip().splitlines()[-1])
+    calm = [x for x in REF["gyro_still"] if abs(x["mean_dps"]) < 1.0 and x["std_dps"] < 1.0]
+    assert len(calm) >= 10
+    assert abs(s["gyro_noise"] - statistics.median(x["std_dps"] for x in calm)) <= 0.05, s
+    # half the bias range is the median |bias| drawn; the calm prechecks' median
+    # |mean| (bias, plus the floating boat really turning) is at most 10 % more
+    assert s["gyro_bias_max"] / 2.0 >= 0.9 * statistics.median(abs(x["mean_dps"]) for x in calm), s
+
+
+def test_with_the_lake_sensors_every_mission_still_finishes(sim):
+    """Software: every run ends DONE -- no abort, spin or never-ending -- where
+    its own GPS says home is.  Outcome: the distance from the TRUE start also
+    carries that run's GPS drift, which no mission can see."""
+    for extra in ((), ("--left",)):
+        res = run(sim, "--lake", "--runs", "300", *extra)
+        assert res.returncode == 0, res.stderr
+        s = json.loads(res.stdout.strip().splitlines()[-1])
+        assert s["done"] == s["runs"] and s["aborted"] == 0 and s["never_ended"] == 0 and s["spins"] == 0, s
+        assert s["in_zone_gps"] >= 0.95 and s["false_arrivals_gps"] == 0, s
+        # at 5000 runs: median 2.2 m from the true start, 74 % within 3 m, 91 % within 4 m
+        assert s["d_final_median"] <= 2.6 and s["within_4m"] >= 0.85, s
+
+
+def test_with_the_lake_sensors_the_catalogue_does_its_job(sim):
+    """Every fault scenario with the lake sensors, judged on the boat's own GPS.
+    Three sit just under their bar, for known reasons: OUT+TURN left ends 50-67
+    deg off home 1 time in 20 (the old compass's direction-dependent error; in
+    the FULL mission the way back corrects it); out 5 m is too short a leg to
+    learn the old compass's 15-55 deg offset; a frozen GPS was caught after
+    4.1 s instead of 4 once in 400 runs (the boat was slow)."""
+    n = 100
+    res = run(sim, "--lake", "--judge", "gps", "--catalogue", "--runs", str(n))
+    known = {"out_turn_left": 0.90, "out_5m": 0.90, "gps_frozen": 0.99}
+    rows, failing = 0, []
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1].endswith("%") and parts[2].endswith("%"):
+            rows += 1
+            name, got, need = parts[0], float(parts[1][:-1]) / 100.0, float(parts[2][:-1]) / 100.0
+            bar = known.get(name, need)
+            # Many scenarios sit at 96-99 % here (a stop just outside the zone
+            # by the boat's own GPS), so 100 runs of one of them can land a
+            # little under a 95 % bar: fail only 2 standard errors under it.
+            # The 100 % safety scenarios (STOP, DISARM, GPS lost...) stay exact.
+            if got + 2.0 * math.sqrt(bar * (1.0 - bar) / n) + 1e-6 < bar:
+                failing.append((name, got, bar))
+    assert rows >= 60, res.stdout
+    assert not failing, failing

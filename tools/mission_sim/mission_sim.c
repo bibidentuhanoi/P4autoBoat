@@ -20,7 +20,10 @@
  *   speed: table from the straight runs, 5-6 s to speed, glide half-life ~3.3 s;
  *   compass: constant + heading-dependent + throttle-dependent error;
  *   GPS:   white noise, slow wander, 50-200 ms lag, dropouts, jumps,
- *          reported speed accuracy.
+ *          reported speed accuracy.  The default wander (0.3 m, 60 s, from 0)
+ *          is gentle, for checking the logic; --gps lake is the wander the
+ *          18-21 Sep lake GPS really had (model_ref.json gps_drift, checked
+ *          by --gps-check): smooth ramps that level off, 1.12 m, 11 s.
  * Firmware timing: control 100 Hz, fusion 50 Hz, autonomy 20 Hz, GPS 10 Hz.
  * The control-task glue (AUTO owner -> heading hold -> mixer) is replicated in
  * the control step below.
@@ -32,7 +35,15 @@
  *   mission_sim --sweep NAME|all [--runs N]          one parameter at a time
  *   mission_sim --plant [--runs N]                   model metrics, JSON lines
  *   mission_sim --replay FILE [--runs N]             recorded commands -> model yaw
+ *   mission_sim --gps-check [--gps lake] [--runs N]  the GPS wander alone, JSON lines
  *   mission_sim --list                               scenario names
+ *   mission_sim --beta-check [--lake] [--runs N]     outbound compass offset, JSON lines
+ * Sensor models (any mode): --gps legacy (default) | lake | lake-good, or set
+ * --gps-wander/--gps-tau/--gps-order/--gps-spread/--gps-white/--gps-drop/
+ * --gps-jump (random dropouts and jumps per second) by hand;
+ * --compass legacy | lake; --gyro legacy | lake; --lake = all three lake.
+ * --judge true (default) | gps: pass/fail on the true position, or on the
+ * boat's own GPS (the software's job; see envelope_t judge_gps).
  * Everything is judged on the TRUE position. */
 #include <math.h>
 #include <stdint.h>
@@ -89,14 +100,30 @@ typedef struct {
     float drift_min, drift_max;          /* magnitude uniform in [min, max], any direction */
     /* compass */
     float bias_max; int bias_fixed;      /* fixed: |bias| = bias_max, random sign */
+    int bias_sign;                       /* 0: random sign; +-1: this sign */
     float hdg_err_max, thr_err_max;
+    int hdg_fixed; float hdg_phase_deg;  /* 1: amplitude hdg_err_max at this phase, every run */
+    float compass_noise;                 /* deg rms per 50 Hz reading */
+    /* gyro */
+    float gyro_noise;                    /* deg/s rms per 50 Hz reading */
+    float gyro_bias_max;                 /* per-run bias uniform in +- this, deg/s */
+    float gyro_scale_err;                /* per-run scale uniform in 1 +- this */
     /* GPS */
     float gps_white, gps_wander, gps_drop_per_s, gps_jump_per_s;
+    float gps_tau_s;                     /* wander time constant */
+    int gps_order;                       /* 1: one Gauss-Markov stage from 0; 2: two in series, steady state */
+    float gps_wander_spread;             /* per-run wander scale uniform in 1 +- this */
     float gps_lag_min_s, gps_lag_max_s;
     float sacc_mean;                     /* reported speed accuracy (m/s) */
     float vel_noise;                     /* actual GPS velocity noise per axis (m/s) */
     /* radio */
     float link_cut_start, link_cut_len;
+    /* judging: 0 = the TRUE position (default); 1 = the boat's own GPS -- did
+     * the mission take the boat where its GPS says home is?  With the lake
+     * GPS the true stop point also carries that run's GPS drift, which no
+     * mission can see, so --judge gps is the test of the software and the
+     * true distances (d_final, within_*m) are the outcome at the lake. */
+    int judge_gps;
     mission_settings_t settings;
 } envelope_t;
 
@@ -173,6 +200,7 @@ typedef struct {
     float start_heading;
     int gps_lag_steps;
     float sacc_base;
+    float gyro_scale;
 } boat_params_t;
 
 typedef struct {
@@ -193,6 +221,41 @@ static float speed_table(float T)
         if (T <= t[i]) return v[i - 1] + (v[i] - v[i - 1]) * (T - t[i - 1]) / (t[i] - t[i - 1]);
     }
     return 0.70f;
+}
+
+/* ---- GPS position error ("wander"), 10 Hz -------------------------------
+ * Order 1 (the default): one Gauss-Markov stage, time constant gps_tau_s,
+ * steady-state std gps_wander, starting at 0.  Order 2: two such stages in
+ * series -- the lake GPS drifts in smooth ramps that level off after ~30 s,
+ * which one stage cannot do -- started in its steady state (burn-in), with a
+ * per-run scale (some runs had worse sky than others).  The output stage's
+ * steady-state std is gps_wander: the first stage runs sqrt(2) larger. */
+typedef struct { float e1, n1, e, n, sigma; } gps_wander_t;
+
+static void gps_wander_step(const envelope_t *env, gps_wander_t *w)
+{
+    if (env->gps_order == 2) {
+        const float a = expf(-0.1f / env->gps_tau_s);
+        const float k = sqrtf(1.0f - a * a) * 1.41421356f * w->sigma;
+        w->e1 = a * w->e1 + k * gauss();
+        w->n1 = a * w->n1 + k * gauss();
+        w->e = a * w->e + (1.0f - a) * w->e1;
+        w->n = a * w->n + (1.0f - a) * w->n1;
+    } else {
+        w->e += (-w->e / env->gps_tau_s) * 0.1f + w->sigma * sqrtf(2.0f * 0.1f / env->gps_tau_s) * gauss();
+        w->n += (-w->n / env->gps_tau_s) * 0.1f + w->sigma * sqrtf(2.0f * 0.1f / env->gps_tau_s) * gauss();
+    }
+}
+
+static void gps_wander_init(const envelope_t *env, gps_wander_t *w)
+{
+    memset(w, 0, sizeof(*w));
+    w->sigma = env->gps_wander;
+    if (env->gps_wander_spread > 0.0f) w->sigma *= uni(1.0f - env->gps_wander_spread, 1.0f + env->gps_wander_spread);
+    if (env->gps_order == 2) {
+        const int burn = (int)(10.0f * env->gps_tau_s / 0.1f);
+        for (int i = 0; i < burn; ++i) gps_wander_step(env, w);
+    }
 }
 
 /* Every random draw happens in the same order whatever the scenario, so a
@@ -219,13 +282,18 @@ static void boat_draw(boat_params_t *p, const envelope_t *env, const scenario_t 
     const float bsign = sign_rand();
     const float bmag = uni(0.0f, env->bias_max);
     p->bias = env->bias_fixed ? bsign * env->bias_max : bsign * bmag;
+    if (env->bias_sign != 0) p->bias = (float)env->bias_sign * fabsf(p->bias);
     p->hdg_amp = uni(0.0f, (sc && sc->compass_hdg_amp > 0.0f) ? sc->compass_hdg_amp : env->hdg_err_max);
     p->hdg_phase = uni(0.0f, 360.0f);
+    if (env->hdg_fixed && !(sc && sc->compass_hdg_amp > 0.0f)) {
+        p->hdg_amp = env->hdg_err_max;
+        p->hdg_phase = env->hdg_phase_deg;
+    }
     p->thr_err = uni(-env->thr_err_max, env->thr_err_max) + (sc ? sc->compass_thr_amp : 0.0f);
     p->wave_sigma = uni(env->wave_min, env->wave_max);
     p->chop_sigma = uni(env->chop_min, env->chop_max);
     const float gsign = sign_rand();
-    p->gyro_bias = uni(-0.3f, 0.3f) + gsign * (sc ? sc->gyro_bias : 0.0f);
+    p->gyro_bias = uni(-env->gyro_bias_max, env->gyro_bias_max) + gsign * (sc ? sc->gyro_bias : 0.0f);
     const float h0 = uni(0.0f, 360.0f);
     const float h1 = uni(sc ? sc->start_hdg_min : 0.0f, sc ? sc->start_hdg_max : 0.0f);
     p->start_heading = (sc && sc->start_hdg_fixed) ? nav_wrap_360(h1) : h0;
@@ -234,6 +302,7 @@ static void boat_draw(boat_params_t *p, const envelope_t *env, const scenario_t 
     if (lag > HIST - 2) lag = HIST - 2;
     p->gps_lag_steps = lag;
     p->sacc_base = env->sacc_mean * uni(0.7f, 1.3f);
+    p->gyro_scale = env->gyro_scale_err > 0.0f ? uni(1.0f - env->gyro_scale_err, 1.0f + env->gyro_scale_err) : 1.0f;
 }
 
 static void boat_init(boat_t *b, const boat_params_t *p)
@@ -309,6 +378,13 @@ typedef struct {
     float max_cmd;       /* largest jet command written by the mission */
     float latency;       /* first scripted fault -> terminal state (s); -1 = n/a */
     float beta_final;
+    float start_heading;               /* true */
+    float out_beta_mean, out_beta_std; /* the mission's own outbound estimate */
+    int out_beta_valid; uint32_t out_beta_n;
+    /* the same, measured the boat's own way: its last fix against the home
+     * its fixes gave it (--judge gps) */
+    float d_done_gps, d_final_gps, closest_gps, heading_err_gps;
+    int false_arrival_gps;
 } result_t;
 
 static bool active_window(float t, float at, float len) { return at >= 0.0f && t >= at && t < at + len; }
@@ -345,10 +421,12 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
     uint8_t fix_type = 3, fix_sats = 12;
     float frozen_e = 0.0f, frozen_n = 0.0f; bool frozen_set = false;
     float hist_e[HIST] = {0}, hist_n[HIST] = {0}, hist_ve[HIST] = {0}, hist_vn[HIST] = {0}; int hi = 0;
-    float gm_e = 0.0f, gm_n = 0.0f, jump_e = 0.0f, jump_n = 0.0f, jump_until = -1.0f, drop_until = -1.0f;
+    gps_wander_t gw; gps_wander_init(env, &gw);
+    float jump_e = 0.0f, jump_n = 0.0f, jump_until = -1.0f, drop_until = -1.0f;
 
     result_t res; memset(&res, 0, sizeof(res));
     res.closest_true = 1e9f; res.reason = -1; res.latency = -1.0f;
+    res.closest_gps = 1e9f; res.d_done_gps = res.d_final_gps = -1.0f;
     float t = 0.0f, t_done = -1.0f, t_start = -1.0f, t_event = -1.0f;
     float t_state_first[8]; for (int i = 0; i < 8; ++i) t_state_first[i] = -1.0f;
     const float t_max = 400.0f;
@@ -411,8 +489,7 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
 
         /* ---- GPS at 10 Hz, late, with scripted and random faults -------- */
         if (step % 10 == 0) {
-            gm_e += (-gm_e / 60.0f) * 0.1f + env->gps_wander * sqrtf(2.0f * 0.1f / 60.0f) * gauss();
-            gm_n += (-gm_n / 60.0f) * 0.1f + env->gps_wander * sqrtf(2.0f * 0.1f / 60.0f) * gauss();
+            gps_wander_step(env, &gw);
             if (t > drop_until && urand() < env->gps_drop_per_s * 0.1) drop_until = t + uni(0.5f, 1.5f);
             if (t > jump_until && urand() < env->gps_jump_per_s * 0.1) {
                 jump_until = t + uni(1.0f, 2.0f);
@@ -422,8 +499,8 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
             const bool dropped = (t < drop_until) || active_window(te, sc->gps_drop_at, sc->gps_drop_len);
             if (!dropped) {
                 const int k = (hi - 1 - p.gps_lag_steps + 2 * HIST) % HIST;
-                float ge = hist_e[k] + gm_e + env->gps_white * gauss();
-                float gn = hist_n[k] + gm_n + env->gps_white * gauss();
+                float ge = hist_e[k] + gw.e + env->gps_white * gauss();
+                float gn = hist_n[k] + gw.n + env->gps_white * gauss();
                 if (t < jump_until) { ge += jump_e; gn += jump_n; }
                 if (active_window(te, sc->gps_jump_at, sc->gps_jump_len)) {
                     const float dx = b.e - true_home_e, dy = b.n - true_home_n;
@@ -452,10 +529,10 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
         const bool fusion_tick = (step % 2) == 0;
         const bool imu_frozen = active_window(te, sc->imu_frozen_at, sc->imu_frozen_len);
         if (fusion_tick && !imu_frozen) {
-            r_meas = boat_yaw(&b) * sc->gyro_scale + p.gyro_bias + 0.3f * gauss();
+            r_meas = boat_yaw(&b) * sc->gyro_scale * p.gyro_scale + p.gyro_bias + env->gyro_noise * gauss();
             const float cerr = p.bias + p.hdg_amp * sinf((b.psi + p.hdg_phase) * D2R) +
                                p.thr_err * (b.T / 0.4f) + compass_step;
-            const float mag = b.psi + cerr + 1.0f * gauss();
+            const float mag = b.psi + cerr + env->compass_noise * gauss();
             fused = nav_wrap_360(fused - r_meas * 0.02f);
             fused = nav_wrap_360(fused + 0.02f * wrap180(mag - fused));
             last_fusion_t = t;
@@ -556,7 +633,10 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
         /* ---- bookkeeping ------------------------------------------------ */
         if (t_state_first[m.state] < 0.0f) t_state_first[m.state] = t;
         if (m.state == MISSION_HOME) {
-            if (!in_home) { in_home = true; th_e = th_n = 0.0; th_k = 0; have_p0 = false; res.closest_true = 1e9f; }
+            if (!in_home) {
+                in_home = true; th_e = th_n = 0.0; th_k = 0; have_p0 = false;
+                res.closest_true = 1e9f; res.closest_gps = 1e9f;
+            }
             th_e += b.e; th_n += b.n; th_k++;
             true_home_e = (float)(th_e / th_k); true_home_n = (float)(th_n / th_k);
         } else {
@@ -566,9 +646,17 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
         leg_psi_turn += -boat_yaw(&b) * DT;
         if (mission_is_active(&m)) res.max_abs_turn = fmaxf(res.max_abs_turn, fabsf(leg_psi_turn));
         const float d_true = hypotf(b.e - true_home_e, b.n - true_home_n);
+        nav_en_t gps_home = {0.0f, 0.0f}, gps_pos = {0.0f, 0.0f};
+        float d_gps = -1.0f;
+        if (m.have_origin && last_fix_t >= 0.0f) {
+            gps_home = nav_to_local(&o, m.origin.lat0_deg, m.origin.lon0_deg);
+            gps_pos = nav_to_local(&o, fix_lat, fix_lon);
+            d_gps = nav_distance_m(gps_pos, gps_home);
+        }
         if (m.state == MISSION_RETURN) {
             if (!have_p0) { p0_e = b.e; p0_n = b.n; have_p0 = true; }
             res.closest_true = fminf(res.closest_true, d_true);
+            if (d_gps >= 0.0f) res.closest_gps = fminf(res.closest_gps, d_gps);
             const nav_line_pos_t lp = nav_line_position((nav_en_t){p0_e, p0_n},
                                                         (nav_en_t){true_home_e, true_home_n},
                                                         (nav_en_t){b.e, b.n});
@@ -602,6 +690,14 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
             if (m.reason == MISSION_DONE_TURNED) {
                 res.heading_err_at_turn_end = wrap180(atan2f(true_home_e - b.e, true_home_n - b.n) / D2R - b.psi);
             }
+            res.d_done_gps = d_gps;
+            if (m.state == MISSION_DONE && m.reason == MISSION_DONE_IN_ZONE &&
+                d_gps > env->settings.home_radius_m + 1.5f) res.false_arrival_gps = 1;
+            if (m.state == MISSION_DONE && (m.reason == MISSION_DONE_PASSED || m.reason == MISSION_DONE_NEAR) &&
+                res.closest_gps > 2.0f * env->settings.home_radius_m + 1.0f) res.false_arrival_gps = 1;
+            if (m.reason == MISSION_DONE_TURNED && d_gps >= 0.0f) {
+                res.heading_err_gps = wrap180(nav_bearing_deg(gps_pos, gps_home) - b.psi);
+            }
         }
         if (t_done >= 0.0f && t > t_done + 6.0f) break;
         t += DT; step++;
@@ -609,7 +705,15 @@ static result_t run_one(const envelope_t *env, const scenario_t *sc, uint64_t se
     const float d_now = hypotf(b.e - true_home_e, b.n - true_home_n);
     if (t_done < 0.0f) { res.reason = -1; res.state = (int)m.state; res.t_done = t_max; res.d_done = d_now; }
     res.d_final = d_now;
+    if (m.have_origin && last_fix_t >= 0.0f) {
+        res.d_final_gps = nav_distance_m(nav_to_local(&o, fix_lat, fix_lon),
+                                         nav_to_local(&o, m.origin.lat0_deg, m.origin.lon0_deg));
+    }
+    if (t_done < 0.0f) res.d_done_gps = res.d_final_gps;
     res.spun = res.max_abs_turn > 400.0f;
+    res.start_heading = p.start_heading;
+    res.out_beta_mean = m.out_result.mean_deg; res.out_beta_std = m.out_result.std_deg;
+    res.out_beta_valid = m.out_result.valid; res.out_beta_n = m.out_result.n;
     return res;
 }
 
@@ -624,10 +728,13 @@ static envelope_t nominal_envelope(void)
         .cbal_min = 0.05f, .cbal_max = 0.40f, .cbal_hdg_max = 0.40f, .cbal_walk = 0.12f,
         .wave_min = 1.0f, .wave_max = 2.5f, .chop_min = 0.6f, .chop_max = 1.2f,
         .drift_min = 0.0f, .drift_max = 0.10f,
-        .bias_max = 45.0f, .bias_fixed = 0, .hdg_err_max = 8.0f, .thr_err_max = 5.0f,
+        .bias_max = 45.0f, .bias_fixed = 0, .bias_sign = 0, .hdg_err_max = 8.0f, .thr_err_max = 5.0f,
+        .hdg_fixed = 0, .hdg_phase_deg = 0.0f, .compass_noise = 1.0f,
+        .gyro_noise = 0.3f, .gyro_bias_max = 0.3f, .gyro_scale_err = 0.0f,
         .gps_white = 0.12f, .gps_wander = 0.3f, .gps_drop_per_s = 0.01f, .gps_jump_per_s = 0.003f,
+        .gps_tau_s = 60.0f, .gps_order = 1, .gps_wander_spread = 0.0f,
         .gps_lag_min_s = 0.05f, .gps_lag_max_s = 0.20f, .sacc_mean = 0.06f, .vel_noise = 0.04f,
-        .link_cut_start = 20.0f, .link_cut_len = 30.0f };
+        .link_cut_start = 20.0f, .link_cut_len = 30.0f, .judge_gps = 0 };
     e.settings = mission_settings_default();
     return e;
 }
@@ -638,24 +745,31 @@ static bool in_zone_true(const envelope_t *env, const result_t *r)
            r->d_final <= env->settings.home_radius_m + 0.5f && !r->spun;
 }
 
+static bool in_zone_gps(const envelope_t *env, const result_t *r)
+{
+    return r->state == MISSION_DONE && r->reason >= MISSION_DONE_IN_ZONE &&
+           r->d_final_gps >= 0.0f && r->d_final_gps <= env->settings.home_radius_m + 0.5f && !r->spun;
+}
+
 /* Does one run meet its scenario's expectation?  Never if it declared an
  * arrival far from home or left the jets running after a stop. */
 static bool meets(const scenario_t *sc, const envelope_t *env, const result_t *r)
 {
-    if (r->false_arrival || r->motors_after_stop) return false;
+    const bool gps = env->judge_gps != 0;
+    if ((gps ? r->false_arrival_gps : r->false_arrival) || r->motors_after_stop) return false;
     if (sc->need_motors_never && r->max_cmd > 0.0f) return false;
     if (sc->need_compass_bad && !r->compass_bad) return false;
     if (sc->need_beta_invalid && r->beta_valid_ever) return false;
     if (sc->need_runs && r->runs_started != sc->need_runs) return false;
     switch (sc->expect) {
     case EXPECT_IN_ZONE:
-        return in_zone_true(env, r);
+        return gps ? in_zone_gps(env, r) : in_zone_true(env, r);
     case EXPECT_DONE_OUT:
         return r->state == MISSION_DONE && r->reason == MISSION_DONE_OUT &&
-               r->d_done >= env->settings.out_distance_m - 1.0f;
+               (gps ? r->d_done_gps : r->d_done) >= env->settings.out_distance_m - 1.0f;
     case EXPECT_DONE_TURNED:
         return r->state == MISSION_DONE && r->reason == MISSION_DONE_TURNED &&
-               fabsf(r->heading_err_at_turn_end) < 60.0f;
+               fabsf(gps ? r->heading_err_gps : r->heading_err_at_turn_end) < 60.0f;
     case EXPECT_ABORT:
         return r->state == MISSION_ABORTED && r->reason == sc->abort_reason &&
                r->latency >= 0.0f && r->latency <= sc->max_latency_s;
@@ -683,19 +797,34 @@ static void env_far_50(envelope_t *e) { e->settings.out_distance_m = 50.0f; }
 static void env_out_5(envelope_t *e) { e->settings.out_distance_m = 5.0f; }
 static void env_thr_20(envelope_t *e) { e->settings.throttle = 0.20f; e->settings.approach_throttle = 0.20f; }
 static void env_thr_60(envelope_t *e) { e->settings.throttle = 0.60f; }
-static void env_bias_45(envelope_t *e) { e->bias_max = 45.0f; e->bias_fixed = 1; }
-static void env_bias_55(envelope_t *e) { e->bias_max = 55.0f; e->bias_fixed = 1; }
-static void env_bias_70(envelope_t *e) { e->bias_max = 70.0f; e->bias_fixed = 1; }
+/* A scenario that sets the compass sets all of it: under --compass lake its
+ * fixed sign and heading pattern must not stack on the scenario's own fault. */
+static void env_bias_45(envelope_t *e) { e->bias_max = 45.0f; e->bias_fixed = 1; e->bias_sign = 0; e->hdg_fixed = 0; }
+static void env_bias_55(envelope_t *e) { e->bias_max = 55.0f; e->bias_fixed = 1; e->bias_sign = 0; e->hdg_fixed = 0; }
+static void env_bias_70(envelope_t *e) { e->bias_max = 70.0f; e->bias_fixed = 1; e->bias_sign = 0; e->hdg_fixed = 0; }
 static void env_lag_200(envelope_t *e) { e->gps_lag_min_s = e->gps_lag_max_s = 0.20f; }
-static void env_sacc_poor(envelope_t *e) { e->sacc_mean = 0.60f; e->bias_max = 10.0f; }
-static void env_sacc_poor_b30(envelope_t *e) { e->sacc_mean = 0.60f; e->bias_max = 30.0f; e->bias_fixed = 1; }
+static void env_sacc_poor(envelope_t *e)
+{
+    e->sacc_mean = 0.60f; e->bias_max = 10.0f;
+    e->bias_fixed = 0; e->bias_sign = 0; e->hdg_fixed = 0; e->hdg_err_max = 8.0f;
+}
+static void env_sacc_poor_b30(envelope_t *e)
+{
+    e->sacc_mean = 0.60f; e->bias_max = 30.0f; e->bias_fixed = 1; e->bias_sign = 0; e->hdg_fixed = 0;
+}
 static void env_cbal_wide(envelope_t *e) { e->cbal_min = -0.35f; e->cbal_max = 0.60f; e->cbal_walk = 0.25f; }
 static void env_windy(envelope_t *e) { e->cbal_hdg_max = 0.60f; e->cbal_walk = 0.20f; }
-static void env_old_compass(envelope_t *e) { e->bias_max = 45.0f; e->hdg_err_max = 22.0f; }
+static void env_old_compass(envelope_t *e)
+{
+    e->bias_max = 45.0f; e->hdg_err_max = 22.0f; e->bias_fixed = 0; e->bias_sign = 0; e->hdg_fixed = 0;
+}
 static void env_waves_x2(envelope_t *e) { e->wave_min *= 2.0f; e->wave_max *= 2.0f; e->chop_min *= 2.0f; e->chop_max *= 2.0f; }
 static void env_drift_015(envelope_t *e) { e->drift_min = 0.10f; e->drift_max = 0.15f; }
 static void env_gps_noisy(envelope_t *e) { e->gps_white = 0.30f; e->gps_jump_per_s = 0.02f; }
-static void env_new_compass(envelope_t *e) { e->bias_max = 5.0f; e->hdg_err_max = 5.0f; }
+static void env_new_compass(envelope_t *e)
+{
+    e->bias_max = 5.0f; e->hdg_err_max = 5.0f; e->bias_fixed = 0; e->bias_sign = 0; e->hdg_fixed = 0;
+}
 static void env_slow_boat(envelope_t *e) { e->K_min = 20.0f; e->K_max = 30.0f; e->tau_min = 1.1f; e->tau_max = 1.5f; e->delay_min = 0.4f; e->delay_max = 0.5f; }
 
 #define NSC 72
@@ -791,7 +920,9 @@ static int cmpf(const void *a, const void *b)
 
 typedef struct {
     int n, meet, inzone, done, aborted, refused, never, spins, false_arr, warned, beta_valid;
-    float d_med, d_p95, t_med;
+    int within[4];       /* ended DONE and truly within 1, 2, 3, 4 m of home */
+    int inzone_gps, false_arr_gps;
+    float d_med, d_p90, d_p95, t_med;
 } stats_t;
 
 static stats_t run_set(const envelope_t *env, const scenario_t *sc, int runs, uint64_t seed, int verbose)
@@ -807,6 +938,8 @@ static stats_t run_set(const envelope_t *env, const scenario_t *sc, int runs, ui
         s.refused += r.state == MISSION_REFUSED; s.never += r.reason == -1;
         s.spins += r.spun; s.false_arr += r.false_arrival; s.warned += r.warned;
         s.beta_valid += r.beta_valid_ever;
+        s.inzone_gps += in_zone_gps(env, &r); s.false_arr_gps += r.false_arrival_gps;
+        for (int w = 0; w < 4; ++w) s.within[w] += r.state == MISSION_DONE && r.d_final <= (float)(w + 1);
         d[i] = r.d_final; tt[i] = r.t_done;
         if (verbose && !good) {
             printf("   miss run %d: state=%d reason=%d t=%.1f d_done=%.2f d_final=%.2f closest=%.2f false=%d "
@@ -818,7 +951,8 @@ static stats_t run_set(const envelope_t *env, const scenario_t *sc, int runs, ui
     }
     qsort(d, (size_t)runs, sizeof(float), cmpf);
     qsort(tt, (size_t)runs, sizeof(float), cmpf);
-    s.d_med = d[runs / 2]; s.d_p95 = d[(int)((float)runs * 0.95f)]; s.t_med = tt[runs / 2];
+    s.d_med = d[runs / 2]; s.d_p90 = d[(int)((float)runs * 0.90f)];
+    s.d_p95 = d[(int)((float)runs * 0.95f)]; s.t_med = tt[runs / 2];
     free(d); free(tt);
     return s;
 }
@@ -1041,11 +1175,130 @@ static int replay(const envelope_t *env, const char *path, int runs, uint64_t se
     return seg_count > 0 ? 0 : 2;
 }
 
+/* --gps NAME.  lake / lake-good are fitted to the lake GPS drift in
+ * model_ref.json gps_drift.by_day: 2026-09-21 (12 satellites; the typical
+ * day, most data) and 2026-09-20 (15 satellites, the best sky).  Faults as
+ * the 09-18..21 runs had them: no dropout in 1,306 s of fixes (longest gap
+ * 0.6 s) -> 0.002/s, the 95 % upper bound; 2 jumps over 1 m, both in the
+ * first minute after power-up -> 0.0015/s.  Legacy injects 5x / 2x more. */
+static int gps_preset(envelope_t *e, const char *name)
+{
+    if (!strcmp(name, "legacy")) {
+        e->gps_white = 0.12f; e->gps_wander = 0.30f; e->gps_tau_s = 60.0f; e->gps_order = 1; e->gps_wander_spread = 0.0f;
+        e->gps_drop_per_s = 0.01f; e->gps_jump_per_s = 0.003f;
+    } else if (!strcmp(name, "lake")) {
+        e->gps_white = 0.03f; e->gps_wander = 1.12f; e->gps_tau_s = 11.0f; e->gps_order = 2; e->gps_wander_spread = 0.4f;
+        e->gps_drop_per_s = 0.002f; e->gps_jump_per_s = 0.0015f;
+    } else if (!strcmp(name, "lake-good")) {
+        e->gps_white = 0.03f; e->gps_wander = 0.52f; e->gps_tau_s = 9.0f; e->gps_order = 2; e->gps_wander_spread = 0.0f;
+        e->gps_drop_per_s = 0.002f; e->gps_jump_per_s = 0.0015f;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+/* --compass NAME / --gyro NAME.  lake: fitted to the 2026-09-20/21 lake runs
+ * (model_ref.json).  The compass as it was THEN -- the old calibration,
+ * before the 09-24 flat one: over the P-ON straights, GPS course minus
+ * heading = 34.5 + 20.1 cos(course - 280) deg (2.2 deg rms residual), so the
+ * heading reads -34.5 + 20.1 sin(psi - 10) off -- turns read 35 % short or
+ * long depending on direction.  The gyro: 0.20 deg/s noise on the still boat
+ * (gyro_still), bias within +-0.7 deg/s (half of that = the calm prechecks'
+ * median |mean|, some of it the boat really turning), scale within +-2 % (the
+ * 09-24 calibration read gyro/compass 1.015). */
+static int compass_preset(envelope_t *e, const char *name)
+{
+    if (!strcmp(name, "legacy")) {
+        e->bias_max = 45.0f; e->bias_fixed = 0; e->bias_sign = 0; e->hdg_err_max = 8.0f; e->hdg_fixed = 0;
+        e->hdg_phase_deg = 0.0f; e->thr_err_max = 5.0f; e->compass_noise = 1.0f;
+    } else if (!strcmp(name, "lake")) {
+        e->bias_max = 34.5f; e->bias_fixed = 1; e->bias_sign = -1; e->hdg_err_max = 20.1f; e->hdg_fixed = 1;
+        e->hdg_phase_deg = -10.0f; e->thr_err_max = 5.0f; e->compass_noise = 1.0f;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static int gyro_preset(envelope_t *e, const char *name)
+{
+    if (!strcmp(name, "legacy")) {
+        e->gyro_noise = 0.30f; e->gyro_bias_max = 0.30f; e->gyro_scale_err = 0.0f;
+    } else if (!strcmp(name, "lake")) {
+        e->gyro_noise = 0.20f; e->gyro_bias_max = 0.70f; e->gyro_scale_err = 0.02f;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+/* ---- --beta-check: the compass as the mission sees it ---------------------
+ * Stage-1 missions (out 10 m, stop), one JSON line per run: the true start
+ * heading and the mission's own outbound estimate of GPS course minus heading,
+ * to compare with the lake's P-ON straights (model_ref.json p_on). */
+static void beta_check(const envelope_t *env0, int runs, uint64_t seed)
+{
+    envelope_t env = *env0;
+    env.settings.stage = MISSION_STAGE_OUT;
+    scenario_t nom = scenario_defaults(); nom.name = "beta_check";
+    for (int i = 0; i < runs; ++i) {
+        const result_t r = run_one(&env, &nom, seed + (uint64_t)i, NULL);
+        printf("{\"run\":%d,\"start_heading\":%.1f,\"beta_mean\":%.2f,\"beta_std\":%.2f,\"valid\":%d,"
+               "\"n\":%u,\"state\":%d,\"reason\":%d}\n",
+               i, r.start_heading, r.out_beta_mean, r.out_beta_std, r.out_beta_valid, (unsigned)r.out_beta_n,
+               r.state, r.reason);
+    }
+}
+
+/* ---- --gps-check: the GPS wander alone ------------------------------------
+ * Measured the way model_from_dataout.py measures the lake (gps_drift): how
+ * far the GPS position moves away from the true track over tau seconds,
+ * white noise included.  Each window starts 2 s in, about when the mission
+ * takes home; one window per run, so the runs are independent. */
+static void gps_check(const envelope_t *env, int runs, uint64_t seed)
+{
+    static const int taus[] = {5, 10, 20, 30, 40, 70};
+    enum { NT = 6, T0 = 20, LEN = T0 + 700 + 1 };
+    static float E[LEN], N[LEN];
+    float *d[NT] = {0};
+    for (int k = 0; k < NT; ++k) {
+        d[k] = malloc(sizeof(float) * (size_t)runs);
+        if (!d[k]) {
+            for (int j = 0; j < NT; ++j) free(d[j]);
+            fprintf(stderr, "out of memory\n");
+            return;
+        }
+    }
+    for (int r = 0; r < runs; ++r) {
+        seed_rng(seed + (uint64_t)r);
+        gps_wander_t w; gps_wander_init(env, &w);
+        for (int i = 0; i < LEN; ++i) {
+            gps_wander_step(env, &w);
+            E[i] = w.e + env->gps_white * gauss();
+            N[i] = w.n + env->gps_white * gauss();
+        }
+        for (int k = 0; k < NT; ++k) {
+            const int j = T0 + taus[k] * 10;
+            d[k][r] = hypotf(E[j] - E[T0], N[j] - N[T0]);
+        }
+    }
+    for (int k = 0; k < NT; ++k) {
+        qsort(d[k], (size_t)runs, sizeof(float), cmpf);
+        printf("{\"tau_s\":%d,\"median_m\":%.3f,\"p90_m\":%.3f,\"runs\":%d,\"gps_wander\":%.2f,"
+               "\"gps_tau_s\":%.0f,\"gps_order\":%d,\"gps_spread\":%.2f}\n",
+               taus[k], d[k][runs / 2], d[k][(int)((float)runs * 0.9f)], runs, env->gps_wander,
+               env->gps_tau_s, env->gps_order, env->gps_wander_spread);
+        free(d[k]);
+    }
+}
+
 int main(int argc, char **argv)
 {
     envelope_t env = nominal_envelope();
     int runs = 200; uint64_t seed = 1; const char *trace_path = NULL; int verbose = 0;
     const char *only = NULL, *sweep = NULL, *replay_path = NULL; int catalogue = 0, plant = 0, list = 0;
+    int gps_chk = 0, beta_chk = 0;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--runs") && i + 1 < argc) runs = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
@@ -1053,6 +1306,40 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--bias") && i + 1 < argc) env.bias_max = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gps-white") && i + 1 < argc) env.gps_white = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--gps-wander") && i + 1 < argc) env.gps_wander = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gps-tau") && i + 1 < argc) env.gps_tau_s = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gps-drop") && i + 1 < argc) env.gps_drop_per_s = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gps-jump") && i + 1 < argc) env.gps_jump_per_s = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gps-order") && i + 1 < argc) env.gps_order = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--gps-spread") && i + 1 < argc) env.gps_wander_spread = strtof(argv[++i], NULL);
+        else if (!strcmp(argv[i], "--gps") && i + 1 < argc) {
+            if (gps_preset(&env, argv[++i]) != 0) {
+                fprintf(stderr, "unknown GPS model %s (legacy, lake, lake-good)\n", argv[i]);
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--gps-check")) gps_chk = 1;
+        else if (!strcmp(argv[i], "--beta-check")) beta_chk = 1;
+        else if (!strcmp(argv[i], "--judge") && i + 1 < argc) {
+            const char *j = argv[++i];
+            if (!strcmp(j, "gps")) env.judge_gps = 1;
+            else if (!strcmp(j, "true")) env.judge_gps = 0;
+            else { fprintf(stderr, "unknown judge %s (true, gps)\n", j); return 2; }
+        }
+        else if (!strcmp(argv[i], "--compass") && i + 1 < argc) {
+            if (compass_preset(&env, argv[++i]) != 0) {
+                fprintf(stderr, "unknown compass model %s (legacy, lake)\n", argv[i]);
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--gyro") && i + 1 < argc) {
+            if (gyro_preset(&env, argv[++i]) != 0) {
+                fprintf(stderr, "unknown gyro model %s (legacy, lake)\n", argv[i]);
+                return 2;
+            }
+        }
+        else if (!strcmp(argv[i], "--lake")) {
+            (void)gps_preset(&env, "lake"); (void)compass_preset(&env, "lake"); (void)gyro_preset(&env, "lake");
+        }
         else if (!strcmp(argv[i], "--radius") && i + 1 < argc) env.settings.home_radius_m = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--throttle") && i + 1 < argc) env.settings.throttle = strtof(argv[++i], NULL);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) env.settings.out_distance_m = strtof(argv[++i], NULL);
@@ -1083,6 +1370,20 @@ int main(int argc, char **argv)
         for (int k = 0; k < ncat; ++k) printf("%s\n", cat[k].name);
         return 0;
     }
+    if (!(env.gps_tau_s > 0.0f) || (env.gps_order != 1 && env.gps_order != 2) ||
+        !(env.gps_wander_spread >= 0.0f && env.gps_wander_spread < 1.0f) || !(env.gps_wander >= 0.0f) ||
+        !(env.gps_drop_per_s >= 0.0f) || !(env.gps_jump_per_s >= 0.0f)) {
+        fprintf(stderr, "bad GPS model: tau > 0, order 1 or 2, 0 <= spread < 1, wander/drop/jump >= 0\n");
+        return 2;
+    }
+    if (!(env.gyro_noise >= 0.0f) || !(env.gyro_bias_max >= 0.0f) || !(env.compass_noise >= 0.0f) ||
+        !(env.gyro_scale_err >= 0.0f && env.gyro_scale_err < 0.5f)) {
+        fprintf(stderr, "bad gyro/compass model\n");
+        return 2;
+    }
+    if (g_approach > 0.0f) env.settings.approach_throttle = g_approach;
+    if (gps_chk) { gps_check(&env, runs, seed); return 0; }
+    if (beta_chk) { beta_check(&env, runs, seed); return 0; }
     if (plant) { plant_check(&env, runs, seed); return 0; }
     if (replay_path) return replay(&env, replay_path, runs, seed);
     if (sweep) {
@@ -1095,6 +1396,7 @@ int main(int argc, char **argv)
     }
     if (catalogue || only) {
         int failed = 0, found = 0;
+        if (env.judge_gps) printf("(judged against the boat's own GPS; 'in zone' and 'd_med' are TRUE)\n");
         printf("%-20s %6s %5s %8s %6s  %s\n", "scenario", "pass", "need", "in zone", "d_med", "what");
         for (int k = 0; k < ncat; ++k) {
             if (only && strcmp(only, cat[k].name)) continue;
@@ -1122,8 +1424,17 @@ int main(int argc, char **argv)
     const stats_t s = run_set(&env, &nom, runs, seed, verbose);
     printf("{\"runs\":%d,\"drift_max\":%.2f,\"bias_max\":%.0f,\"radius\":%.1f,\"in_zone\":%.3f,\"done\":%d,"
            "\"refused\":%d,\"aborted\":%d,\"never_ended\":%d,\"spins\":%d,\"false_arrivals\":%d,\"warned\":%d,"
-           "\"d_final_median\":%.2f,\"d_final_p95\":%.2f,\"time_median\":%.0f}\n",
+           "\"d_final_median\":%.2f,\"d_final_p95\":%.2f,\"time_median\":%.0f,"
+           "\"gps_wander\":%.2f,\"gps_tau_s\":%.0f,\"gps_order\":%d,\"d_final_p90\":%.2f,"
+           "\"within_1m\":%.3f,\"within_2m\":%.3f,\"within_3m\":%.3f,\"within_4m\":%.3f,"
+           "\"compass_bias\":%.1f,\"compass_hdg_amp\":%.1f,\"compass_fixed\":%d,\"gyro_noise\":%.2f,"
+           "\"gyro_bias_max\":%.2f,\"gyro_scale_err\":%.3f,\"beta_valid\":%.3f,"
+           "\"in_zone_gps\":%.3f,\"false_arrivals_gps\":%d}\n",
            s.n, env.drift_max, env.bias_max, env.settings.home_radius_m, (double)s.inzone / s.n, s.done,
-           s.refused, s.aborted, s.never, s.spins, s.false_arr, s.warned, s.d_med, s.d_p95, s.t_med);
+           s.refused, s.aborted, s.never, s.spins, s.false_arr, s.warned, s.d_med, s.d_p95, s.t_med,
+           env.gps_wander, env.gps_tau_s, env.gps_order, s.d_p90,
+           (double)s.within[0] / s.n, (double)s.within[1] / s.n, (double)s.within[2] / s.n, (double)s.within[3] / s.n,
+           (double)env.bias_sign * env.bias_max, env.hdg_err_max, env.hdg_fixed, env.gyro_noise, env.gyro_bias_max,
+           env.gyro_scale_err, (double)s.beta_valid / s.n, (double)s.inzone_gps / s.n, s.false_arr_gps);
     return 0;
 }

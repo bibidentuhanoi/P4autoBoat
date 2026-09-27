@@ -14,6 +14,12 @@ the current physical boat -- and writes tools/mission_sim/model_ref.json:
   segments   every turn / yaw pulse: the P-held straight before it (c_pre,
              yaw_pre) and its rows (t, left, right, yaw, command age)
   gps_still  the still boat before each run: GPS spread and speed
+  gyro_still the same still boat: gyro yaw mean and std (the boat floats, so
+             some of the mean is the boat really turning)
+  gps_drift  how far the GPS position wanders from the boat's real track over
+             5-40 s: GPS track minus the track its own speed + course add up
+             to (the speed is Doppler, far steadier than the position), from
+             windows that start with START-quality sky (>= 8 sats, pDOP <= 2.5)
 
 tests/test_mission_sim.py checks the simulator's boat model against this file.
 Re-run it when new lake data should change the model:
@@ -38,6 +44,9 @@ MIN_STRAIGHT_S = 15.0      # shorter straights were cut by a failsafe or STOP
 SETTLE_S = 5.0             # speed-up at the start of a straight
 MAX_GPS_SPEED = 2.0        # the boat cannot do this: a GPS glitch
 MAX_FIX_STEP_M = 5.0       # consecutive fixes this far apart: a GPS glitch
+DRIFT_TAUS_S = (5, 10, 20, 30, 40)
+DRIFT_START_MIN_SATS = 8   # the mission's START gate
+DRIFT_START_MAX_PDOP = 2.5
 
 
 def default_dataout():
@@ -270,10 +279,71 @@ def still_metrics(name, rows, out):
                                          if any(math.isfinite(num(r.get("satellites"))) for r in fx) else 0)})
 
 
+def drift_windows(rows):
+    """{tau: [metres]}: GPS track minus speed-integrated track over tau seconds,
+    one window per second of the run, each starting with START-quality sky."""
+    fx = [r for r in fixes(rows) if truthy(r.get("gps_valid")) and math.isfinite(num(r.get("t_mono")))]
+    out = {tau: [] for tau in DRIFT_TAUS_S}
+    if len(fx) < 20 or glitchy(fx):
+        return out
+    lat0, lon0 = num(fx[0]["lat"]), num(fx[0]["lon"])
+    t, err = [], []
+    ie = inn = 0.0
+    prev = None
+    for r in fx:
+        e, n = local_en(num(r["lat"]), num(r["lon"]), lat0, lon0)
+        sp, co = num(r["speed_mps"]), num(r.get("course_deg"))
+        ve, vn = (sp * math.sin(math.radians(co)), sp * math.cos(math.radians(co))) if math.isfinite(co) else (0.0, 0.0)
+        tt = num(r["t_mono"])
+        if prev is not None:
+            dt = tt - prev[0]
+            ie += 0.5 * (prev[1] + ve) * dt
+            inn += 0.5 * (prev[2] + vn) * dt
+        prev = (tt, ve, vn)
+        t.append(tt)
+        err.append((e - ie, n - inn, num(r.get("satellites")), num(r.get("hdop"))))
+    for tau in DRIFT_TAUS_S:
+        i, next_start = 0, t[0]
+        while i < len(t):
+            if t[i] < next_start:
+                i += 1
+                continue
+            next_start = t[i] + 1.0
+            if not (err[i][2] >= DRIFT_START_MIN_SATS and 0.0 < err[i][3] <= DRIFT_START_MAX_PDOP):
+                continue
+            j = i
+            while j < len(t) and t[j] < t[i] + tau:
+                j += 1
+            if j < len(t) and abs(t[j] - t[i] - tau) <= 0.3:
+                out[tau].append(math.hypot(err[j][0] - err[i][0], err[j][1] - err[i][1]))
+    return out
+
+
+def drift_summary(windows):
+    res = {"tau_s": list(DRIFT_TAUS_S), "n": [], "median_m": [], "p90_m": []}
+    for tau in DRIFT_TAUS_S:
+        xs = sorted(windows[tau])
+        res["n"].append(len(xs))
+        res["median_m"].append(round(statistics.median(xs), 3) if xs else None)
+        res["p90_m"].append(round(xs[min(len(xs) - 1, int(0.9 * len(xs)))], 3) if xs else None)
+    return res
+
+
+def gyro_still_metrics(name, rows, out):
+    yaw = [num(r.get("yaw_dps")) for r in rows if r.get("phase") == "precheck"]
+    yaw = [y for y in yaw if math.isfinite(y)]
+    if len(yaw) < 20:
+        return
+    out["gyro_still"].append({"run": name, "mean_dps": round(statistics.fmean(yaw), 3),
+                              "std_dps": round(statistics.pstdev(yaw), 3), "n": len(yaw)})
+
+
 def extract(dataout, days, offset_h):
     out = {"meta": {"days": days, "utc_offset_h": offset_h, "source": "dataout/<run>/{summary.json,samples.csv}",
                     "generated_by": "tools/mission_sim/model_from_dataout.py", "runs": [], "excluded": []},
-           "speed": [], "glide": [], "p_on": [], "p_off": [], "segments": [], "gps_still": []}
+           "speed": [], "glide": [], "p_on": [], "p_off": [], "segments": [], "gps_still": [], "gyro_still": []}
+    drift_all = {tau: [] for tau in DRIFT_TAUS_S}
+    drift_by_day = {}
     for run_dir in sorted(p for p in Path(dataout).iterdir() if p.is_dir() and p.name.startswith(FAMILIES)):
         try:
             summary = json.loads((run_dir / "summary.json").read_text())
@@ -290,6 +360,13 @@ def extract(dataout, days, offset_h):
         glide_metrics(run_dir.name, rows, out)
         segment_metrics(run_dir.name, summary, rows, out, out["meta"]["excluded"])
         still_metrics(run_dir.name, rows, out)
+        gyro_still_metrics(run_dir.name, rows, out)
+        day = local_day(summary.get("t_utc_end"), offset_h)
+        for tau, xs in drift_windows(rows).items():
+            drift_all[tau].extend(xs)
+            drift_by_day.setdefault(day, {k: [] for k in DRIFT_TAUS_S})[tau].extend(xs)
+    out["gps_drift"] = drift_summary(drift_all)
+    out["gps_drift"]["by_day"] = {day: drift_summary(w) for day, w in sorted(drift_by_day.items())}
     return out
 
 
@@ -308,9 +385,10 @@ def main():
         raise SystemExit("no runs from %s in %s" % (", ".join(days), args.dataout))
     args.out.write_text(json.dumps(ref, indent=1, sort_keys=True) + "\n")
     print("%d runs -> %s: %d speeds, %d glides, %d P-ON straights, %d P-OFF straights, %d turn segments, "
-          "%d still checks, %d exclusions" % (len(ref["meta"]["runs"]), args.out, len(ref["speed"]), len(ref["glide"]),
-                                              len(ref["p_on"]), len(ref["p_off"]), len(ref["segments"]),
-                                              len(ref["gps_still"]), len(ref["meta"]["excluded"])))
+          "%d still checks, %d GPS drift windows (30 s), %d exclusions"
+          % (len(ref["meta"]["runs"]), args.out, len(ref["speed"]), len(ref["glide"]),
+             len(ref["p_on"]), len(ref["p_off"]), len(ref["segments"]),
+             len(ref["gps_still"]), ref["gps_drift"]["n"][DRIFT_TAUS_S.index(30)], len(ref["meta"]["excluded"])))
 
 
 if __name__ == "__main__":
